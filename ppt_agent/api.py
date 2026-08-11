@@ -236,6 +236,7 @@ if(r.ok){location.reload();}else{const data=await r.json();out.textContent=(data
 
     SCOPE_LABEL={"global":"全局","page":"页面","element":"元素"}
     ACTOR_LABEL={"user":"用户","system":"系统"}
+    BASIS_LABEL={"prompt_semantics":"Prompt 语义","current_selection":"当前选择"}
     def sample_page(self,start,task_id):
         view=self.service.sample_view(task_id); esc=self.esc; selection=view.get("selection") or {}; sample=view.get("sample") or {}
         ids=selection.get("slide_ids",[]); checks="".join(f'<label><input type="checkbox" name="slide" value="{esc(x)}" checked> {esc(x)}</label>' for x in ids)
@@ -247,7 +248,7 @@ if(r.ok){location.reload();}else{const data=await r.json();out.textContent=(data
         entries=[]
         for record in view["versions"]:
             meta=record["metadata"] or {}; artifact=json.loads(self.service.version(task_id,record["hash"]))
-            entries.append({"hash":record["hash"],"version":artifact.get("version"),"created_at":artifact.get("created_at",""),"outline_hash":artifact.get("outline_hash",""),"content_hash":artifact.get("content_hash",""),"summary":meta.get("summary",""),"scope":meta.get("scope","global"),"slide_id":meta.get("slide_id"),"element_id":meta.get("element_id"),"actor":actors.get(record["hash"],"system"),"html":meta.get("html","")})
+            entries.append({"hash":record["hash"],"version":artifact.get("version"),"created_at":artifact.get("created_at",""),"outline_hash":artifact.get("outline_hash",""),"content_hash":artifact.get("content_hash",""),"summary":meta.get("summary",""),"scope":meta.get("scope","global"),"slide_id":meta.get("slide_id"),"element_id":meta.get("element_id"),"basis":(meta.get("scope_understanding") or {}).get("basis"),"actor":actors.get(record["hash"],"system"),"html":meta.get("html","")})
         entries.sort(key=lambda entry:entry["version"] or 0)
         rows=[]
         for entry in entries:
@@ -255,8 +256,9 @@ if(r.ok){location.reload();}else{const data=await r.json();out.textContent=(data
             if entry["scope"]=="element" and entry["element_id"]: target=f' · 目标：元素 {esc(entry["element_id"])}'
             elif entry["scope"]=="page" and entry["slide_id"]: target=f' · 目标：页面 {esc(entry["slide_id"])}'
             else: target=""
+            basis=f' · 依据：{esc(self.BASIS_LABEL.get(entry["basis"],entry["basis"]))}' if entry["basis"] else ""
             stamp=esc(entry["created_at"][:19].replace("T"," "))
-            rows.append(f'<li data-hash="{entry["hash"]}"' + (' class="current"' if current else "") + f'><strong>v{entry["version"]}</strong>{badge} <span class="sum">{esc(entry["summary"])}</span><br><span class="meta">来源：{esc(self.ACTOR_LABEL.get(entry["actor"],entry["actor"]))} · 作用域：{esc(self.SCOPE_LABEL.get(entry["scope"],entry["scope"]))}{target} · {stamp} · 大纲 <code>{esc(entry["outline_hash"][:12])}…</code> · 内容 <code>{esc(entry["content_hash"][:12])}…</code></span> <button type="button" class="preview-version" data-hash="{entry["hash"]}">预览此版本</button></li>')
+            rows.append(f'<li data-hash="{entry["hash"]}"' + (' class="current"' if current else "") + f'><strong>v{entry["version"]}</strong>{badge} <span class="sum">{esc(entry["summary"])}</span><br><span class="meta">来源：{esc(self.ACTOR_LABEL.get(entry["actor"],entry["actor"]))} · 作用域：{esc(self.SCOPE_LABEL.get(entry["scope"],entry["scope"]))}{target}{basis} · {stamp} · 大纲 <code>{esc(entry["outline_hash"][:12])}…</code> · 内容 <code>{esc(entry["content_hash"][:12])}…</code></span> <button type="button" class="preview-version" data-hash="{entry["hash"]}">预览此版本</button></li>')
         timeline="".join(rows) or "<li>尚无样品版本；生成后按时间线展示来源、修改摘要、操作者与大纲/HTML 对应关系。</li>"
         if len(entries)>=2:
             def options_for(selected):
@@ -265,14 +267,24 @@ if(r.ok){location.reload();}else{const data=await r.json();out.textContent=(data
         else:
             diff_block='<p class="meta">形成两个以上样品版本后，可在此选择任意两个版本对比 HTML 差异。</p>'
         preview_label=f'<p id="previewLabel" aria-live="polite">正在预览：当前版本 v{esc(version)}</p>' if sample else '<p id="previewLabel" aria-live="polite">尚未生成样品</p>'
+        understanding_panel=""
+        if sample:
+            latest=(sample.get("metadata") or {}).get("scope_understanding")
+            if latest:
+                if latest.get("element_id"): utarget=f' · 目标：元素 {esc(latest["element_id"])}'
+                elif latest.get("slide_id"): utarget=f' · 目标：页面 {esc(latest["slide_id"])}'
+                else: utarget=""
+                understanding_panel=(f'<p class="understanding" aria-live="polite">最近修改理解：作用域：{esc(self.SCOPE_LABEL.get(latest.get("scope"),latest.get("scope")))}'
+                    f' · 依据：{esc(self.BASIS_LABEL.get(latest.get("basis"),latest.get("basis")))}{utarget}</p>')
         version_map={entry["hash"]:{key:entry[key] for key in ("version","summary","scope","slide_id","element_id","actor","created_at","outline_hash","content_hash","html")} for entry in entries}
         versions_json=json.dumps(version_map,ensure_ascii=False).replace("</","<\\/")
         script=("<script>const TASK_ID="+json.dumps(task_id)+",CURRENT_HASH="+json.dumps(current_hash or "")+",SAMPLE_VERSIONS="+versions_json+";"
         "const base='/v1/tasks/'+TASK_ID+'/samples/';"
-        "async function send(a,b){const r=await fetch(base+a,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});if(r.ok)location.reload();else document.querySelector('output').textContent=((await r.json()).error||{}).message;}"
+        "async function send(a,b){const r=await fetch(base+a,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});if(r.ok)location.reload();else document.querySelector('#actionResult').textContent=((await r.json()).error||{}).message;}"
         "select.onclick=()=>send('select',{slide_ids:[...document.querySelectorAll('[name=slide]:checked')].map(x=>x.value)});"
         "generate.onclick=()=>send('generate',{prompt:prompt.value});"
-        "modify.onclick=()=>send('modify',{prompt:prompt.value,scope:scope.value,slide_id:slide.value||null,element_id:element.value||null});"
+        "modify.onclick=()=>{const b={prompt:prompt.value,slide_id:slide.value||null,element_id:element.value||null};if(scope.value!=='auto')b.scope=scope.value;"
+        "fetch(base+'modify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}).then(async r=>{if(r.ok)location.reload();else document.querySelector('#modifyHint').textContent=((await r.json()).error||{}).message;});};"
         "confirm.onclick=()=>send('confirm',{});"
         "const frame=document.querySelector('#previewFrame'),label=document.querySelector('#previewLabel'),back=document.querySelector('#backCurrent');"
         "function showVersion(h){const v=SAMPLE_VERSIONS[h];if(!v||!frame)return;frame.srcdoc=v.html;if(h===CURRENT_HASH){label.textContent='正在预览：当前版本 v'+v.version;back.hidden=true;}else{label.textContent='正在预览：历史版本 v'+v.version+'（'+v.summary+'）';back.hidden=false;}}"
@@ -283,8 +295,8 @@ if(r.ok){location.reload();}else{const data=await r.json();out.textContent=(data
         "function renderDiff(){const box=document.querySelector('#diffResult');if(!box)return;box.textContent='';const l=SAMPLE_VERSIONS[diffLeft.value],r=SAMPLE_VERSIONS[diffRight.value];if(!l||!r)return;if(diffLeft.value===diffRight.value){box.textContent='请选择两个不同的版本进行对比。';return;}const head=document.createElement('p');head.textContent='左：v'+l.version+'（'+l.summary+'）　右：v'+r.version+'（'+r.summary+'）';box.appendChild(head);if(l.html===r.html){const same=document.createElement('p');same.textContent='两个版本的 HTML 内容一致。';box.appendChild(same);return;}const pre=document.createElement('pre');pre.className='diff';for(const row of diffLines(l.html,r.html)){const div=document.createElement('div');div.className=row[0]==='+'?'add':(row[0]==='-'?'del':'ctx');div.textContent=row[0]+' '+row[1];pre.appendChild(div);}box.appendChild(pre);}"
         "const diffRun=document.querySelector('#diffRun');if(diffRun)diffRun.onclick=renderDiff;"
         "</script>")
-        raw=(f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>HTML 样品页</title><style>body{{font:16px system-ui;max-width:1280px;margin:24px auto;padding:0 20px;color:#172033}}main{{display:grid;grid-template-columns:340px 1fr;gap:20px}}section{{border:1px solid #ccd3df;padding:16px;border-radius:10px;margin-bottom:16px}}iframe{{width:100%;height:620px;border:1px solid #ccd3df;border-radius:8px}}label,button{{display:block;margin:8px 0}}textarea{{width:100%;height:100px}}button{{padding:8px 12px}}.timeline{{list-style:none;padding:0;margin:0}}.timeline li{{border:1px solid #ccd3df;border-radius:8px;padding:10px;margin:8px 0}}.timeline li.current{{border-color:#1570ef;background:#eff4ff}}.badge.cur{{background:#1570ef;color:#fff;border-radius:6px;padding:1px 6px;font-size:12px;margin-left:6px}}.meta{{color:#475467;font-size:13px}}.diff{{background:#0b1020;color:#d1e7ff;padding:10px;border-radius:8px;font-size:12px;white-space:pre-wrap;word-break:break-all}}.diff .add{{background:#064e3b}}.diff .del{{background:#7f1d1d}}.diff .ctx{{color:#94a3b8}}@media(max-width:800px){{main{{grid-template-columns:1fr}}}}</style>'''
-        f'''<h1>HTML 样品页</h1><p>样品版本：{esc(version)}；确认状态：{'已绑定确认' if confirmed else '待人工确认'}</p><main><div><section aria-label="样品操作"><h2>样品选择</h2><div id="slides">{checks or '尚未推荐，生成时默认推荐 2 页'}</div><button id="select">保存选择</button><h2>修改</h2><label>作用域 <select id="scope"><option>global</option><option>page</option><option>element</option></select></label><label>页面 ID <input id="slide"></label><label>元素 ID <input id="element"></label><textarea id="prompt" placeholder="输入视觉修改要求"></textarea><button id="generate">生成样品</button><button id="modify">提交修改</button><button id="confirm">确认样品并生成全稿</button><output></output></section>'''
+        raw=(f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>HTML 样品页</title><style>body{{font:16px system-ui;max-width:1280px;margin:24px auto;padding:0 20px;color:#172033}}main{{display:grid;grid-template-columns:340px 1fr;gap:20px}}section{{border:1px solid #ccd3df;padding:16px;border-radius:10px;margin-bottom:16px}}iframe{{width:100%;height:620px;border:1px solid #ccd3df;border-radius:8px}}label,button{{display:block;margin:8px 0}}textarea{{width:100%;height:100px}}button{{padding:8px 12px}}.timeline{{list-style:none;padding:0;margin:0}}.timeline li{{border:1px solid #ccd3df;border-radius:8px;padding:10px;margin:8px 0}}.timeline li.current{{border-color:#1570ef;background:#eff4ff}}.badge.cur{{background:#1570ef;color:#fff;border-radius:6px;padding:1px 6px;font-size:12px;margin-left:6px}}.meta{{color:#475467;font-size:13px}}.diff{{background:#0b1020;color:#d1e7ff;padding:10px;border-radius:8px;font-size:12px;white-space:pre-wrap;word-break:break-all}}.diff .add{{background:#064e3b}}.diff .del{{background:#7f1d1d}}.diff .ctx{{color:#94a3b8}}.hint{{display:block;min-height:20px;color:#b42318;margin:6px 0}}.understanding{{background:#eff4ff;border:1px solid #1570ef;border-radius:8px;padding:8px;font-size:14px}}@media(max-width:800px){{main{{grid-template-columns:1fr}}}}</style>'''
+        f'''<h1>HTML 样品页</h1><p>样品版本：{esc(version)}；确认状态：{'已绑定确认' if confirmed else '待人工确认'}</p><main><div><section aria-label="样品操作"><h2>样品选择</h2><div id="slides">{checks or '尚未推荐，生成时默认推荐 2 页'}</div><button id="select">保存选择</button><h2>修改</h2><label>作用域 <select id="scope"><option value="auto" selected>自动识别</option><option value="global">global</option><option value="page">page</option><option value="element">element</option></select></label><label>页面 ID <input id="slide"></label><label>元素 ID <input id="element"></label><textarea id="prompt" placeholder="输入视觉修改要求"></textarea><p class="meta">作用域默认自动识别：结合 Prompt 与当前页面/元素选择判断范围；仅在明显歧义时要求澄清，也可手动指定作用域。</p><output id="modifyHint" class="hint" aria-live="polite"></output>{understanding_panel}<button id="generate">生成样品</button><button id="modify">提交修改</button><button id="confirm">确认样品并生成全稿</button><output id="actionResult" class="hint"></output></section>'''
         f'''<section aria-label="版本时间线"><h2>版本时间线</h2><ol class="timeline">{timeline}</ol></section></div>'''
         f'''<div><section aria-label="安全预览"><h2>安全预览</h2>{preview_label}<button id="backCurrent" type="button" hidden>返回当前版本</button><iframe sandbox="" id="previewFrame" srcdoc="{esc(preview)}"></iframe></section>'''
         f'''<section aria-label="差异对比"><h2>差异对比</h2>{diff_block}</section></div></main>''' + script + "</html>").encode()

@@ -174,6 +174,88 @@ class SamplePageTests(unittest.TestCase):
         # 注入文本仅作为摘要以转义形式出现
         self.assertIn("&lt;/script&gt;&lt;script&gt;alert(1)&lt;/script&gt;", page)
 
+    def post_raw(self, action, body):
+        status, _, raw = self.call("POST", f"/v1/tasks/task/samples/{action}", body)
+        return status, json.loads(raw)
+
+    def test_auto_scope_is_default_and_modify_omits_scope(self):
+        _, page = self.page()
+        # 自动识别为默认选项，手动 global/page/element 仍可显式指定
+        select = re.search(r'<select id="scope">(.*?)</select>', page, re.S).group(1)
+        self.assertIn('<option value="auto" selected>自动识别</option>', select)
+        self.assertIn('<option value="global">global</option>', select)
+        self.assertIn('<option value="page">page</option>', select)
+        self.assertIn('<option value="element">element</option>', select)
+        self.assertIn("作用域默认自动识别", page)
+        # auto 路径提交体不带 scope，由后端结合 Prompt 与当前选择推断
+        self.assertIn("if(scope.value!=='auto')b.scope=scope.value", page)
+        # 歧义/冲突等澄清错误路由到 modifyHint 展示
+        self.assertIn('<output id="modifyHint" class="hint" aria-live="polite"></output>', page)
+        self.assertIn("document.querySelector('#modifyHint').textContent", page)
+
+    def test_auto_modify_prompt_semantics_basis_shown_in_panel_and_timeline(self):
+        self.act("generate", {})
+        sid = self.svc.sample_view("task")["selection"]["slide_ids"][0]
+        # 与页面 JS 自动识别路径一致的真实调用：不提交 scope
+        status, result = self.post_raw("modify", {"prompt": "当前页标题更醒目", "slide_id": sid, "element_id": None})
+        self.assertTrue(status.startswith("200"), result)
+        understanding = result["sample"]["metadata"]["scope_understanding"]
+        self.assertEqual(understanding["scope"], "page")
+        self.assertEqual(understanding["basis"], "prompt_semantics")
+        _, page = self.page()
+        # 理解依据在修改面板持久展示（刷新后仍可见）
+        panel = re.search(r'<p class="understanding"[^>]*>(.*?)</p>', page, re.S).group(1)
+        self.assertIn("最近修改理解：作用域：页面 · 依据：Prompt 语义", panel)
+        self.assertIn(f"目标：页面 {sid}", panel)
+        # 时间线行同步展示依据；生成版本无理解记录不出依据
+        rows = self.timeline_rows(page)
+        self.assertIn("依据：Prompt 语义", rows[-1][2])
+        self.assertNotIn("依据", rows[0][2])
+
+    def test_auto_modify_current_selection_basis_shown(self):
+        self.act("generate", {})
+        sid = self.svc.sample_view("task")["selection"]["slide_ids"][0]
+        status, result = self.post_raw("modify", {"prompt": "改成蓝色系", "slide_id": sid, "element_id": None})
+        self.assertTrue(status.startswith("200"), result)
+        understanding = result["sample"]["metadata"]["scope_understanding"]
+        self.assertEqual(understanding["basis"], "current_selection")
+        self.assertEqual(understanding["scope"], "page")
+        _, page = self.page()
+        self.assertIn("最近修改理解：作用域：页面 · 依据：当前选择", page)
+        rows = self.timeline_rows(page)
+        self.assertIn("依据：当前选择", rows[-1][2])
+
+    def test_auto_modify_element_scope_via_selection(self):
+        self.act("generate", {})
+        sid = self.svc.sample_view("task")["selection"]["slide_ids"][0]
+        status, result = self.post_raw("modify", {"prompt": "标题改成蓝色", "slide_id": sid, "element_id": "title"})
+        self.assertTrue(status.startswith("200"), result)
+        understanding = result["sample"]["metadata"]["scope_understanding"]
+        self.assertEqual(understanding["scope"], "element")
+        self.assertEqual(understanding["basis"], "prompt_semantics")
+        _, page = self.page()
+        panel = re.search(r'<p class="understanding"[^>]*>(.*?)</p>', page, re.S).group(1)
+        self.assertIn("作用域：元素", panel)
+        self.assertIn("目标：元素 title", panel)
+
+    def test_modify_ambiguity_and_conflict_surface_as_clarification_hint(self):
+        self.act("generate", {})
+        sid = self.svc.sample_view("task")["selection"]["slide_ids"][0]
+        before = len(self.svc.sample_view("task")["versions"])
+        # 明显歧义：后端返回澄清错误，页面据此在 modifyHint 提示，且不产生新版本
+        status, result = self.post_raw("modify", {"prompt": "统一所有页，但只改当前页", "slide_id": sid, "element_id": None})
+        self.assertTrue(status.startswith("400"), result)
+        self.assertIn("歧义", result["error"]["message"])
+        self.assertIn("请明确是全局、页面还是元素", result["error"]["message"])
+        # 显式作用域与 Prompt 语义冲突同样要求澄清
+        status, result = self.post_raw("modify", {"prompt": "统一所有页背景", "scope": "page", "slide_id": sid, "element_id": None})
+        self.assertTrue(status.startswith("400"), result)
+        self.assertIn("冲突", result["error"]["message"])
+        self.assertEqual(len(self.svc.sample_view("task")["versions"]), before)
+        _, page = self.page()
+        self.assertIn('<output id="modifyHint" class="hint" aria-live="polite"></output>', page)
+        self.assertIn("正在预览：当前版本 v1", page)  # 失败修改不产生版本、不破坏页面
+
 
 if __name__ == "__main__":
     unittest.main()
