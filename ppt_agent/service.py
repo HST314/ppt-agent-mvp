@@ -9,6 +9,8 @@ from .gateways import FakeGenerationGateway, FakeHtmlBuilder, FakeInspectionGate
 from .schema import DeliveryManifest, InspectionReport, IssueDisposition
 from .p2 import canonical, digest, now, parse_task_card, questions_for, scan_resources, validate_answer
 from .schema import ClarificationSet, ResourceManifest, TaskCard, TaskInputSnapshot
+from .schema import NarrativeDocument, SlideOutline
+from .p3 import changed_slide_ids, narrative_markdown, outline_markdown, parse_outline, requested_slide_count
 
 def utcnow(): return datetime.now(timezone.utc).isoformat()
 def fingerprint(value): return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(",",":")).encode()).hexdigest()
@@ -86,6 +88,96 @@ class TaskService:
         state=TaskState.parse(self.get(task_id)); new=TaskState(**{**state.__dict__,"status":state.status.WAITING_FOR_USER if pending else state.status.READY,"waiting_reason":"missing_required_input" if pending else None,"required_action":"answer_clarifications" if pending else None,"revision":state.revision+1})
         event={"event_id":hashlib.sha256(f"{task_id}:answer:{ch}".encode()).hexdigest()[:24],"command_id":f"answer-{ch[:16]}","action":"answer_clarification","actor":"user","request_hash":fingerprint(answer),"at":utcnow(),"from":state.to_dict(),"to":new.to_dict(),"result":{"clarification_hash":ch,"invalidated":payload["invalidated"]}}
         self.store.commit(task_id,new.to_dict(),event); return {"state":new.to_dict(),"clarification_hash":ch,**payload,"confirmed":not pending}
+    def _current_version(self,task_id,kind):
+        for event in reversed(self.events(task_id)):
+            if event["action"].startswith(kind + "_") and event["result"].get("hash"):
+                return event["result"]["hash"]
+        return None
+    def _record_p3(self,task_id,kind,model,metadata,action,actor="system"):
+        raw=canonical(model.to_dict()); artifact_hash=self.store.put_version(task_id,kind,raw,metadata)
+        state=TaskState.parse(self.get(task_id)); new=TaskState(**{**state.__dict__,"revision":state.revision+1})
+        event={"event_id":hashlib.sha256(f"{task_id}:{action}:{artifact_hash}".encode()).hexdigest()[:24],"command_id":f"{action}-{artifact_hash[:16]}","action":action,"actor":actor,"request_hash":artifact_hash,"at":utcnow(),"from":state.to_dict(),"to":new.to_dict(),"result":{"hash":artifact_hash,"version":model.version,"affected":metadata.get("affected",[])}}
+        self.store.commit(task_id,new.to_dict(),event); return artifact_hash
+    def _p3_input(self,task_id):
+        view=self.input_view(task_id)
+        if not view.get("snapshot") or not view.get("clarification",{}).get("confirmed"):
+            raise ConflictError("须先冻结输入并完成阻断澄清")
+        return view
+    def planning_view(self,task_id):
+        state=self.get(task_id); result={"state":state,"narrative":None,"outline":None,"versions":self.versions(task_id)}
+        for kind in ("narrative","outline"):
+            current=self._current_version(task_id,kind)
+            if current:
+                item=json.loads(self.version(task_id,current)); meta=next(v["metadata"] for v in self.versions(task_id,kind) if v["hash"]==current)
+                result[kind]={**item,"hash":current,"metadata":meta}
+        return result
+    def generate_narrative(self,task_id,prompt=None,scope="all"):
+        view=self._p3_input(task_id); state=TaskState.parse(view["state"])
+        skill=self.skills.load("narrative"); prior=self._current_version(task_id,"narrative")
+        text=narrative_markdown(view["task_card"])
+        if prompt: text += f"\n## 修改要求\n{prompt.strip()}\n"
+        version=len(self.versions(task_id,"narrative"))+1; content_hash=digest(text.encode())
+        model=NarrativeDocument.parse({"document_id":f"narrative-{content_hash[:16]}","task_id":task_id,"version":version,"markdown":text,"content_hash":content_hash,"created_at":now(),"schema_version":"1.0"})
+        metadata={"parent":prior,"action":"generate" if not prior else "regenerate","scope":scope,"summary":"生成整稿叙事结构","skill":{"action":"narrative","version":skill["version"],"hash":digest(skill["content"].encode()),"included":["narrative"],"trimmed":["outline","html","inspection"]},"input_snapshot_hash":view["snapshot_hash"]}
+        h=self._record_p3(task_id,"narrative",model,metadata,"narrative_generate")
+        if state.stage in {state.stage.CLARIFICATION,state.stage.CREATED}:
+            self.command(task_id,f"narrative-stage-{h[:12]}","advance")
+        return self.planning_view(task_id)
+    def edit_narrative(self,task_id,markdown,summary="直接编辑"):
+        self._p3_input(task_id)
+        if not isinstance(markdown,str) or not markdown.strip(): raise ValidationError("叙事 Markdown 不得为空")
+        prior=self._current_version(task_id,"narrative"); version=len(self.versions(task_id,"narrative"))+1; content_hash=digest(markdown.encode())
+        model=NarrativeDocument.parse({"document_id":f"narrative-{content_hash[:16]}","task_id":task_id,"version":version,"markdown":markdown,"content_hash":content_hash,"created_at":now(),"schema_version":"1.0"})
+        self._record_p3(task_id,"narrative",model,{"parent":prior,"action":"direct_edit","summary":summary,"authoritative":True,"invalidated":["outline","sample","deck"]},"narrative_edit","user")
+        return self.planning_view(task_id)
+    def confirm_narrative(self,task_id):
+        current=self._current_version(task_id,"narrative")
+        if not current: raise ConflictError("尚未生成叙事结构")
+        state=TaskState.parse(self.get(task_id))
+        if state.stage==state.stage.NARRATIVE: self.command(task_id,f"confirm-narrative-{current[:12]}","advance","user")
+        return self.planning_view(task_id)
+    def generate_outline(self,task_id,prompt=None,slide_ids=None):
+        view=self._p3_input(task_id); narrative=self._current_version(task_id,"narrative")
+        if not narrative: raise ConflictError("须先生成叙事结构")
+        state=TaskState.parse(self.get(task_id))
+        if state.mode=="manual" and state.stage==state.stage.NARRATIVE: raise ConflictError("manual 模式须先确认叙事结构")
+        skill=self.skills.load("outline"); count=requested_slide_count(view["task_card"]); resources=view["manifest"].get("resources",[])
+        current=self._current_version(task_id,"outline")
+        if slide_ids:
+            if not current or not prompt: raise ValidationError("指定页修改需要现有大纲和修改 Prompt")
+            old=json.loads(self.version(task_id,current))["markdown"]; order,blocks=parse_outline(old,resources,None)
+            unknown=set(slide_ids)-set(order)
+            if unknown: raise ValidationError("指定页面不存在")
+            for sid in slide_ids: blocks[sid] += f"\n- 修改要求：{prompt.strip()}"
+            prefix=old[:old.index("## [")].rstrip(); text=prefix+"\n\n"+"\n\n".join(blocks[sid] for sid in order)+"\n"
+        else:
+            text=outline_markdown(view["task_card"],resources,count)
+            if prompt: text += f"\n<!-- 修改要求：{prompt.strip()} -->\n"
+        return self.edit_outline(task_id,text,"生成逐页大纲",actor="system",skill=skill)
+    def edit_outline(self,task_id,markdown,summary="直接编辑",actor="user",skill=None):
+        view=self._p3_input(task_id); expected=requested_slide_count(view["task_card"])
+        slide_ids,blocks=parse_outline(markdown,view["manifest"].get("resources",[]),expected)
+        prior=self._current_version(task_id,"outline"); before={}
+        if prior: _,before=parse_outline(json.loads(self.version(task_id,prior))["markdown"],view["manifest"].get("resources",[]),None)
+        affected=changed_slide_ids(before,blocks); version=len(self.versions(task_id,"outline"))+1; content_hash=digest(markdown.encode())
+        model=SlideOutline.parse({"outline_id":f"outline-{content_hash[:16]}","task_id":task_id,"version":version,"markdown":markdown,"slide_ids":slide_ids,"content_hash":content_hash,"created_at":now(),"schema_version":"1.0"})
+        meta={"parent":prior,"action":"generate" if not prior else "edit","summary":summary,"affected":affected,"unchanged":[sid for sid in blocks if sid in before and blocks[sid]==before[sid]],"authoritative":True,"invalidated":{"sample":affected,"deck":affected}}
+        if skill: meta["skill"]={"action":"outline","version":skill["version"],"hash":digest(skill["content"].encode()),"included":["outline"],"trimmed":["narrative","html","inspection"]}
+        h=self._record_p3(task_id,"outline",model,meta,"outline_generate" if not prior else "outline_edit",actor)
+        state=TaskState.parse(self.get(task_id))
+        if state.stage==state.stage.NARRATIVE and state.mode=="auto": self.command(task_id,f"auto-outline-stage-{h[:12]}","advance")
+        return self.planning_view(task_id)
+    def rollback_planning(self,task_id,kind,target_hash):
+        if kind not in {"narrative","outline"}: raise ValidationError("版本类型无效")
+        target=json.loads(self.version(task_id,target_hash)); known={v["hash"] for v in self.versions(task_id,kind)}
+        if target_hash not in known: raise ValidationError("目标版本类型不匹配")
+        return self.edit_narrative(task_id,target["markdown"],f"回退自 {target_hash[:12]}") if kind=="narrative" else self.edit_outline(task_id,target["markdown"],f"回退自 {target_hash[:12]}")
+    def confirm_outline(self,task_id):
+        current=self._current_version(task_id,"outline")
+        if not current: raise ConflictError("尚未生成逐页大纲")
+        state=TaskState.parse(self.get(task_id))
+        if state.stage==state.stage.OUTLINE: self.command(task_id,f"confirm-outline-{current[:12]}","advance","user" if state.mode=="manual" else "system")
+        return self.planning_view(task_id)
     def run_fake_pipeline(self,task_id):
         state=self.get(task_id)
         if state["stage"] != "created": raise ConflictError("fake 全链路只能从空任务启动")

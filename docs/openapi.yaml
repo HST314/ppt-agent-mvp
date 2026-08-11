@@ -1,5 +1,5 @@
 openapi: 3.1.0
-info: {title: PPT Agent P2 API, version: 0.4.0}
+info: {title: PPT Agent P3 API, version: 0.5.0}
 components:
   parameters:
     TaskId: {in: path, name: task_id, required: true, schema: {type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$'}}
@@ -9,7 +9,7 @@ components:
       required: [error]
       properties:
         error: {type: object, required: [code, message, diagnostic_id], properties: {code: {type: string}, message: {type: string}, diagnostic_id: {type: string}}}
-    Health: {type: object, required: [status, stage, runtime_ready], properties: {status: {const: ok}, stage: {const: P2}, runtime_ready: {type: boolean}}}
+    Health: {type: object, required: [status, stage, runtime_ready], properties: {status: {const: ok}, stage: {const: P3}, runtime_ready: {type: boolean}}}
     TaskState:
       type: object
       required: [task_id, stage, status, mode, sample_confirmed, blockers_resolved, delivery_confirmed, revision, waiting_reason, required_action]
@@ -46,7 +46,7 @@ components:
 paths:
   /healthz:
     get:
-      responses: {'200': {description: Ready, content: {application/json: {schema: {$ref: '#/components/schemas/Health'}, example: {status: ok, stage: P2, runtime_ready: true}}}}}
+      responses: {'200': {description: Ready, content: {application/json: {schema: {$ref: '#/components/schemas/Health'}, example: {status: ok, stage: P3, runtime_ready: true}}}}}
   /v1/tasks:
     post:
       requestBody: {required: true, content: {application/json: {schema: {type: object, additionalProperties: false, required: [task_id], properties: {task_id: {type: string}, mode: {enum: [manual, auto]}}}, example: {task_id: demo, mode: auto}}}}
@@ -73,6 +73,30 @@ paths:
       parameters: [{$ref: '#/components/parameters/TaskId'}, {in: path, name: question_id, required: true, schema: {type: string}}]
       requestBody: {required: true, content: {application/json: {schema: {type: object, additionalProperties: false, required: [option], properties: {option: {type: string}, other: {type: string}}}, example: {option: Other, other: 管理层}}}}
       responses: {'200': {description: Answer saved as a new clarification version, content: {application/json: {schema: {$ref: '#/components/schemas/ClarificationResult'}, example: {state: *task, clarification_hash: abc, questions: [], answers: {missing-audience: 管理层}, invalidated: [], confirmed: true}}}}, '400': {$ref: '#/components/responses/Error'}, '404': {$ref: '#/components/responses/Error'}, '409': {$ref: '#/components/responses/Error'}}
+  /v1/tasks/{task_id}/planning:
+    get:
+      parameters: [{$ref: '#/components/parameters/TaskId'}]
+      responses: {'200': {description: Current narrative, outline and visible version history, content: {application/json: {schema: {type: object}, example: {state: {}, narrative: null, outline: null, versions: []}}}}, '400': {$ref: '#/components/responses/Error'}}
+  /v1/tasks/{task_id}/narrative:
+    post:
+      parameters: [{$ref: '#/components/parameters/TaskId'}]
+      responses: {'200': {description: Authoritative narrative edit saved as a new version, content: {application/json: {schema: {type: object}, example: {state: {}, narrative: {}, outline: null, versions: []}}}}, '400': {$ref: '#/components/responses/Error'}}
+  /v1/tasks/{task_id}/narrative/generate:
+    post:
+      parameters: [{$ref: '#/components/parameters/TaskId'}]
+      responses: {'200': {description: Narrative generated with a traceable skill slice, content: {application/json: {schema: {type: object}, example: {state: {}, narrative: {}, outline: null, versions: []}}}}, '400': {$ref: '#/components/responses/Error'}}
+  /v1/tasks/{task_id}/outline:
+    post:
+      parameters: [{$ref: '#/components/parameters/TaskId'}]
+      responses: {'200': {description: Validated authoritative outline edit and affected slides, content: {application/json: {schema: {type: object}, example: {state: {}, narrative: {}, outline: {}, versions: []}}}}, '400': {$ref: '#/components/responses/Error'}}
+  /v1/tasks/{task_id}/outline/generate:
+    post:
+      parameters: [{$ref: '#/components/parameters/TaskId'}]
+      responses: {'200': {description: Outline generated from current narrative and frozen resources, content: {application/json: {schema: {type: object}, example: {state: {}, narrative: {}, outline: {}, versions: []}}}}, '400': {$ref: '#/components/responses/Error'}}
+  /v1/tasks/{task_id}/planning/rollback:
+    post:
+      parameters: [{$ref: '#/components/parameters/TaskId'}]
+      responses: {'200': {description: Historical content copied into a new current version, content: {application/json: {schema: {type: object}, example: {state: {}, narrative: {}, outline: {}, versions: []}}}}, '400': {$ref: '#/components/responses/Error'}}
   /v1/tasks/{task_id}/events:
     get:
       parameters: [{$ref: '#/components/parameters/TaskId'}]

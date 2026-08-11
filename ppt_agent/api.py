@@ -18,6 +18,11 @@ ISSUES=re.compile(r"^/v1/tasks/([^/]+)/issues/([^/]+)/disposition$")
 INPUT=re.compile(r"^/v1/tasks/([^/]+)/input$")
 ANSWER=re.compile(r"^/v1/tasks/([^/]+)/clarifications/([^/]+)/answer$")
 WORKSPACE=re.compile(r"^/tasks/([^/]+)$")
+PLANNING=re.compile(r"^/v1/tasks/([^/]+)/planning$")
+NARRATIVE=re.compile(r"^/v1/tasks/([^/]+)/narrative(?:/(generate|confirm))?$")
+OUTLINE=re.compile(r"^/v1/tasks/([^/]+)/outline(?:/(generate|confirm))?$")
+ROLLBACK=re.compile(r"^/v1/tasks/([^/]+)/planning/rollback$")
+OUTLINE_PAGE=re.compile(r"^/tasks/([^/]+)/outline$")
 
 class App:
     def __init__(self,service): self.service=service
@@ -25,7 +30,7 @@ class App:
         try:
             method=environ["REQUEST_METHOD"]; path=environ["PATH_INFO"]
             size=int(environ.get("CONTENT_LENGTH") or 0); body=json.loads(environ["wsgi.input"].read(size) or b"{}")
-            if method=="GET" and path=="/healthz": return self.reply(start_response,200,{"status":"ok","stage":"P2","runtime_ready":True})
+            if method=="GET" and path=="/healthz": return self.reply(start_response,200,{"status":"ok","stage":"P3","runtime_ready":True})
             if method=="POST" and path=="/v1/tasks":
                 self.exact(body,{"task_id","mode"},{"task_id"}); return self.reply(start_response,201,self.service.create(body["task_id"],body.get("mode","manual")))
             m=TASK.match(path)
@@ -41,6 +46,25 @@ class App:
                 return self.reply(start_response,200,self.service.answer_clarification(m.group(1),m.group(2),body))
             m=WORKSPACE.match(path)
             if method=="GET" and m:return self.page(start_response,m.group(1))
+            m=OUTLINE_PAGE.match(path)
+            if method=="GET" and m:return self.outline_page(start_response,m.group(1))
+            m=PLANNING.match(path)
+            if method=="GET" and m:return self.reply(start_response,200,self.service.planning_view(m.group(1)))
+            m=NARRATIVE.match(path)
+            if method=="POST" and m:
+                if m.group(2)=="generate": self.exact(body,{"prompt","scope"},set()); result=self.service.generate_narrative(m.group(1),body.get("prompt"),body.get("scope","all"))
+                elif m.group(2)=="confirm": self.exact(body,set(),set()); result=self.service.confirm_narrative(m.group(1))
+                else: self.exact(body,{"markdown","summary"},{"markdown"}); result=self.service.edit_narrative(m.group(1),body["markdown"],body.get("summary","直接编辑"))
+                return self.reply(start_response,200,result)
+            m=OUTLINE.match(path)
+            if method=="POST" and m:
+                if m.group(2)=="generate": self.exact(body,{"prompt","slide_ids"},set()); result=self.service.generate_outline(m.group(1),body.get("prompt"),body.get("slide_ids"))
+                elif m.group(2)=="confirm": self.exact(body,set(),set()); result=self.service.confirm_outline(m.group(1))
+                else: self.exact(body,{"markdown","summary"},{"markdown"}); result=self.service.edit_outline(m.group(1),body["markdown"],body.get("summary","直接编辑"))
+                return self.reply(start_response,200,result)
+            m=ROLLBACK.match(path)
+            if method=="POST" and m:
+                self.exact(body,{"kind","hash"},{"kind","hash"}); return self.reply(start_response,200,self.service.rollback_planning(m.group(1),body["kind"],body["hash"]))
             m=ACTION.match(path)
             if method=="POST" and m:
                 self.exact(body,{"command_id","action","actor","payload"},{"command_id","action"})
@@ -178,6 +202,23 @@ if(r.ok){location.reload();}else{const data=await r.json();out.textContent=(data
         '.stages li.current{border-color:#1570ef;background:#eff4ff}.stages li.todo{color:#667085}'
         'output{display:block;min-height:20px;color:#b42318;margin-top:8px}@media(max-width:760px){main{grid-template-columns:1fr}}</style>'
         f'<h1>任务/资料</h1>{nav}{status_bar}<main><div>{import_form}{card_section}</div><div>{resource_section}{clarification_section}{action_section}</div></main>{script}</html>').encode()
+        start("200 OK",[("Content-Type","text/html; charset=utf-8"),("Content-Length",str(len(raw)))]); return [raw]
+
+    def outline_page(self,start,task_id):
+        view=self.service.planning_view(task_id); esc=self.esc
+        narrative=view.get("narrative") or {}; outline=view.get("outline") or {}; state=view["state"]
+        def timeline(kind):
+            rows=[]
+            for item in [v for v in view["versions"] if v["kind"]==kind]:
+                meta=item["metadata"]; rows.append(f'<li><code>{esc(item["hash"][:12])}</code> {esc(meta.get("summary",meta.get("action","版本")))} <button class="rollback" data-kind="{kind}" data-hash="{item["hash"]}">回退</button></li>')
+            return "".join(rows) or "<li>尚无版本</li>"
+        raw=(f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>大纲工作区</title>
+<style>body{{font:16px system-ui;max-width:1280px;margin:24px auto;padding:0 20px;color:#172033}}nav a{{margin-right:16px}}main{{display:grid;grid-template-columns:1fr 1fr;gap:20px}}section{{border:1px solid #ccd3df;border-radius:12px;padding:18px}}textarea{{width:100%;min-height:420px}}button,input{{padding:9px;margin:5px}}.meta{{background:#f1f5fa;padding:10px;border-radius:8px}}@media(max-width:800px){{main{{grid-template-columns:1fr}}}}</style>
+<h1>大纲工作区</h1><nav><a href="/tasks/{esc(task_id)}">任务/资料</a><strong>大纲</strong><span>样品（前置条件：完成逐页大纲）</span></nav><p>每次操作形成可见版本，历史版本支持非破坏回退。</p>
+<p class="meta">阶段：{esc(state['stage'])}　模式：{esc(state['mode'])}　状态：{esc(state['status'])}。大纲阶段不生成视觉预览。</p>
+<main><section aria-label="叙事结构"><h2>整稿叙事结构</h2><form data-kind="narrative"><textarea aria-label="叙事 Markdown">{esc(narrative.get('markdown',''))}</textarea><input name="prompt" aria-label="叙事修改 Prompt" placeholder="输入修改要求"><button name="generate" type="button">生成/整体重生成</button><button name="save">保存直接编辑</button><button name="confirm" type="button">确认叙事</button><output aria-live="polite"></output></form><h3>版本</h3><ul>{timeline('narrative')}</ul></section>
+<section aria-label="逐页大纲"><h2>逐页大纲</h2><form data-kind="outline"><textarea aria-label="逐页大纲 Markdown">{esc(outline.get('markdown',''))}</textarea><input name="prompt" aria-label="大纲修改 Prompt" placeholder="输入页/章节修改要求"><button name="generate" type="button">生成/整体重生成</button><button name="save">保存直接编辑</button><button name="confirm" type="button">确认大纲</button><output aria-live="polite"></output></form><p>最近影响范围：{esc(', '.join((outline.get('metadata') or {}).get('affected',[])) or '无')}</p><h3>版本</h3><ul>{timeline('outline')}</ul></section></main>
+<script>const ID={json.dumps(task_id)};document.querySelectorAll('form[data-kind]').forEach(f=>{{const k=f.dataset.kind,send=async(url,data)=>{{const r=await fetch(url,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(data)}});if(r.ok)location.reload();else f.querySelector('output').textContent=((await r.json()).error||{{}}).message||'操作失败';}};f.onsubmit=e=>{{e.preventDefault();send('/v1/tasks/'+ID+'/'+k,{{markdown:f.querySelector('textarea').value}})}};f.querySelector('[name=generate]').onclick=()=>send('/v1/tasks/'+ID+'/'+k+'/generate',{{prompt:f.querySelector('[name=prompt]').value}});f.querySelector('[name=confirm]').onclick=()=>send('/v1/tasks/'+ID+'/'+k+'/confirm',{{}});}});document.querySelectorAll('.rollback').forEach(b=>b.onclick=()=>fetch('/v1/tasks/'+ID+'/planning/rollback',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{kind:b.dataset.kind,hash:b.dataset.hash}})}}).then(()=>location.reload()));</script></html>''').encode()
         start("200 OK",[("Content-Type","text/html; charset=utf-8"),("Content-Length",str(len(raw)))]); return [raw]
 
 def serve(root=".ppt-agent-data",host="127.0.0.1",port=8000):

@@ -2,7 +2,7 @@
 
 PPT Agent MVP 的需求、实现决策与验收追踪仓库。
 
-P2 任务创建、授权资源扫描、输入冻结与澄清闭环已实现。产品行为以 `docs/product-contract.md` 为准，实施顺序以 `docs/development-plan.md` 为准。
+P3 叙事结构与逐页大纲闭环已实现，包括分阶段 Skill 装载、版本化编辑、影响域、回退及 manual/auto 门禁。产品行为以 `docs/product-contract.md` 为准，实施顺序以 `docs/development-plan.md` 为准。
 
 ## 本地启动
 
