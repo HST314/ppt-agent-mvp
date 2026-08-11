@@ -51,3 +51,11 @@ API 契约见 `docs/openapi.yaml`，内核契约见 `docs/p1-contract.md`。
 ## P4 样品闭环
 
 `GET /tasks/{task_id}/samples` 打开安全沙箱预览。样品只内嵌当前冻结 manifest 中、读取时 hash 仍匹配的图片；外链、跨任务路径、未授权 data URL 与主动内容会被拒绝。`POST /v1/tasks/{task_id}/samples/modify` 可只提交 Prompt，并结合当前 `slide_id`/`element_id` 自动判断全局、页面或元素范围；语义冲突或明显歧义返回可理解的校验错误。确认事实原子绑定当前大纲、选择与样品内容版本。
+
+样品页脚本对全部控件使用显式 `getElementById` 绑定，不依赖 window 隐式命名属性（`prompt`/`confirm` 会与浏览器原生冲突）。`tests/test_p4_sample_page_browser.py` 在真实 headless Chromium 中执行页面 JavaScript，覆盖自动识别提交、理解依据刷新展示、歧义提示与确认门禁四条交互；该模块需要额外依赖，缺失时自动跳过、不影响全量套件：
+
+```bash
+pip install playwright
+python3 -m playwright install chromium
+python3 -m unittest discover -s tests
+```

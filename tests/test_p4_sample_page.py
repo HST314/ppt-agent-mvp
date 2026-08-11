@@ -174,6 +174,20 @@ class SamplePageTests(unittest.TestCase):
         # 注入文本仅作为摘要以转义形式出现
         self.assertIn("&lt;/script&gt;&lt;script&gt;alert(1)&lt;/script&gt;", page)
 
+    def test_sample_page_uses_explicit_dom_queries_only(self):
+        _, page = self.page()
+        script = re.search(r"<script>(.*?)</script>", page, re.S).group(1)
+        # 全部控件经 getElementById 显式绑定，不再依赖 window 隐式命名属性
+        for control in ("select", "generate", "modify", "confirm", "prompt", "scope", "slide", "element",
+                        "modifyHint", "actionResult", "previewFrame", "previewLabel", "backCurrent",
+                        "diffLeft", "diffRight", "diffRun", "diffResult"):
+            self.assertIn(f"getElementById('{control}')", script)
+        # 与浏览器原生冲突的隐式引用不得复发（prompt/confirm 等）
+        self.assertNotRegex(script, r"(?<![A-Za-z])prompt\.value")
+        self.assertNotRegex(script, r"(?<![A-Za-z])confirm\.onclick")
+        self.assertNotRegex(script, r"(?<![A-Za-z])(select|generate|modify)\.onclick")
+        self.assertNotRegex(script, r"(?<![A-Za-z])(scope|slide|element)\.value")
+
     def post_raw(self, action, body):
         status, _, raw = self.call("POST", f"/v1/tasks/task/samples/{action}", body)
         return status, json.loads(raw)
@@ -188,10 +202,10 @@ class SamplePageTests(unittest.TestCase):
         self.assertIn('<option value="element">element</option>', select)
         self.assertIn("作用域默认自动识别", page)
         # auto 路径提交体不带 scope，由后端结合 Prompt 与当前选择推断
-        self.assertIn("if(scope.value!=='auto')b.scope=scope.value", page)
+        self.assertIn("if(scopeSelect.value!=='auto')b.scope=scopeSelect.value", page)
         # 歧义/冲突等澄清错误路由到 modifyHint 展示
         self.assertIn('<output id="modifyHint" class="hint" aria-live="polite"></output>', page)
-        self.assertIn("document.querySelector('#modifyHint').textContent", page)
+        self.assertIn("modifyHint.textContent=", page)
 
     def test_auto_modify_prompt_semantics_basis_shown_in_panel_and_timeline(self):
         self.act("generate", {})
