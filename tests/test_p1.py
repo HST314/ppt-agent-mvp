@@ -48,5 +48,5 @@ class ServiceTests(unittest.TestCase):
    svc.command("t","5","confirm_sample","user");svc.command("t","6","advance");svc.command("t","7","advance");svc.command("t","8","advance")
    self.assertNotEqual(svc.get("t")["status"],"completed");svc.command("t","9","resolve_blockers","user");svc.command("t","10","confirm_delivery","user");self.assertEqual(svc.get("t")["status"],"completed")
  def test_inspector_has_isolated_input(self):
-  calls=[]; result=FakeInspectionGateway(calls=calls).inspect("original","<html/>");self.assertTrue(result["passed"]);self.assertEqual(set(calls[0]),{"outline","html"})
+  calls=[]; result=FakeInspectionGateway(calls=calls).inspect("original","<html/>");self.assertFalse(result["passed"]);self.assertEqual(result["issues"][0]["severity"],"blocker");self.assertEqual(set(calls[0]),{"outline","html"})
 if __name__=="__main__":unittest.main()

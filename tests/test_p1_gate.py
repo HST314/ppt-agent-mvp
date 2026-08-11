@@ -2,9 +2,10 @@ import io,json,tempfile,unittest
 from pathlib import Path
 
 from ppt_agent.api import App
+from ppt_agent.contracts import validate_instance
 from ppt_agent.errors import ConflictError,GateError,ValidationError
 from ppt_agent.fsm import Stage,TaskState,transition
-from ppt_agent.schema import MODELS,ClarificationSet,DeckArtifact,NarrativeDocument,ResourceManifest,SlideOutline,TaskInputSnapshot
+from ppt_agent.schema import MODELS,ClarificationSet,DeckArtifact,DeliveryManifest,InspectionReport,IssueDisposition,NarrativeDocument,ResourceManifest,SlideOutline,TaskInputSnapshot
 from ppt_agent.service import TaskService
 from ppt_agent.store import WorkspaceStore
 
@@ -32,6 +33,18 @@ class NegativeContractTests(unittest.TestCase):
   with self.assertRaises(ValidationError): TaskInputSnapshot.parse({"snapshot_id":"snap","task_id":"task","task_card_hash":H,"resource_manifest_hash":H,"created_at":"2026-08-11T00:00:00","schema_version":"1.0"})
   with self.assertRaises(ValidationError): SlideOutline.parse({**common,"outline_id":"outline","version":1,"markdown":"# ok","slide_ids":["bad/id"],"content_hash":H,"created_at":NOW})
   with self.assertRaises(ValidationError): DeckArtifact.parse({**common,"artifact_id":"artifact","version":1,"kind":"zip","outline_hash":H,"content_hash":H,"created_at":NOW})
+ def test_exported_schema_and_runtime_are_bidirectionally_equivalent(self):
+  common={"task_id":"task","schema_version":"1.0"}
+  fixtures=[
+   (NarrativeDocument,{**common,"document_id":"doc","version":1,"markdown":"# valid","content_hash":H,"created_at":NOW}),
+   (ResourceManifest,{**common,"manifest_id":"manifest","resources":[{"resource_id":"source-1","uri":"asset://source-1","media_type":"text/markdown","content_hash":H}],"content_hash":H,"created_at":NOW}),
+   (InspectionReport,{**common,"report_id":"report","deck_hash":H,"issues":[{"issue_id":"overflow-1","severity":"blocker","code":"text_overflow","message":"overflow","slide_id":"slide-1"}],"passed":False,"created_at":NOW})]
+  for model,fixture in fixtures:
+   parsed=model.parse(fixture); validate_instance(parsed.to_dict(),model.json_schema()); model.parse(parsed.to_dict())
+  for bad in (0,-1):
+   value={**fixtures[0][1],"version":bad}
+   with self.assertRaises(ValidationError): validate_instance(value,NarrativeDocument.json_schema())
+   with self.assertRaises(ValidationError): NarrativeDocument.parse(value)
  def test_kind_escape_rejected(self):
   with tempfile.TemporaryDirectory() as p:
    s=WorkspaceStore(p); s.create("t",TaskState("t").to_dict())
@@ -70,13 +83,18 @@ class ApiIntegrationTests(unittest.TestCase):
   for path,item in spec["paths"].items():
    for operation in item.values():
     responses=operation["responses"]; success=next(v for k,v in responses.items() if str(k).startswith("2"))
-    self.assertIn("content",success,path); self.assertIn("schema",success["content"]["application/json"],path)
+    media=success["content"]["application/json"]; self.assertIn("schema",media,path); self.assertIn("example",media,path)
+    validate_instance(media["example"],media["schema"],spec)
     if path != "/healthz": self.assertTrue(any(v.get("$ref")=="#/components/responses/Error" for k,v in responses.items() if not str(k).startswith("2")),path)
   with tempfile.TemporaryDirectory() as p:
    app=App(TaskService(WorkspaceStore(p))); self.assertEqual(self.call(app,"POST","/v1/tasks",{"task_id":"t","mode":"auto"})[0],201)
-   code,result=self.call(app,"POST","/v1/tasks/t/preview"); self.assertEqual(code,200); self.assertTrue(result["passed"])
+   code,result=self.call(app,"POST","/v1/tasks/t/preview"); self.assertEqual(code,200); self.assertFalse(result["passed"])
    self.assertEqual(result["state"]["status"],"completed")
-   code,versions=self.call(app,"GET","/v1/tasks/t/versions"); self.assertEqual(code,200); self.assertEqual({v["kind"] for v in versions["versions"]},{"outline","deck","inspection","delivery"})
+   code,versions=self.call(app,"GET","/v1/tasks/t/versions"); self.assertEqual(code,200); self.assertEqual({v["kind"] for v in versions["versions"]},{"outline","deck","inspection","issue-disposition","delivery"})
+   self.assertEqual(len(result["disposition_hashes"]),1)
+   IssueDisposition.parse(json.loads(app.service.version("t",result["disposition_hashes"][0])))
+   delivery=DeliveryManifest.parse(json.loads(app.service.version("t",result["delivery_hash"])))
+   self.assertEqual(delivery.deck_hash,result["deck_hash"])
    actions=[e["action"] for e in app.service.events("t")]
    for action in ("confirm_sample","resolve_blockers","confirm_delivery"): self.assertIn(action,actions)
 

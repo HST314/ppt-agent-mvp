@@ -24,7 +24,8 @@
     },
     "version": {
       "title": "version",
-      "type": "integer"
+      "type": "integer",
+      "minimum": 1
     },
     "kind": {
       "title": "kind",

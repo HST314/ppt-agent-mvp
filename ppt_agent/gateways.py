@@ -26,7 +26,7 @@ class FakeInspectionGateway:
     calls:list|None=None
     def inspect(self,original_outline,html):
         if self.calls is not None:self.calls.append({"outline":original_outline,"html":html})
-        return {"issues":[],"passed":True,"model":self.model}
+        return {"issues":[{"issue_id":"fake-overflow","severity":"blocker","code":"text_overflow","message":"标题文本溢出","slide_id":"slide-1"}],"passed":False,"model":self.model}
 @dataclass
 class FakeHtmlBuilder:
     version:str="fake-builder-1"

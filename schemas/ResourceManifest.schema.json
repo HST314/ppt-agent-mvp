@@ -26,7 +26,38 @@
       "title": "resources",
       "type": "array",
       "items": {
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "resource_id": {
+            "title": "resource_id",
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+          },
+          "uri": {
+            "title": "uri",
+            "type": "string",
+            "minLength": 1
+          },
+          "media_type": {
+            "title": "media_type",
+            "type": "string",
+            "minLength": 1
+          },
+          "content_hash": {
+            "title": "content_hash",
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        },
+        "required": [
+          "resource_id",
+          "uri",
+          "media_type",
+          "content_hash"
+        ]
       }
     },
     "content_hash": {

@@ -10,6 +10,54 @@
       "minLength": 1,
       "const": "1.0"
     },
+    "issues": {
+      "title": "issues",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "issue_id": {
+            "title": "issue_id",
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+          },
+          "severity": {
+            "title": "severity",
+            "type": "string",
+            "minLength": 1,
+            "enum": [
+              "warning",
+              "blocker"
+            ]
+          },
+          "code": {
+            "title": "code",
+            "type": "string",
+            "minLength": 1
+          },
+          "message": {
+            "title": "message",
+            "type": "string",
+            "minLength": 1
+          },
+          "slide_id": {
+            "title": "slide_id",
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+          }
+        },
+        "required": [
+          "issue_id",
+          "severity",
+          "code",
+          "message",
+          "slide_id"
+        ]
+      }
+    },
     "report_id": {
       "title": "report_id",
       "type": "string",
@@ -28,13 +76,6 @@
       "minLength": 1,
       "pattern": "^[0-9a-f]{64}$"
     },
-    "issues": {
-      "title": "issues",
-      "type": "array",
-      "items": {
-        "type": "object"
-      }
-    },
     "passed": {
       "title": "passed",
       "type": "boolean"
@@ -47,10 +88,10 @@
     }
   },
   "required": [
+    "issues",
     "report_id",
     "task_id",
     "deck_hash",
-    "issues",
     "passed",
     "created_at"
   ]

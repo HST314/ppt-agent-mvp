@@ -19,13 +19,26 @@ components:
       additionalProperties: false
       required: [command_id, action]
       properties: {command_id: {type: string}, action: {type: string}, actor: {enum: [system, user]}, payload: {type: object}}
-    Event: {type: object, required: [event_id, command_id, action, actor, request_hash, at, from, to, result], additionalProperties: true}
+    Event:
+      type: object
+      additionalProperties: false
+      required: [event_id, command_id, action, actor, request_hash, at, from, to, result]
+      properties:
+        event_id: {type: string}
+        command_id: {type: string}
+        action: {type: string}
+        actor: {enum: [system, user]}
+        request_hash: {type: string, pattern: '^[0-9a-f]{64}$'}
+        at: {type: string, format: date-time}
+        from: {$ref: '#/components/schemas/TaskState'}
+        to: {$ref: '#/components/schemas/TaskState'}
+        result: {$ref: '#/components/schemas/TaskState'}
     Events: {type: object, required: [events], properties: {events: {type: array, items: {$ref: '#/components/schemas/Event'}}}}
     Version: {type: object, required: [kind, hash, metadata], properties: {kind: {type: string}, hash: {type: string, pattern: '^[0-9a-f]{64}$'}, metadata: {type: object}}}
     Versions: {type: object, required: [versions], properties: {versions: {type: array, items: {$ref: '#/components/schemas/Version'}}}}
     VersionContent: {type: object, required: [hash, content], properties: {hash: {type: string}, content: {type: string}}}
     Comparison: {type: object, required: [left, right, equal], properties: {left: {type: string}, right: {type: string}, equal: {type: boolean}}}
-    PipelineResult: {type: object, required: [outline_hash, deck_hash, report_hash, delivery_hash, passed, preview, state], properties: {outline_hash: {type: string}, deck_hash: {type: string}, report_hash: {type: string}, delivery_hash: {type: string}, passed: {type: boolean}, preview: {type: string}, state: {$ref: '#/components/schemas/TaskState'}}}
+    PipelineResult: {type: object, required: [outline_hash, deck_hash, report_hash, disposition_hashes, delivery_hash, passed, preview, state], properties: {outline_hash: {type: string}, deck_hash: {type: string}, report_hash: {type: string}, disposition_hashes: {type: array, items: {type: string}}, delivery_hash: {type: string}, passed: {type: boolean}, preview: {type: string}, state: {$ref: '#/components/schemas/TaskState'}}}
   responses:
     Error: {description: Unified domain error, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}, example: {error: {code: validation_error, message: 请求字段无效, diagnostic_id: abc123}}}}}
 paths:
@@ -35,40 +48,40 @@ paths:
   /v1/tasks:
     post:
       requestBody: {required: true, content: {application/json: {schema: {type: object, additionalProperties: false, required: [task_id], properties: {task_id: {type: string}, mode: {enum: [manual, auto]}}}, example: {task_id: demo, mode: auto}}}}
-      responses: {'201': {description: Created, content: {application/json: {schema: {$ref: '#/components/schemas/TaskState'}}}}, '400': {$ref: '#/components/responses/Error'}, '409': {$ref: '#/components/responses/Error'}}
+      responses: {'201': {description: Created, content: {application/json: {schema: {$ref: '#/components/schemas/TaskState'}, example: &task {task_id: demo, stage: created, status: ready, mode: auto, sample_confirmed: false, blockers_resolved: false, delivery_confirmed: false, revision: 0, waiting_reason: null, required_action: null}}}}, '400': {$ref: '#/components/responses/Error'}, '409': {$ref: '#/components/responses/Error'}}
   /v1/tasks/{task_id}:
     get:
       parameters: [{$ref: '#/components/parameters/TaskId'}]
-      responses: {'200': {description: Current state, content: {application/json: {schema: {$ref: '#/components/schemas/TaskState'}}}}, '400': {$ref: '#/components/responses/Error'}, '404': {$ref: '#/components/responses/Error'}}
+      responses: {'200': {description: Current state, content: {application/json: {schema: {$ref: '#/components/schemas/TaskState'}, example: *task}}}, '400': {$ref: '#/components/responses/Error'}, '404': {$ref: '#/components/responses/Error'}}
   /v1/tasks/{task_id}/actions:
     post:
       parameters: [{$ref: '#/components/parameters/TaskId'}]
       requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/Command'}, example: {command_id: cmd-1, action: advance, actor: system}}}}
-      responses: {'200': {description: Stable command result, content: {application/json: {schema: {$ref: '#/components/schemas/TaskState'}}}}, '400': {$ref: '#/components/responses/Error'}, '404': {$ref: '#/components/responses/Error'}, '409': {$ref: '#/components/responses/Error'}}
+      responses: {'200': {description: Stable command result, content: {application/json: {schema: {$ref: '#/components/schemas/TaskState'}, example: *task}}}, '400': {$ref: '#/components/responses/Error'}, '404': {$ref: '#/components/responses/Error'}, '409': {$ref: '#/components/responses/Error'}}
   /v1/tasks/{task_id}/events:
     get:
       parameters: [{$ref: '#/components/parameters/TaskId'}]
-      responses: {'200': {description: Audit event list, content: {application/json: {schema: {$ref: '#/components/schemas/Events'}}}}, '400': {$ref: '#/components/responses/Error'}, '404': {$ref: '#/components/responses/Error'}}
+      responses: {'200': {description: Audit event list, content: {application/json: {schema: {$ref: '#/components/schemas/Events'}, example: {events: [{event_id: evt-1, command_id: cmd-1, action: advance, actor: system, request_hash: '0000000000000000000000000000000000000000000000000000000000000000', at: '2026-08-11T00:00:00+00:00', from: *task, to: *task, result: *task}]}}}}, '400': {$ref: '#/components/responses/Error'}, '404': {$ref: '#/components/responses/Error'}}
   /v1/tasks/{task_id}/versions:
     get:
       parameters: [{$ref: '#/components/parameters/TaskId'}]
-      responses: {'200': {description: Version list, content: {application/json: {schema: {$ref: '#/components/schemas/Versions'}}}}, '400': {$ref: '#/components/responses/Error'}, '404': {$ref: '#/components/responses/Error'}}
+      responses: {'200': {description: Version list, content: {application/json: {schema: {$ref: '#/components/schemas/Versions'}, example: {versions: [{kind: deck, hash: '0000000000000000000000000000000000000000000000000000000000000000', metadata: {source: fake}}]}}}}, '400': {$ref: '#/components/responses/Error'}, '404': {$ref: '#/components/responses/Error'}}
   /v1/tasks/{task_id}/versions/{hash}:
     get:
       parameters: [{$ref: '#/components/parameters/TaskId'}, {in: path, name: hash, required: true, schema: {type: string, pattern: '^[0-9a-f]{64}$'}}]
-      responses: {'200': {description: Immutable version, content: {application/json: {schema: {$ref: '#/components/schemas/VersionContent'}}}}, '400': {$ref: '#/components/responses/Error'}, '404': {$ref: '#/components/responses/Error'}}
+      responses: {'200': {description: Immutable version, content: {application/json: {schema: {$ref: '#/components/schemas/VersionContent'}, example: {hash: '0000000000000000000000000000000000000000000000000000000000000000', content: '<html></html>'}}}}, '400': {$ref: '#/components/responses/Error'}, '404': {$ref: '#/components/responses/Error'}}
   /v1/tasks/{task_id}/versions/compare:
     post:
       parameters: [{$ref: '#/components/parameters/TaskId'}]
       requestBody: {required: true, content: {application/json: {schema: {type: object, additionalProperties: false, required: [left, right], properties: {left: {type: string}, right: {type: string}}}, example: {left: 0000000000000000000000000000000000000000000000000000000000000000, right: 0000000000000000000000000000000000000000000000000000000000000000}}}}
-      responses: {'200': {description: Comparison result, content: {application/json: {schema: {$ref: '#/components/schemas/Comparison'}}}}, '400': {$ref: '#/components/responses/Error'}, '404': {$ref: '#/components/responses/Error'}}
+      responses: {'200': {description: Comparison result, content: {application/json: {schema: {$ref: '#/components/schemas/Comparison'}, example: {left: '0000000000000000000000000000000000000000000000000000000000000000', right: '0000000000000000000000000000000000000000000000000000000000000000', equal: true}}}}, '400': {$ref: '#/components/responses/Error'}, '404': {$ref: '#/components/responses/Error'}}
   /v1/tasks/{task_id}/preview:
     post:
       parameters: [{$ref: '#/components/parameters/TaskId'}]
       requestBody: {content: {application/json: {schema: {type: object, additionalProperties: false}, example: {}}}}
-      responses: {'200': {description: Fake full delivery result, content: {application/json: {schema: {$ref: '#/components/schemas/PipelineResult'}}}}, '400': {$ref: '#/components/responses/Error'}, '404': {$ref: '#/components/responses/Error'}, '409': {$ref: '#/components/responses/Error'}}
+      responses: {'200': {description: Fake full delivery result, content: {application/json: {schema: {$ref: '#/components/schemas/PipelineResult'}, example: {outline_hash: '0000000000000000000000000000000000000000000000000000000000000000', deck_hash: '0000000000000000000000000000000000000000000000000000000000000000', report_hash: '0000000000000000000000000000000000000000000000000000000000000000', disposition_hashes: ['0000000000000000000000000000000000000000000000000000000000000000'], delivery_hash: '0000000000000000000000000000000000000000000000000000000000000000', passed: false, preview: '<html></html>', state: *task}}}}, '400': {$ref: '#/components/responses/Error'}, '404': {$ref: '#/components/responses/Error'}, '409': {$ref: '#/components/responses/Error'}}
   /v1/tasks/{task_id}/issues/{issue_id}/disposition:
     post:
       parameters: [{$ref: '#/components/parameters/TaskId'}, {in: path, name: issue_id, required: true, schema: {type: string}}]
       requestBody: {required: true, content: {application/json: {schema: {type: object, additionalProperties: false, required: [command_id, action, actor], properties: {command_id: {type: string}, action: {enum: [resolve, waive]}, actor: {const: user}}}, example: {command_id: disposition-1, action: resolve, actor: user}}}}
-      responses: {'200': {description: Disposed, content: {application/json: {schema: {$ref: '#/components/schemas/TaskState'}}}}, '400': {$ref: '#/components/responses/Error'}, '404': {$ref: '#/components/responses/Error'}, '409': {$ref: '#/components/responses/Error'}}
+      responses: {'200': {description: Disposed, content: {application/json: {schema: {$ref: '#/components/schemas/TaskState'}, example: *task}}}, '400': {$ref: '#/components/responses/Error'}, '404': {$ref: '#/components/responses/Error'}, '409': {$ref: '#/components/responses/Error'}}

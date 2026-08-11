@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import MISSING, asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, is_dataclass
 from datetime import datetime
 from typing import Any, ClassVar, get_args, get_origin, get_type_hints
 
@@ -17,7 +17,24 @@ def _schema(t):
         args=get_args(t); item=args[0] if args else Any
         return {"type": "array", "items": {} if item is Any else _schema(item)}
     if origin is dict: return {"type":"object"}
+    if isinstance(t,type) and is_dataclass(t):
+        hints=get_type_hints(t)
+        return {"type":"object","additionalProperties":False,
+                "properties":{f.name:_property_schema(f.name,hints[f.name]) for f in fields(t)},
+                "required":[f.name for f in fields(t)]}
     return {"type": {str: "string", int: "integer", bool: "boolean", dict: "object"}.get(t, "string")}
+
+def _property_schema(name,t):
+    prop={"title":name,**_schema(t)}
+    if prop.get("type") == "string": prop["minLength"] = 1
+    if name.endswith("_id") or name == "task_id": prop["pattern"] = ID.pattern
+    if name.endswith("_hash") or name == "content_hash": prop["pattern"] = HASH.pattern
+    if name.endswith("_at"): prop["format"] = "date-time"
+    if name == "version": prop["minimum"] = 1
+    enums={"source_format":["json","markdown"],"kind":["sample","deck"],"action":["resolve","waive"],"actor":["user"],"confirmed_by":["user"],"severity":["warning","blocker"]}
+    if name in enums: prop["enum"]=enums[name]
+    if name.endswith("_ids"): prop.update({"minItems":1,"uniqueItems":True,"items":{"type":"string","pattern":ID.pattern}})
+    return prop
 
 def _json_value(value, expected, name):
     """Validate JSON-shaped input and normalize arrays to immutable tuples."""
@@ -29,6 +46,12 @@ def _json_value(value, expected, name):
     if origin is dict:
         if not isinstance(value,dict): raise ValidationError(f"{name} 类型无效")
         return value
+    if isinstance(expected,type) and is_dataclass(expected):
+        if not isinstance(value,dict): raise ValidationError(f"{name} 类型无效")
+        allowed={f.name for f in fields(expected)}
+        if set(value) != allowed: raise ValidationError(f"{name} 字段无效")
+        hints=get_type_hints(expected)
+        return expected(**{k:_json_value(v,hints[k],f"{name}.{k}") for k,v in value.items()})
     if expected is Any: return value
     if not isinstance(value,expected) or (expected is int and isinstance(value,bool)): raise ValidationError(f"{name} 类型无效")
     return value
@@ -62,6 +85,10 @@ class StrictModel:
             if f.name.endswith("_ids"):
                 if not value or len(set(value)) != len(value) or any(not ID.fullmatch(x) for x in value): raise ValidationError(f"{f.name} 引用无效")
             if isinstance(value,tuple) and any(isinstance(x,str) and not x.strip() for x in value): raise ValidationError(f"{f.name} 元素不得为空")
+            if isinstance(value,tuple):
+                for item in value:
+                    validate=getattr(item,"validate",None)
+                    if validate: validate()
 
     @classmethod
     def parse(cls, value: dict[str, Any]):
@@ -80,16 +107,7 @@ class StrictModel:
     @classmethod
     def json_schema(cls):
         hints = get_type_hints(cls)
-        props = {f.name: {"title": f.name, **_schema(hints[f.name])} for f in fields(cls)}
-        for name in props:
-            if props[name].get("type") == "string": props[name]["minLength"] = 1
-            if name.endswith("_id") or name == "task_id": props[name]["pattern"] = ID.pattern
-            if name.endswith("_hash") or name == "content_hash": props[name]["pattern"] = HASH.pattern
-            if name.endswith("_at"): props[name]["format"] = "date-time"
-            if name.endswith("_ids"): props[name].update({"minItems":1,"uniqueItems":True,"items":{"type":"string","pattern":ID.pattern}})
-        enums={"source_format":["json","markdown"],"kind":["sample","deck"],"action":["resolve","waive"],"actor":["user"],"confirmed_by":["user"]}
-        for name,values in enums.items():
-            if name in props: props[name]["enum"]=values
+        props = {f.name:_property_schema(f.name,hints[f.name]) for f in fields(cls)}
         props["schema_version"]["const"] = "1.0"
         return {"$schema":"https://json-schema.org/draft/2020-12/schema","title":cls.__name__,"type":"object","additionalProperties":False,"properties":props,"required":[f.name for f in fields(cls) if f.name != "schema_version"]}
 
@@ -103,7 +121,12 @@ class TaskCard(StrictModel):
 @dataclass(frozen=True)
 class TaskInputSnapshot(StrictModel): snapshot_id:str=""; task_id:str=""; task_card_hash:str=""; resource_manifest_hash:str=""; created_at:str=""
 @dataclass(frozen=True)
-class ResourceManifest(StrictModel): manifest_id:str=""; task_id:str=""; resources:tuple[dict[str,Any],...]=(); content_hash:str=""; created_at:str=""
+class ResourceEntry:
+    resource_id:str; uri:str; media_type:str; content_hash:str
+    def validate(self):
+        if not ID.fullmatch(self.resource_id) or not self.uri.strip() or not self.media_type.strip() or not HASH.fullmatch(self.content_hash): raise ValidationError("resource 字段语义无效")
+@dataclass(frozen=True)
+class ResourceManifest(StrictModel): manifest_id:str=""; task_id:str=""; resources:tuple[ResourceEntry,...]=(); content_hash:str=""; created_at:str=""
 @dataclass(frozen=True)
 class ClarificationSet(StrictModel): clarification_id:str=""; task_id:str=""; questions:tuple[str,...]=(); assumptions:tuple[str,...]=(); confirmed:bool=False
 @dataclass(frozen=True)
@@ -123,7 +146,12 @@ class DeckArtifact(StrictModel):
         super().__post_init__()
         if self.kind not in {"sample","deck"}: raise ValidationError("kind 无效")
 @dataclass(frozen=True)
-class InspectionReport(StrictModel): report_id:str=""; task_id:str=""; deck_hash:str=""; issues:tuple[dict[str,Any],...]=(); passed:bool=False; created_at:str=""
+class InspectionIssue:
+    issue_id:str; severity:str; code:str; message:str; slide_id:str
+    def validate(self):
+        if not ID.fullmatch(self.issue_id) or not ID.fullmatch(self.slide_id) or self.severity not in {"warning","blocker"} or not self.code.strip() or not self.message.strip(): raise ValidationError("issue 字段语义无效")
+@dataclass(frozen=True)
+class InspectionReport(StrictModel): issues:tuple[InspectionIssue,...]=(); report_id:str=""; task_id:str=""; deck_hash:str=""; passed:bool=False; created_at:str=""
 @dataclass(frozen=True)
 class IssueDisposition(StrictModel):
     disposition_id:str=""; task_id:str=""; issue_id:str=""; action:str=""; actor:str=""; created_at:str=""
