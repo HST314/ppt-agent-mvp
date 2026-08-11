@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import hashlib, json, mimetypes, re
+import hashlib, json, mimetypes, re, struct
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +14,27 @@ DEFAULTS={"language":"zh-CN","aspect_ratio":"16:9","sample_count":2}
 def now(): return datetime.now(timezone.utc).isoformat()
 def digest(data): return hashlib.sha256(data).hexdigest()
 def canonical(value): return json.dumps(value,ensure_ascii=False,sort_keys=True,separators=(",",":")).encode()
+
+def valid_image_content(data, suffix):
+    """Validate the container enough to reject mislabeled or truncated images."""
+    suffix=suffix.lower()
+    if suffix==".png":
+        return len(data)>=33 and data[:8]==b"\x89PNG\r\n\x1a\n" and data[12:16]==b"IHDR" and struct.unpack(">II",data[16:24])!=(0,0)
+    if suffix in {".jpg",".jpeg"}:
+        return len(data)>=4 and data[:3] in {b"\xff\xd8\xff"} and data[-2:]==b"\xff\xd9"
+    if suffix==".gif":
+        return len(data)>=14 and data[:6] in {b"GIF87a",b"GIF89a"} and data[-1:]==b";" and struct.unpack("<HH",data[6:10])!=(0,0)
+    if suffix==".webp":
+        return len(data)>=16 and data[:4]==b"RIFF" and data[8:12]==b"WEBP" and struct.unpack("<I",data[4:8])[0]+8==len(data)
+    if suffix==".svg":
+        if b"<!DOCTYPE" in data.upper(): return False
+        try:
+            import xml.etree.ElementTree as ET
+            root=ET.fromstring(data)
+        except (ET.ParseError,UnicodeDecodeError,ValueError):
+            return False
+        return root.tag.rsplit("}",1)[-1].lower()=="svg"
+    return False
 
 def parse_task_card(source, source_format):
     if source_format not in {"json","markdown"}: raise ValidationError("任务卡格式只能是 json 或 markdown")
@@ -48,7 +69,10 @@ def scan_resources(root: Path):
         if root not in resolved.parents: raise ValidationError("资源路径越权")
         data=resolved.read_bytes()
         if not data: warnings.append({"code":"empty_resource","path":str(path.relative_to(root))}); continue
-        h=digest(data); rel=path.relative_to(root).as_posix(); sidecar=path.with_suffix(".md")
+        rel=path.relative_to(root).as_posix()
+        if not valid_image_content(data,path.suffix):
+            warnings.append({"code":"invalid_image_content","path":rel}); continue
+        h=digest(data); sidecar=path.with_suffix(".md")
         description=None
         if sidecar.exists():
             if sidecar.is_symlink() or root not in sidecar.resolve().parents: raise ValidationError("资源说明路径越权")

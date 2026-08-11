@@ -7,6 +7,9 @@ from ppt_agent.p2 import parse_task_card,scan_resources
 from ppt_agent.service import TaskService
 from ppt_agent.store import WorkspaceStore
 
+PNG=b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
+JPEG=b"\xff\xd8\xff\xe0JFIF\x00\xff\xd9"
+
 class P2Tests(unittest.TestCase):
  def setUp(self): self.tmp=tempfile.TemporaryDirectory(); self.store=WorkspaceStore(self.tmp.name); self.svc=TaskService(self.store); self.svc.create("task")
  def tearDown(self): self.tmp.cleanup()
@@ -18,16 +21,22 @@ class P2Tests(unittest.TestCase):
   self.assertEqual(result["state"]["status"],"waiting_for_user"); self.assertEqual(len(result["clarification"]["details"]),2)
   with self.assertRaises(ConflictError): self.svc.import_input("task",{"goal":"x","audience":"a","topic":"t"})
  def test_resource_pairing_hash_freeze_and_explicit_rebuild(self):
-  self.store.put_resource("task","hero.png",b"png-data"); self.store.put_resource("task","hero.md","主视觉说明".encode())
+  self.store.put_resource("task","hero.png",PNG); self.store.put_resource("task","hero.md","主视觉说明".encode())
   first=self.svc.import_input("task",{"goal":"g","audience":"a","topic":"t"})
   self.assertEqual(first["manifest"]["resources"][0]["description"],"主视觉说明")
-  self.store.put_resource("task","later.jpg",b"later")
+  self.store.put_resource("task","later.jpg",JPEG)
   frozen=self.svc.input_view("task"); self.assertEqual(frozen["snapshot_hash"],first["snapshot_hash"])
   second=self.svc.import_input("task",{"goal":"g","audience":"a","topic":"t"},rebuild=True)
   self.assertNotEqual(second["snapshot_hash"],first["snapshot_hash"]); self.assertEqual(len(second["manifest"]["resources"]),2)
  def test_no_images_and_path_guards(self):
   resources,warnings=scan_resources(self.store.resource_root("task")); self.assertEqual(resources,[])
   with self.assertRaises(ValidationError): self.store.put_resource("task","../escape.png",b"x")
+ def test_corrupt_image_is_diagnosed_and_excluded(self):
+  self.store.put_resource("task","broken.png",b"not-an-image")
+  self.store.put_resource("task","valid.png",PNG)
+  resources,warnings=scan_resources(self.store.resource_root("task"))
+  self.assertEqual([item["uri"] for item in resources],["resources://valid.png"])
+  self.assertIn({"code":"invalid_image_content","path":"broken.png"},warnings)
  def test_other_answer_and_change_invalidation(self):
   result=self.svc.import_input("task",{"goal":"g","topic":"t"}); q=result["clarification"]["details"][0]
   with self.assertRaises(ValidationError): self.svc.answer_clarification("task",q["question_id"],{"option":"Other"})
