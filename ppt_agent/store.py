@@ -27,6 +27,18 @@ class WorkspaceStore:
             p=self._task(task_id)
             if p.exists(): raise ConflictError("任务已存在")
             (p/"artifacts").mkdir(parents=True); (p/"versions").mkdir(); self.atomic_json(p/"checkpoint.json",state); (p/"events.jsonl").touch(); return state
+    def resource_root(self,task_id):
+        p=self._task(task_id)
+        if not p.exists(): raise NotFoundError("任务不存在")
+        root=p/"resources"; root.mkdir(exist_ok=True); return root
+    def put_resource(self,task_id,name,content:bytes):
+        if not name or Path(name).name != name or name in {".",".."}: raise ValidationError("资源文件名无效")
+        root=self.resource_root(task_id); target=(root/name).resolve()
+        if root.resolve() not in target.parents: raise ValidationError("资源路径越权")
+        if target.exists() and target.read_bytes()!=content: raise ConflictError("同名资源不可静默覆盖")
+        if not target.exists():
+            tmp=target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp"); tmp.write_bytes(content); os.replace(tmp,target)
+        return self.digest(content)
     def checkpoint(self,task_id):
         self.recover(task_id)
         p=self._task(task_id)/"checkpoint.json"

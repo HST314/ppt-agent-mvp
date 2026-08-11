@@ -4,10 +4,10 @@
 
 | ID | 验收行为 | 责任任务 | 接口/页面 | 最终证据位置 |
 |---|---|---|---|---|
-| AC-01 | Markdown/JSON 任务卡创建 | P2-01、P2-05 | 创建任务 API；任务/资料页 | `tests/e2e/test_ac_01_task_import.py` |
-| AC-02 | 扫描目录并使用图片 Markdown | P2-02、P2-05 | 资源扫描 API；任务/资料页 | `tests/e2e/test_ac_02_resources.py` |
-| AC-03 | 阻断等待与可见默认值 | P2-01、P2-04 | 澄清 API；任务/资料页 | `tests/e2e/test_ac_03_missing_input.py` |
-| AC-04 | 选择题及 Other 回答 | P2-04、P2-05 | 问答 API；任务/资料页 | `tests/e2e/test_ac_04_clarification.py` |
+| AC-01 | Markdown/JSON 任务卡创建 | P2-01、P2-05 | 创建任务 API；任务/资料页 | `tests/test_p2.py::test_json_markdown_normalize_and_block`、`test_api_and_desktop_page` |
+| AC-02 | 扫描目录并使用图片 Markdown | P2-02、P2-05 | 资源扫描 API；任务/资料页 | `tests/test_p2.py::test_resource_pairing_hash_freeze_and_explicit_rebuild` |
+| AC-03 | 阻断等待与可见默认值 | P2-01、P2-04 | 澄清 API；任务/资料页 | `tests/test_p2.py::test_json_markdown_normalize_and_block` |
+| AC-04 | 选择题及 Other 回答 | P2-04、P2-05 | 问答 API；任务/资料页 | `tests/test_p2.py::test_other_answer_and_change_invalidation` |
 | AC-05 | 叙事后逐页大纲且均可编辑 | P3-02、P3-03、P3-05 | 大纲 API；大纲页 | `tests/e2e/test_ac_05_outline_flow.py` |
 | AC-06 | 编辑/Prompt 产生新版本且局部隔离 | P3-04、P5-03 | 修改与版本 API；大纲/全稿页 | `tests/e2e/test_ac_06_scoped_edit.py` |
 | AC-07 | 默认 2 个可调真实 HTML 样品 | P4-01、P4-02 | 样品生成 API；样品页 | `tests/e2e/test_ac_07_samples.py` |

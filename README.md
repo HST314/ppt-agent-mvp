@@ -2,7 +2,7 @@
 
 PPT Agent MVP 的需求、实现决策与验收追踪仓库。
 
-P1 机器契约与可恢复运行内核已实现。产品行为以 `docs/product-contract.md` 为准，实施顺序以 `docs/development-plan.md` 为准。
+P2 任务创建、授权资源扫描、输入冻结与澄清闭环已实现。产品行为以 `docs/product-contract.md` 为准，实施顺序以 `docs/development-plan.md` 为准。
 
 ## 本地启动
 
@@ -41,3 +41,9 @@ python3 scripts/start.py --data .ppt-agent-data
 ```
 
 API 契约见 `docs/openapi.yaml`，内核契约见 `docs/p1-contract.md`。P1 仅建立运行内核；任务输入、生成工作流和前端从 P2 起实现。
+
+## P2 使用
+
+创建任务后，向 `POST /v1/tasks/{task_id}/input` 提交 `source`、`source_format`（`json`/`markdown`）及可选 `rebuild`。服务只扫描任务工作区的 `resources/`；图片可使用同名 `.md` 描述。`GET /tasks/{task_id}` 提供桌面端“任务/资料”页面，`GET /v1/tasks/{task_id}/input` 返回当前冻结快照和澄清状态，`POST /v1/tasks/{task_id}/clarifications/{question_id}/answer` 保存选项或 `Other` 回答。
+
+输入首次导入即冻结；目录后续变化不会静默进入当前 manifest，只有在大纲前显式 `rebuild: true` 才会生成新快照。
