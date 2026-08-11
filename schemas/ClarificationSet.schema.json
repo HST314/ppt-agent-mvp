@@ -5,23 +5,38 @@
   "additionalProperties": false,
   "properties": {
     "schema_version": {
-      "title": "schema_version"
+      "title": "schema_version",
+      "type": "string",
+      "const": "1.0"
     },
     "clarification_id": {
-      "title": "clarification_id"
+      "title": "clarification_id",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
     },
     "task_id": {
-      "title": "task_id"
+      "title": "task_id",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
     },
     "questions": {
-      "title": "questions"
+      "title": "questions",
+      "type": "string"
     },
     "assumptions": {
-      "title": "assumptions"
+      "title": "assumptions",
+      "type": "string"
     },
     "confirmed": {
-      "title": "confirmed"
+      "title": "confirmed",
+      "type": "boolean"
     }
   },
-  "required": []
+  "required": [
+    "clarification_id",
+    "task_id",
+    "questions",
+    "assumptions",
+    "confirmed"
+  ]
 }

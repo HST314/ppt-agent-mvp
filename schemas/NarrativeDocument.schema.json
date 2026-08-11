@@ -5,26 +5,45 @@
   "additionalProperties": false,
   "properties": {
     "schema_version": {
-      "title": "schema_version"
+      "title": "schema_version",
+      "type": "string",
+      "const": "1.0"
     },
     "document_id": {
-      "title": "document_id"
+      "title": "document_id",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
     },
     "task_id": {
-      "title": "task_id"
+      "title": "task_id",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
     },
     "version": {
-      "title": "version"
+      "title": "version",
+      "type": "integer"
     },
     "markdown": {
-      "title": "markdown"
+      "title": "markdown",
+      "type": "string"
     },
     "content_hash": {
-      "title": "content_hash"
+      "title": "content_hash",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
     },
     "created_at": {
-      "title": "created_at"
+      "title": "created_at",
+      "type": "string",
+      "format": "date-time"
     }
   },
-  "required": []
+  "required": [
+    "document_id",
+    "task_id",
+    "version",
+    "markdown",
+    "content_hash",
+    "created_at"
+  ]
 }

@@ -5,29 +5,51 @@
   "additionalProperties": false,
   "properties": {
     "schema_version": {
-      "title": "schema_version"
+      "title": "schema_version",
+      "type": "string",
+      "const": "1.0"
     },
     "artifact_id": {
-      "title": "artifact_id"
+      "title": "artifact_id",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
     },
     "task_id": {
-      "title": "task_id"
+      "title": "task_id",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
     },
     "version": {
-      "title": "version"
+      "title": "version",
+      "type": "integer"
     },
     "kind": {
-      "title": "kind"
+      "title": "kind",
+      "type": "string"
     },
     "outline_hash": {
-      "title": "outline_hash"
+      "title": "outline_hash",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
     },
     "content_hash": {
-      "title": "content_hash"
+      "title": "content_hash",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
     },
     "created_at": {
-      "title": "created_at"
+      "title": "created_at",
+      "type": "string",
+      "format": "date-time"
     }
   },
-  "required": []
+  "required": [
+    "artifact_id",
+    "task_id",
+    "version",
+    "kind",
+    "outline_hash",
+    "content_hash",
+    "created_at"
+  ]
 }

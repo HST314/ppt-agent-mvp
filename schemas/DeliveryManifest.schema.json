@@ -5,26 +5,45 @@
   "additionalProperties": false,
   "properties": {
     "schema_version": {
-      "title": "schema_version"
+      "title": "schema_version",
+      "type": "string",
+      "const": "1.0"
     },
     "delivery_id": {
-      "title": "delivery_id"
+      "title": "delivery_id",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
     },
     "task_id": {
-      "title": "task_id"
+      "title": "task_id",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
     },
     "deck_hash": {
-      "title": "deck_hash"
+      "title": "deck_hash",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
     },
     "files": {
-      "title": "files"
+      "title": "files",
+      "type": "string"
     },
     "confirmed_by": {
-      "title": "confirmed_by"
+      "title": "confirmed_by",
+      "type": "string"
     },
     "confirmed_at": {
-      "title": "confirmed_at"
+      "title": "confirmed_at",
+      "type": "string",
+      "format": "date-time"
     }
   },
-  "required": []
+  "required": [
+    "delivery_id",
+    "task_id",
+    "deck_hash",
+    "files",
+    "confirmed_by",
+    "confirmed_at"
+  ]
 }

@@ -5,23 +5,41 @@
   "additionalProperties": false,
   "properties": {
     "schema_version": {
-      "title": "schema_version"
+      "title": "schema_version",
+      "type": "string",
+      "const": "1.0"
     },
     "snapshot_id": {
-      "title": "snapshot_id"
+      "title": "snapshot_id",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
     },
     "task_id": {
-      "title": "task_id"
+      "title": "task_id",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
     },
     "task_card_hash": {
-      "title": "task_card_hash"
+      "title": "task_card_hash",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
     },
     "resource_manifest_hash": {
-      "title": "resource_manifest_hash"
+      "title": "resource_manifest_hash",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
     },
     "created_at": {
-      "title": "created_at"
+      "title": "created_at",
+      "type": "string",
+      "format": "date-time"
     }
   },
-  "required": []
+  "required": [
+    "snapshot_id",
+    "task_id",
+    "task_card_hash",
+    "resource_manifest_hash",
+    "created_at"
+  ]
 }

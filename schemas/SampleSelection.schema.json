@@ -5,23 +5,39 @@
   "additionalProperties": false,
   "properties": {
     "schema_version": {
-      "title": "schema_version"
+      "title": "schema_version",
+      "type": "string",
+      "const": "1.0"
     },
     "selection_id": {
-      "title": "selection_id"
+      "title": "selection_id",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
     },
     "task_id": {
-      "title": "task_id"
+      "title": "task_id",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
     },
     "outline_hash": {
-      "title": "outline_hash"
+      "title": "outline_hash",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
     },
     "slide_ids": {
-      "title": "slide_ids"
+      "title": "slide_ids",
+      "type": "string"
     },
     "confirmed": {
-      "title": "confirmed"
+      "title": "confirmed",
+      "type": "boolean"
     }
   },
-  "required": []
+  "required": [
+    "selection_id",
+    "task_id",
+    "outline_hash",
+    "slide_ids",
+    "confirmed"
+  ]
 }

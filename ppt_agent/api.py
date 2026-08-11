@@ -10,6 +10,11 @@ from .store import WorkspaceStore
 TASK=re.compile(r"^/v1/tasks/([^/]+)$")
 ACTION=re.compile(r"^/v1/tasks/([^/]+)/actions$")
 EVENTS=re.compile(r"^/v1/tasks/([^/]+)/events$")
+VERSIONS=re.compile(r"^/v1/tasks/([^/]+)/versions$")
+VERSION=re.compile(r"^/v1/tasks/([^/]+)/versions/([0-9a-f]{64})$")
+COMPARE=re.compile(r"^/v1/tasks/([^/]+)/versions/compare$")
+PREVIEW=re.compile(r"^/v1/tasks/([^/]+)/preview$")
+ISSUES=re.compile(r"^/v1/tasks/([^/]+)/issues/([^/]+)/disposition$")
 
 class App:
     def __init__(self,service): self.service=service
@@ -24,10 +29,23 @@ class App:
             if method=="GET" and m:return self.reply(start_response,200,self.service.get(m.group(1)))
             m=ACTION.match(path)
             if method=="POST" and m:
-                self.exact(body,{"command_id","action","actor"},{"command_id","action"})
-                return self.reply(start_response,200,self.service.command(m.group(1),body["command_id"],body["action"],body.get("actor","system")))
+                self.exact(body,{"command_id","action","actor","payload"},{"command_id","action"})
+                return self.reply(start_response,200,self.service.command(m.group(1),body["command_id"],body["action"],body.get("actor","system"),body.get("payload")))
             m=EVENTS.match(path)
             if method=="GET" and m:return self.reply(start_response,200,{"events":self.service.events(m.group(1))})
+            m=COMPARE.match(path)
+            if method=="POST" and m:
+                self.exact(body,{"left","right"},{"left","right"}); return self.reply(start_response,200,self.service.compare(m.group(1),body["left"],body["right"]))
+            m=VERSION.match(path)
+            if method=="GET" and m:return self.reply(start_response,200,{"hash":m.group(2),"content":self.service.version(m.group(1),m.group(2)).decode(errors="replace")})
+            m=VERSIONS.match(path)
+            if method=="GET" and m:return self.reply(start_response,200,{"versions":self.service.versions(m.group(1))})
+            m=PREVIEW.match(path)
+            if method=="POST" and m:return self.reply(start_response,200,self.service.run_fake_pipeline(m.group(1)))
+            m=ISSUES.match(path)
+            if method=="POST" and m:
+                self.exact(body,{"command_id","action","actor"},{"command_id","action","actor"})
+                payload={"issue_id":m.group(2),"disposition":body["action"]}; return self.reply(start_response,200,self.service.command(m.group(1),body["command_id"],"resolve_blockers",body["actor"],payload))
             raise NotFoundError("接口不存在")
         except DomainError as exc:return self.reply(start_response,exc.status,exc.public())
         except Exception:

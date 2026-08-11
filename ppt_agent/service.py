@@ -3,24 +3,38 @@ from __future__ import annotations
 import hashlib, json
 from datetime import datetime, timezone
 
-from .errors import ConflictError
+from .errors import ConflictError, ValidationError
 from .fsm import TaskState, transition
+from .gateways import FakeGenerationGateway, FakeHtmlBuilder, FakeInspectionGateway, FakeSkillLoader
 
 def utcnow(): return datetime.now(timezone.utc).isoformat()
+def fingerprint(value): return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(",",":")).encode()).hexdigest()
 
 class TaskService:
-    def __init__(self,store): self.store=store
+    def __init__(self,store,generator=None,inspector=None,skills=None,builder=None):
+        self.store=store; self.generator=generator or FakeGenerationGateway(); self.inspector=inspector or FakeInspectionGateway(); self.skills=skills or FakeSkillLoader(); self.builder=builder or FakeHtmlBuilder()
     def create(self,task_id,mode="manual"):
+        if mode not in {"manual","auto"}: raise ValidationError("mode 只能是 manual 或 auto")
         s=TaskState(task_id=task_id,mode=mode); self.store.create(task_id,s.to_dict()); return s.to_dict()
     def get(self,task_id): return self.store.checkpoint(task_id)
-    def command(self,task_id,command_id,action,actor="system"):
+    def command(self,task_id,command_id,action,actor="system",payload=None):
+        request={"action":action,"actor":actor,"payload":payload or {}}
         with self.store.lock(task_id):
             prior=[e for e in self.store.events(task_id) if e["command_id"]==command_id]
             if prior:
-                if prior[0]["action"] != action: raise ConflictError("command_id 已用于其他动作")
-                return self.get(task_id)
+                if prior[0]["request_hash"] != fingerprint(request): raise ConflictError("command_id 请求内容冲突")
+                return prior[0]["result"]
             old=TaskState.parse(self.get(task_id)); new=transition(old,action,actor=actor)
-            event={"event_id":hashlib.sha256(f"{task_id}:{command_id}".encode()).hexdigest()[:24],"command_id":command_id,"action":action,"actor":actor,"at":utcnow(),"from":old.to_dict(),"to":new.to_dict()}
-            self.store.commit(task_id,new.to_dict(),event); return new.to_dict()
-    def versions(self,task_id): return []
+            result=new.to_dict()
+            event={"event_id":hashlib.sha256(f"{task_id}:{command_id}".encode()).hexdigest()[:24],"command_id":command_id,"action":action,"actor":actor,"request_hash":fingerprint(request),"at":utcnow(),"from":old.to_dict(),"to":result,"result":result}
+            self.store.commit(task_id,result,event); return result
+    def versions(self,task_id,kind=None): return self.store.versions(task_id,kind)
+    def version(self,task_id,digest): return self.store.artifact(task_id,digest)
+    def compare(self,task_id,left,right): return {"left":left,"right":right,"equal":self.version(task_id,left)==self.version(task_id,right)}
     def events(self,task_id): return self.store.events(task_id)
+    def run_fake_pipeline(self,task_id):
+        outline=self.generator.generate("outline",{"task_id":task_id},skill=self.skills.load("outline")["version"])["text"]
+        outline_hash=self.store.put_version(task_id,"outline",outline.encode(),{"generator":"fake"})
+        html=self.builder.build(outline); deck_hash=self.store.put_version(task_id,"deck",html.encode(),{"outline_hash":outline_hash})
+        inspection=self.inspector.inspect(outline,html); report_hash=self.store.put_version(task_id,"inspection",json.dumps(inspection,sort_keys=True).encode(),{"deck_hash":deck_hash})
+        return {"outline_hash":outline_hash,"deck_hash":deck_hash,"report_hash":report_hash,"passed":inspection["passed"],"preview":html}

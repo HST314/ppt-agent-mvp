@@ -5,23 +5,40 @@
   "additionalProperties": false,
   "properties": {
     "schema_version": {
-      "title": "schema_version"
+      "title": "schema_version",
+      "type": "string",
+      "const": "1.0"
     },
     "manifest_id": {
-      "title": "manifest_id"
+      "title": "manifest_id",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
     },
     "task_id": {
-      "title": "task_id"
+      "title": "task_id",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
     },
     "resources": {
-      "title": "resources"
+      "title": "resources",
+      "type": "string"
     },
     "content_hash": {
-      "title": "content_hash"
+      "title": "content_hash",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
     },
     "created_at": {
-      "title": "created_at"
+      "title": "created_at",
+      "type": "string",
+      "format": "date-time"
     }
   },
-  "required": []
+  "required": [
+    "manifest_id",
+    "task_id",
+    "resources",
+    "content_hash",
+    "created_at"
+  ]
 }

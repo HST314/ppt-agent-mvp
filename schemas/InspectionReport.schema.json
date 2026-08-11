@@ -5,26 +5,45 @@
   "additionalProperties": false,
   "properties": {
     "schema_version": {
-      "title": "schema_version"
+      "title": "schema_version",
+      "type": "string",
+      "const": "1.0"
     },
     "report_id": {
-      "title": "report_id"
+      "title": "report_id",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
     },
     "task_id": {
-      "title": "task_id"
+      "title": "task_id",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
     },
     "deck_hash": {
-      "title": "deck_hash"
+      "title": "deck_hash",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
     },
     "issues": {
-      "title": "issues"
+      "title": "issues",
+      "type": "string"
     },
     "passed": {
-      "title": "passed"
+      "title": "passed",
+      "type": "boolean"
     },
     "created_at": {
-      "title": "created_at"
+      "title": "created_at",
+      "type": "string",
+      "format": "date-time"
     }
   },
-  "required": []
+  "required": [
+    "report_id",
+    "task_id",
+    "deck_hash",
+    "issues",
+    "passed",
+    "created_at"
+  ]
 }

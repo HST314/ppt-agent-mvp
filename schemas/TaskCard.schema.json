@@ -5,23 +5,37 @@
   "additionalProperties": false,
   "properties": {
     "schema_version": {
-      "title": "schema_version"
+      "title": "schema_version",
+      "type": "string",
+      "const": "1.0"
     },
     "task_id": {
-      "title": "task_id"
+      "title": "task_id",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
     },
     "goal": {
-      "title": "goal"
+      "title": "goal",
+      "type": "string"
     },
     "audience": {
-      "title": "audience"
+      "title": "audience",
+      "type": "string"
     },
     "topic": {
-      "title": "topic"
+      "title": "topic",
+      "type": "string"
     },
     "source_format": {
-      "title": "source_format"
+      "title": "source_format",
+      "type": "string"
     }
   },
-  "required": []
+  "required": [
+    "task_id",
+    "goal",
+    "audience",
+    "topic",
+    "source_format"
+  ]
 }
