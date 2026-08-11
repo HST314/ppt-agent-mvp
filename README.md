@@ -2,7 +2,7 @@
 
 PPT Agent MVP 的需求、实现决策与验收追踪仓库。
 
-P3 叙事结构与逐页大纲闭环已实现，包括分阶段 Skill 装载、版本化编辑、影响域、回退及 manual/auto 门禁。产品行为以 `docs/product-contract.md` 为准，实施顺序以 `docs/development-plan.md` 为准。
+P4 HTML 样品页闭环已实现，包括样品推荐与改选、真实 HTML 安全预览、元素/页面/全局修改、版本追踪，以及绑定大纲与样品 hash 的人工确认门禁。产品行为以 `docs/product-contract.md` 为准，实施顺序以 `docs/development-plan.md` 为准。
 
 ## 本地启动
 

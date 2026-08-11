@@ -9,8 +9,9 @@ from .gateways import FakeGenerationGateway, FakeHtmlBuilder, FakeInspectionGate
 from .schema import DeliveryManifest, InspectionReport, IssueDisposition
 from .p2 import canonical, digest, now, parse_task_card, questions_for, scan_resources, validate_answer
 from .schema import ClarificationSet, ResourceManifest, TaskCard, TaskInputSnapshot
-from .schema import NarrativeDocument, SlideOutline
+from .schema import NarrativeDocument, SlideOutline, SampleSelection, DeckArtifact
 from .p3 import changed_slide_ids, narrative_markdown, outline_markdown, parse_outline, requested_slide_count
+from .p4 import recommend, render, validate_html
 
 def utcnow(): return datetime.now(timezone.utc).isoformat()
 def fingerprint(value): return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(",",":")).encode()).hexdigest()
@@ -197,6 +198,79 @@ class TaskService:
         state=TaskState.parse(self.get(task_id))
         if state.stage==state.stage.OUTLINE: self.command(task_id,f"confirm-outline-{current[:12]}","advance","user" if state.mode=="manual" else "system")
         return self.planning_view(task_id)
+    def _confirmed_outline_hash(self,task_id):
+        for event in reversed(self.events(task_id)):
+            if event["action"] == "confirm_outline": return event["result"].get("confirmed_outline_hash")
+            if event["action"] == "advance" and event["from"]["stage"] == "outline": return self._current_version(task_id,"outline")
+        return None
+    def sample_view(self,task_id):
+        outline=self._current_version(task_id,"outline"); current=self._current_version(task_id,"sample")
+        result={"state":self.get(task_id),"outline_hash":outline,"selection":None,"sample":None,"confirmation":None,"versions":self.versions(task_id,"sample")}
+        sels=self.versions(task_id,"sample-selection")
+        if sels:
+            last=sels[-1]; result["selection"]={**json.loads(self.version(task_id,last["hash"])),"hash":last["hash"],"metadata":last["metadata"]}
+        if current:
+            item=json.loads(self.version(task_id,current)); meta=next(v["metadata"] for v in self.versions(task_id,"sample") if v["hash"]==current)
+            result["sample"]={**item,"hash":current,"html":meta["html"],"metadata":meta}
+        for event in reversed(self.events(task_id)):
+            if event["action"]=="confirm_sample_version":
+                if current and event["result"].get("confirmed_sample_hash")==current and event["result"].get("confirmed_outline_hash")==outline: result["confirmation"]=event["result"]
+                break
+        return result
+    def _invalidate_sample_gate(self,task_id,artifact_hash):
+        state=TaskState.parse(self.get(task_id))
+        if not state.sample_confirmed: return
+        new=TaskState(**{**state.__dict__,"sample_confirmed":False,"status":state.status.WAITING_FOR_USER,"waiting_reason":"manual_gate","required_action":"confirm_sample","revision":state.revision+1})
+        event={"event_id":hashlib.sha256(f"{task_id}:invalidate-sample:{artifact_hash}".encode()).hexdigest()[:24],"command_id":f"invalidate-sample-{artifact_hash[:16]}","action":"invalidate_sample_confirmation","actor":"system","request_hash":artifact_hash,"at":utcnow(),"from":state.to_dict(),"to":new.to_dict(),"result":{"hash":artifact_hash,"invalidated":["sample_confirmation","deck"]}}
+        self.store.commit(task_id,new.to_dict(),event)
+    def select_samples(self,task_id,slide_ids=None,count=2):
+        outline=self._current_version(task_id,"outline"); state=TaskState.parse(self.get(task_id))
+        if not outline or state.stage != state.stage.SAMPLE: raise ConflictError("须先完成并确认逐页大纲")
+        data=json.loads(self.version(task_id,outline)); valid=list(data["slide_ids"])
+        if slide_ids is None: slide_ids,reasons=recommend(data["markdown"],count)
+        else:
+            if not isinstance(slide_ids,list) or not slide_ids or len(slide_ids)>len(valid) or len(set(slide_ids))!=len(slide_ids) or any(x not in valid for x in slide_ids): raise ValidationError("样品页面选择无效或重复")
+            reasons={sid:"用户选择" for sid in slide_ids}
+        seed=canonical({"outline_hash":outline,"slide_ids":slide_ids}); model=SampleSelection.parse({"selection_id":f"selection-{digest(seed)[:16]}","task_id":task_id,"outline_hash":outline,"slide_ids":slide_ids,"confirmed":False,"schema_version":"1.0"})
+        h=self.store.put_version(task_id,"sample-selection",canonical(model.to_dict()),{"reasons":reasons})
+        return {**self.sample_view(task_id),"selection":{**model.to_dict(),"hash":h,"metadata":{"reasons":reasons}}}
+    def generate_sample(self,task_id,prompt=None):
+        view=self.sample_view(task_id); selection=view["selection"]
+        if not selection: view=self.select_samples(task_id); selection=view["selection"]
+        outline=self._current_version(task_id,"outline")
+        if selection["outline_hash"] != outline: raise ConflictError("样品选择已因大纲变化而失效")
+        data=json.loads(self.version(task_id,outline)); rules=[]
+        if prompt: rules.append(prompt.strip())
+        html_text=validate_html(render(data["markdown"],selection["slide_ids"],rules),selection["slide_ids"])
+        version=len(self.versions(task_id,"sample"))+1; content_hash=digest(html_text.encode()); model=DeckArtifact.parse({"artifact_id":f"sample-{content_hash[:16]}","task_id":task_id,"version":version,"kind":"sample","outline_hash":outline,"content_hash":content_hash,"created_at":now(),"schema_version":"1.0"})
+        prior=self._current_version(task_id,"sample"); meta={"html":html_text,"selection_hash":selection["hash"],"parent":prior,"summary":"生成真实 HTML 样品","scope":"global","global_rules":rules,"local_exceptions":{},"build":"success"}
+        h=self._record_p3(task_id,"sample",model,meta,"sample_generate")
+        self._invalidate_sample_gate(task_id,h)
+        return self.sample_view(task_id)
+    def modify_sample(self,task_id,prompt,scope=None,slide_id=None,element_id=None):
+        view=self.sample_view(task_id); sample=view["sample"]
+        if not sample: raise ConflictError("尚未生成样品")
+        if not isinstance(prompt,str) or not prompt.strip(): raise ValidationError("修改 Prompt 不得为空")
+        ids=list(view["selection"]["slide_ids"])
+        if scope is None: scope="element" if element_id else ("page" if slide_id else "global")
+        if scope not in {"element","page","global"}: raise ValidationError("修改作用域无效")
+        if scope in {"element","page"} and slide_id not in ids: raise ValidationError("修改页面不在样品中")
+        if scope=="element" and not element_id: raise ValidationError("元素级修改必须指定 element_id")
+        meta=sample["metadata"]; rules=list(meta.get("global_rules",[])); exceptions={k:list(v) for k,v in meta.get("local_exceptions",{}).items()}
+        if scope=="global": rules.append(prompt.strip())
+        else: exceptions.setdefault(slide_id,[]).append((f"元素 {element_id}: " if scope=="element" else "")+prompt.strip())
+        outline=self._current_version(task_id,"outline"); data=json.loads(self.version(task_id,outline)); html_text=validate_html(render(data["markdown"],ids,rules,exceptions),ids)
+        version=len(self.versions(task_id,"sample"))+1; ch=digest(html_text.encode()); model=DeckArtifact.parse({"artifact_id":f"sample-{ch[:16]}","task_id":task_id,"version":version,"kind":"sample","outline_hash":outline,"content_hash":ch,"created_at":now(),"schema_version":"1.0"})
+        h=self._record_p3(task_id,"sample",model,{"html":html_text,"selection_hash":view["selection"]["hash"],"parent":sample["hash"],"summary":prompt.strip(),"scope":scope,"slide_id":slide_id,"element_id":element_id,"global_rules":rules,"local_exceptions":exceptions,"build":"success"},"sample_modify","user")
+        self._invalidate_sample_gate(task_id,h)
+        return self.sample_view(task_id)
+    def confirm_sample(self,task_id):
+        view=self.sample_view(task_id); sample=view["sample"]; outline=self._current_version(task_id,"outline")
+        if not sample or sample["outline_hash"] != outline: raise ConflictError("须先生成基于当前大纲的样品")
+        state=TaskState.parse(self.get(task_id)); new=transition(state,"confirm_sample",actor="user")
+        result={"confirmed_outline_hash":outline,"confirmed_sample_hash":sample["hash"],"confirmed_content_hash":sample["content_hash"],"selection_hash":view["selection"]["hash"]}
+        event={"event_id":hashlib.sha256(f"{task_id}:confirm-sample:{sample['hash']}".encode()).hexdigest()[:24],"command_id":f"confirm-sample-{sample['hash'][:16]}","action":"confirm_sample_version","actor":"user","request_hash":sample["hash"],"at":utcnow(),"from":state.to_dict(),"to":new.to_dict(),"result":result}
+        self.store.commit(task_id,new.to_dict(),event); return self.sample_view(task_id)
     def run_fake_pipeline(self,task_id):
         state=self.get(task_id)
         if state["stage"] != "created": raise ConflictError("fake 全链路只能从空任务启动")

@@ -23,6 +23,8 @@ NARRATIVE=re.compile(r"^/v1/tasks/([^/]+)/narrative(?:/(generate|confirm))?$")
 OUTLINE=re.compile(r"^/v1/tasks/([^/]+)/outline(?:/(generate|confirm))?$")
 ROLLBACK=re.compile(r"^/v1/tasks/([^/]+)/planning/rollback$")
 OUTLINE_PAGE=re.compile(r"^/tasks/([^/]+)/outline$")
+SAMPLES=re.compile(r"^/v1/tasks/([^/]+)/samples(?:/(select|generate|modify|confirm))?$")
+SAMPLE_PAGE=re.compile(r"^/tasks/([^/]+)/samples$")
 
 class App:
     def __init__(self,service): self.service=service
@@ -30,7 +32,7 @@ class App:
         try:
             method=environ["REQUEST_METHOD"]; path=environ["PATH_INFO"]
             size=int(environ.get("CONTENT_LENGTH") or 0); body=json.loads(environ["wsgi.input"].read(size) or b"{}")
-            if method=="GET" and path=="/healthz": return self.reply(start_response,200,{"status":"ok","stage":"P3","runtime_ready":True})
+            if method=="GET" and path=="/healthz": return self.reply(start_response,200,{"status":"ok","stage":"P4","runtime_ready":True})
             if method=="POST" and path=="/v1/tasks":
                 self.exact(body,{"task_id","mode"},{"task_id"}); return self.reply(start_response,201,self.service.create(body["task_id"],body.get("mode","manual")))
             m=TASK.match(path)
@@ -48,6 +50,17 @@ class App:
             if method=="GET" and m:return self.page(start_response,m.group(1))
             m=OUTLINE_PAGE.match(path)
             if method=="GET" and m:return self.outline_page(start_response,m.group(1))
+            m=SAMPLE_PAGE.match(path)
+            if method=="GET" and m:return self.sample_page(start_response,m.group(1))
+            m=SAMPLES.match(path)
+            if method=="GET" and m and not m.group(2): return self.reply(start_response,200,self.service.sample_view(m.group(1)))
+            if method=="POST" and m:
+                if m.group(2)=="select": self.exact(body,{"slide_ids","count"},set()); result=self.service.select_samples(m.group(1),body.get("slide_ids"),body.get("count",2))
+                elif m.group(2)=="generate": self.exact(body,{"prompt"},set()); result=self.service.generate_sample(m.group(1),body.get("prompt"))
+                elif m.group(2)=="modify": self.exact(body,{"prompt","scope","slide_id","element_id"},{"prompt"}); result=self.service.modify_sample(m.group(1),body["prompt"],body.get("scope"),body.get("slide_id"),body.get("element_id"))
+                elif m.group(2)=="confirm": self.exact(body,set(),set()); result=self.service.confirm_sample(m.group(1))
+                else: raise NotFoundError("接口不存在")
+                return self.reply(start_response,200,result)
             m=PLANNING.match(path)
             if method=="GET" and m:return self.reply(start_response,200,self.service.planning_view(m.group(1)))
             m=NARRATIVE.match(path)
@@ -220,6 +233,13 @@ if(r.ok){location.reload();}else{const data=await r.json();out.textContent=(data
 <section aria-label="逐页大纲"><h2>逐页大纲</h2><form data-kind="outline"><textarea aria-label="逐页大纲 Markdown">{esc(outline.get('markdown',''))}</textarea><input name="prompt" aria-label="大纲修改 Prompt" placeholder="输入页/章节修改要求"><button name="generate" type="button">生成/整体重生成</button><button name="save">保存直接编辑</button><button name="confirm" type="button">确认大纲</button><output aria-live="polite"></output></form><p>最近影响范围：{esc(', '.join((outline.get('metadata') or {}).get('affected',[])) or '无')}</p><h3>版本</h3><ul>{timeline('outline')}</ul></section></main>
 <script>const ID={json.dumps(task_id)};document.querySelectorAll('form[data-kind]').forEach(f=>{{const k=f.dataset.kind,send=async(url,data)=>{{const r=await fetch(url,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(data)}});if(r.ok)location.reload();else f.querySelector('output').textContent=((await r.json()).error||{{}}).message||'操作失败';}};f.onsubmit=e=>{{e.preventDefault();send('/v1/tasks/'+ID+'/'+k,{{markdown:f.querySelector('textarea').value}})}};f.querySelector('[name=generate]').onclick=()=>send('/v1/tasks/'+ID+'/'+k+'/generate',{{prompt:f.querySelector('[name=prompt]').value}});f.querySelector('[name=confirm]').onclick=()=>send('/v1/tasks/'+ID+'/'+k+'/confirm',{{}});}});document.querySelectorAll('.rollback').forEach(b=>b.onclick=()=>fetch('/v1/tasks/'+ID+'/planning/rollback',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{kind:b.dataset.kind,hash:b.dataset.hash}})}}).then(()=>location.reload()));</script></html>''').encode()
         start("200 OK",[("Content-Type","text/html; charset=utf-8"),("Content-Length",str(len(raw)))]); return [raw]
+
+    def sample_page(self,start,task_id):
+        view=self.service.sample_view(task_id); esc=self.esc; selection=view.get("selection") or {}; sample=view.get("sample") or {}
+        ids=selection.get("slide_ids",[]); checks="".join(f'<label><input type="checkbox" name="slide" value="{esc(x)}" checked> {esc(x)}</label>' for x in ids)
+        preview=sample.get("html",""); version=sample.get("version","-"); confirmed=view.get("confirmation")
+        raw=f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>HTML 样品页</title><style>body{{font:16px system-ui;max-width:1200px;margin:24px auto}}main{{display:grid;grid-template-columns:320px 1fr;gap:20px}}section{{border:1px solid #ccd3df;padding:16px;border-radius:10px}}iframe{{width:100%;height:620px;border:0}}label,button{{display:block;margin:8px 0}}textarea{{width:100%;height:100px}}</style><h1>HTML 样品页</h1><p>样品版本：{esc(version)}；确认状态：{'已绑定确认' if confirmed else '待人工确认'}</p><main><section><h2>样品选择</h2><div id="slides">{checks or '尚未推荐，生成时默认推荐 2 页'}</div><button id="select">保存选择</button><h2>修改</h2><label>作用域 <select id="scope"><option>global</option><option>page</option><option>element</option></select></label><label>页面 ID <input id="slide"></label><label>元素 ID <input id="element"></label><textarea id="prompt" placeholder="输入视觉修改要求"></textarea><button id="generate">生成样品</button><button id="modify">提交修改</button><button id="confirm">确认样品并生成全稿</button><output></output></section><section><h2>安全预览</h2><iframe sandbox="" srcdoc="{esc(preview)}"></iframe></section></main><script>const base='/v1/tasks/{esc(task_id)}/samples/';async function send(a,b){{const r=await fetch(base+a,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(b)}});if(r.ok)location.reload();else document.querySelector('output').textContent=((await r.json()).error||{{}}).message}}select.onclick=()=>send('select',{{slide_ids:[...document.querySelectorAll('[name=slide]:checked')].map(x=>x.value)}});generate.onclick=()=>send('generate',{{prompt:prompt.value}});modify.onclick=()=>send('modify',{{prompt:prompt.value,scope:scope.value,slide_id:slide.value||null,element_id:element.value||null}});confirm.onclick=()=>send('confirm',{{}});</script></html>'''.encode()
+        start("200 OK",[("Content-Type","text/html; charset=utf-8"),("Content-Security-Policy","default-src 'self'; frame-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"),("Content-Length",str(len(raw)))]); return [raw]
 
 def serve(root=".ppt-agent-data",host="127.0.0.1",port=8000):
     make_server(host,port,App(TaskService(WorkspaceStore(root)))).serve_forever()
