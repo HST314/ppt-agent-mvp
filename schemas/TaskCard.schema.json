@@ -7,28 +7,38 @@
     "schema_version": {
       "title": "schema_version",
       "type": "string",
+      "minLength": 1,
       "const": "1.0"
     },
     "task_id": {
       "title": "task_id",
       "type": "string",
+      "minLength": 1,
       "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
     },
     "goal": {
       "title": "goal",
-      "type": "string"
+      "type": "string",
+      "minLength": 1
     },
     "audience": {
       "title": "audience",
-      "type": "string"
+      "type": "string",
+      "minLength": 1
     },
     "topic": {
       "title": "topic",
-      "type": "string"
+      "type": "string",
+      "minLength": 1
     },
     "source_format": {
       "title": "source_format",
-      "type": "string"
+      "type": "string",
+      "minLength": 1,
+      "enum": [
+        "json",
+        "markdown"
+      ]
     }
   },
   "required": [

@@ -7,34 +7,48 @@
     "schema_version": {
       "title": "schema_version",
       "type": "string",
+      "minLength": 1,
       "const": "1.0"
     },
     "disposition_id": {
       "title": "disposition_id",
       "type": "string",
+      "minLength": 1,
       "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
     },
     "task_id": {
       "title": "task_id",
       "type": "string",
+      "minLength": 1,
       "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
     },
     "issue_id": {
       "title": "issue_id",
       "type": "string",
+      "minLength": 1,
       "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
     },
     "action": {
       "title": "action",
-      "type": "string"
+      "type": "string",
+      "minLength": 1,
+      "enum": [
+        "resolve",
+        "waive"
+      ]
     },
     "actor": {
       "title": "actor",
-      "type": "string"
+      "type": "string",
+      "minLength": 1,
+      "enum": [
+        "user"
+      ]
     },
     "created_at": {
       "title": "created_at",
       "type": "string",
+      "minLength": 1,
       "format": "date-time"
     }
   },

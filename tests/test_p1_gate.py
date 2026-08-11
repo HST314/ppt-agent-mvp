@@ -4,7 +4,7 @@ from pathlib import Path
 from ppt_agent.api import App
 from ppt_agent.errors import ConflictError,GateError,ValidationError
 from ppt_agent.fsm import Stage,TaskState,transition
-from ppt_agent.schema import MODELS,TaskInputSnapshot
+from ppt_agent.schema import MODELS,ClarificationSet,DeckArtifact,NarrativeDocument,ResourceManifest,SlideOutline,TaskInputSnapshot
 from ppt_agent.service import TaskService
 from ppt_agent.store import WorkspaceStore
 
@@ -23,6 +23,15 @@ class NegativeContractTests(unittest.TestCase):
   TaskInputSnapshot.parse(good)
   for key,bad in (("snapshot_id",1),("task_id",[]),("task_card_hash",{}),("created_at","yesterday")):
    with self.assertRaises(ValidationError): TaskInputSnapshot.parse({**good,key:bad})
+ def test_json_arrays_and_field_semantics(self):
+  common={"task_id":"task","schema_version":"1.0"}
+  resource=ResourceManifest.parse({**common,"manifest_id":"manifest","resources":[],"content_hash":H,"created_at":NOW})
+  clarification=ClarificationSet.parse({**common,"clarification_id":"clarify","questions":[],"assumptions":[],"confirmed":False})
+  self.assertEqual(resource.resources,()); self.assertEqual(clarification.questions,())
+  with self.assertRaises(ValidationError): NarrativeDocument.parse({**common,"document_id":"doc","version":1,"markdown":" ","content_hash":H,"created_at":NOW})
+  with self.assertRaises(ValidationError): TaskInputSnapshot.parse({"snapshot_id":"snap","task_id":"task","task_card_hash":H,"resource_manifest_hash":H,"created_at":"2026-08-11T00:00:00","schema_version":"1.0"})
+  with self.assertRaises(ValidationError): SlideOutline.parse({**common,"outline_id":"outline","version":1,"markdown":"# ok","slide_ids":["bad/id"],"content_hash":H,"created_at":NOW})
+  with self.assertRaises(ValidationError): DeckArtifact.parse({**common,"artifact_id":"artifact","version":1,"kind":"zip","outline_hash":H,"content_hash":H,"created_at":NOW})
  def test_kind_escape_rejected(self):
   with tempfile.TemporaryDirectory() as p:
    s=WorkspaceStore(p); s.create("t",TaskState("t").to_dict())
@@ -55,11 +64,20 @@ class ApiIntegrationTests(unittest.TestCase):
   out=b"".join(app({"REQUEST_METHOD":method,"PATH_INFO":path,"CONTENT_LENGTH":str(len(raw)),"wsgi.input":io.BytesIO(raw)},lambda s,h:status.append(s)))
   return int(status[0][:3]),json.loads(out)
  def test_openapi_and_fake_artifact_path(self):
-  text=Path("docs/openapi.yaml").read_text()
+  import yaml
+  text=Path("docs/openapi.yaml").read_text(); spec=yaml.safe_load(text)
   for token in ("requestBody:","Error:","/versions:","/versions/compare:","/preview:","/issues/{issue_id}/disposition:"): self.assertIn(token,text)
+  for path,item in spec["paths"].items():
+   for operation in item.values():
+    responses=operation["responses"]; success=next(v for k,v in responses.items() if str(k).startswith("2"))
+    self.assertIn("content",success,path); self.assertIn("schema",success["content"]["application/json"],path)
+    if path != "/healthz": self.assertTrue(any(v.get("$ref")=="#/components/responses/Error" for k,v in responses.items() if not str(k).startswith("2")),path)
   with tempfile.TemporaryDirectory() as p:
    app=App(TaskService(WorkspaceStore(p))); self.assertEqual(self.call(app,"POST","/v1/tasks",{"task_id":"t","mode":"auto"})[0],201)
    code,result=self.call(app,"POST","/v1/tasks/t/preview"); self.assertEqual(code,200); self.assertTrue(result["passed"])
-   code,versions=self.call(app,"GET","/v1/tasks/t/versions"); self.assertEqual(code,200); self.assertEqual(len(versions["versions"]),3)
+   self.assertEqual(result["state"]["status"],"completed")
+   code,versions=self.call(app,"GET","/v1/tasks/t/versions"); self.assertEqual(code,200); self.assertEqual({v["kind"] for v in versions["versions"]},{"outline","deck","inspection","delivery"})
+   actions=[e["action"] for e in app.service.events("t")]
+   for action in ("confirm_sample","resolve_blockers","confirm_delivery"): self.assertIn(action,actions)
 
 if __name__=="__main__": unittest.main()

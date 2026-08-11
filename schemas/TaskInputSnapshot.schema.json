@@ -7,31 +7,37 @@
     "schema_version": {
       "title": "schema_version",
       "type": "string",
+      "minLength": 1,
       "const": "1.0"
     },
     "snapshot_id": {
       "title": "snapshot_id",
       "type": "string",
+      "minLength": 1,
       "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
     },
     "task_id": {
       "title": "task_id",
       "type": "string",
+      "minLength": 1,
       "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
     },
     "task_card_hash": {
       "title": "task_card_hash",
       "type": "string",
+      "minLength": 1,
       "pattern": "^[0-9a-f]{64}$"
     },
     "resource_manifest_hash": {
       "title": "resource_manifest_hash",
       "type": "string",
+      "minLength": 1,
       "pattern": "^[0-9a-f]{64}$"
     },
     "created_at": {
       "title": "created_at",
       "type": "string",
+      "minLength": 1,
       "format": "date-time"
     }
   },

@@ -13,8 +13,25 @@ HASH = re.compile(r"^[0-9a-f]{64}$")
 
 def _schema(t):
     origin = get_origin(t)
-    if origin is tuple: return {"type": "array", "items": {}}
+    if origin is tuple:
+        args=get_args(t); item=args[0] if args else Any
+        return {"type": "array", "items": {} if item is Any else _schema(item)}
+    if origin is dict: return {"type":"object"}
     return {"type": {str: "string", int: "integer", bool: "boolean", dict: "object"}.get(t, "string")}
+
+def _json_value(value, expected, name):
+    """Validate JSON-shaped input and normalize arrays to immutable tuples."""
+    origin=get_origin(expected)
+    if origin is tuple:
+        if not isinstance(value,(list,tuple)): raise ValidationError(f"{name} 类型无效")
+        args=get_args(expected); item=args[0] if args else Any
+        return tuple(value if item is Any else (_json_value(v,item,name) for v in value))
+    if origin is dict:
+        if not isinstance(value,dict): raise ValidationError(f"{name} 类型无效")
+        return value
+    if expected is Any: return value
+    if not isinstance(value,expected) or (expected is int and isinstance(value,bool)): raise ValidationError(f"{name} 类型无效")
+    return value
 
 
 @dataclass(frozen=True)
@@ -32,14 +49,19 @@ class StrictModel:
         if self.schema_version != "1.0": raise ValidationError("不支持的 schema_version")
         for f in fields(self):
             value = getattr(self, f.name)
+            if isinstance(value,str) and not value.strip(): raise ValidationError(f"{f.name} 不得为空")
             if f.name.endswith("_id") or f.name == "task_id":
                 if not value or not ID.fullmatch(value): raise ValidationError(f"{f.name} 格式无效")
             if f.name.endswith("_hash") or f.name == "content_hash":
                 if not HASH.fullmatch(value): raise ValidationError(f"{f.name} 必须是 sha256")
             if f.name.endswith("_at"):
-                try: datetime.fromisoformat(value.replace("Z", "+00:00"))
+                try: parsed=datetime.fromisoformat(value.replace("Z", "+00:00"))
                 except (ValueError, AttributeError): raise ValidationError(f"{f.name} 必须是 ISO-8601 时间")
+                if parsed.tzinfo is None: raise ValidationError(f"{f.name} 必须包含时区")
             if f.name == "version" and value < 1: raise ValidationError("version 必须大于零")
+            if f.name.endswith("_ids"):
+                if not value or len(set(value)) != len(value) or any(not ID.fullmatch(x) for x in value): raise ValidationError(f"{f.name} 引用无效")
+            if isinstance(value,tuple) and any(isinstance(x,str) and not x.strip() for x in value): raise ValidationError(f"{f.name} 元素不得为空")
 
     @classmethod
     def parse(cls, value: dict[str, Any]):
@@ -48,7 +70,9 @@ class StrictModel:
         if set(value) - allowed: raise ValidationError(f"{cls.__name__} 包含未知字段")
         required = {f.name for f in fields(cls) if f.name != "schema_version"}
         if required - set(value): raise ValidationError(f"{cls.__name__} 缺少必填字段")
-        try: return cls(**value)
+        hints=get_type_hints(cls)
+        normalized={name:_json_value(item,hints[name],name) for name,item in value.items()}
+        try: return cls(**normalized)
         except TypeError as exc: raise ValidationError(f"{cls.__name__} 格式无效") from exc
 
     def to_dict(self): return asdict(self)
@@ -58,9 +82,14 @@ class StrictModel:
         hints = get_type_hints(cls)
         props = {f.name: {"title": f.name, **_schema(hints[f.name])} for f in fields(cls)}
         for name in props:
+            if props[name].get("type") == "string": props[name]["minLength"] = 1
             if name.endswith("_id") or name == "task_id": props[name]["pattern"] = ID.pattern
             if name.endswith("_hash") or name == "content_hash": props[name]["pattern"] = HASH.pattern
             if name.endswith("_at"): props[name]["format"] = "date-time"
+            if name.endswith("_ids"): props[name].update({"minItems":1,"uniqueItems":True,"items":{"type":"string","pattern":ID.pattern}})
+        enums={"source_format":["json","markdown"],"kind":["sample","deck"],"action":["resolve","waive"],"actor":["user"],"confirmed_by":["user"]}
+        for name,values in enums.items():
+            if name in props: props[name]["enum"]=values
         props["schema_version"]["const"] = "1.0"
         return {"$schema":"https://json-schema.org/draft/2020-12/schema","title":cls.__name__,"type":"object","additionalProperties":False,"properties":props,"required":[f.name for f in fields(cls) if f.name != "schema_version"]}
 
@@ -74,22 +103,38 @@ class TaskCard(StrictModel):
 @dataclass(frozen=True)
 class TaskInputSnapshot(StrictModel): snapshot_id:str=""; task_id:str=""; task_card_hash:str=""; resource_manifest_hash:str=""; created_at:str=""
 @dataclass(frozen=True)
-class ResourceManifest(StrictModel): manifest_id:str=""; task_id:str=""; resources:tuple=(); content_hash:str=""; created_at:str=""
+class ResourceManifest(StrictModel): manifest_id:str=""; task_id:str=""; resources:tuple[dict[str,Any],...]=(); content_hash:str=""; created_at:str=""
 @dataclass(frozen=True)
-class ClarificationSet(StrictModel): clarification_id:str=""; task_id:str=""; questions:tuple=(); assumptions:tuple=(); confirmed:bool=False
+class ClarificationSet(StrictModel): clarification_id:str=""; task_id:str=""; questions:tuple[str,...]=(); assumptions:tuple[str,...]=(); confirmed:bool=False
 @dataclass(frozen=True)
-class NarrativeDocument(StrictModel): document_id:str=""; task_id:str=""; version:int=1; markdown:str=""; content_hash:str=""; created_at:str=""
+class NarrativeDocument(StrictModel):
+    document_id:str=""; task_id:str=""; version:int=1; markdown:str=""; content_hash:str=""; created_at:str=""
+    def __post_init__(self):
+        super().__post_init__()
+        if not self.markdown.strip(): raise ValidationError("markdown 不得为空")
 @dataclass(frozen=True)
-class SlideOutline(StrictModel): outline_id:str=""; task_id:str=""; version:int=1; markdown:str=""; slide_ids:tuple=(); content_hash:str=""; created_at:str=""
+class SlideOutline(StrictModel): outline_id:str=""; task_id:str=""; version:int=1; markdown:str=""; slide_ids:tuple[str,...]=(); content_hash:str=""; created_at:str=""
 @dataclass(frozen=True)
-class SampleSelection(StrictModel): selection_id:str=""; task_id:str=""; outline_hash:str=""; slide_ids:tuple=(); confirmed:bool=False
+class SampleSelection(StrictModel): selection_id:str=""; task_id:str=""; outline_hash:str=""; slide_ids:tuple[str,...]=(); confirmed:bool=False
 @dataclass(frozen=True)
-class DeckArtifact(StrictModel): artifact_id:str=""; task_id:str=""; version:int=1; kind:str="sample"; outline_hash:str=""; content_hash:str=""; created_at:str=""
+class DeckArtifact(StrictModel):
+    artifact_id:str=""; task_id:str=""; version:int=1; kind:str="sample"; outline_hash:str=""; content_hash:str=""; created_at:str=""
+    def __post_init__(self):
+        super().__post_init__()
+        if self.kind not in {"sample","deck"}: raise ValidationError("kind 无效")
 @dataclass(frozen=True)
-class InspectionReport(StrictModel): report_id:str=""; task_id:str=""; deck_hash:str=""; issues:tuple=(); passed:bool=False; created_at:str=""
+class InspectionReport(StrictModel): report_id:str=""; task_id:str=""; deck_hash:str=""; issues:tuple[dict[str,Any],...]=(); passed:bool=False; created_at:str=""
 @dataclass(frozen=True)
-class IssueDisposition(StrictModel): disposition_id:str=""; task_id:str=""; issue_id:str=""; action:str=""; actor:str=""; created_at:str=""
+class IssueDisposition(StrictModel):
+    disposition_id:str=""; task_id:str=""; issue_id:str=""; action:str=""; actor:str=""; created_at:str=""
+    def __post_init__(self):
+        super().__post_init__()
+        if self.action not in {"resolve","waive"} or self.actor != "user": raise ValidationError("问题处置语义无效")
 @dataclass(frozen=True)
-class DeliveryManifest(StrictModel): delivery_id:str=""; task_id:str=""; deck_hash:str=""; files:tuple=(); confirmed_by:str=""; confirmed_at:str=""
+class DeliveryManifest(StrictModel):
+    delivery_id:str=""; task_id:str=""; deck_hash:str=""; files:tuple[str,...]=(); confirmed_by:str=""; confirmed_at:str=""
+    def __post_init__(self):
+        super().__post_init__()
+        if self.confirmed_by != "user" or not self.files: raise ValidationError("交付确认语义无效")
 
 MODELS=(TaskCard,TaskInputSnapshot,ResourceManifest,ClarificationSet,NarrativeDocument,SlideOutline,SampleSelection,DeckArtifact,InspectionReport,IssueDisposition,DeliveryManifest)

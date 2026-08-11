@@ -33,8 +33,20 @@ class TaskService:
     def compare(self,task_id,left,right): return {"left":left,"right":right,"equal":self.version(task_id,left)==self.version(task_id,right)}
     def events(self,task_id): return self.store.events(task_id)
     def run_fake_pipeline(self,task_id):
+        state=self.get(task_id)
+        if state["stage"] != "created": raise ConflictError("fake 全链路只能从空任务启动")
+        # The fake is an executable acceptance path, not a preview-only shortcut.
+        for number in range(1,5): self.command(task_id,f"fake-{number}","advance")
+        self.command(task_id,"fake-sample-confirm","confirm_sample","user")
+        self.command(task_id,"fake-to-deck","advance")
         outline=self.generator.generate("outline",{"task_id":task_id},skill=self.skills.load("outline")["version"])["text"]
         outline_hash=self.store.put_version(task_id,"outline",outline.encode(),{"generator":"fake"})
         html=self.builder.build(outline); deck_hash=self.store.put_version(task_id,"deck",html.encode(),{"outline_hash":outline_hash})
         inspection=self.inspector.inspect(outline,html); report_hash=self.store.put_version(task_id,"inspection",json.dumps(inspection,sort_keys=True).encode(),{"deck_hash":deck_hash})
-        return {"outline_hash":outline_hash,"deck_hash":deck_hash,"report_hash":report_hash,"passed":inspection["passed"],"preview":html}
+        self.command(task_id,"fake-to-review","advance")
+        self.command(task_id,"fake-blockers","resolve_blockers","user",{"issues":inspection["issues"]})
+        self.command(task_id,"fake-to-delivery","advance")
+        delivery=json.dumps({"task_id":task_id,"deck_hash":deck_hash,"files":["deck.html"],"confirmed_by":"user"},sort_keys=True).encode()
+        delivery_hash=self.store.put_version(task_id,"delivery",delivery,{"deck_hash":deck_hash})
+        final=self.command(task_id,"fake-delivery-confirm","confirm_delivery","user")
+        return {"outline_hash":outline_hash,"deck_hash":deck_hash,"report_hash":report_hash,"delivery_hash":delivery_hash,"passed":inspection["passed"],"preview":html,"state":final}
