@@ -8,6 +8,7 @@
       "title": "schema_version",
       "type": "string",
       "minLength": 1,
+      "pattern": "^[\\s\\S]*\\S[\\s\\S]*$",
       "const": "1.0"
     },
     "selection_id": {

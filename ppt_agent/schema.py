@@ -9,6 +9,7 @@ from .errors import ValidationError
 
 ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 HASH = re.compile(r"^[0-9a-f]{64}$")
+NON_BLANK = r"^[\s\S]*\S[\s\S]*$"
 
 
 def _schema(t):
@@ -22,11 +23,15 @@ def _schema(t):
         return {"type":"object","additionalProperties":False,
                 "properties":{f.name:_property_schema(f.name,hints[f.name]) for f in fields(t)},
                 "required":[f.name for f in fields(t)]}
-    return {"type": {str: "string", int: "integer", bool: "boolean", dict: "object"}.get(t, "string")}
+    schema = {"type": {str: "string", int: "integer", bool: "boolean", dict: "object"}.get(t, "string")}
+    if t is str:
+        schema.update({"minLength": 1, "pattern": NON_BLANK})
+    return schema
 
 def _property_schema(name,t):
     prop={"title":name,**_schema(t)}
-    if prop.get("type") == "string": prop["minLength"] = 1
+    if prop.get("type") == "string":
+        prop.update({"minLength": 1, "pattern": NON_BLANK})
     if name.endswith("_id") or name == "task_id": prop["pattern"] = ID.pattern
     if name.endswith("_hash") or name == "content_hash": prop["pattern"] = HASH.pattern
     if name.endswith("_at"): prop["format"] = "date-time"

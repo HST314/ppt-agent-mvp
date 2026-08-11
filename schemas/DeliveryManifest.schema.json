@@ -8,6 +8,7 @@
       "title": "schema_version",
       "type": "string",
       "minLength": 1,
+      "pattern": "^[\\s\\S]*\\S[\\s\\S]*$",
       "const": "1.0"
     },
     "delivery_id": {
@@ -32,13 +33,16 @@
       "title": "files",
       "type": "array",
       "items": {
-        "type": "string"
+        "type": "string",
+        "minLength": 1,
+        "pattern": "^[\\s\\S]*\\S[\\s\\S]*$"
       }
     },
     "confirmed_by": {
       "title": "confirmed_by",
       "type": "string",
       "minLength": 1,
+      "pattern": "^[\\s\\S]*\\S[\\s\\S]*$",
       "enum": [
         "user"
       ]
@@ -47,6 +51,7 @@
       "title": "confirmed_at",
       "type": "string",
       "minLength": 1,
+      "pattern": "^[\\s\\S]*\\S[\\s\\S]*$",
       "format": "date-time"
     }
   },

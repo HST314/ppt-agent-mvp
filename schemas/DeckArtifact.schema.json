@@ -8,6 +8,7 @@
       "title": "schema_version",
       "type": "string",
       "minLength": 1,
+      "pattern": "^[\\s\\S]*\\S[\\s\\S]*$",
       "const": "1.0"
     },
     "artifact_id": {
@@ -31,6 +32,7 @@
       "title": "kind",
       "type": "string",
       "minLength": 1,
+      "pattern": "^[\\s\\S]*\\S[\\s\\S]*$",
       "enum": [
         "sample",
         "deck"
@@ -52,6 +54,7 @@
       "title": "created_at",
       "type": "string",
       "minLength": 1,
+      "pattern": "^[\\s\\S]*\\S[\\s\\S]*$",
       "format": "date-time"
     }
   },

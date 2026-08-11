@@ -8,6 +8,7 @@
       "title": "schema_version",
       "type": "string",
       "minLength": 1,
+      "pattern": "^[\\s\\S]*\\S[\\s\\S]*$",
       "const": "1.0"
     },
     "disposition_id": {
@@ -32,6 +33,7 @@
       "title": "action",
       "type": "string",
       "minLength": 1,
+      "pattern": "^[\\s\\S]*\\S[\\s\\S]*$",
       "enum": [
         "resolve",
         "waive"
@@ -41,6 +43,7 @@
       "title": "actor",
       "type": "string",
       "minLength": 1,
+      "pattern": "^[\\s\\S]*\\S[\\s\\S]*$",
       "enum": [
         "user"
       ]
@@ -49,6 +52,7 @@
       "title": "created_at",
       "type": "string",
       "minLength": 1,
+      "pattern": "^[\\s\\S]*\\S[\\s\\S]*$",
       "format": "date-time"
     }
   },

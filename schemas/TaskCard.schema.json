@@ -8,6 +8,7 @@
       "title": "schema_version",
       "type": "string",
       "minLength": 1,
+      "pattern": "^[\\s\\S]*\\S[\\s\\S]*$",
       "const": "1.0"
     },
     "task_id": {
@@ -19,22 +20,26 @@
     "goal": {
       "title": "goal",
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "pattern": "^[\\s\\S]*\\S[\\s\\S]*$"
     },
     "audience": {
       "title": "audience",
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "pattern": "^[\\s\\S]*\\S[\\s\\S]*$"
     },
     "topic": {
       "title": "topic",
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "pattern": "^[\\s\\S]*\\S[\\s\\S]*$"
     },
     "source_format": {
       "title": "source_format",
       "type": "string",
       "minLength": 1,
+      "pattern": "^[\\s\\S]*\\S[\\s\\S]*$",
       "enum": [
         "json",
         "markdown"

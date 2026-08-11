@@ -8,6 +8,7 @@
       "title": "schema_version",
       "type": "string",
       "minLength": 1,
+      "pattern": "^[\\s\\S]*\\S[\\s\\S]*$",
       "const": "1.0"
     },
     "document_id": {
@@ -30,7 +31,8 @@
     "markdown": {
       "title": "markdown",
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "pattern": "^[\\s\\S]*\\S[\\s\\S]*$"
     },
     "content_hash": {
       "title": "content_hash",
@@ -42,6 +44,7 @@
       "title": "created_at",
       "type": "string",
       "minLength": 1,
+      "pattern": "^[\\s\\S]*\\S[\\s\\S]*$",
       "format": "date-time"
     }
   },

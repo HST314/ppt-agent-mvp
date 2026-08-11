@@ -8,6 +8,7 @@
       "title": "schema_version",
       "type": "string",
       "minLength": 1,
+      "pattern": "^[\\s\\S]*\\S[\\s\\S]*$",
       "const": "1.0"
     },
     "issues": {
@@ -27,6 +28,7 @@
             "title": "severity",
             "type": "string",
             "minLength": 1,
+            "pattern": "^[\\s\\S]*\\S[\\s\\S]*$",
             "enum": [
               "warning",
               "blocker"
@@ -35,12 +37,14 @@
           "code": {
             "title": "code",
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "pattern": "^[\\s\\S]*\\S[\\s\\S]*$"
           },
           "message": {
             "title": "message",
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "pattern": "^[\\s\\S]*\\S[\\s\\S]*$"
           },
           "slide_id": {
             "title": "slide_id",
@@ -84,6 +88,7 @@
       "title": "created_at",
       "type": "string",
       "minLength": 1,
+      "pattern": "^[\\s\\S]*\\S[\\s\\S]*$",
       "format": "date-time"
     }
   },

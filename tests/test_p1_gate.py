@@ -5,7 +5,7 @@ from ppt_agent.api import App
 from ppt_agent.contracts import validate_instance
 from ppt_agent.errors import ConflictError,GateError,ValidationError
 from ppt_agent.fsm import Stage,TaskState,transition
-from ppt_agent.schema import MODELS,ClarificationSet,DeckArtifact,DeliveryManifest,InspectionReport,IssueDisposition,NarrativeDocument,ResourceManifest,SlideOutline,TaskInputSnapshot
+from ppt_agent.schema import MODELS,ClarificationSet,DeckArtifact,DeliveryManifest,InspectionReport,IssueDisposition,NarrativeDocument,ResourceManifest,SampleSelection,SlideOutline,TaskCard,TaskInputSnapshot
 from ppt_agent.service import TaskService
 from ppt_agent.store import WorkspaceStore
 
@@ -35,14 +35,51 @@ class NegativeContractTests(unittest.TestCase):
   with self.assertRaises(ValidationError): DeckArtifact.parse({**common,"artifact_id":"artifact","version":1,"kind":"zip","outline_hash":H,"content_hash":H,"created_at":NOW})
  def test_exported_schema_and_runtime_are_bidirectionally_equivalent(self):
   common={"task_id":"task","schema_version":"1.0"}
-  fixtures=[
-   (NarrativeDocument,{**common,"document_id":"doc","version":1,"markdown":"# valid","content_hash":H,"created_at":NOW}),
-   (ResourceManifest,{**common,"manifest_id":"manifest","resources":[{"resource_id":"source-1","uri":"asset://source-1","media_type":"text/markdown","content_hash":H}],"content_hash":H,"created_at":NOW}),
-   (InspectionReport,{**common,"report_id":"report","deck_hash":H,"issues":[{"issue_id":"overflow-1","severity":"blocker","code":"text_overflow","message":"overflow","slide_id":"slide-1"}],"passed":False,"created_at":NOW})]
-  for model,fixture in fixtures:
-   parsed=model.parse(fixture); validate_instance(parsed.to_dict(),model.json_schema()); model.parse(parsed.to_dict())
+  fixtures={
+   TaskCard:{**common,"goal":"Build a deck","audience":"reviewers","topic":"P1","source_format":"json"},
+   TaskInputSnapshot:{**common,"snapshot_id":"snapshot","task_card_hash":H,"resource_manifest_hash":H,"created_at":NOW},
+   ResourceManifest:{**common,"manifest_id":"manifest","resources":[{"resource_id":"source-1","uri":"asset://source-1","media_type":"text/markdown","content_hash":H}],"content_hash":H,"created_at":NOW},
+   ClarificationSet:{**common,"clarification_id":"clarify","questions":["Which audience?"],"assumptions":["Internal review"],"confirmed":False},
+   NarrativeDocument:{**common,"document_id":"doc","version":1,"markdown":"# valid","content_hash":H,"created_at":NOW},
+   SlideOutline:{**common,"outline_id":"outline","version":1,"markdown":"# outline","slide_ids":["slide-1"],"content_hash":H,"created_at":NOW},
+   SampleSelection:{**common,"selection_id":"selection","outline_hash":H,"slide_ids":["slide-1"],"confirmed":True},
+   DeckArtifact:{**common,"artifact_id":"artifact","version":1,"kind":"deck","outline_hash":H,"content_hash":H,"created_at":NOW},
+   InspectionReport:{**common,"report_id":"report","deck_hash":H,"issues":[{"issue_id":"overflow-1","severity":"blocker","code":"text_overflow","message":"overflow","slide_id":"slide-1"}],"passed":False,"created_at":NOW},
+   IssueDisposition:{**common,"disposition_id":"disposition","issue_id":"overflow-1","action":"resolve","actor":"user","created_at":NOW},
+   DeliveryManifest:{**common,"delivery_id":"delivery","deck_hash":H,"files":["deck.html"],"confirmed_by":"user","confirmed_at":NOW}}
+  # Every published model must accept the same legal JSON instance at both
+  # boundaries and preserve that decision after a runtime round-trip.
+  self.assertEqual(set(fixtures),set(MODELS))
+  for model,fixture in fixtures.items():
+   validate_instance(fixture,model.json_schema())
+   parsed=model.parse(fixture)
+   validate_instance(parsed.to_dict(),model.json_schema())
+   model.parse(parsed.to_dict())
+  # One semantic counterexample per model. This includes all three audit
+  # reproductions: blank markdown, blank delivery file and blank question.
+  invalid={
+   TaskCard:{**fixtures[TaskCard],"goal":" \t"},
+   TaskInputSnapshot:{**fixtures[TaskInputSnapshot],"snapshot_id":" "},
+   ResourceManifest:{**fixtures[ResourceManifest],"resources":[{**fixtures[ResourceManifest]["resources"][0],"uri":"\n "}]},
+   ClarificationSet:{**fixtures[ClarificationSet],"questions":[""]},
+   NarrativeDocument:{**fixtures[NarrativeDocument],"markdown":" "},
+   SlideOutline:{**fixtures[SlideOutline],"markdown":"\n\t"},
+   SampleSelection:{**fixtures[SampleSelection],"slide_ids":[""]},
+   DeckArtifact:{**fixtures[DeckArtifact],"kind":" "},
+   InspectionReport:{**fixtures[InspectionReport],"issues":[{**fixtures[InspectionReport]["issues"][0],"message":" "}]},
+   IssueDisposition:{**fixtures[IssueDisposition],"action":" "},
+   DeliveryManifest:{**fixtures[DeliveryManifest],"files":[""]}}
+  self.assertEqual(set(invalid),set(MODELS))
+  for model,value in invalid.items():
+   schema_accepts=runtime_accepts=True
+   try: validate_instance(value,model.json_schema())
+   except ValidationError: schema_accepts=False
+   try: model.parse(value)
+   except ValidationError: runtime_accepts=False
+   self.assertEqual(schema_accepts,runtime_accepts,model.__name__)
+   self.assertFalse(schema_accepts,model.__name__)
   for bad in (0,-1):
-   value={**fixtures[0][1],"version":bad}
+   value={**fixtures[NarrativeDocument],"version":bad}
    with self.assertRaises(ValidationError): validate_instance(value,NarrativeDocument.json_schema())
    with self.assertRaises(ValidationError): NarrativeDocument.parse(value)
  def test_kind_escape_rejected(self):
