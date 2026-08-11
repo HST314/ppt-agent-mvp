@@ -10,6 +10,16 @@
 - P3：叙事与逐页大纲生成、直接编辑、局部影响域、版本及人工确认。
 - P4：样品推荐/改选、真实 HTML、安全沙箱、冻结资源 hash 复核与内嵌、Prompt 作用域识别、精确版本确认门禁。
 
+## P0-01 基线证据（持续保留）
+
+- 审计基线 revision：`768471c3efa5aee5032c41468d2438a16d43c8dd`。
+- 核心模型与状态契约：`agent_core/models.py`。
+- 原子工作区与项目存储：`storage/project_store.py`。
+- 模型路由边界：`model_router/gateway.py`。
+- 既有桌面入口：`frontend/index.html`。
+
+这些路径记录的是 P0 对 Image Agent 既有能力的审计证据；后续阶段更新本页时不得删除。
+
 ## 运行与验证
 
 ```bash
