@@ -25,6 +25,8 @@ ROLLBACK=re.compile(r"^/v1/tasks/([^/]+)/planning/rollback$")
 OUTLINE_PAGE=re.compile(r"^/tasks/([^/]+)/outline$")
 SAMPLES=re.compile(r"^/v1/tasks/([^/]+)/samples(?:/(select|generate|modify|confirm))?$")
 SAMPLE_PAGE=re.compile(r"^/tasks/([^/]+)/samples$")
+DECKS=re.compile(r"^/v1/tasks/([^/]+)/deck(?:/(generate|modify|rollback))?$")
+DECK_PAGE=re.compile(r"^/tasks/([^/]+)/deck$")
 
 class App:
     def __init__(self,service): self.service=service
@@ -32,7 +34,7 @@ class App:
         try:
             method=environ["REQUEST_METHOD"]; path=environ["PATH_INFO"]
             size=int(environ.get("CONTENT_LENGTH") or 0); body=json.loads(environ["wsgi.input"].read(size) or b"{}")
-            if method=="GET" and path=="/healthz": return self.reply(start_response,200,{"status":"ok","stage":"P4","runtime_ready":True})
+            if method=="GET" and path=="/healthz": return self.reply(start_response,200,{"status":"ok","stage":"P5","runtime_ready":True})
             if method=="POST" and path=="/v1/tasks":
                 self.exact(body,{"task_id","mode"},{"task_id"}); return self.reply(start_response,201,self.service.create(body["task_id"],body.get("mode","manual")))
             m=TASK.match(path)
@@ -52,6 +54,16 @@ class App:
             if method=="GET" and m:return self.outline_page(start_response,m.group(1))
             m=SAMPLE_PAGE.match(path)
             if method=="GET" and m:return self.sample_page(start_response,m.group(1))
+            m=DECK_PAGE.match(path)
+            if method=="GET" and m:return self.deck_page(start_response,m.group(1))
+            m=DECKS.match(path)
+            if method=="GET" and m and not m.group(2): return self.reply(start_response,200,self.service.deck_view(m.group(1)))
+            if method=="POST" and m:
+                if m.group(2)=="generate": self.exact(body,set(),set()); result=self.service.generate_deck(m.group(1))
+                elif m.group(2)=="modify": self.exact(body,{"prompt","change_type","scope","slide_ids","element_id"},{"prompt"}); result=self.service.modify_deck(m.group(1),body["prompt"],body.get("change_type","visual"),body.get("scope"),body.get("slide_ids"),body.get("element_id"))
+                elif m.group(2)=="rollback": self.exact(body,{"hash"},{"hash"}); result=self.service.rollback_deck(m.group(1),body["hash"])
+                else: raise NotFoundError("接口不存在")
+                return self.reply(start_response,200,result)
             m=SAMPLES.match(path)
             if method=="GET" and m and not m.group(2): return self.reply(start_response,200,self.service.sample_view(m.group(1)))
             if method=="POST" and m:
@@ -303,6 +315,18 @@ if(r.ok){location.reload();}else{const data=await r.json();out.textContent=(data
         f'''<section aria-label="版本时间线"><h2>版本时间线</h2><ol class="timeline">{timeline}</ol></section></div>'''
         f'''<div><section aria-label="安全预览"><h2>安全预览</h2>{preview_label}<button id="backCurrent" type="button" hidden>返回当前版本</button><iframe sandbox="" id="previewFrame" srcdoc="{esc(preview)}"></iframe></section>'''
         f'''<section aria-label="差异对比"><h2>差异对比</h2>{diff_block}</section></div></main>''' + script + "</html>").encode()
+        start("200 OK",[("Content-Type","text/html; charset=utf-8"),("Content-Security-Policy","default-src 'self'; frame-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"),("Content-Length",str(len(raw)))]); return [raw]
+
+    def deck_page(self,start,task_id):
+        view=self.service.deck_view(task_id); deck=view.get("deck") or {}; esc=self.esc
+        versions=[]
+        for item in view["versions"]:
+            artifact=json.loads(self.service.version(task_id,item["hash"])); meta=item["metadata"]
+            versions.append({"hash":item["hash"],"version":artifact["version"],"html":meta["html"],"summary":meta.get("summary",""),"affected":meta.get("affected",[]),"outline_hash":artifact["outline_hash"],"consistent":meta.get("outline_consistent",True)})
+        current=deck.get("hash",""); payload=json.dumps({v["hash"]:v for v in versions},ensure_ascii=False).replace("</","<\\/")
+        rows="".join(f'<li><strong>v{v["version"]}</strong> {esc(v["summary"])} · 影响：{esc(", ".join(v["affected"]) or "无")} · 大纲 <code>{esc(v["outline_hash"][:12])}…</code> · {"一致" if v["consistent"] else "需重新生成"} <button class="preview" data-hash="{v["hash"]}">预览</button><button class="rollback" data-hash="{v["hash"]}">非破坏回退</button></li>' for v in versions)
+        ids=list((deck.get("metadata") or {}).get("page_hashes",{})); options="".join(f'<option value="{esc(s)}">{esc(s)}</option>' for s in ids)
+        raw=(f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>完整 HTML 演示稿</title><style>body{{font:16px system-ui;max-width:1280px;margin:24px auto;padding:0 20px;color:#172033}}main{{display:grid;grid-template-columns:360px 1fr;gap:20px}}section{{border:1px solid #ccd3df;border-radius:10px;padding:16px;margin-bottom:16px}}iframe{{width:100%;height:650px;border:1px solid #ccd3df}}textarea,select,input,button{{display:block;width:100%;box-sizing:border-box;margin:8px 0;padding:9px}}li{{margin:10px 0}}.hint{{color:#b42318}}@media(max-width:800px){{main{{grid-template-columns:1fr}}}}</style><h1>完整 HTML 演示稿</h1><p>阶段：{esc(view["state"]["stage"])}；当前版本：v{esc(deck.get("version","-"))}；页数：{len(ids)}；待办：继续修改或进入后续检查。</p><main><div><section><button id="generate">生成完整演示稿</button><label>修改类型<select id="changeType"><option value="visual">纯视觉</option><option value="content">内容/叙事</option></select></label><label>作用域<select id="scope"><option value="global">整稿</option><option value="page">指定页</option><option value="element">指定元素</option></select></label><label>页面<select id="slide"><option value="">请选择</option>{options}</select></label><label>元素 ID<input id="element"></label><textarea id="prompt" placeholder="输入修改要求"></textarea><button id="modify">提交修改</button><output id="result" class="hint" aria-live="polite"></output></section><section><h2>版本时间线</h2><ol>{rows or "<li>尚未生成全稿</li>"}</ol></section></div><section><p id="previewLabel">正在预览当前版本</p><iframe id="previewFrame" sandbox="" srcdoc="{esc(deck.get("html",""))}"></iframe></section></main><script>const ID={json.dumps(task_id)},CURRENT={json.dumps(current)},VERSIONS={payload};const result=document.getElementById('result'),frame=document.getElementById('previewFrame'),label=document.getElementById('previewLabel');async function send(path,body){{const r=await fetch('/v1/tasks/'+ID+'/deck/'+path,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body)}});if(r.ok)location.reload();else result.textContent=((await r.json()).error||{{}}).message||'操作失败';}}document.getElementById('generate').onclick=()=>send('generate',{{}});document.getElementById('modify').onclick=()=>{{const scope=document.getElementById('scope').value,slide=document.getElementById('slide').value;send('modify',{{prompt:document.getElementById('prompt').value,change_type:document.getElementById('changeType').value,scope:scope,slide_ids:scope==='global'?[]:[slide],element_id:document.getElementById('element').value||null}})}};document.querySelectorAll('.preview').forEach(b=>b.onclick=()=>{{frame.srcdoc=VERSIONS[b.dataset.hash].html;label.textContent='正在预览历史版本 v'+VERSIONS[b.dataset.hash].version}});document.querySelectorAll('.rollback').forEach(b=>b.onclick=()=>send('rollback',{{hash:b.dataset.hash}}));</script></html>''').encode()
         start("200 OK",[("Content-Type","text/html; charset=utf-8"),("Content-Security-Policy","default-src 'self'; frame-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"),("Content-Length",str(len(raw)))]); return [raw]
 
 def serve(root=".ppt-agent-data",host="127.0.0.1",port=8000):
