@@ -25,8 +25,30 @@ def _canonical(value: str) -> str:
         current = html.unescape(previous)
         if current == previous: break
         previous = current
-    # CSS escapes contain up to six hex digits and may consume one whitespace.
-    return re.sub(r"\\([0-9a-fA-F]{1,6})\s?|\\(.)", lambda m: chr(int(m.group(1), 16)) if m.group(1) else m.group(2), previous)
+    # CSS escapes contain at most six hex digits and consume at most one CSS
+    # whitespace character.  Invalid scalar values become U+FFFD in the CSS
+    # tokenizer; reject them here so hostile input cannot survive canonicalization.
+    result=[]; index=0
+    while index < len(previous):
+        if previous[index] != "\\":
+            result.append(previous[index]); index += 1; continue
+        if index + 1 == len(previous) or previous[index + 1] in "\n\r\f":
+            raise ValidationError("CSS 包含截断或无效 escape")
+        index += 1
+        start=index
+        while index < len(previous) and index-start < 6 and previous[index] in "0123456789abcdefABCDEF":
+            index += 1
+        if index > start:
+            codepoint=int(previous[start:index],16)
+            if codepoint == 0 or codepoint > 0x10FFFF or 0xD800 <= codepoint <= 0xDFFF:
+                raise ValidationError("CSS escape 包含无效码点")
+            result.append(chr(codepoint))
+            if index < len(previous) and previous[index] in " \t\n\r\f":
+                if previous[index] == "\r" and index + 1 < len(previous) and previous[index + 1] == "\n": index += 1
+                index += 1
+        else:
+            result.append(previous[index]); index += 1
+    return "".join(result)
 
 def _validate_css(css: str) -> None:
     css = re.sub(r"/\*.*?\*/", "", _canonical(css), flags=re.S)
