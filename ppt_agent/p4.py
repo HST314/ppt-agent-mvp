@@ -6,21 +6,61 @@ from html.parser import HTMLParser
 from .errors import ValidationError
 
 SLIDE = re.compile(r"^## \[([A-Za-z0-9_-]+)\]\s*(.*?)(?=^## \[|\Z)", re.M | re.S)
-ACTIVE_TAGS = {"script", "iframe", "object", "embed", "form", "base", "link"}
-RESOURCE_ATTRS = {"src", "srcset", "href", "action", "formaction", "poster", "data", "xlink:href"}
+ALLOWED_TAGS = {"html", "head", "meta", "style", "body", "section", "aside", "div", "h1", "h2", "h3", "p", "small", "span", "strong", "em", "ul", "ol", "li", "table", "thead", "tbody", "tr", "th", "td", "br"}
+GLOBAL_ATTRS = {"id", "class", "style", "lang", "hidden", "data-slide-id", "data-element-id", "data-global-rules"}
+TAG_ATTRS = {"meta": {"charset", "name", "content"}, "th": {"colspan", "rowspan"}, "td": {"colspan", "rowspan"}}
+CSS_PROPERTIES = {
+    "align-items", "background", "background-color", "background-image", "border", "border-color", "border-radius",
+    "border-style", "border-width", "box-sizing", "color", "display", "flex", "flex-direction", "font-family",
+    "font-size", "font-style", "font-weight", "gap", "height", "justify-content", "letter-spacing", "line-height",
+    "list-style", "margin", "margin-bottom", "margin-left", "margin-right", "margin-top", "max-height", "max-width",
+    "min-height", "min-width", "opacity", "overflow", "padding", "padding-bottom", "padding-left", "padding-right",
+    "padding-top", "text-align", "text-decoration", "text-transform", "width", "word-break"
+}
+SAFE_CSS_FUNCTIONS = {"calc", "clamp", "hsl", "hsla", "linear-gradient", "min", "max", "rgb", "rgba", "var"}
+
+def _canonical(value: str) -> str:
+    previous = value
+    for _ in range(3):
+        current = html.unescape(previous)
+        if current == previous: break
+        previous = current
+    # CSS escapes contain up to six hex digits and may consume one whitespace.
+    return re.sub(r"\\([0-9a-fA-F]{1,6})\s?|\\(.)", lambda m: chr(int(m.group(1), 16)) if m.group(1) else m.group(2), previous)
+
+def _validate_css(css: str) -> None:
+    css = re.sub(r"/\*.*?\*/", "", _canonical(css), flags=re.S)
+    if "@" in css or re.search(r"(?:https?|file|resources)\s*:|(?:^|[^:])/[/\\]|\.\.[/\\]", css, re.I):
+        raise ValidationError("CSS 包含规则或任务外资源")
+    functions = {name.lower() for name in re.findall(r"([_a-zA-Z-][_a-zA-Z0-9-]*)\s*\(", css)}
+    if not functions <= SAFE_CSS_FUNCTIONS:
+        raise ValidationError("CSS 包含不允许的函数")
+    for block in re.findall(r"\{([^{}]*)\}", css, re.S) or [css]:
+        for declaration in block.split(";"):
+            if not declaration.strip(): continue
+            if ":" not in declaration: raise ValidationError("CSS 声明无效")
+            prop = declaration.split(":", 1)[0].strip().lower()
+            if prop not in CSS_PROPERTIES: raise ValidationError("CSS 属性不在白名单")
 
 class _SafeHtmlParser(HTMLParser):
     def __init__(self):
-        super().__init__(convert_charrefs=True); self.errors=[]
+        super().__init__(convert_charrefs=True); self.errors=[]; self.styles=[]; self._in_style=False; self.slide_ids=[]
     def handle_starttag(self, tag, attrs): self._check(tag, attrs)
     def handle_startendtag(self, tag, attrs): self._check(tag, attrs)
+    def handle_endtag(self, tag):
+        if tag.lower() == "style": self._in_style=False
+    def handle_data(self, data):
+        if self._in_style: self.styles.append(data)
     def _check(self, tag, attrs):
         tag=tag.lower(); values={str(k).lower(): (v or "") for k,v in attrs}
-        if tag in ACTIVE_TAGS: self.errors.append(f"禁止标签 {tag}")
-        if any(k.startswith("on") for k in values): self.errors.append("禁止事件处理属性")
-        if any(k in RESOURCE_ATTRS for k in values): self.errors.append("禁止未解析资源引用")
-        if re.search(r"@import\b|url\s*\(|expression\s*\(",values.get("style",""),re.I): self.errors.append("禁止 CSS 外部资源")
-        if tag == "meta" and values.get("http-equiv","").strip().lower() == "refresh": self.errors.append("禁止 meta refresh")
+        if tag not in ALLOWED_TAGS: self.errors.append(f"禁止标签 {tag}")
+        allowed=GLOBAL_ATTRS | TAG_ATTRS.get(tag,set())
+        if any(k not in allowed for k in values): self.errors.append("HTML 属性不在白名单")
+        if "style" in values:
+            try: _validate_css(values["style"])
+            except ValidationError as exc: self.errors.append(str(exc))
+        if tag == "style": self._in_style=True
+        if "data-slide-id" in values: self.slide_ids.append(values["data-slide-id"])
 
 def recommend(markdown: str, count: int = 2):
     slides=[(m.group(1),m.group(2)) for m in SLIDE.finditer(markdown)]
@@ -49,12 +89,13 @@ def validate_html(value: str, expected_ids: list[str]):
     parser=_SafeHtmlParser()
     try: parser.feed(value); parser.close()
     except Exception as exc: raise ValidationError("HTML 语法无效") from exc
-    css="\n".join(re.findall(r"<style\b[^>]*>(.*?)</style\s*>",value,re.I|re.S))
-    if parser.errors or re.search(r"@import\b|url\s*\(|expression\s*\(",css,re.I):
+    try: _validate_css("\n".join(parser.styles))
+    except ValidationError as exc: parser.errors.append(str(exc))
+    if parser.errors:
         raise ValidationError("HTML 包含不允许的主动内容或任务外资源")
-    if re.search(r"(?:\.\.[/\\]|file:|https?:|//|resources://|tasks?[/\\])",value,re.I):
+    if re.search(r"(?:\.\.[/\\]|file\s*:|https?\s*:|//|resources\s*://|tasks?[/\\])",_canonical(value),re.I):
         raise ValidationError("HTML 包含路径穿越、跨任务或未解析资源引用")
-    actual=re.findall(r'data-slide-id="([A-Za-z0-9_-]+)"',value)
+    actual=parser.slide_ids
     if actual != list(expected_ids): raise ValidationError("HTML 页面与样品选择不一致")
     if re.search(r"占位|placeholder|lorem ipsum",value,re.I): raise ValidationError("样品不得包含占位内容")
     return value

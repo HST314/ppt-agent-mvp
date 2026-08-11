@@ -63,6 +63,10 @@ class P4Tests(unittest.TestCase):
             '<img srcset="https://evil.test/a 1x">', '<meta http-equiv="refresh" content="0;url=https://evil.test">',
             '<iframe src="https://evil.test"></iframe>', '<a href="../../secret">x</a>',
             '<img src="file:///etc/passwd">', '<img src="resources://other-task/secret">',
+            '<table background="&#104;&#116;&#116;&#112;&#115;&#58;&#47;&#47;evil.test/a"><tr><td>x</td></tr></table>',
+            '<style>body{background-image:\\75rl(\\68ttps\\3a\\2f\\2fevil.test\\2fa)}</style>',
+            '<style>body{background-image:image-set("&#104;&#116;&#116;&#112;&#115;&#58;&#47;&#47;evil.test/a" 1x)}</style>',
+            '<div style="background-image:cross-fade(red, blue)">x</div>',
         ]
         for attack in attacks:
             with self.subTest(attack=attack), self.assertRaises(ValidationError):
