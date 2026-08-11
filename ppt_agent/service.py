@@ -90,9 +90,22 @@ class TaskService:
         self.store.commit(task_id,new.to_dict(),event); return {"state":new.to_dict(),"clarification_hash":ch,**payload,"confirmed":not pending}
     def _current_version(self,task_id,kind):
         for event in reversed(self.events(task_id)):
+            # A narrative revision invalidates the previously generated outline.
+            if kind == "outline" and event["action"] in {"narrative_generate","narrative_edit"}:
+                return None
             if event["action"].startswith(kind + "_") and event["result"].get("hash"):
                 return event["result"]["hash"]
         return None
+    def _confirmed_narrative_hash(self,task_id):
+        for event in reversed(self.events(task_id)):
+            if event["action"] == "confirm_narrative": return event["result"]["confirmed_narrative_hash"]
+        return None
+    def _reset_narrative_gate(self,task_id,artifact_hash):
+        state=TaskState.parse(self.get(task_id))
+        if state.mode != "manual": return
+        new=TaskState(**{**state.__dict__,"stage":state.stage.NARRATIVE,"status":state.status.WAITING_FOR_USER,"waiting_reason":"manual_gate","required_action":"approve_narrative","revision":state.revision+1})
+        event={"event_id":hashlib.sha256(f"{task_id}:invalidate-narrative:{artifact_hash}".encode()).hexdigest()[:24],"command_id":f"invalidate-narrative-{artifact_hash[:16]}","action":"invalidate_narrative_confirmation","actor":"system","request_hash":artifact_hash,"at":utcnow(),"from":state.to_dict(),"to":new.to_dict(),"result":{"hash":artifact_hash,"confirmed_narrative_hash":None,"invalidated":["outline","sample","deck"]}}
+        self.store.commit(task_id,new.to_dict(),event)
     def _record_p3(self,task_id,kind,model,metadata,action,actor="system"):
         raw=canonical(model.to_dict()); artifact_hash=self.store.put_version(task_id,kind,raw,metadata)
         state=TaskState.parse(self.get(task_id)); new=TaskState(**{**state.__dict__,"revision":state.revision+1})
@@ -122,25 +135,31 @@ class TaskService:
         h=self._record_p3(task_id,"narrative",model,metadata,"narrative_generate")
         if state.stage in {state.stage.CLARIFICATION,state.stage.CREATED}:
             self.command(task_id,f"narrative-stage-{h[:12]}","advance")
+        else:
+            self._reset_narrative_gate(task_id,h)
         return self.planning_view(task_id)
     def edit_narrative(self,task_id,markdown,summary="直接编辑"):
         self._p3_input(task_id)
         if not isinstance(markdown,str) or not markdown.strip(): raise ValidationError("叙事 Markdown 不得为空")
         prior=self._current_version(task_id,"narrative"); version=len(self.versions(task_id,"narrative"))+1; content_hash=digest(markdown.encode())
         model=NarrativeDocument.parse({"document_id":f"narrative-{content_hash[:16]}","task_id":task_id,"version":version,"markdown":markdown,"content_hash":content_hash,"created_at":now(),"schema_version":"1.0"})
-        self._record_p3(task_id,"narrative",model,{"parent":prior,"action":"direct_edit","summary":summary,"authoritative":True,"invalidated":["outline","sample","deck"]},"narrative_edit","user")
+        h=self._record_p3(task_id,"narrative",model,{"parent":prior,"action":"direct_edit","summary":summary,"authoritative":True,"invalidated":["outline","sample","deck"]},"narrative_edit","user")
+        self._reset_narrative_gate(task_id,h)
         return self.planning_view(task_id)
     def confirm_narrative(self,task_id):
         current=self._current_version(task_id,"narrative")
         if not current: raise ConflictError("尚未生成叙事结构")
         state=TaskState.parse(self.get(task_id))
-        if state.stage==state.stage.NARRATIVE: self.command(task_id,f"confirm-narrative-{current[:12]}","advance","user")
+        if state.stage==state.stage.NARRATIVE:
+            new=transition(state,"advance",actor="user")
+            event={"event_id":hashlib.sha256(f"{task_id}:confirm-narrative:{current}".encode()).hexdigest()[:24],"command_id":f"confirm-narrative-{current[:16]}","action":"confirm_narrative","actor":"user","request_hash":current,"at":utcnow(),"from":state.to_dict(),"to":new.to_dict(),"result":{"confirmed_narrative_hash":current}}
+            self.store.commit(task_id,new.to_dict(),event)
         return self.planning_view(task_id)
     def generate_outline(self,task_id,prompt=None,slide_ids=None):
         view=self._p3_input(task_id); narrative=self._current_version(task_id,"narrative")
         if not narrative: raise ConflictError("须先生成叙事结构")
         state=TaskState.parse(self.get(task_id))
-        if state.mode=="manual" and state.stage==state.stage.NARRATIVE: raise ConflictError("manual 模式须先确认叙事结构")
+        if state.mode=="manual" and self._confirmed_narrative_hash(task_id) != narrative: raise ConflictError("manual 模式须先确认当前版本叙事结构")
         skill=self.skills.load("outline"); count=requested_slide_count(view["task_card"]); resources=view["manifest"].get("resources",[])
         current=self._current_version(task_id,"outline")
         if slide_ids:

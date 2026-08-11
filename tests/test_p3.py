@@ -28,6 +28,23 @@ class P3Tests(unittest.TestCase):
         self.assertEqual(two["version"],2); self.assertIn("人工结论",two["markdown"]); self.assertTrue(two["metadata"]["authoritative"])
         self.assertEqual(two["metadata"]["parent"],one["hash"])
 
+    def test_manual_direct_edit_cannot_bypass_narrative_confirmation(self):
+        first=self.service.generate_narrative("task-1")["narrative"]
+        edited=self.service.edit_narrative("task-1",first["markdown"]+"\n人工结论\n")
+        self.assertEqual(edited["state"]["stage"],"narrative")
+        self.assertEqual(edited["state"]["status"],"waiting_for_user")
+        with self.assertRaises(ConflictError): self.service.generate_outline("task-1")
+
+    def test_manual_edit_after_outline_invalidates_confirmation_and_outline(self):
+        first=self.service.generate_narrative("task-1")["narrative"]
+        self.service.confirm_narrative("task-1")
+        self.service.generate_outline("task-1")
+        edited=self.service.edit_narrative("task-1",first["markdown"]+"\n确认后修改\n")
+        self.assertEqual(edited["state"]["stage"],"narrative")
+        self.assertEqual(edited["state"]["status"],"waiting_for_user")
+        self.assertIsNone(edited["outline"])
+        with self.assertRaises(ConflictError): self.service.generate_outline("task-1")
+
     def test_outline_scope_resource_and_page_validation(self):
         self.service.generate_narrative("task-1"); self.service.confirm_narrative("task-1"); first=self.service.generate_outline("task-1")["outline"]
         changed=first["markdown"].replace("推进第 2 个叙事节点","只修改第二页")
@@ -43,6 +60,13 @@ class P3Tests(unittest.TestCase):
         self.service.edit_narrative("task-1",first["markdown"]+"\n新版")
         rolled=self.service.rollback_planning("task-1","narrative",first["hash"])["narrative"]
         self.assertEqual(rolled["version"],3); self.assertEqual(rolled["markdown"],first["markdown"]); self.assertEqual(len(self.service.versions("task-1","narrative")),3)
+
+    def test_narrative_rollback_resets_manual_confirmation(self):
+        first=self.service.generate_narrative("task-1")["narrative"]
+        self.service.confirm_narrative("task-1"); self.service.generate_outline("task-1")
+        rolled=self.service.rollback_planning("task-1","narrative",first["hash"])
+        self.assertEqual(rolled["state"]["stage"],"narrative"); self.assertIsNone(rolled["outline"])
+        with self.assertRaises(ConflictError): self.service.generate_outline("task-1")
 
     def test_auto_advances_without_hiding_versions(self):
         self.service.create("auto",mode="auto"); self.service.import_input("auto",{"goal":"发布","audience":"客户","topic":"方案","页数":2})
