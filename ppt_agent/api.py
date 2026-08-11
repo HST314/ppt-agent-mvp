@@ -70,11 +70,114 @@ class App:
     @staticmethod
     def reply(start,status,data):
         raw=json.dumps(data,ensure_ascii=False).encode(); start(f"{status} OK",[("Content-Type","application/json; charset=utf-8"),("Content-Length",str(len(raw)))]); return [raw]
+    STAGE_LIST=[("created","任务/资料"),("clarification","澄清"),("narrative","叙事结构"),("outline","逐页大纲"),("sample","样品"),("deck","全稿"),("review","检查"),("delivery","交付")]
+    STAGE_PRE={"clarification":"前置条件：完成任务创建与资料导入","narrative":"前置条件：完成澄清回答","outline":"前置条件：确认叙事结构","sample":"前置条件：完成逐页大纲","deck":"前置条件：确认样品","review":"前置条件：生成全稿","delivery":"前置条件：通过检查与人工审核"}
+    STATUS_LABEL={"ready":"就绪","running":"运行中","waiting_for_user":"等待人工","paused":"已暂停","cancelled":"已取消","failed":"失败","completed":"已完成"}
+    WAIT_LABEL={"missing_required_input":"缺少必填信息","manual_gate":"等待人工确认"}
+    ACTION_LABEL={"answer_clarifications":"回答澄清问题","approve_narrative":"确认叙事结构","confirm_sample":"确认样品","confirm_delivery":"确认交付"}
+    FIELD_LABEL={"goal":"演示目标","audience":"受众","topic":"核心主题"}
+    WARNING_LABEL={"missing_sidecar":"缺少配套 Markdown 说明","empty_resource":"空文件，已跳过","duplicate_content":"内容与已有资源重复","invalid_image_content":"图片内容无效或已损坏，未纳入清单"}
+    @staticmethod
+    def esc(value): return html.escape(str(value),quote=True)
     def page(self,start,task_id):
-        view=self.service.input_view(task_id); state=view["state"]; clarification=view.get("clarification") or {}; questions=clarification.get("questions",[]); answers=clarification.get("answers",{})
-        qs="".join(f'<section><h3>{html.escape(q["prompt"])}</h3><p>选项：{html.escape(" / ".join(q["options"]))} / Other</p><p>当前回答：{html.escape(str(answers.get(q["question_id"],"待回答")))}</p></section>' for q in questions if isinstance(q,dict))
-        snapshot="已冻结" if view.get("snapshot") else "尚未导入"
-        raw=f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>任务/资料</title><style>body{{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 24px;color:#172033}}main{{display:grid;grid-template-columns:1fr 1fr;gap:24px}}section,form{{border:1px solid #ccd3df;border-radius:12px;padding:20px}}textarea{{width:100%;min-height:260px}}button,select{{padding:10px;margin-top:10px}}.status{{background:#f1f5fa;padding:12px;border-radius:8px}}@media(max-width:760px){{main{{grid-template-columns:1fr}}}}</style><h1>任务/资料</h1><p class="status">阶段：{html.escape(state["stage"])}　状态：{html.escape(state["status"])}　输入：{snapshot}　等待原因：{html.escape(str(state.get("waiting_reason") or "无"))}</p><main><form id="import"><h2>创建/导入任务卡</h2><label>格式 <select id="fmt"><option value="markdown">Markdown</option><option value="json">JSON</option></select></label><textarea id="source" aria-label="任务卡" placeholder="演示目标：...\n受众：...\n核心主题：..."></textarea><label><input type="checkbox" id="rebuild"> 显式重建快照</label><br><button>导入并扫描授权资源</button><pre id="result" aria-live="polite"></pre></form><div><section><h2>澄清</h2>{qs or '<p>当前没有待展示问题。</p>'}</section><section><h2>主操作</h2><p>{html.escape(state.get("required_action") or "资料已可用于下一阶段")}</p></section></div></main><script>document.querySelector('#import').onsubmit=async(e)=>{{e.preventDefault();let r=await fetch('/v1/tasks/{html.escape(task_id)}/input',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{source:source.value,source_format:fmt.value,rebuild:rebuild.checked}})}});result.textContent=JSON.stringify(await r.json(),null,2);if(r.ok)setTimeout(()=>location.reload(),500)}};</script></html>'''.encode()
+        view=self.service.input_view(task_id); state=view["state"]; esc=self.esc
+        snapshot=view.get("snapshot"); card=view.get("task_card") or {}; manifest=view.get("manifest") or {}
+        clarification=view.get("clarification") or {}; questions=[q for q in clarification.get("questions",[]) if isinstance(q,dict)]; answers=clarification.get("answers",{})
+        current=state["stage"]; reached=[key for key,_ in self.STAGE_LIST].index(current) if current in dict(self.STAGE_LIST) else 0
+        steps=[]
+        for index,(key,label) in enumerate(self.STAGE_LIST):
+            if index<reached: steps.append(f'<li class="done">{esc(label)}（已完成）</li>')
+            elif index==reached: steps.append(f'<li class="current" aria-current="step"><strong>{esc(label)}（当前阶段）</strong></li>')
+            else: steps.append(f'<li class="todo">{esc(label)}（未到达：{esc(self.STAGE_PRE.get(key,"前置条件：完成前一阶段"))}）</li>')
+        nav=f'<nav aria-label="业务阶段"><ol class="stages">{"".join(steps)}</ol></nav>'
+        waiting=self.WAIT_LABEL.get(state.get("waiting_reason"),state.get("waiting_reason")) if state.get("waiting_reason") else "无"
+        action=self.ACTION_LABEL.get(state.get("required_action"),state.get("required_action")) if state.get("required_action") else None
+        frozen=f'已冻结（快照 {esc(view.get("snapshot_hash","")[:12])}…）' if snapshot else "尚未导入"
+        status_bar=f'<p class="status">阶段：{esc(dict(self.STAGE_LIST).get(current,current))}　运行状态：{esc(self.STATUS_LABEL.get(state["status"],state["status"]))}　输入：{frozen}　等待原因：{esc(waiting)}　所需动作：{esc(action or "无")}</p>'
+        import_button="重建快照并重新扫描授权资源" if snapshot else "导入并扫描授权资源"
+        import_form=f'''<form id="import"><h2>创建/导入任务卡</h2><label>格式 <select id="fmt"><option value="markdown">Markdown</option><option value="json">JSON</option></select></label><textarea id="source" aria-label="任务卡" placeholder="演示目标：...\n受众：...\n核心主题：..."></textarea><label><input type="checkbox" id="rebuild"> 显式重建快照（仅大纲确认前可用）</label><br><button>{import_button}</button><pre id="result" aria-live="polite"></pre></form>'''
+        if snapshot:
+            def field(key):
+                value=card.get(key); return esc(value) if value else '<mark>待澄清（阻断）</mark>'
+            constraints="".join(f'<li>{esc(k)}：{esc(v)}</li>' for k,v in (card.get("constraints") or {}).items()) or "<li>无</li>"
+            defaults=card.get("defaults") or {}
+            default_items="".join(f'<li>{esc(label)}：{esc(defaults.get(key,"-"))}（默认值，可在任务卡中覆盖）</li>' for key,label in (("language","语言"),("aspect_ratio","画布比例"),("sample_count","样品页数")))
+            assumptions="".join(f'<li>{esc(a)}</li>' for a in card.get("assumptions") or []) or "<li>无</li>"
+            missing="".join(f'<li><span class="badge">阻断</span>{esc(self.FIELD_LABEL.get(key,key))}</li>' for key in card.get("missing") or []) or "<li>无缺失项</li>"
+            card_section=f'<section aria-label="任务卡"><h2>任务卡</h2><dl><dt>演示目标</dt><dd>{field("goal")}</dd><dt>受众</dt><dd>{field("audience")}</dd><dt>核心主题</dt><dd>{field("topic")}</dd></dl><h3>约束</h3><ul>{constraints}</ul><h3>默认值</h3><ul>{default_items}</ul><h3>显式假设</h3><ul>{assumptions}</ul><h3>缺失项</h3><ul>{missing}</ul></section>'
+        else:
+            card_section='<section aria-label="任务卡"><h2>任务卡</h2><p>尚未导入任务卡，请先在左侧提交 Markdown 或 JSON 任务卡。</p></section>'
+        resources=manifest.get("resources") or []; warnings=manifest.get("warnings") or []
+        if snapshot:
+            rows="".join(f'<tr><td>{esc(r["uri"])}</td><td>{esc(r["media_type"])}</td><td><code>{esc(r["content_hash"][:12])}…</code></td><td>{esc(r.get("description") or "无配套说明")}</td></tr>' for r in resources)
+            table=f'<table><thead><tr><th>资源</th><th>类型</th><th>内容 hash</th><th>说明</th></tr></thead><tbody>{rows}</tbody></table>' if rows else '<p>尚未发现授权资源；没有图片也可以继续规划，可在大纲确认前补充并重建快照。</p>'
+            def warning_text(w):
+                label=self.WARNING_LABEL.get(w.get("code"),w.get("code")); extra=f'（{esc(w.get("same_as"))}）' if w.get("same_as") else ""
+                return f'<li>{esc(w.get("path"))}：{esc(label)}{extra}</li>'
+            warning_list=f'<h3>资源诊断</h3><ul>{"".join(warning_text(w) for w in warnings)}</ul>' if warnings else ""
+            resource_section=f'<section aria-label="资源清单"><h2>资源清单（{len(resources)} 项）</h2>{table}{warning_list}</section>'
+        else:
+            resource_section='<section aria-label="资源清单"><h2>资源清单</h2><p>导入任务卡后自动扫描当前任务授权资源目录。</p></section>'
+        if not snapshot:
+            qa='<p>导入任务卡后生成澄清问题。</p>'
+        elif not questions:
+            qa='<p>当前没有待展示问题。</p>'
+        else:
+            banner='<p class="ok">澄清已确认，所有阻断问题均已回答；仍可修改回答，修改会使相关下游产物标记过期。</p>' if clarification.get("confirmed") else ""
+            forms=[]
+            for q in questions:
+                qid=q["question_id"]; blocking='<span class="badge">阻断</span>' if q.get("blocking") else '<span class="badge plain">非阻断</span>'
+                radios="".join(f'<label><input type="radio" name="option" value="{esc(o)}" required> {esc(o)}</label>' for o in q.get("options",[]))
+                other=f'<label><input type="radio" name="option" value="Other" required> Other（自定义）</label><label class="other-text">自定义回答 <input type="text" name="other" aria-label="Other 自定义回答"></label>' if q.get("allow_other") else ""
+                current_answer=answers.get(qid); answer_line=f'<p>当前回答：<strong>{esc(current_answer)}</strong></p>' if current_answer is not None else '<p>当前回答：待回答</p>'
+                button="修改回答" if current_answer is not None else "提交回答"
+                forms.append(f'<form class="answer" data-qid="{esc(qid)}"><fieldset><legend>{esc(q["prompt"])} {blocking}</legend>{answer_line}{radios}{other}<br><button type="submit">{button}</button><output class="answer-result" aria-live="polite"></output></fieldset></form>')
+            qa=banner+"".join(forms)
+        clarification_section=f'<section id="clarification" aria-label="澄清"><h2>澄清</h2>{qa}</section>'
+        if action:
+            link=' <a href="#clarification">前往回答</a>' if state.get("required_action")=="answer_clarifications" else ""
+            main_action=f'<p>{esc(action)}{link}</p>'
+        else:
+            main_action='<p>资料已可用于下一阶段。</p>' if snapshot else '<p>请先导入任务卡。</p>'
+        action_section=f'<section aria-label="主操作"><h2>主操作</h2>{main_action}</section>'
+        task_js=json.dumps(task_id)
+        script='''<script>
+const TASK_ID='''+task_js+''';
+document.querySelector('#import').addEventListener('submit',async(e)=>{
+e.preventDefault();
+const r=await fetch('/v1/tasks/'+TASK_ID+'/input',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:source.value,source_format:fmt.value,rebuild:rebuild.checked})});
+document.querySelector('#result').textContent=JSON.stringify(await r.json(),null,2);
+if(r.ok)setTimeout(()=>location.reload(),500);
+});
+document.querySelectorAll('form.answer').forEach((form)=>{
+form.addEventListener('submit',async(e)=>{
+e.preventDefault();
+const out=form.querySelector('.answer-result');
+const picked=form.querySelector('input[name="option"]:checked');
+if(!picked){out.textContent='请选择一个选项';return;}
+const body={option:picked.value};
+if(picked.value==='Other'){
+const text=form.querySelector('input[name="other"]').value.trim();
+if(!text){out.textContent='选择 Other 时必须填写自定义回答';return;}
+body.other=text;
+}
+const r=await fetch('/v1/tasks/'+TASK_ID+'/clarifications/'+encodeURIComponent(form.dataset.qid)+'/answer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+if(r.ok){location.reload();}else{const data=await r.json();out.textContent=(data.error&&data.error.message)||'提交失败，请重试';}
+});
+});
+</script>'''
+        raw=('<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>任务/资料</title>'
+        '<style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 24px;color:#172033}'
+        'main{display:grid;grid-template-columns:1fr 1fr;gap:24px}section,form{border:1px solid #ccd3df;border-radius:12px;padding:20px}'
+        'form.answer{border:none;padding:0;margin:12px 0}fieldset{border:1px solid #ccd3df;border-radius:12px;padding:16px}legend{font-weight:600;padding:0 6px}'
+        'textarea{width:100%;min-height:260px}button,select{padding:10px;margin-top:10px}label{display:block;margin:6px 0}label.other-text{margin-left:24px}'
+        'table{width:100%;border-collapse:collapse}th,td{border:1px solid #ccd3df;padding:6px 10px;text-align:left;font-size:14px}'
+        '.status{background:#f1f5fa;padding:12px;border-radius:8px}.badge{background:#b42318;color:#fff;border-radius:6px;padding:2px 8px;font-size:12px;margin-right:6px}'
+        '.badge.plain{background:#475467}.ok{background:#ecfdf3;border:1px solid #abefc6;border-radius:8px;padding:10px}mark{background:#fef0c7;padding:2px 6px;border-radius:4px}'
+        '.stages{display:flex;flex-wrap:wrap;gap:8px;list-style:none;padding:0}.stages li{border:1px solid #ccd3df;border-radius:8px;padding:6px 10px;font-size:14px}'
+        '.stages li.current{border-color:#1570ef;background:#eff4ff}.stages li.todo{color:#667085}'
+        'output{display:block;min-height:20px;color:#b42318;margin-top:8px}@media(max-width:760px){main{grid-template-columns:1fr}}</style>'
+        f'<h1>任务/资料</h1>{nav}{status_bar}<main><div>{import_form}{card_section}</div><div>{resource_section}{clarification_section}{action_section}</div></main>{script}</html>').encode()
         start("200 OK",[("Content-Type","text/html; charset=utf-8"),("Content-Length",str(len(raw)))]); return [raw]
 
 def serve(root=".ppt-agent-data",host="127.0.0.1",port=8000):

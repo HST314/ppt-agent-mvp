@@ -44,6 +44,6 @@ API 契约见 `docs/openapi.yaml`，内核契约见 `docs/p1-contract.md`。P1 �
 
 ## P2 使用
 
-创建任务后，向 `POST /v1/tasks/{task_id}/input` 提交 `source`、`source_format`（`json`/`markdown`）及可选 `rebuild`。服务只扫描任务工作区的 `resources/`；图片可使用同名 `.md` 描述。`GET /tasks/{task_id}` 提供桌面端“任务/资料”页面，`GET /v1/tasks/{task_id}/input` 返回当前冻结快照和澄清状态，`POST /v1/tasks/{task_id}/clarifications/{question_id}/answer` 保存选项或 `Other` 回答。
+创建任务后，向 `POST /v1/tasks/{task_id}/input` 提交 `source`、`source_format`（`json`/`markdown`）及可选 `rebuild`。服务只扫描任务工作区的 `resources/`；图片可使用同名 `.md` 描述，内容损坏或格式不符的图片会被诊断为 `invalid_image_content` 且不纳入清单。`GET /tasks/{task_id}` 提供桌面端“任务/资料”页面：展示任务卡摘要、可见默认值、阻断缺失项、资源清单与诊断、当前主操作，并可在页面内直接以选择题或 `Other` 自定义完成澄清回答与改答。`GET /v1/tasks/{task_id}/input` 返回当前冻结快照、任务卡、资源清单和澄清状态，`POST /v1/tasks/{task_id}/clarifications/{question_id}/answer` 保存选项或 `Other` 回答。
 
 输入首次导入即冻结；目录后续变化不会静默进入当前 manifest，只有在大纲前显式 `rebuild: true` 才会生成新快照。

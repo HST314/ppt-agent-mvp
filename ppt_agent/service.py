@@ -68,7 +68,9 @@ class TaskService:
         for event in reversed(self.events(task_id)):
             if event["action"] == "answer_clarification": ch=event["result"]["clarification_hash"]; break
         cv=next(v for v in self.versions(task_id,"clarification") if v["hash"]==ch)
-        return {"state":self.get(task_id),"snapshot":snapshot,"snapshot_hash":item["hash"],"clarification":{**json.loads(self.version(task_id,ch)),**cv["metadata"]}}
+        card=next(v for v in self.versions(task_id,"task-card") if v["hash"]==snapshot["task_card_hash"])
+        manifest=next(v for v in self.versions(task_id,"resource-manifest") if v["hash"]==snapshot["resource_manifest_hash"])
+        return {"state":self.get(task_id),"snapshot":snapshot,"snapshot_hash":item["hash"],"task_card":card["metadata"]["normalized"],"manifest":{**json.loads(self.version(task_id,snapshot["resource_manifest_hash"])),**manifest["metadata"]},"clarification":{**json.loads(self.version(task_id,ch)),**cv["metadata"]}}
     def answer_clarification(self,task_id,question_id,answer):
         view=self.input_view(task_id); clarification=view.get("clarification")
         if not clarification: raise ConflictError("尚未生成澄清问题")
