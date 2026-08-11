@@ -6,6 +6,8 @@ from ppt_agent.service import TaskService
 from ppt_agent.store import WorkspaceStore
 from ppt_agent.p4 import validate_html
 
+PNG=b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
+
 class P4Tests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory(); self.s=TaskService(WorkspaceStore(self.tmp.name)); self.s.create("p4")
@@ -27,6 +29,25 @@ class P4Tests(unittest.TestCase):
         self.assertEqual(element["metadata"]["element_id"],"title")
         global_=self.s.modify_sample("p4","统一高对比度","global")["sample"]
         self.assertIn("统一高对比度",global_["metadata"]["global_rules"]); self.assertEqual(global_["version"],4)
+    def test_prompt_scope_inference_and_ambiguity(self):
+        self.s.generate_sample("p4"); sid=self.s.sample_view("p4")["selection"]["slide_ids"][0]
+        page=self.s.modify_sample("p4","当前页增加留白",slide_id=sid)["sample"]
+        self.assertEqual(page["metadata"]["scope"],"page"); self.assertEqual(page["metadata"]["scope_understanding"]["basis"],"prompt_semantics")
+        element=self.s.modify_sample("p4","标题改成蓝色",slide_id=sid,element_id="title")["sample"]
+        self.assertEqual(element["metadata"]["scope"],"element")
+        with self.assertRaisesRegex(ValidationError,"歧义"):
+            self.s.modify_sample("p4","统一所有页，但只改当前页",slide_id=sid)
+        with self.assertRaisesRegex(ValidationError,"冲突"):
+            self.s.modify_sample("p4","统一所有页背景","page",sid)
+    def test_frozen_resource_is_embedded_and_tamper_is_rejected(self):
+        self.s.create("asset"); self.s.store.put_resource("asset","hero.png",PNG)
+        self.s.import_input("asset",{"goal":"发布","audience":"客户","topic":"方案","页数":1})
+        self.s.generate_narrative("asset"); self.s.confirm_narrative("asset"); self.s.generate_outline("asset"); self.s.confirm_outline("asset")
+        sample=self.s.generate_sample("asset")["sample"]
+        self.assertIn('<img data-element-id="resource" src="data:image/png;base64,',sample["html"])
+        (self.s.store.resource_root("asset")/"hero.png").write_bytes(PNG+b"tampered")
+        with self.assertRaisesRegex(ValidationError,"内容已变化"):
+            self.s.generate_sample("asset")
     def test_confirmation_binds_exact_versions_and_never_auto_skips(self):
         self.s.generate_sample("p4")
         view=self.s.confirm_sample("p4"); fact=view["confirmation"]
@@ -63,6 +84,7 @@ class P4Tests(unittest.TestCase):
             '<img srcset="https://evil.test/a 1x">', '<meta http-equiv="refresh" content="0;url=https://evil.test">',
             '<iframe src="https://evil.test"></iframe>', '<a href="../../secret">x</a>',
             '<img src="file:///etc/passwd">', '<img src="resources://other-task/secret">',
+            '<img src="data:image/png;base64,AAAA">',
             '<table background="&#104;&#116;&#116;&#112;&#115;&#58;&#47;&#47;evil.test/a"><tr><td>x</td></tr></table>',
             '<style>body{background-image:\\75rl(\\68ttps\\3a\\2f\\2fevil.test\\2fa)}</style>',
             '<style>body{background-image:image-set("&#104;&#116;&#116;&#112;&#115;&#58;&#47;&#47;evil.test/a" 1x)}</style>',

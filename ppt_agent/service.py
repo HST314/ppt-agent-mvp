@@ -11,7 +11,7 @@ from .p2 import canonical, digest, now, parse_task_card, questions_for, scan_res
 from .schema import ClarificationSet, ResourceManifest, TaskCard, TaskInputSnapshot
 from .schema import NarrativeDocument, SlideOutline, SampleSelection, DeckArtifact
 from .p3 import changed_slide_ids, narrative_markdown, outline_markdown, parse_outline, requested_slide_count
-from .p4 import recommend, render, validate_html
+from .p4 import controlled_assets, infer_scope, recommend, render, validate_html
 
 def utcnow(): return datetime.now(timezone.utc).isoformat()
 def fingerprint(value): return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(",",":")).encode()).hexdigest()
@@ -263,9 +263,9 @@ class TaskService:
         if not selection: view=self.select_samples(task_id); selection=view["selection"]
         outline=self._current_version(task_id,"outline")
         if selection["outline_hash"] != outline: raise ConflictError("样品选择已因大纲变化而失效")
-        data=json.loads(self.version(task_id,outline)); rules=[]
+        data=json.loads(self.version(task_id,outline)); rules=[]; assets=controlled_assets(self.input_view(task_id)["manifest"],self.store.resource_root(task_id))
         if prompt: rules.append(prompt.strip())
-        html_text=validate_html(render(data["markdown"],selection["slide_ids"],rules),selection["slide_ids"])
+        html_text=validate_html(render(data["markdown"],selection["slide_ids"],rules,assets=assets),selection["slide_ids"],assets.values())
         version=len(self.versions(task_id,"sample"))+1; content_hash=digest(html_text.encode()); model=DeckArtifact.parse({"artifact_id":f"sample-{content_hash[:16]}","task_id":task_id,"version":version,"kind":"sample","outline_hash":outline,"content_hash":content_hash,"created_at":now(),"schema_version":"1.0"})
         prior=self._current_version(task_id,"sample"); meta={"html":html_text,"selection_hash":selection["hash"],"parent":prior,"summary":"生成真实 HTML 样品","scope":"global","global_rules":rules,"local_exceptions":{},"build":"success"}
         h=self._record_p3(task_id,"sample",model,meta,"sample_generate")
@@ -276,16 +276,15 @@ class TaskService:
         if not sample: raise ConflictError("尚未生成样品")
         if not isinstance(prompt,str) or not prompt.strip(): raise ValidationError("修改 Prompt 不得为空")
         ids=list(view["selection"]["slide_ids"])
-        if scope is None: scope="element" if element_id else ("page" if slide_id else "global")
-        if scope not in {"element","page","global"}: raise ValidationError("修改作用域无效")
+        scope,understanding=infer_scope(prompt,slide_id,element_id,scope)
         if scope in {"element","page"} and slide_id not in ids: raise ValidationError("修改页面不在样品中")
         if scope=="element" and not element_id: raise ValidationError("元素级修改必须指定 element_id")
         meta=sample["metadata"]; rules=list(meta.get("global_rules",[])); exceptions={k:list(v) for k,v in meta.get("local_exceptions",{}).items()}
         if scope=="global": rules.append(prompt.strip())
         else: exceptions.setdefault(slide_id,[]).append((f"元素 {element_id}: " if scope=="element" else "")+prompt.strip())
-        outline=self._current_version(task_id,"outline"); data=json.loads(self.version(task_id,outline)); html_text=validate_html(render(data["markdown"],ids,rules,exceptions),ids)
+        outline=self._current_version(task_id,"outline"); data=json.loads(self.version(task_id,outline)); assets=controlled_assets(self.input_view(task_id)["manifest"],self.store.resource_root(task_id)); html_text=validate_html(render(data["markdown"],ids,rules,exceptions,assets),ids,assets.values())
         version=len(self.versions(task_id,"sample"))+1; ch=digest(html_text.encode()); model=DeckArtifact.parse({"artifact_id":f"sample-{ch[:16]}","task_id":task_id,"version":version,"kind":"sample","outline_hash":outline,"content_hash":ch,"created_at":now(),"schema_version":"1.0"})
-        h=self._record_p3(task_id,"sample",model,{"html":html_text,"selection_hash":view["selection"]["hash"],"parent":sample["hash"],"summary":prompt.strip(),"scope":scope,"slide_id":slide_id,"element_id":element_id,"global_rules":rules,"local_exceptions":exceptions,"build":"success"},"sample_modify","user")
+        h=self._record_p3(task_id,"sample",model,{"html":html_text,"selection_hash":view["selection"]["hash"],"parent":sample["hash"],"summary":prompt.strip(),"scope":scope,"scope_understanding":understanding,"slide_id":slide_id,"element_id":element_id,"global_rules":rules,"local_exceptions":exceptions,"build":"success"},"sample_modify","user")
         self._invalidate_sample_gate(task_id,h)
         return self.sample_view(task_id)
     def confirm_sample(self,task_id):

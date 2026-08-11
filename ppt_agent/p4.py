@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-import html, re
+import base64, hashlib, html, re
 from html.parser import HTMLParser
 
 from .errors import ValidationError
 
 SLIDE = re.compile(r"^## \[([A-Za-z0-9_-]+)\]\s*(.*?)(?=^## \[|\Z)", re.M | re.S)
-ALLOWED_TAGS = {"html", "head", "meta", "style", "body", "section", "aside", "div", "h1", "h2", "h3", "p", "small", "span", "strong", "em", "ul", "ol", "li", "table", "thead", "tbody", "tr", "th", "td", "br"}
+ALLOWED_TAGS = {"html", "head", "meta", "style", "body", "section", "aside", "div", "h1", "h2", "h3", "p", "small", "span", "strong", "em", "ul", "ol", "li", "table", "thead", "tbody", "tr", "th", "td", "br", "img"}
 GLOBAL_ATTRS = {"id", "class", "style", "lang", "hidden", "data-slide-id", "data-element-id", "data-global-rules"}
-TAG_ATTRS = {"meta": {"charset", "name", "content"}, "th": {"colspan", "rowspan"}, "td": {"colspan", "rowspan"}}
+TAG_ATTRS = {"meta": {"charset", "name", "content"}, "th": {"colspan", "rowspan"}, "td": {"colspan", "rowspan"}, "img": {"src", "alt"}}
 CSS_PROPERTIES = {
     "align-items", "background", "background-color", "background-image", "border", "border-color", "border-radius",
     "border-style", "border-width", "box-sizing", "color", "display", "flex", "flex-direction", "font-family",
@@ -65,8 +65,8 @@ def _validate_css(css: str) -> None:
             if prop not in CSS_PROPERTIES: raise ValidationError("CSS 属性不在白名单")
 
 class _SafeHtmlParser(HTMLParser):
-    def __init__(self):
-        super().__init__(convert_charrefs=True); self.errors=[]; self.styles=[]; self._in_style=False; self.slide_ids=[]
+    def __init__(self, allowed_assets=()):
+        super().__init__(convert_charrefs=True); self.errors=[]; self.styles=[]; self._in_style=False; self.slide_ids=[]; self.allowed_assets=set(allowed_assets)
     def handle_starttag(self, tag, attrs): self._check(tag, attrs)
     def handle_startendtag(self, tag, attrs): self._check(tag, attrs)
     def handle_endtag(self, tag):
@@ -82,6 +82,7 @@ class _SafeHtmlParser(HTMLParser):
             try: _validate_css(values["style"])
             except ValidationError as exc: self.errors.append(str(exc))
         if tag == "style": self._in_style=True
+        if tag == "img" and values.get("src") not in self.allowed_assets: self.errors.append("图片不属于当前冻结资源清单")
         if "data-slide-id" in values: self.slide_ids.append(values["data-slide-id"])
 
 def recommend(markdown: str, count: int = 2):
@@ -92,30 +93,65 @@ def recommend(markdown: str, count: int = 2):
     chosen=sorted(ranked[:count],key=lambda x:x[0])
     return [x[1][0] for x in chosen], {x[1][0]:"覆盖主要内容与资源版式" for x in chosen}
 
-def render(markdown: str, slide_ids: list[str], rules=None, exceptions=None):
+def controlled_assets(manifest: dict, resource_root):
+    """Resolve only frozen, hash-matching manifest resources to inert data URLs."""
+    assets={}
+    for item in manifest.get("resources",[]):
+        uri=item.get("uri","")
+        if not re.fullmatch(r"resources://[A-Za-z0-9_.-]+",uri): raise ValidationError("资源引用格式无效")
+        path=(resource_root/uri.removeprefix("resources://")).resolve()
+        if resource_root.resolve() not in path.parents or not path.is_file(): raise ValidationError("冻结资源不存在或路径越权")
+        data=path.read_bytes()
+        if hashlib.sha256(data).hexdigest()!=item.get("content_hash"): raise ValidationError("冻结资源内容已变化")
+        media=item.get("media_type","")
+        if media not in {"image/png","image/jpeg","image/gif","image/webp"}: raise ValidationError("资源媒体类型不允许进入预览")
+        assets[uri]=f"data:{media};base64,{base64.b64encode(data).decode()}"
+    return assets
+
+def infer_scope(prompt: str, slide_id=None, element_id=None, requested=None):
+    text=prompt.strip().lower()
+    global_hint=bool(re.search(r"整稿|全局|所有页|每一页|统一|global|all slides",text))
+    page_hint=bool(re.search(r"当前页|这一页|本页|指定页|page|slide-[a-z0-9_-]+",text))
+    element_hint=bool(re.search(r"标题|正文|图表|图片|元素|title|body|element",text))
+    if global_hint and (page_hint or element_hint): raise ValidationError("修改范围存在歧义，请明确是全局、页面还是元素")
+    inferred="global" if global_hint else ("element" if element_hint and element_id else ("page" if (page_hint or slide_id) else "global"))
+    if requested is not None and requested not in {"global","page","element"}: raise ValidationError("修改作用域无效")
+    if requested and requested != inferred and (global_hint or page_hint or element_hint): raise ValidationError("显式作用域与 Prompt 语义冲突，请确认修改范围")
+    scope=requested or inferred
+    if scope=="element" and not element_id: raise ValidationError("Prompt 指向元素，但未选择具体元素")
+    if scope in {"page","element"} and not slide_id: raise ValidationError("Prompt 指向局部，但未选择具体页面")
+    return scope,{"scope":scope,"basis":"prompt_semantics" if (global_hint or page_hint or element_hint) else "current_selection","slide_id":slide_id if scope!="global" else None,"element_id":element_id if scope=="element" else None}
+
+def render(markdown: str, slide_ids: list[str], rules=None, exceptions=None, assets=None):
     blocks={m.group(1):m.group(2).strip() for m in SLIDE.finditer(markdown)}
     rules=rules or []; exceptions=exceptions or {}
     sections=[]
     for sid in slide_ids:
         text=blocks[sid]
-        lines=[html.escape(x.strip(" -")) for x in text.splitlines() if x.strip() and not x.lstrip().startswith("!")]
+        lines=[html.escape(x.strip(" -")) for x in text.splitlines() if x.strip() and not re.search(r"!\[[^\]]*\]\(resources://[^)]+\)",x)]
         title=lines[0] if lines else sid
         body="".join(f"<p>{x}</p>" for x in lines[1:]) or "<p>内容已依据确认大纲生成</p>"
         note="".join(f"<small>{html.escape(x)}</small>" for x in exceptions.get(sid,[]))
-        sections.append(f'<section class="slide" id="{sid}" data-slide-id="{sid}"><h1 data-element-id="title">{title}</h1><div data-element-id="body">{body}</div>{note}</section>')
+        images=[]
+        for alt,uri in re.findall(r"!\[([^\]]*)\]\((resources://[^)]+)\)",text):
+            if uri not in (assets or {}): raise ValidationError("大纲引用不属于当前冻结资源清单")
+            images.append(f'<img data-element-id="resource" src="{html.escape(assets[uri],quote=True)}" alt="{html.escape(alt,quote=True)}">')
+        sections.append(f'<section class="slide" id="{sid}" data-slide-id="{sid}"><h1 data-element-id="title">{title}</h1><div data-element-id="body">{body}</div>{"".join(images)}{note}</section>')
     rule_text=" · ".join(html.escape(x) for x in rules)
     return '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><style>html,body{margin:0;background:#111827;color:#f8fafc;font-family:system-ui}.slide{box-sizing:border-box;width:1280px;height:720px;padding:72px;margin:24px auto;background:linear-gradient(135deg,#172033,#253858);overflow:hidden}.slide h1{font-size:46px}.slide p{font-size:25px;line-height:1.5}small{display:block;color:#93c5fd}</style></head><body><aside hidden data-global-rules="'+rule_text+'"></aside>'+"".join(sections)+"</body></html>"
 
-def validate_html(value: str, expected_ids: list[str]):
+def validate_html(value: str, expected_ids: list[str], allowed_assets=()):
     if not isinstance(value,str) or not value.startswith("<!doctype html>"): raise ValidationError("HTML 构建结果无效")
-    parser=_SafeHtmlParser()
+    parser=_SafeHtmlParser(allowed_assets)
     try: parser.feed(value); parser.close()
     except Exception as exc: raise ValidationError("HTML 语法无效") from exc
     try: _validate_css("\n".join(parser.styles))
     except ValidationError as exc: parser.errors.append(str(exc))
     if parser.errors:
         raise ValidationError("HTML 包含不允许的主动内容或任务外资源")
-    if re.search(r"(?:\.\.[/\\]|file\s*:|https?\s*:|//|resources\s*://|tasks?[/\\])",_canonical(value),re.I):
+    scrubbed=value
+    for asset in allowed_assets: scrubbed=scrubbed.replace(asset,"")
+    if re.search(r"(?:\.\.[/\\]|file\s*:|https?\s*:|//|resources\s*://|tasks?[/\\]|data\s*:)",_canonical(scrubbed),re.I):
         raise ValidationError("HTML 包含路径穿越、跨任务或未解析资源引用")
     actual=parser.slide_ids
     if actual != list(expected_ids): raise ValidationError("HTML 页面与样品选择不一致")
