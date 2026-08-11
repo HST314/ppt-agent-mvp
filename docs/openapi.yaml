@@ -71,6 +71,25 @@ paths:
     post:
       parameters: [{$ref: '#/components/parameters/TaskId'}]
       responses: {'200': {description: Human confirmation bound to exact outline, selection and sample content hashes, content: {application/json: {schema: {type: object}, example: {confirmation: {confirmed_sample_hash: abc}}}}}, '400': {$ref: '#/components/responses/Error'}, '409': {$ref: '#/components/responses/Error'}}
+  /v1/tasks/{task_id}/deck:
+    get:
+      parameters: [{$ref: '#/components/parameters/TaskId'}]
+      responses: {'200': {description: Current deck plus immutable timeline with source and operator, content: {application/json: {schema: {type: object}, example: {state: {}, deck: null, versions: []}}}}, '404': {$ref: '#/components/responses/Error'}}
+  /v1/tasks/{task_id}/deck/generate:
+    post:
+      parameters: [{$ref: '#/components/parameters/TaskId'}]
+      requestBody: {content: {application/json: {schema: {type: object, additionalProperties: false}}}}
+      responses: {'200': {description: Atomically validated complete HTML deck, content: {application/json: {schema: {type: object}, example: {state: {}, deck: {}, versions: []}}}}, '409': {$ref: '#/components/responses/Error'}}
+  /v1/tasks/{task_id}/deck/modify:
+    post:
+      parameters: [{$ref: '#/components/parameters/TaskId'}]
+      requestBody: {required: true, content: {application/json: {schema: {type: object, additionalProperties: false, required: [prompt], properties: {prompt: {type: string}, change_type: {enum: [visual, content]}, scope: {enum: [global, page, element]}, slide_ids: {type: array, uniqueItems: true, items: {type: string}}, element_id: {type: [string, 'null']}}}}}}
+      responses: {'200': {description: Atomically validated deck edit, content: {application/json: {schema: {type: object}, example: {state: {}, deck: {}, versions: []}}}}, '400': {$ref: '#/components/responses/Error'}, '409': {$ref: '#/components/responses/Error'}}
+  /v1/tasks/{task_id}/deck/compare:
+    post:
+      parameters: [{$ref: '#/components/parameters/TaskId'}]
+      requestBody: {required: true, content: {application/json: {schema: {type: object, additionalProperties: false, required: [left, right], properties: {left: {type: string}, right: {type: string}}}}}}
+      responses: {'200': {description: Per-slide HTML comparison with added removed modified and unchanged status, content: {application/json: {schema: {type: object, required: [left, right, equal, pages, changed_slide_ids], properties: {left: {type: object}, right: {type: object}, equal: {type: boolean}, pages: {type: array, items: {type: object, required: [slide_id, status, left_html, right_html], properties: {slide_id: {type: string}, status: {enum: [added, removed, modified, unchanged]}, left_html: {type: [string, 'null']}, right_html: {type: [string, 'null']}}}}, changed_slide_ids: {type: array, items: {type: string}}}}, example: {left: {version: 1}, right: {version: 2}, equal: false, pages: [{slide_id: slide-2, status: modified, left_html: '<section></section>', right_html: '<section>changed</section>'}], changed_slide_ids: [slide-2]}}}}, '400': {$ref: '#/components/responses/Error'}}
   /v1/tasks:
     post:
       requestBody: {required: true, content: {application/json: {schema: {type: object, additionalProperties: false, required: [task_id], properties: {task_id: {type: string}, mode: {enum: [manual, auto]}}}, example: {task_id: demo, mode: auto}}}}

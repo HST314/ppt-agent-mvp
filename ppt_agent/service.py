@@ -40,6 +40,19 @@ class TaskService:
     def versions(self,task_id,kind=None): return self.store.versions(task_id,kind)
     def version(self,task_id,digest): return self.store.artifact(task_id,digest)
     def compare(self,task_id,left,right): return {"left":left,"right":right,"equal":self.version(task_id,left)==self.version(task_id,right)}
+    def compare_decks(self,task_id,left,right):
+        records={v["hash"]:v for v in self.versions(task_id,"deck")}
+        if left not in records or right not in records: raise ValidationError("只能对比全稿版本")
+        def describe(value):
+            artifact=json.loads(self.version(task_id,value)); meta=records[value]["metadata"]
+            return {"hash":value,"version":artifact["version"],"outline_hash":artifact["outline_hash"],"source":meta.get("source","unknown"),"operator":meta.get("operator","system"),"summary":meta.get("summary",""),"html":meta["html"],"fragments":self._slide_fragments(meta["html"])}
+        lhs,rhs=describe(left),describe(right); page_ids=list(dict.fromkeys([*lhs["fragments"],*rhs["fragments"]])); pages=[]
+        for slide_id in page_ids:
+            lhtml=lhs["fragments"].get(slide_id); rhtml=rhs["fragments"].get(slide_id)
+            status="added" if lhtml is None else "removed" if rhtml is None else "unchanged" if lhtml==rhtml else "modified"
+            pages.append({"slide_id":slide_id,"status":status,"left_html":lhtml,"right_html":rhtml})
+        for side in (lhs,rhs): side.pop("fragments")
+        return {"left":lhs,"right":rhs,"equal":all(p["status"]=="unchanged" for p in pages),"pages":pages,"changed_slide_ids":[p["slide_id"] for p in pages if p["status"]!="unchanged"]}
     def events(self,task_id): return self.store.events(task_id)
     def import_input(self,task_id,source,source_format="json",rebuild=False):
         with self.store.lock(task_id):
@@ -313,14 +326,13 @@ class TaskService:
         version=len(self.versions(task_id,"deck"))+1; content_hash=digest(html_text.encode())
         model=DeckArtifact.parse({"artifact_id":f"deck-{content_hash[:16]}","task_id":task_id,"version":version,"kind":"deck","outline_hash":outline_hash,"content_hash":content_hash,"created_at":now(),"schema_version":"1.0"})
         fragments=self._slide_fragments(html_text)
-        metadata={**metadata,"html":html_text,"page_hashes":{sid:digest(fragment.encode()) for sid,fragment in fragments.items()}}
+        metadata={"source":action,"operator":actor,**metadata,"html":html_text,"page_hashes":{sid:digest(fragment.encode()) for sid,fragment in fragments.items()}}
         self._record_p3(task_id,"deck",model,metadata,action,actor)
         return self.deck_view(task_id)
     def generate_deck(self,task_id):
         sample_view=self.sample_view(task_id); self._require_current_sample_confirmation(task_id)
         state=TaskState.parse(self.get(task_id))
-        if state.stage==state.stage.SAMPLE: self.command(task_id,f"to-deck-{sample_view['sample']['hash'][:12]}","advance","system")
-        elif state.stage!=state.stage.DECK: raise ConflictError("当前阶段不能生成全稿")
+        if state.stage not in {state.stage.SAMPLE,state.stage.DECK}: raise ConflictError("当前阶段不能生成全稿")
         outline=self._current_version(task_id,"outline"); data=json.loads(self.version(task_id,outline)); ids=list(data["slide_ids"])
         sample=sample_view["sample"]; meta=sample["metadata"]
         assets=controlled_assets(self.input_view(task_id)["manifest"],self.store.resource_root(task_id))
@@ -328,7 +340,11 @@ class TaskService:
         sample_fragments=self._slide_fragments(sample["html"]); deck_fragments=self._slide_fragments(html_text)
         preserved={sid:digest(deck_fragments[sid].encode())==digest(fragment.encode()) for sid,fragment in sample_fragments.items()}
         if not all(preserved.values()): raise ConflictError("确认样品发生未提示变化")
-        return self._record_deck(task_id,html_text,outline,{"parent":self._current_version(task_id,"deck"),"summary":"生成完整 HTML 演示稿","scope":"global","affected":ids,"sample_hash":sample["hash"],"sample_pages_preserved":preserved,"outline_consistent":True,"global_rules":meta.get("global_rules",[]),"local_exceptions":meta.get("local_exceptions",{})},"deck_generate")
+        result=self._record_deck(task_id,html_text,outline,{"parent":self._current_version(task_id,"deck"),"summary":"生成完整 HTML 演示稿","scope":"global","affected":ids,"sample_hash":sample["hash"],"sample_pages_preserved":preserved,"outline_consistent":True,"global_rules":meta.get("global_rules",[]),"local_exceptions":meta.get("local_exceptions",{})},"deck_generate")
+        if state.stage==state.stage.SAMPLE:
+            self.command(task_id,f"to-deck-{sample['hash'][:12]}","advance","system")
+            result=self.deck_view(task_id)
+        return result
     def modify_deck(self,task_id,prompt,change_type="visual",scope=None,slide_ids=None,element_id=None):
         view=self.deck_view(task_id); deck=view["deck"]
         if not deck: raise ConflictError("尚未生成全稿")
@@ -341,18 +357,24 @@ class TaskService:
         affected=all_ids if inferred=="global" else list(slide_ids)
         outline_hash=self._current_version(task_id,"outline"); outline=json.loads(self.version(task_id,outline_hash)); markdown=outline["markdown"]
         rules=list(deck["metadata"].get("global_rules",[])); exceptions={k:list(v) for k,v in deck["metadata"].get("local_exceptions",{}).items()}
+        pending_outline=None
         if change_type=="content":
             order,blocks=parse_outline(markdown,self.input_view(task_id)["manifest"].get("resources",[]),None)
             for sid in affected: blocks[sid] += f"\n- 内容修改：{prompt.strip()}"
             markdown=markdown[:markdown.index("## [")].rstrip()+"\n\n"+"\n\n".join(blocks[s] for s in order)+"\n"
             content_hash=digest(markdown.encode()); model=SlideOutline.parse({"outline_id":f"outline-{content_hash[:16]}","task_id":task_id,"version":len(self.versions(task_id,"outline"))+1,"markdown":markdown,"slide_ids":order,"content_hash":content_hash,"created_at":now(),"schema_version":"1.0"})
-            outline_hash=self._record_p3(task_id,"outline",model,{"parent":outline_hash,"action":"deck_content_edit","summary":prompt.strip(),"affected":affected,"authoritative":True,"invalidated":{"deck":affected}},"outline_edit","user")
+            pending_outline=(model,{"parent":outline_hash,"action":"deck_content_edit","summary":prompt.strip(),"affected":affected,"authoritative":True,"invalidated":{"deck":affected}})
+            outline_hash=digest(canonical(model.to_dict()))
         elif inferred=="global": rules.append(prompt.strip())
         else:
             for sid in affected: exceptions.setdefault(sid,[]).append((f"元素 {element_id}: " if inferred=="element" else "")+prompt.strip())
         assets=controlled_assets(self.input_view(task_id)["manifest"],self.store.resource_root(task_id)); html_text=validate_html(render(markdown,all_ids,rules,exceptions,assets),all_ids,assets.values())
         before=deck["metadata"]["page_hashes"]; after={sid:digest(fragment.encode()) for sid,fragment in self._slide_fragments(html_text).items()}; actual=[sid for sid in all_ids if before[sid]!=after[sid]]
         if any(s not in affected for s in actual): raise ConflictError("修改超出声明影响范围")
+        # Cross-artifact edits are prepared and validated above. Only successful
+        # render/validation may publish the outline and deck versions.
+        if pending_outline:
+            outline_hash=self._record_p3(task_id,"outline",pending_outline[0],pending_outline[1],"outline_edit","user")
         return self._record_deck(task_id,html_text,outline_hash,{"parent":deck["hash"],"summary":prompt.strip(),"scope":inferred,"change_type":change_type,"affected":actual,"requested_affected":affected,"unchanged":[s for s in all_ids if s not in actual],"scope_understanding":understanding,"element_id":element_id,"outline_consistent":True,"global_rules":rules,"local_exceptions":exceptions},"deck_modify","user")
     def rollback_deck(self,task_id,target_hash):
         known={v["hash"] for v in self.versions(task_id,"deck")}
