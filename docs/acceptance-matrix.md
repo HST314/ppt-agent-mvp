@@ -11,7 +11,7 @@
 | AC-05 | 叙事后逐页大纲且均可编辑 | P3-02、P3-03、P3-05 | 大纲 API；大纲页 | `tests/test_p3.py::test_skill_slices_and_manual_gate`、`test_workspace_has_dual_editors_no_preview` |
 | AC-06 | 编辑/Prompt 产生新版本且局部隔离 | P3-04、P5-03 | 修改与版本 API；大纲/全稿页 | `tests/test_p3.py::test_direct_edit_is_authoritative_version`、`test_outline_scope_resource_and_page_validation`、`test_non_destructive_rollback` |
 | AC-07 | 默认 2 个可调真实 HTML 样品 | P4-01、P4-02 | 样品生成 API；样品页 | `tests/e2e/test_ac_07_samples.py` |
-| AC-08 | 样品可反复调整且确认门禁有效 | P4-03、P4-04 | 样品动作 API；样品页 | `tests/e2e/test_ac_08_sample_gate.py` |
+| AC-08 | 样品可反复调整且确认门禁有效 | P4-03、P4-04 | 样品动作 API；样品页 | `tests/test_p4.py`、`tests/test_p4_sample_page.py`（版本时间线/历史预览/差异对比 UI 交互）、`tests/e2e/test_ac_08_sample_gate.py` |
 | AC-09 | 全稿页数等于最终大纲 | P5-01、P5-02 | 全稿生成 API；全稿页 | `tests/e2e/test_ac_09_full_deck.py` |
 | AC-10 | 整稿/页/元素修改、摘要、对比、版本 | P5-03、P5-04 | 修改/版本 API；全稿/版本页 | `tests/e2e/test_ac_10_deck_edit.py` |
 | AC-11 | 独立检查模型执行三级检查 | P6-01、P6-02 | 检查 API；检查页 | `tests/e2e/test_ac_11_inspection.py` |
