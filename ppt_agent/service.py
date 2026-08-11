@@ -30,7 +30,10 @@ class TaskService:
             if prior:
                 if prior[0]["request_hash"] != fingerprint(request): raise ConflictError("command_id 请求内容冲突")
                 return prior[0]["result"]
-            old=TaskState.parse(self.get(task_id)); new=transition(old,action,actor=actor)
+            old=TaskState.parse(self.get(task_id))
+            if action == "advance" and old.stage == old.stage.SAMPLE and self.versions(task_id,"sample"):
+                self._require_current_sample_confirmation(task_id)
+            new=transition(old,action,actor=actor)
             result=new.to_dict()
             event={"event_id":hashlib.sha256(f"{task_id}:{command_id}".encode()).hexdigest()[:24],"command_id":command_id,"action":action,"actor":actor,"request_hash":fingerprint(request),"at":utcnow(),"from":old.to_dict(),"to":result,"result":result}
             self.store.commit(task_id,result,event); return result
@@ -184,6 +187,7 @@ class TaskService:
         meta={"parent":prior,"action":"generate" if not prior else "edit","summary":summary,"affected":affected,"unchanged":[sid for sid in blocks if sid in before and blocks[sid]==before[sid]],"authoritative":True,"invalidated":{"sample":affected,"deck":affected}}
         if skill: meta["skill"]={"action":"outline","version":skill["version"],"hash":digest(skill["content"].encode()),"included":["outline"],"trimmed":["narrative","html","inspection"]}
         h=self._record_p3(task_id,"outline",model,meta,"outline_generate" if not prior else "outline_edit",actor)
+        self._invalidate_sample_gate(task_id,h)
         state=TaskState.parse(self.get(task_id))
         if state.stage==state.stage.NARRATIVE and state.mode=="auto": self.command(task_id,f"auto-outline-stage-{h[:12]}","advance")
         return self.planning_view(task_id)
@@ -208,15 +212,30 @@ class TaskService:
         result={"state":self.get(task_id),"outline_hash":outline,"selection":None,"sample":None,"confirmation":None,"versions":self.versions(task_id,"sample")}
         sels=self.versions(task_id,"sample-selection")
         if sels:
-            last=sels[-1]; result["selection"]={**json.loads(self.version(task_id,last["hash"])),"hash":last["hash"],"metadata":last["metadata"]}
+            selected=None
+            for event in reversed(self.events(task_id)):
+                if event["action"] == "select_samples": selected=event["result"].get("hash"); break
+            last=next((item for item in sels if item["hash"]==selected),sels[-1])
+            result["selection"]={**json.loads(self.version(task_id,last["hash"])),"hash":last["hash"],"metadata":last["metadata"]}
         if current:
             item=json.loads(self.version(task_id,current)); meta=next(v["metadata"] for v in self.versions(task_id,"sample") if v["hash"]==current)
             result["sample"]={**item,"hash":current,"html":meta["html"],"metadata":meta}
         for event in reversed(self.events(task_id)):
             if event["action"]=="confirm_sample_version":
-                if current and event["result"].get("confirmed_sample_hash")==current and event["result"].get("confirmed_outline_hash")==outline: result["confirmation"]=event["result"]
+                sample=result["sample"]; selection=result["selection"]
+                if (current and sample and selection
+                    and event["result"].get("confirmed_sample_hash")==current
+                    and event["result"].get("confirmed_content_hash")==sample["content_hash"]
+                    and event["result"].get("confirmed_outline_hash")==outline
+                    and event["result"].get("selection_hash")==selection["hash"]
+                    and sample["metadata"].get("selection_hash")==selection["hash"]):
+                    result["confirmation"]=event["result"]
                 break
         return result
+    def _require_current_sample_confirmation(self,task_id):
+        view=self.sample_view(task_id)
+        if not view["confirmation"] or not view["state"]["sample_confirmed"]:
+            raise ConflictError("当前大纲、样品内容或页面选择尚未由用户确认")
     def _invalidate_sample_gate(self,task_id,artifact_hash):
         state=TaskState.parse(self.get(task_id))
         if not state.sample_confirmed: return
@@ -233,6 +252,11 @@ class TaskService:
             reasons={sid:"用户选择" for sid in slide_ids}
         seed=canonical({"outline_hash":outline,"slide_ids":slide_ids}); model=SampleSelection.parse({"selection_id":f"selection-{digest(seed)[:16]}","task_id":task_id,"outline_hash":outline,"slide_ids":slide_ids,"confirmed":False,"schema_version":"1.0"})
         h=self.store.put_version(task_id,"sample-selection",canonical(model.to_dict()),{"reasons":reasons})
+        state=TaskState.parse(self.get(task_id))
+        new=(TaskState(**{**state.__dict__,"sample_confirmed":False,"status":state.status.WAITING_FOR_USER,"waiting_reason":"manual_gate","required_action":"confirm_sample","revision":state.revision+1})
+             if state.sample_confirmed else TaskState(**{**state.__dict__,"revision":state.revision+1}))
+        event={"event_id":hashlib.sha256(f"{task_id}:select-samples:{h}:{state.revision}".encode()).hexdigest()[:24],"command_id":f"select-samples-{h[:16]}-{state.revision}","action":"select_samples","actor":"user" if slide_ids is not None else "system","request_hash":h,"at":utcnow(),"from":state.to_dict(),"to":new.to_dict(),"result":{"hash":h,"invalidated":["sample_confirmation","deck"] if state.sample_confirmed else []}}
+        self.store.commit(task_id,new.to_dict(),event)
         return {**self.sample_view(task_id),"selection":{**model.to_dict(),"hash":h,"metadata":{"reasons":reasons}}}
     def generate_sample(self,task_id,prompt=None):
         view=self.sample_view(task_id); selection=view["selection"]
@@ -266,7 +290,11 @@ class TaskService:
         return self.sample_view(task_id)
     def confirm_sample(self,task_id):
         view=self.sample_view(task_id); sample=view["sample"]; outline=self._current_version(task_id,"outline")
-        if not sample or sample["outline_hash"] != outline: raise ConflictError("须先生成基于当前大纲的样品")
+        selection=view["selection"]
+        if (not sample or not selection or sample["outline_hash"] != outline
+            or selection["outline_hash"] != outline
+            or sample["metadata"].get("selection_hash") != selection["hash"]):
+            raise ConflictError("须先基于当前大纲和页面选择重新生成样品")
         state=TaskState.parse(self.get(task_id)); new=transition(state,"confirm_sample",actor="user")
         result={"confirmed_outline_hash":outline,"confirmed_sample_hash":sample["hash"],"confirmed_content_hash":sample["content_hash"],"selection_hash":view["selection"]["hash"]}
         event={"event_id":hashlib.sha256(f"{task_id}:confirm-sample:{sample['hash']}".encode()).hexdigest()[:24],"command_id":f"confirm-sample-{sample['hash'][:16]}","action":"confirm_sample_version","actor":"user","request_hash":sample["hash"],"at":utcnow(),"from":state.to_dict(),"to":new.to_dict(),"result":result}

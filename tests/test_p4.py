@@ -4,6 +4,7 @@ from ppt_agent.api import App
 from ppt_agent.errors import ConflictError, ValidationError
 from ppt_agent.service import TaskService
 from ppt_agent.store import WorkspaceStore
+from ppt_agent.p4 import validate_html
 
 class P4Tests(unittest.TestCase):
     def setUp(self):
@@ -41,5 +42,30 @@ class P4Tests(unittest.TestCase):
         self.assertEqual(self.s.sample_view("p4")["sample"]["hash"],good)
         status=[]; body=b"".join(App(self.s)({"REQUEST_METHOD":"GET","PATH_INFO":"/tasks/p4/samples","CONTENT_LENGTH":"0","wsgi.input":io.BytesIO()},lambda s,h:status.append((s,h)))).decode()
         self.assertIn('<iframe sandbox=""',body); self.assertIn("确认样品并生成全稿",body); self.assertTrue(status[0][0].startswith("200"))
+    def test_selection_and_outline_changes_invalidate_confirmation_and_block_advance(self):
+        first=self.s.generate_sample("p4"); self.s.confirm_sample("p4")
+        ids=list(first["selection"]["slide_ids"]); ids.reverse()
+        changed=self.s.select_samples("p4",ids)
+        self.assertFalse(changed["state"]["sample_confirmed"]); self.assertIsNone(changed["confirmation"])
+        with self.assertRaises(ConflictError): self.s.command("p4","advance-after-selection","advance")
+        self.s.generate_sample("p4"); self.s.confirm_sample("p4")
+        outline=self.s.planning_view("p4")["outline"]["markdown"]
+        changed=self.s.edit_outline("p4",outline+"\n<!-- changed -->\n")
+        self.assertFalse(changed["state"]["sample_confirmed"])
+        with self.assertRaises(ConflictError): self.s.command("p4","advance-after-outline","advance")
+    def test_html_security_negative_matrix(self):
+        base='<!doctype html><html><body><section data-slide-id="slide-1">x</section></body></html>'
+        self.assertEqual(validate_html(base,["slide-1"]),base)
+        attacks=[
+            '<script>alert(1)</script>', '<img src=x onerror=alert(1)>',
+            '<style>@import "https://evil.test/x.css"</style>', '<style>body{background:url(//evil.test/x)}</style>',
+            '<div style="background:url(https://evil.test/x)">x</div>',
+            '<img srcset="https://evil.test/a 1x">', '<meta http-equiv="refresh" content="0;url=https://evil.test">',
+            '<iframe src="https://evil.test"></iframe>', '<a href="../../secret">x</a>',
+            '<img src="file:///etc/passwd">', '<img src="resources://other-task/secret">',
+        ]
+        for attack in attacks:
+            with self.subTest(attack=attack), self.assertRaises(ValidationError):
+                validate_html(base.replace('</body>',attack+'</body>'),["slide-1"])
 
 if __name__ == "__main__": unittest.main()
