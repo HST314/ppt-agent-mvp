@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "InspectionReport",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "title": "schema_version"
+    },
+    "report_id": {
+      "title": "report_id"
+    },
+    "task_id": {
+      "title": "task_id"
+    },
+    "deck_hash": {
+      "title": "deck_hash"
+    },
+    "issues": {
+      "title": "issues"
+    },
+    "passed": {
+      "title": "passed"
+    },
+    "created_at": {
+      "title": "created_at"
+    }
+  },
+  "required": []
+}

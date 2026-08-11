@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskInputSnapshot",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "title": "schema_version"
+    },
+    "snapshot_id": {
+      "title": "snapshot_id"
+    },
+    "task_id": {
+      "title": "task_id"
+    },
+    "task_card_hash": {
+      "title": "task_card_hash"
+    },
+    "resource_manifest_hash": {
+      "title": "resource_manifest_hash"
+    },
+    "created_at": {
+      "title": "created_at"
+    }
+  },
+  "required": []
+}

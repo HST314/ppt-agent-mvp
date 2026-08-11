@@ -2,7 +2,7 @@
 
 PPT Agent MVP 的需求、实现决策与验收追踪仓库。
 
-当前处于 P0（基线、勘察与实现决策），尚未进入 P1 运行内核实现。产品行为以 `docs/product-contract.md` 为准，实施顺序以 `docs/development-plan.md` 为准。
+P1 机器契约与可恢复运行内核已实现。产品行为以 `docs/product-contract.md` 为准，实施顺序以 `docs/development-plan.md` 为准。
 
 ## 本地启动
 
@@ -32,4 +32,12 @@ python3 scripts/verify_p0.py
 - `docs/product-contract.md`：已确认产品需求与流程契约
 - `docs/development-plan.md`：分阶段开发任务清单
 
-P1 将在这个脚手架之外建立真实业务运行内核、API、前端和测试；P0 不宣称这些能力已经存在。
+## P1 运行与测试
+
+```bash
+python3 scripts/export_schemas.py
+python3 -m unittest discover -s tests -v
+python3 scripts/start.py --data .ppt-agent-data
+```
+
+API 契约见 `docs/openapi.yaml`，内核契约见 `docs/p1-contract.md`。P1 仅建立运行内核；任务输入、生成工作流和前端从 P2 起实现。

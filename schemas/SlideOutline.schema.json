@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SlideOutline",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "title": "schema_version"
+    },
+    "outline_id": {
+      "title": "outline_id"
+    },
+    "task_id": {
+      "title": "task_id"
+    },
+    "version": {
+      "title": "version"
+    },
+    "markdown": {
+      "title": "markdown"
+    },
+    "slide_ids": {
+      "title": "slide_ids"
+    },
+    "content_hash": {
+      "title": "content_hash"
+    },
+    "created_at": {
+      "title": "created_at"
+    }
+  },
+  "required": []
+}

@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DeckArtifact",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "title": "schema_version"
+    },
+    "artifact_id": {
+      "title": "artifact_id"
+    },
+    "task_id": {
+      "title": "task_id"
+    },
+    "version": {
+      "title": "version"
+    },
+    "kind": {
+      "title": "kind"
+    },
+    "outline_hash": {
+      "title": "outline_hash"
+    },
+    "content_hash": {
+      "title": "content_hash"
+    },
+    "created_at": {
+      "title": "created_at"
+    }
+  },
+  "required": []
+}

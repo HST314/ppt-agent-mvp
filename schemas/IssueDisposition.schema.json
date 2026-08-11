@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "IssueDisposition",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "title": "schema_version"
+    },
+    "disposition_id": {
+      "title": "disposition_id"
+    },
+    "task_id": {
+      "title": "task_id"
+    },
+    "issue_id": {
+      "title": "issue_id"
+    },
+    "action": {
+      "title": "action"
+    },
+    "actor": {
+      "title": "actor"
+    },
+    "created_at": {
+      "title": "created_at"
+    }
+  },
+  "required": []
+}

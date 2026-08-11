@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DeliveryManifest",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "title": "schema_version"
+    },
+    "delivery_id": {
+      "title": "delivery_id"
+    },
+    "task_id": {
+      "title": "task_id"
+    },
+    "deck_hash": {
+      "title": "deck_hash"
+    },
+    "files": {
+      "title": "files"
+    },
+    "confirmed_by": {
+      "title": "confirmed_by"
+    },
+    "confirmed_at": {
+      "title": "confirmed_at"
+    }
+  },
+  "required": []
+}

@@ -1,0 +1,13 @@
+openapi: 3.1.0
+info: {title: PPT Agent P1 API, version: 0.1.0}
+paths:
+  /healthz:
+    get: {responses: {'200': {description: P1 runtime ready}}}
+  /v1/tasks:
+    post: {summary: Create isolated task, responses: {'201': {description: Created}, '400': {description: Invalid request}}}
+  /v1/tasks/{task_id}:
+    get: {summary: Read authoritative checkpoint, parameters: [{in: path, name: task_id, required: true, schema: {type: string}}], responses: {'200': {description: Current task}, '404': {description: Missing}}}
+  /v1/tasks/{task_id}/actions:
+    post: {summary: Submit an idempotent command, parameters: [{in: path, name: task_id, required: true, schema: {type: string}}], responses: {'200': {description: Updated task}, '409': {description: Gate or conflict}}}
+  /v1/tasks/{task_id}/events:
+    get: {summary: Read public audit events, parameters: [{in: path, name: task_id, required: true, schema: {type: string}}], responses: {'200': {description: Event list}}}

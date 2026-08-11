@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ClarificationSet",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "title": "schema_version"
+    },
+    "clarification_id": {
+      "title": "clarification_id"
+    },
+    "task_id": {
+      "title": "task_id"
+    },
+    "questions": {
+      "title": "questions"
+    },
+    "assumptions": {
+      "title": "assumptions"
+    },
+    "confirmed": {
+      "title": "confirmed"
+    }
+  },
+  "required": []
+}
