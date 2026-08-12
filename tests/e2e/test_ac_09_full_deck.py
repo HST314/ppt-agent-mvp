@@ -3,6 +3,12 @@
 from unittest.mock import patch
 
 from .support import SampleJourney
+from ppt_agent.errors import GatewayUnknownResult
+
+
+class UnknownInspector:
+    def inspect(self, outline, html):
+        raise GatewayUnknownResult("inspection result unknown")
 
 
 class AC09FullDeckE2E(SampleJourney):
@@ -33,3 +39,19 @@ class AC09FullDeckE2E(SampleJourney):
         self.assertEqual(self.get_json("/v1/tasks/journey"),before_state)
         self.assertEqual(self.get_json("/v1/tasks/journey/deck")["versions"],before_versions)
         self.assertEqual(self.get_json("/v1/tasks/journey/events")["events"],before_events)
+
+    def test_first_inspection_unknown_keeps_deck_and_state_unpublished(self):
+        self.ok("/v1/tasks/journey/samples/generate",{})
+        self.ok("/v1/tasks/journey/samples/confirm",{})
+        self.app.service.inspector=UnknownInspector()
+        before_state=self.get_json("/v1/tasks/journey")
+        before_versions=self.get_json("/v1/tasks/journey/deck")["versions"]
+        before_events=self.get_json("/v1/tasks/journey/events")["events"]
+
+        status,_=self.call("POST","/v1/tasks/journey/deck/generate",{})
+
+        self.assertTrue(status.startswith("503"))
+        self.assertEqual(self.get_json("/v1/tasks/journey"),before_state)
+        self.assertEqual(self.get_json("/v1/tasks/journey/deck")["versions"],before_versions)
+        self.assertEqual(self.get_json("/v1/tasks/journey/events")["events"],before_events)
+        self.assertFalse(self.app.service.versions("journey","inspection"))

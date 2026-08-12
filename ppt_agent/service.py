@@ -407,11 +407,17 @@ class TaskService:
             html_text=validate_html(html_text,ids,assets.values()); deck_fragments=self._slide_fragments(html_text)
         preserved={sid:digest(deck_fragments[sid].encode())==digest(fragment.encode()) for sid,fragment in sample_fragments.items()}
         if not all(preserved.values()): raise ConflictError("确认样品发生未提示变化")
+        # The first inspection is part of publishing a generated deck.  Ask the
+        # independent gateway while the deck is still only an in-memory
+        # candidate, so an unknown result cannot leave a deck/version or stage
+        # transition behind.
+        inspection_outline=data["markdown"]
+        prepared_inspection=self.inspector.inspect(inspection_outline,html_text)
         result=self._record_deck(task_id,html_text,outline,{"parent":self._current_version(task_id,"deck"),"summary":"生成完整 HTML 演示稿","scope":"global","affected":ids,"sample_hash":sample["hash"],"sample_pages_preserved":preserved,"outline_consistent":True,"global_rules":meta.get("global_rules",[]),"local_exceptions":meta.get("local_exceptions",{})},"deck_generate")
         if state.stage==state.stage.SAMPLE:
             self.command(task_id,f"to-deck-{sample['hash'][:12]}","advance","system")
             result=self.deck_view(task_id)
-        self.run_inspection(task_id,max_rounds=2)
+        self.run_inspection(task_id,max_rounds=2,_prepared_raw=prepared_inspection)
         result=self.deck_view(task_id)
         return result
     def modify_deck(self,task_id,prompt,change_type="visual",scope=None,slide_ids=None,element_id=None):
@@ -482,14 +488,14 @@ class TaskService:
             normalized.append({"issue_id":item.get("issue_id") or f"issue-{index+1}","severity":item.get("severity","warning"),"level":level,"code":item.get("code","quality_issue"),"message":item.get("message","发现质量问题"),"slide_id":item.get("slide_id","") or "","element_id":item.get("element_id","") or "","evidence":item.get("evidence",item.get("message","发现质量问题")),"suggestion":item.get("suggestion","请人工检查并修复")})
         return normalized
 
-    def _inspect_once(self,task_id,scope,affected,round_number):
+    def _inspect_once(self,task_id,scope,affected,round_number,prepared_raw=None):
         deck=self.deck_view(task_id)["deck"]
         if not deck: raise ConflictError("尚未生成全稿")
         outline=json.loads(self.version(task_id,deck["outline_hash"]))["markdown"]
         # Deliberately pass only the original outline and review HTML. Generation
         # dialogue, model self-description, resources and screenshots never cross this boundary.
         skill=self.skills.load("inspection")
-        raw=self.inspector.inspect(outline,deck["html"])
+        raw=prepared_raw if prepared_raw is not None else self.inspector.inspect(outline,deck["html"])
         issues=self._normalize_inspection_issues(raw.get("issues",[])); passed=bool(raw.get("passed",not issues)) and not issues
         created=utcnow(); seed=canonical({"deck_hash":deck["hash"],"issues":issues,"created_at":created})
         report=InspectionReport.parse({"report_id":f"report-{digest(seed)[:16]}","task_id":task_id,"deck_hash":deck["hash"],"issues":issues,"passed":passed,"created_at":created,"schema_version":"1.0"})
@@ -497,7 +503,7 @@ class TaskService:
         h=self.store.put_version(task_id,"inspection",canonical(report.to_dict()),metadata)
         return {**report.to_dict(),"hash":h,"metadata":metadata}
 
-    def _auto_fix(self,task_id,report,round_number):
+    def _prepare_auto_fix(self,task_id,report,round_number):
         deck=self.deck_view(task_id)["deck"]; affected=list(dict.fromkeys(i["slide_id"] for i in report["issues"] if i["slide_id"]))
         if not affected: affected=list(deck["metadata"]["page_hashes"])
         outline=json.loads(self.version(task_id,deck["outline_hash"]))["markdown"]
@@ -510,19 +516,31 @@ class TaskService:
         else:
             html_text=self.builder.build(outline,action="inspection",slide_ids=list(deck["metadata"]["page_hashes"]),assets=assets,previous_html=deck["html"],inspection_report=report,suggestions=suggestions,affected_slide_ids=affected)
         html_text=validate_html(html_text,list(deck["metadata"]["page_hashes"]),assets.values())
-        return self._record_deck(task_id,html_text,deck["outline_hash"],{"parent":deck["hash"],"summary":f"自动修复第 {round_number} 轮","scope":"page","affected":affected,"outline_consistent":True,"global_rules":deck["metadata"].get("global_rules",[]),"local_exceptions":deck["metadata"].get("local_exceptions",{}),"inspection_report_hash":report["hash"],"auto_fix_round":round_number},"deck_auto_fix","system")["deck"]
+        metadata={"parent":deck["hash"],"summary":f"自动修复第 {round_number} 轮","scope":"page","affected":affected,"outline_consistent":True,"global_rules":deck["metadata"].get("global_rules",[]),"local_exceptions":deck["metadata"].get("local_exceptions",{}),"inspection_report_hash":report["hash"],"auto_fix_round":round_number}
+        return html_text,deck["outline_hash"],metadata
 
-    def run_inspection(self,task_id,max_rounds=2,affected_slide_ids=None):
+    def _auto_fix(self,task_id,report,round_number,prepared=None):
+        html_text,outline_hash,metadata=prepared or self._prepare_auto_fix(task_id,report,round_number)
+        return self._record_deck(task_id,html_text,outline_hash,metadata,"deck_auto_fix","system")["deck"]
+
+    def run_inspection(self,task_id,max_rounds=2,affected_slide_ids=None,_prepared_raw=None):
         metric_started=time.monotonic()
         self._require_actionable(task_id)
         if not isinstance(max_rounds,int) or isinstance(max_rounds,bool) or max_rounds<0 or max_rounds>10: raise ValidationError("max_rounds 必须为 0 到 10 的整数")
         state=TaskState.parse(self.get(task_id))
-        if state.stage==state.stage.DECK: self.command(task_id,f"to-review-{self._current_version(task_id,'deck')[:12]}","advance","system"); state=TaskState.parse(self.get(task_id))
-        if state.stage!=state.stage.REVIEW: raise ConflictError("当前阶段不能执行检查")
-        deck=self.deck_view(task_id)["deck"]; all_ids=list(deck["metadata"]["page_hashes"]); affected_slide_ids=affected_slide_ids or []
+        # Obtain the Gateway result before advancing deck -> review.  Public
+        # callers therefore observe the exact pre-call snapshot on ambiguity.
+        deck=self.deck_view(task_id)["deck"]
+        if not deck: raise ConflictError("尚未生成全稿")
+        all_ids=list(deck["metadata"]["page_hashes"]); affected_slide_ids=affected_slide_ids or []
         if any(x not in all_ids for x in affected_slide_ids): raise ValidationError("增量检查页面不存在")
         scope="incremental" if affected_slide_ids else "full"; affected=affected_slide_ids or all_ids
-        report=self._inspect_once(task_id,scope,affected,0); rounds=0
+        if _prepared_raw is None:
+            outline=json.loads(self.version(task_id,deck["outline_hash"]))["markdown"]
+            _prepared_raw=self.inspector.inspect(outline,deck["html"])
+        if state.stage==state.stage.DECK: self.command(task_id,f"to-review-{self._current_version(task_id,'deck')[:12]}","advance","system"); state=TaskState.parse(self.get(task_id))
+        if state.stage!=state.stage.REVIEW: raise ConflictError("当前阶段不能执行检查")
+        report=self._inspect_once(task_id,scope,affected,0,_prepared_raw); rounds=0
         if state.mode=="auto":
             while not report["passed"] and rounds<max_rounds:
                 rounds+=1; self._auto_fix(task_id,report,rounds); report=self._inspect_once(task_id,"incremental",affected,rounds)
@@ -549,10 +567,14 @@ class TaskService:
         if action not in {"agent_fix","manual","waive","defer"}: raise ValidationError("问题处置动作无效")
         if action in {"manual","waive"} and actor!="user": raise ValidationError("手工处理和豁免必须由用户执行")
         if action=="waive" and (not isinstance(rationale,str) or not rationale.strip()): raise ValidationError("豁免必须填写依据")
+        # Build and validate the repair candidate before publishing the audit
+        # disposition.  GatewayUnknownResult must not assert that a fix was
+        # performed when no repaired deck exists.
+        prepared_fix=self._prepare_auto_fix(task_id,report,1) if action=="agent_fix" else None
         created=utcnow(); payload={"task_id":task_id,"issue_id":issue_id,"action":action,"actor":actor,"target_deck_hash":report["deck_hash"],"rationale":(rationale or "按当前处置执行").strip(),"created_at":created,"schema_version":"1.0"}
         model=IssueDisposition.parse({"disposition_id":f"disposition-{digest(canonical(payload))[:16]}",**payload}); h=self.store.put_version(task_id,"issue-disposition",canonical(model.to_dict()),{"report_hash":report["hash"],"severity":issue["severity"],"code":issue["code"],"sequence":len(self.versions(task_id,"issue-disposition"))+1})
         if action=="agent_fix":
-            self._auto_fix(task_id,report,1)
+            self._auto_fix(task_id,report,1,prepared_fix)
         return {**self.inspection_view(task_id),"disposition_hash":h}
 
     def dispose_issues(self,task_id,issue_ids,action,rationale):
