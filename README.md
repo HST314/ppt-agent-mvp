@@ -4,7 +4,7 @@ PPT Agent MVP 的需求、实现决策与验收追踪仓库。
 
 P8 后端发布边界已实现：全写动作生命周期保护、版本 hash 审批、真实 Builder/分阶段 Skill、生成后自动独立检查、有界修复、请求与资源大小限制及结构化错误日志。产品行为以 `docs/product-contract.md` 为准。
 
-## 本地启动
+## 快速开始（默认 fake、可离线）
 
 环境要求：Python 3.10+。首次运行测试前安装声明依赖：`python3 -m pip install -r requirements.txt`。
 
@@ -14,7 +14,15 @@ python3 scripts/start.py --data .ppt-agent-data --host 127.0.0.1 --port 8000
 
 另一个终端访问 `http://127.0.0.1:8000/healthz`，应得到含 `"stage": "P8"`、`"status": "ok"` 和 `"runtime_ready": true` 的 JSON。
 
-默认使用 deterministic fake，保证 CI 离线稳定。真实能力使用显式环境配置启用：`PPT_AGENT_GATEWAY_MODE=http`、`PPT_AGENT_MODEL_ENDPOINT`、`PPT_AGENT_MODEL`、`PPT_AGENT_SKILL_DIR`，凭证仅通过 `PPT_AGENT_API_KEY` 注入，可选 `PPT_AGENT_MODEL_TIMEOUT`。模型端点须为 HTTPS（本机回环调试除外），生成与独立检查请求使用不同 purpose；连接结果未知时运行内核不会盲目重试。
+默认配置 `config/ppt-agent.yaml` 使用 deterministic fake：不需要 `.env`、网络或密钥。启动后从任务页依次完成资料导入、澄清、叙事确认、大纲确认、样品确认、全稿、独立检查和最终交付确认。内置 Skill 位于 `ppt_agent/builtin_skills/guizang-ppt/`，运行时只按需读取 `SKILL.md` 与 lock 清单中的 references/assets。
+
+真实 Responses API 模式请复制配置文件，把 `gateway.mode` 改为 `agent`，并按 YAML 中 `api_key_env`、`base_url_env` 指定的变量名在 `.env` 中提供生成与检查配置；推荐两者使用独立模型配置。然后运行：
+
+```bash
+PPT_AGENT_CONFIG=config/ppt-agent.yaml python3 scripts/start.py --data .ppt-agent-data
+```
+
+Base URL 必须为 HTTPS（回环调试除外），请求不携带图片或联网工具。连接结果未知时不会自动重试；先核对供应商请求记录，再由用户决定下一步。完整配置、操作和故障恢复见 `docs/runbook.md`。
 
 ## P0 校验
 
@@ -79,3 +87,14 @@ python3 scripts/verify_browser_gate.py
 ## P7 交付与恢复
 
 `POST /v1/tasks/{task_id}/delivery/confirm` 必须由用户提交当前候选 `deck_hash`，检查报告有效且阻断问题全部解决或豁免后才会完成任务。交付目录包含 HTML、两类 Markdown、冻结资源清单、授权资源、结果摘要和逐文件 hash manifest，并以目录级原子发布避免半交付。`POST /delivery/derive` 从历史交付派生新候选，旧交付保持不可变，新候选必须重新检查和确认。`GET /summary` 输出不含对话或推理的编排摘要；通用 actions 接口提供 pause/resume/cancel/fail/retry，非活动状态不会启动新的生成或检查动作。
+
+## 阶段 D 离线交付
+
+最终确认后，交付目录位于 `<data>/tasks/<task-id>/deliveries/<delivery-id>/`。下列命令先校验 manifest、HTML 和外部 URL，再生成内容与时间戳均确定的 ZIP；相同交付重复打包应得到相同 SHA-256：
+
+```bash
+python3 scripts/build_offline_bundle.py .ppt-agent-data/tasks/<task-id>/deliveries/<delivery-id>
+python3 scripts/verify_offline_delivery.py .ppt-agent-data/tasks/<task-id>/deliveries/<delivery-id>.zip
+```
+
+将 ZIP 搬到断网机器后再次执行校验，随后直接用浏览器打开解压后的 `deck.html`。ZIP 的 SHA-256 会由打包命令输出，适合作为传输校验值；ZIP 内 `manifest.json` 覆盖全部实际交付内容文件。
