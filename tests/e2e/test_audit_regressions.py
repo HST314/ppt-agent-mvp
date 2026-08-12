@@ -3,6 +3,9 @@ from ppt_agent.errors import ConflictError
 from ppt_agent.fsm import TaskState
 from ppt_agent.p4 import render
 from ppt_agent.service import TaskService
+from ppt_agent.store import WorkspaceStore
+
+import tempfile
 
 
 class ProbeBuilder:
@@ -13,6 +16,35 @@ class ProbeBuilder:
 
 
 class AuditRegressionTests(SampleJourney):
+    def test_latest_disposition_overrides_older_waiver(self):
+        self.app.service.generate_sample("journey"); self.app.service.confirm_sample("journey")
+        self.app.service.generate_deck("journey"); self.app.service.run_inspection("journey",0)
+        waived=self.app.service.dispose_issue("journey","fake-overflow","waive","accepted")
+        self.assertTrue(waived["delivery_allowed"])
+        deferred=self.app.service.dispose_issue("journey","fake-overflow","defer","")
+        self.assertFalse(deferred["delivery_allowed"])
+
+    def test_completed_state_has_no_waiting_action(self):
+        self.app.service.generate_sample("journey"); self.app.service.confirm_sample("journey")
+        deck=self.app.service.generate_deck("journey")["deck"]
+        self.app.service.run_inspection("journey",0)
+        self.app.service.dispose_issue("journey","fake-overflow","waive","accepted")
+        state=self.app.service.confirm_delivery("journey",deck["hash"])["state"]
+        self.assertEqual(state["status"],"completed")
+        self.assertIsNone(state["waiting_reason"]); self.assertIsNone(state["required_action"])
+        summary=self.app.service.status_summary("journey")
+        self.assertIsNone(summary["current_action"]); self.assertEqual(summary["human_actions"],[])
+
+    def test_rebuilt_input_and_summary_use_explicit_current_versions(self):
+        with tempfile.TemporaryDirectory() as root:
+            service=TaskService(WorkspaceStore(root)); service.create("current")
+            first=service.import_input("current",{"goal":"old","audience":"a","topic":"t"})
+            second=service.import_input("current",{"goal":"new","audience":"a","topic":"t"},rebuild=True)
+            self.assertEqual(service.input_view("current")["snapshot_hash"],second["snapshot_hash"])
+            self.assertEqual(service.input_view("current")["task_card"]["goal"],"new")
+            self.assertEqual(service.status_summary("current")["latest_artifacts"]["input-snapshot"],second["snapshot_hash"])
+            self.assertNotEqual(first["snapshot_hash"],second["snapshot_hash"])
+
     def test_cancelled_rejects_every_planning_write(self):
         self.app.service.command("journey", "audit-cancel", "cancel", "user")
         for action in (

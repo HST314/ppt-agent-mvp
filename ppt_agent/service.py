@@ -90,7 +90,8 @@ class TaskService:
     def input_view(self,task_id):
         snapshots=self.versions(task_id,"input-snapshot")
         if not snapshots: return {"state":self.get(task_id),"snapshot":None}
-        item=snapshots[-1]; snapshot=json.loads(self.version(task_id,item["hash"])); meta=item["metadata"]
+        current=next((e["result"].get("snapshot_hash") for e in reversed(self.events(task_id)) if e["action"] in {"import_input","rebuild_input"}),None)
+        item=next(v for v in snapshots if v["hash"]==current); snapshot=json.loads(self.version(task_id,item["hash"])); meta=item["metadata"]
         ch=meta["clarification_hash"]
         # The frozen input points at the initial set; answers are append-only
         # clarification versions, so select the newest committed answer event.
@@ -464,8 +465,10 @@ class TaskService:
         dispositions=[]
         for record in self.versions(task_id,"issue-disposition"):
             value=json.loads(self.version(task_id,record["hash"]))
-            dispositions.append({**value,"hash":record["hash"],"stale":not deck or value["target_deck_hash"]!=deck["hash"]})
-        active={d["issue_id"]:d for d in dispositions if not d["stale"]}
+            dispositions.append({**value,"hash":record["hash"],"metadata":record["metadata"],"stale":not deck or value["target_deck_hash"]!=deck["hash"]})
+        active={}
+        for disposition in sorted((d for d in dispositions if not d["stale"]),key=lambda d:(d["metadata"].get("sequence",0),d["created_at"],d["hash"])):
+            active[disposition["issue_id"]]=disposition
         unresolved=[] if not current or current["stale"] else [i for i in current["issues"] if active.get(i["issue_id"],{}).get("action") not in {"resolve","manual","waive"}]
         blockers=[i for i in unresolved if i["severity"]=="blocker"]
         return {"state":self.get(task_id),"deck":deck,"report":current,"reports":reports,"dispositions":dispositions,"unresolved":unresolved,"blocking_issues":blockers,"delivery_allowed":bool(current and not current["stale"] and not blockers),"waiting_reason":self.get(task_id).get("waiting_reason")}
@@ -547,7 +550,7 @@ class TaskService:
         if action in {"manual","waive"} and actor!="user": raise ValidationError("手工处理和豁免必须由用户执行")
         if action=="waive" and (not isinstance(rationale,str) or not rationale.strip()): raise ValidationError("豁免必须填写依据")
         created=utcnow(); payload={"task_id":task_id,"issue_id":issue_id,"action":action,"actor":actor,"target_deck_hash":report["deck_hash"],"rationale":(rationale or "按当前处置执行").strip(),"created_at":created,"schema_version":"1.0"}
-        model=IssueDisposition.parse({"disposition_id":f"disposition-{digest(canonical(payload))[:16]}",**payload}); h=self.store.put_version(task_id,"issue-disposition",canonical(model.to_dict()),{"report_hash":report["hash"],"severity":issue["severity"],"code":issue["code"]})
+        model=IssueDisposition.parse({"disposition_id":f"disposition-{digest(canonical(payload))[:16]}",**payload}); h=self.store.put_version(task_id,"issue-disposition",canonical(model.to_dict()),{"report_hash":report["hash"],"severity":issue["severity"],"code":issue["code"],"sequence":len(self.versions(task_id,"issue-disposition"))+1})
         if action=="agent_fix":
             self._auto_fix(task_id,report,1)
         return {**self.inspection_view(task_id),"disposition_hash":h}
@@ -582,7 +585,12 @@ class TaskService:
         state=self.get(task_id); latest={}
         for kind in ("input-snapshot","narrative","outline","sample","deck","inspection","delivery"):
             records=self.versions(task_id,kind)
-            if records: latest[kind]=records[-1]["hash"]
+            if not records: continue
+            if kind in {"narrative","outline","sample","deck"}: current=self._current_version(task_id,kind)
+            elif kind=="input-snapshot": current=next((e["result"].get("snapshot_hash") for e in reversed(self.events(task_id)) if e["action"] in {"import_input","rebuild_input"}),None)
+            elif kind=="inspection": current=next((e["result"].get("report_hash") for e in reversed(self.events(task_id)) if e["action"]=="inspection_complete"),None)
+            else: current=records[-1]["hash"]
+            if current: latest[kind]=current
         progress={"created":5,"clarification":15,"narrative":30,"outline":45,"sample":60,"deck":72,"review":85,"delivery":95}.get(state["stage"],0)
         if state["status"]=="completed": progress=100
         return {"task_id":task_id,"stage":state["stage"],"progress":progress,"status":state["status"],"current_action":state.get("required_action"),"waiting_reason":state.get("waiting_reason"),"human_actions":[state["required_action"]] if state.get("required_action") else [],"latest_artifacts":latest,"error_summary":"task_failed" if state["status"]=="failed" else None}
@@ -635,30 +643,3 @@ class TaskService:
         self.store.commit(task_id,reopened.to_dict(),event)
         self._record_deck(task_id,meta["html"],target["outline_hash"],{"parent":delivered["deck_hash"],"derived_from_delivery":delivery_hash,"summary":"从已交付版本派生候选","scope":"global","affected":[],"outline_consistent":True,"global_rules":meta.get("global_rules",[]),"local_exceptions":meta.get("local_exceptions",{})},"delivery_derive","user")
         return self.modify_deck(task_id,prompt,scope="page" if slide_ids else "global",slide_ids=slide_ids or [])
-    def run_fake_pipeline(self,task_id):
-        self._require_actionable(task_id)
-        state=self.get(task_id)
-        if state["stage"] != "created": raise ConflictError("fake 全链路只能从空任务启动")
-        # The fake is an executable acceptance path, not a preview-only shortcut.
-        for number in range(1,5): self.command(task_id,f"fake-{number}","advance")
-        self.command(task_id,"fake-sample-confirm","confirm_sample","user")
-        self.command(task_id,"fake-to-deck","advance")
-        outline=self.generator.generate("outline",{"task_id":task_id},skill=self.skills.load("outline")["version"])["text"]
-        outline_hash=self.store.put_version(task_id,"outline",outline.encode(),{"generator":"fake"})
-        html=self.builder.build(outline); deck_hash=self.store.put_version(task_id,"deck",html.encode(),{"outline_hash":outline_hash})
-        inspection=self.inspector.inspect(outline,html)
-        report=InspectionReport.parse({"report_id":"fake-report","task_id":task_id,"deck_hash":deck_hash,"issues":inspection["issues"],"passed":inspection["passed"],"created_at":utcnow(),"schema_version":"1.0"})
-        report_hash=self.store.put_version(task_id,"inspection",json.dumps(report.to_dict(),sort_keys=True).encode(),{"deck_hash":deck_hash})
-        self.command(task_id,"fake-to-review","advance")
-        dispositions=[]
-        for issue in report.issues:
-            disposition=IssueDisposition.parse({"disposition_id":f"disposition-{issue.issue_id}","task_id":task_id,"issue_id":issue.issue_id,"action":"resolve","actor":"user","created_at":utcnow(),"target_deck_hash":deck_hash,"rationale":"fake 全链路处置","schema_version":"1.0"})
-            raw=json.dumps(disposition.to_dict(),sort_keys=True).encode()
-            dispositions.append(self.store.put_version(task_id,"issue-disposition",raw,{"issue_id":issue.issue_id}))
-        self.command(task_id,"fake-blockers","resolve_blockers","user",{"disposition_hashes":dispositions})
-        self.command(task_id,"fake-to-delivery","advance")
-        manifest=DeliveryManifest.parse({"delivery_id":"fake-delivery","task_id":task_id,"deck_hash":deck_hash,"files":["deck.html"],"confirmed_by":"user","confirmed_at":utcnow(),"schema_version":"1.0"})
-        delivery=json.dumps(manifest.to_dict(),sort_keys=True).encode()
-        delivery_hash=self.store.put_version(task_id,"delivery",delivery,{"deck_hash":deck_hash})
-        final=self.command(task_id,"fake-delivery-confirm","confirm_delivery","user")
-        return {"outline_hash":outline_hash,"deck_hash":deck_hash,"report_hash":report_hash,"disposition_hashes":dispositions,"delivery_hash":delivery_hash,"passed":inspection["passed"],"preview":html,"state":final}

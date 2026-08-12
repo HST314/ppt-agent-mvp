@@ -79,7 +79,12 @@ class WorkspaceStore:
         base=self._task(task_id)/"versions"
         if not base.exists(): raise NotFoundError("任务不存在")
         files=(base/kind).glob("*.json") if kind else base.glob("*/*.json")
-        return [{"kind":p.parent.name,"hash":p.stem,"metadata":json.loads(p.read_text())} for p in sorted(files)]
+        records=[{"kind":p.parent.name,"hash":p.stem,"metadata":json.loads(p.read_text())} for p in files]
+        def order(record):
+            try: artifact=json.loads(self.artifact(task_id,record["hash"]))
+            except (json.JSONDecodeError,UnicodeDecodeError): artifact={}
+            return (artifact.get("version",record["metadata"].get("v",0)),artifact.get("created_at",artifact.get("confirmed_at","")),record["hash"])
+        return sorted(records,key=order)
     def artifact(self,task_id,digest):
         if not HASH.fullmatch(digest): raise ValidationError("hash 格式无效")
         p=self._task(task_id)/"artifacts"/digest

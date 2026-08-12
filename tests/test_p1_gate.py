@@ -113,10 +113,11 @@ class ApiIntegrationTests(unittest.TestCase):
   raw=json.dumps(body or {}).encode(); status=[]
   out=b"".join(app({"REQUEST_METHOD":method,"PATH_INFO":path,"CONTENT_LENGTH":str(len(raw)),"wsgi.input":io.BytesIO(raw)},lambda s,h:status.append(s)))
   return int(status[0][:3]),json.loads(out)
- def test_openapi_and_fake_artifact_path(self):
+ def test_openapi_and_preview_bypass_is_absent(self):
   import yaml
   text=Path("docs/openapi.yaml").read_text(); spec=yaml.safe_load(text)
-  for token in ("requestBody:","Error:","/versions:","/versions/compare:","/preview:","/issues/{issue_id}/disposition:"): self.assertIn(token,text)
+  for token in ("requestBody:","Error:","/versions:","/versions/compare:","/issues/{issue_id}/disposition:"): self.assertIn(token,text)
+  self.assertNotIn("/preview:",text)
   for path,item in spec["paths"].items():
    for operation in item.values():
     responses=operation["responses"]; success=next(v for k,v in responses.items() if str(k).startswith("2"))
@@ -125,14 +126,8 @@ class ApiIntegrationTests(unittest.TestCase):
     if path != "/healthz": self.assertTrue(any(v.get("$ref")=="#/components/responses/Error" for k,v in responses.items() if not str(k).startswith("2")),path)
   with tempfile.TemporaryDirectory() as p:
    app=App(TaskService(WorkspaceStore(p))); self.assertEqual(self.call(app,"POST","/v1/tasks",{"task_id":"t","mode":"auto"})[0],201)
-   code,result=self.call(app,"POST","/v1/tasks/t/preview"); self.assertEqual(code,200); self.assertFalse(result["passed"])
-   self.assertEqual(result["state"]["status"],"completed")
-   code,versions=self.call(app,"GET","/v1/tasks/t/versions"); self.assertEqual(code,200); self.assertEqual({v["kind"] for v in versions["versions"]},{"outline","deck","inspection","issue-disposition","delivery"})
-   self.assertEqual(len(result["disposition_hashes"]),1)
-   IssueDisposition.parse(json.loads(app.service.version("t",result["disposition_hashes"][0])))
-   delivery=DeliveryManifest.parse(json.loads(app.service.version("t",result["delivery_hash"])))
-   self.assertEqual(delivery.deck_hash,result["deck_hash"])
-   actions=[e["action"] for e in app.service.events("t")]
-   for action in ("confirm_sample","resolve_blockers","confirm_delivery"): self.assertIn(action,actions)
+   code,result=self.call(app,"POST","/v1/tasks/t/preview"); self.assertEqual(code,404)
+   self.assertEqual(app.service.get("t")["status"],"ready")
+   self.assertEqual(app.service.versions("t"),[])
 
 if __name__=="__main__": unittest.main()

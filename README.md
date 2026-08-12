@@ -6,7 +6,7 @@ P8 后端发布边界已实现：全写动作生命周期保护、版本 hash �
 
 ## 本地启动
 
-环境要求：Python 3.10+。无需安装第三方依赖。
+环境要求：Python 3.10+。首次运行测试前安装声明依赖：`python3 -m pip install -r requirements.txt`。
 
 ```bash
 python3 scripts/start.py --data .ppt-agent-data --host 127.0.0.1 --port 8000
