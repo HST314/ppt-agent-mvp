@@ -1,5 +1,5 @@
 from e2e.support import SampleJourney
-from ppt_agent.errors import ConflictError
+from ppt_agent.errors import ConflictError, GatewayUnknownResult
 from ppt_agent.fsm import TaskState
 from ppt_agent.p4 import render
 from ppt_agent.service import TaskService
@@ -13,6 +13,14 @@ class ProbeBuilder:
     def build(self, outline, **context):
         self.calls.append(context)
         return render(outline, context["slide_ids"], context.get("rules", []), context.get("exceptions", {}), context.get("assets", {}))
+
+class UnknownOnRecheck:
+    def __init__(self): self.calls=0
+    def inspect(self,outline,html):
+        self.calls+=1
+        if self.calls==1:
+            return {"passed":False,"issues":[{"issue_id":"x","severity":"warning","slide_id":"slide-1","suggestion":"fix"}]}
+        raise GatewayUnknownResult("repair recheck unknown")
 
 
 class AuditRegressionTests(SampleJourney):
@@ -82,3 +90,20 @@ class AuditRegressionTests(SampleJourney):
         self.assertNotEqual(before["html"], fixed["html"])
         self.app.service._inspect_once("journey", "incremental", list(fixed["metadata"]["page_hashes"]), 1)
         self.assertEqual(self.app.service.inspector.calls[-1]["html"], fixed["html"])
+
+    def test_auto_recheck_unknown_rolls_back_deck_report_state_and_events(self):
+        self.app.service.generate_sample("journey"); self.app.service.confirm_sample("journey")
+        self.app.service.generate_deck("journey")
+        self.app.service.switch_inspection_mode("journey","auto")
+        self.app.service.inspector=UnknownOnRecheck()
+        before={
+            "state":self.app.service.get("journey"),
+            "deck":[v["hash"] for v in self.app.service.versions("journey","deck")],
+            "reports":[v["hash"] for v in self.app.service.versions("journey","inspection")],
+            "events":self.app.service.events("journey"),
+        }
+        with self.assertRaises(GatewayUnknownResult): self.app.service.run_inspection("journey",2)
+        self.assertEqual(self.app.service.get("journey"),before["state"])
+        self.assertEqual([v["hash"] for v in self.app.service.versions("journey","deck")],before["deck"])
+        self.assertEqual([v["hash"] for v in self.app.service.versions("journey","inspection")],before["reports"])
+        self.assertEqual(self.app.service.events("journey"),before["events"])

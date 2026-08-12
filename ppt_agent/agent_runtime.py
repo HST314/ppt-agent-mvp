@@ -11,6 +11,7 @@ from .skill_runtime import SkillRuntime
 
 
 STAGES = {"narrative", "outline", "sample", "deck", "inspection"}
+DATA_IMAGE = "data:image/"
 STAGE_PROMPTS = {
     "narrative": "根据任务卡生成叙事结构 Markdown；不要生成逐页 HTML。",
     "outline": "根据已确认叙事生成逐页大纲 Markdown；保持页面标识稳定。",
@@ -69,8 +70,10 @@ class AgentRuntime:
         response_schema = STAGE_OUTPUT_SCHEMAS[stage]
         if not isinstance(payload, dict):
             raise ValidationError("Agent 输入无效")
+        payload = self._text_only(payload)
         started, audit, tool_count = self.clock(), [], 0
-        audit.append({"event": "run", "stage": stage, "skill": self.skill.skill_name, "skill_version": self.skill.skill_version, "lock_sha256": hashlib.sha256(json.dumps(self.skill.manifest, sort_keys=True).encode()).hexdigest()})
+        input_json=json.dumps(payload,ensure_ascii=False,sort_keys=True,separators=(",",":"))
+        audit.append({"event": "run", "stage": stage, "skill": self.skill.skill_name, "skill_version": self.skill.skill_version, "lock_sha256": hashlib.sha256(json.dumps(self.skill.manifest, sort_keys=True).encode()).hexdigest(), "input_sha256": hashlib.sha256(input_json.encode()).hexdigest(), "config_sha256": hashlib.sha256(PRODUCT_OVERRIDE.encode()).hexdigest()})
         def fail(message: str, reason: str, cause=None):
             audit.append({"event": "terminal", "reason": reason, "tool_calls": tool_count})
             self.last_audit = tuple(audit)
@@ -79,7 +82,7 @@ class AgentRuntime:
             if cause is not None:
                 raise error from cause
             raise error
-        conversation: list[Any] = [{"role": "system", "content": f"当前阶段：{stage}\n阶段目标：{STAGE_PROMPTS[stage]}\n{PRODUCT_OVERRIDE}"}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}]
+        conversation: list[Any] = [{"role": "system", "content": f"当前阶段：{stage}\n阶段目标：{STAGE_PROMPTS[stage]}\n{PRODUCT_OVERRIDE}"}, {"role": "user", "content": input_json}]
         for step in range(1, self.max_steps + 1):
             if self.clock() - started >= self.timeout_seconds:
                 fail("Agent 运行超时，未提交阶段产物", "deadline_exceeded")
@@ -130,6 +133,15 @@ class AgentRuntime:
             self.last_audit = tuple(audit)
             return AgentResult(value, self.last_audit, turn.response_id)
         fail("Agent 达到最大步数，未提交阶段产物", "max_steps")
+
+    @classmethod
+    def _text_only(cls, value):
+        """Strip binary image payloads while retaining stable resource references."""
+        if isinstance(value,dict): return {k:cls._text_only(v) for k,v in value.items()}
+        if isinstance(value,list): return [cls._text_only(v) for v in value]
+        if isinstance(value,tuple): return [cls._text_only(v) for v in value]
+        if isinstance(value,str) and value.lstrip().lower().startswith(DATA_IMAGE): return "[image-content-removed]"
+        return value
 
     def _validate_schema(self, value: Any, schema: dict, path: str) -> None:
         """Small strict subset used as a defensive check after provider validation."""

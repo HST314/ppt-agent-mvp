@@ -62,5 +62,19 @@ class StageCIntegrationTests(unittest.TestCase):
         gateway = AgentGateway(ScriptedClient('{"passed":true,"issues":[],"html":"bad"}'), skill=SkillRuntime.builtin())
         with self.assertRaises(GatewayError): gateway.inspect("outline", "<html></html>")
 
+    def test_agent_audit_survives_service_restart_and_records_failures(self):
+        with tempfile.TemporaryDirectory() as root:
+            svc=service(root,ScriptedClient('{"markdown":"# ok"}'))
+            svc.create("task"); svc.import_input("task",{"goal":"g","audience":"a","topic":"t"})
+            svc.generate_narrative("task")
+            first=WorkspaceStore(root).agent_audits()
+            self.assertEqual(first[-1]["events"][-1]["reason"],"success")
+            failing=service(root,RaisingClient(GatewayUnknownResult("unknown")))
+            with self.assertRaises(GatewayUnknownResult): failing.generate_narrative("task")
+            persisted=WorkspaceStore(root).agent_audits()
+            self.assertEqual(len(persisted),len(first)+1)
+            self.assertEqual(persisted[-1]["events"][-1]["reason"],"gateway_unknown_result")
+            self.assertIn("input_sha256",persisted[-1]["events"][0])
+
 
 if __name__ == "__main__": unittest.main()

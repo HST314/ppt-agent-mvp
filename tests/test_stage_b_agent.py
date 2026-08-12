@@ -85,6 +85,18 @@ class StageBAgentTests(unittest.TestCase):
             self.assertIn(denied, system)
         self.assertIn(STAGE_PROMPTS["outline"], system)
 
+    def test_image_content_is_removed_from_every_nested_model_input(self):
+        client = ScriptedClient([ModelTurn('{"html":"<html></html>"}', "r")])
+        result = AgentRuntime(client, SkillRuntime.builtin()).run("deck", {
+            "assets":{"resources://hero.png":"data:image/png;base64,SECRETBYTES"},
+            "items":["ok", " DATA:IMAGE/JPEG;BASE64,MORESECRET"],
+        })
+        serialized=json.dumps(client.inputs,ensure_ascii=False)
+        self.assertEqual(result.value["html"],"<html></html>")
+        self.assertNotIn("SECRETBYTES",serialized); self.assertNotIn("MORESECRET",serialized)
+        self.assertEqual(serialized.count("[image-content-removed]"),2)
+        self.assertEqual(len(result.audit[0]["input_sha256"]),64)
+
     def test_each_stage_has_a_strict_default_output_schema(self):
         self.assertEqual(set(STAGE_PROMPTS), {"narrative", "outline", "sample", "deck", "inspection"})
         for stage, schema in STAGE_OUTPUT_SCHEMAS.items():

@@ -99,13 +99,20 @@ class AgentGateway:
         self.max_steps, self.timeout_seconds = max_steps, timeout_seconds
         self.skill_factory = SkillRuntime.builtin if skill is None else lambda: SkillRuntime(skill.root, max_file_bytes=skill.max_file_bytes, max_total_bytes=skill.max_total_bytes)
         self.runtime = None
+        self.audit_sink = None
+
+    def set_audit_sink(self, sink): self.audit_sink = sink
 
     def _run(self, stage, payload):
         # Read quotas and audit are scoped to one stage invocation.  Reusing a
         # mutable SkillRuntime would let earlier stages consume later budgets.
         self.runtime = AgentRuntime(self.client, self.skill_factory(), max_steps=self.max_steps, timeout_seconds=self.timeout_seconds)
-        result = self.runtime.run(stage, payload)
-        return result.value
+        try:
+            result = self.runtime.run(stage, payload)
+            return result.value
+        finally:
+            if self.audit_sink and self.runtime.last_audit:
+                self.audit_sink({"stage":stage,"model":self.model,"events":list(self.runtime.last_audit)})
 
     def generate(self, action, payload, *, skill=""):
         if action not in {"narrative", "outline"}:

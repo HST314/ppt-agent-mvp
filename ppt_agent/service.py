@@ -20,6 +20,8 @@ def fingerprint(value): return hashlib.sha256(json.dumps(value,sort_keys=True,se
 class TaskService:
     def __init__(self,store,generator=None,inspector=None,skills=None,builder=None):
         self.store=store; self.generator=generator or FakeGenerationGateway(); self.inspector=inspector or FakeInspectionGateway(); self.skills=skills or FakeSkillLoader(); self.builder=builder or FakeHtmlBuilder()
+        for gateway in {id(x):x for x in (self.generator,self.inspector,self.builder)}.values():
+            if hasattr(gateway,"set_audit_sink"): gateway.set_audit_sink(self.store.append_agent_audit)
     def create(self,task_id,mode="manual"):
         if mode not in {"manual","auto"}: raise ValidationError("mode 只能是 manual 或 auto")
         s=TaskState(task_id=task_id,mode=mode); self.store.create(task_id,s.to_dict()); return s.to_dict()
@@ -538,17 +540,18 @@ class TaskService:
         if _prepared_raw is None:
             outline=json.loads(self.version(task_id,deck["outline_hash"]))["markdown"]
             _prepared_raw=self.inspector.inspect(outline,deck["html"])
-        if state.stage==state.stage.DECK: self.command(task_id,f"to-review-{self._current_version(task_id,'deck')[:12]}","advance","system"); state=TaskState.parse(self.get(task_id))
-        if state.stage!=state.stage.REVIEW: raise ConflictError("当前阶段不能执行检查")
-        report=self._inspect_once(task_id,scope,affected,0,_prepared_raw); rounds=0
-        if state.mode=="auto":
-            while not report["passed"] and rounds<max_rounds:
-                rounds+=1; self._auto_fix(task_id,report,rounds); report=self._inspect_once(task_id,"incremental",affected,rounds)
-        waiting=not report["passed"]
-        current=TaskState.parse(self.get(task_id))
-        new=current.__class__(**{**current.__dict__,"status":current.status.WAITING_FOR_USER if waiting or state.mode=="manual" else current.status.READY,"waiting_reason":"inspection_round_limit" if waiting and state.mode=="auto" else "manual_review" if state.mode=="manual" else None,"required_action":"review_issues" if waiting or state.mode=="manual" else None,"revision":current.revision+1})
-        event={"event_id":digest(f"{task_id}:{report['hash']}:inspection".encode())[:24],"command_id":f"inspection-{report['hash'][:16]}","action":"inspection_complete","actor":"system","request_hash":report["hash"],"at":utcnow(),"from":current.to_dict(),"to":new.to_dict(),"result":{"report_hash":report["hash"],"rounds":rounds,"passed":report["passed"],"mode":state.mode}}
-        self.store.commit(task_id,new.to_dict(),event)
+        with self.store.transaction(task_id):
+            if state.stage==state.stage.DECK: self.command(task_id,f"to-review-{self._current_version(task_id,'deck')[:12]}","advance","system"); state=TaskState.parse(self.get(task_id))
+            if state.stage!=state.stage.REVIEW: raise ConflictError("当前阶段不能执行检查")
+            report=self._inspect_once(task_id,scope,affected,0,_prepared_raw); rounds=0
+            if state.mode=="auto":
+                while not report["passed"] and rounds<max_rounds:
+                    rounds+=1; self._auto_fix(task_id,report,rounds); report=self._inspect_once(task_id,"incremental",affected,rounds)
+            waiting=not report["passed"]
+            current=TaskState.parse(self.get(task_id))
+            new=current.__class__(**{**current.__dict__,"status":current.status.WAITING_FOR_USER if waiting or state.mode=="manual" else current.status.READY,"waiting_reason":"inspection_round_limit" if waiting and state.mode=="auto" else "manual_review" if state.mode=="manual" else None,"required_action":"review_issues" if waiting or state.mode=="manual" else None,"revision":current.revision+1})
+            event={"event_id":digest(f"{task_id}:{report['hash']}:inspection".encode())[:24],"command_id":f"inspection-{report['hash'][:16]}","action":"inspection_complete","actor":"system","request_hash":report["hash"],"at":utcnow(),"from":current.to_dict(),"to":new.to_dict(),"result":{"report_hash":report["hash"],"rounds":rounds,"passed":report["passed"],"mode":state.mode}}
+            self.store.commit(task_id,new.to_dict(),event)
         logging.info(json.dumps({"event":"action_metric","action":"inspection_run","task_id":task_id,"duration_ms":round((time.monotonic()-metric_started)*1000,2),"failed":False,"repair_rounds":rounds,"passed":report["passed"]}))
         return {**self.inspection_view(task_id),"rounds":rounds}
 

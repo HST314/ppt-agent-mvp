@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib, json, os, re, shutil, threading, uuid
+from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -17,6 +18,23 @@ class WorkspaceStore:
         return p
     def lock(self, task_id):
         with self._guard: return self._locks.setdefault(task_id,threading.RLock())
+    @contextmanager
+    def transaction(self, task_id):
+        """Rollback every task-local write when a multi-artifact action fails."""
+        with self.lock(task_id):
+            task=self._task(task_id)
+            if not task.is_dir(): raise NotFoundError("任务不存在")
+            backup=task.with_name(f".{task.name}.{uuid.uuid4().hex}.transaction")
+            shutil.copytree(task,backup)
+            try:
+                yield
+            except BaseException:
+                failed=task.with_name(f".{task.name}.{uuid.uuid4().hex}.failed")
+                os.replace(task,failed); os.replace(backup,task)
+                shutil.rmtree(failed,ignore_errors=True)
+                raise
+            else:
+                shutil.rmtree(backup,ignore_errors=True)
     @staticmethod
     def digest(data: bytes): return hashlib.sha256(data).hexdigest()
     def atomic_json(self,path,data):
@@ -138,3 +156,13 @@ class WorkspaceStore:
         p=self._task(task_id)
         if not (p/"events.jsonl").exists(): raise NotFoundError("任务不存在")
         return self._read_events(p)
+    def append_agent_audit(self, record):
+        """Persist a secret-free Agent run record independently of process life."""
+        path=self.root/"agent-audit.jsonl"
+        with self._guard:
+            with open(path,"a",encoding="utf-8") as f:
+                f.write(json.dumps(record,ensure_ascii=False,separators=(",",":"))+"\n")
+                f.flush(); os.fsync(f.fileno())
+    def agent_audits(self):
+        path=self.root/"agent-audit.jsonl"
+        return [] if not path.exists() else [json.loads(line) for line in path.read_text().splitlines() if line]
