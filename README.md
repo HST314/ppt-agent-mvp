@@ -98,3 +98,4 @@ python3 scripts/verify_offline_delivery.py .ppt-agent-data/tasks/<task-id>/deliv
 ```
 
 将 ZIP 搬到断网机器后再次执行校验，随后直接用浏览器打开解压后的 `deck.html`。ZIP 的 SHA-256 会由打包命令输出，适合作为传输校验值；ZIP 内 `manifest.json` 覆盖全部实际交付内容文件。
+`--output` 必须位于交付目录之外；打包器会在写入前拒绝污染交付目录的输出位置。ZIP 校验同时拒绝 POSIX/Windows 路径穿越、绝对路径、盘符、空路径段、重复条目及非普通文件类型。

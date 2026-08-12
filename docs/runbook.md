@@ -35,7 +35,7 @@ python3 scripts/build_offline_bundle.py .ppt-agent-data/tasks/<task-id>/deliveri
 python3 scripts/verify_offline_delivery.py .ppt-agent-data/tasks/<task-id>/deliveries/<delivery-id>.zip
 ```
 
-最后两条命令会拒绝 hash 不匹配、缺失/多余文件、无效 HTML、外部 HTTP(S)/协议相对 URL 和危险 ZIP 路径。把 ZIP 复制到断网临时目录，重新校验并解压，直接打开 `deck.html`，人工确认翻页/滚动与文字、清单内图片均正常。不要通过本地 HTTP 服务掩盖跨目录引用问题。
+最后两条命令会拒绝 hash 不匹配、缺失/多余文件、无效 HTML、外部 HTTP(S)/协议相对 URL，以及按 POSIX/Windows 任一语义危险、重复或非普通文件类型的 ZIP 条目。ZIP 输出必须位于交付目录外，非法输出位置会在任何写入前被拒绝。把 ZIP 复制到断网临时目录，重新校验并解压，直接打开 `deck.html`，人工确认翻页/滚动与文字、清单内图片均正常。不要通过本地 HTTP 服务掩盖跨目录引用问题。
 
 ## 故障排查
 

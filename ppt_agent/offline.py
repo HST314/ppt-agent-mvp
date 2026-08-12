@@ -3,8 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import stat
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 
 REMOTE_URL = re.compile(r"(?:https?:)?//[^\s\"'<>]+", re.I)
@@ -62,6 +63,8 @@ def verify_delivery(root: Path) -> dict[str, str]:
 def build_zip(root: Path, output: Path) -> str:
     """Create a byte-stable ZIP after verifying the immutable delivery directory."""
     root, output = root.resolve(), output.resolve()
+    if output == root or root in output.parents:
+        raise ValueError("output ZIP must be outside the delivery directory")
     verify_delivery(root)
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(f".{output.name}.tmp")
@@ -77,3 +80,33 @@ def build_zip(root: Path, output: Path) -> str:
     finally:
         temporary.unlink(missing_ok=True)
     return sha256(output)
+
+
+def validate_zip_members(archive: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
+    """Reject members that are ambiguous or unsafe on POSIX or Windows."""
+    members = archive.infolist()
+    seen: set[str] = set()
+    for member in members:
+        name = member.filename
+        windows = PureWindowsPath(name)
+        posix = PurePosixPath(name)
+        normalized = name.replace("\\", "/")
+        parts = normalized.split("/")
+        if (
+            not name
+            or name.startswith(("/", "\\"))
+            or posix.is_absolute()
+            or windows.is_absolute()
+            or windows.drive
+            or any(part in {"", ".", ".."} for part in parts)
+        ):
+            raise ValueError(f"ZIP contains an unsafe path: {name!r}")
+        if normalized in seen:
+            raise ValueError(f"ZIP contains a duplicate member: {name!r}")
+        seen.add(normalized)
+
+        unix_mode = member.external_attr >> 16
+        file_type = stat.S_IFMT(unix_mode)
+        if member.is_dir() or (file_type and file_type != stat.S_IFREG):
+            raise ValueError(f"ZIP contains a non-regular member: {name!r}")
+    return members
