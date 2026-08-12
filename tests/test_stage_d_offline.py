@@ -39,6 +39,13 @@ class OfflineDeliveryTests(unittest.TestCase):
         manifest = {"files": {name: hashlib.sha256(content).hexdigest() for name, content in files.items()}}
         (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
 
+    def refresh_manifest(self, root: Path):
+        files = {
+            path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in root.rglob("*") if path.is_file() and path.name != "manifest.json"
+        }
+        (root / "manifest.json").write_text(json.dumps({"files": files}), encoding="utf-8")
+
     def test_zip_is_deterministic_and_verifiable_after_move(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "delivery"; root.mkdir(); self.fixture(root)
@@ -66,6 +73,26 @@ class OfflineDeliveryTests(unittest.TestCase):
             findings = external_urls(root)
             self.assertIn("app.js", findings)
             self.assertIn("index.html", findings)
+
+    def test_embedded_html_runtime_urls_block_all_delivery_entrypoints(self):
+        cases = {
+            "style element": '<style>.hero{background:url("https://style.example/hero.png")}</style>',
+            "style attribute": '<main style="background:url(https://attribute.example/hero.png)">x</main>',
+            "iframe srcdoc": '<iframe srcdoc="&lt;img src=&quot;https://srcdoc.example/hero.png&quot;&gt;"></iframe>',
+        }
+        for label, embedded in cases.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "delivery"; root.mkdir(); self.fixture(root)
+                (root / "deck.html").write_text(f"<!doctype html><html><body>{embedded}</body></html>", encoding="utf-8")
+                self.refresh_manifest(root)
+                findings = external_urls(root)
+                self.assertIn("deck.html", findings)
+                self.assertEqual(len(findings["deck.html"]), 1)
+                with self.assertRaisesRegex(ValueError, "external URLs"):
+                    verify_delivery(root)
+                with self.assertRaisesRegex(ValueError, "external URLs"):
+                    build_zip(root, Path(tmp) / "blocked.zip")
+                self.assertFalse((Path(tmp) / "blocked.zip").exists())
 
     def test_actual_delivery_verifier_builder_and_zip_are_deterministic(self):
         with tempfile.TemporaryDirectory() as tmp:

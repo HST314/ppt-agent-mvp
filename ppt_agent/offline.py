@@ -53,24 +53,49 @@ def _without_js_comments(source: str) -> str:
 class _HTMLRuntimeURLs(HTMLParser):
     URL_ATTRIBUTES = {"src", "href", "action", "poster", "data", "formaction", "srcset"}
 
-    def __init__(self):
+    def __init__(self, depth: int = 0):
         super().__init__(convert_charrefs=True)
         self.urls: list[str] = []
         self.in_script = False
+        self.in_style = False
+        self.depth = depth
+
+    @staticmethod
+    def _css_urls(source: str) -> list[str]:
+        without_comments = re.sub(r"/\*.*?\*/", "", source, flags=re.S)
+        return REMOTE_URL.findall(without_comments)
 
     def handle_starttag(self, tag, attrs):
-        self.in_script = self.in_script or tag.lower() == "script"
+        tag = tag.lower()
+        self.in_script = self.in_script or tag == "script"
+        self.in_style = self.in_style or tag == "style"
         for name, value in attrs:
-            if value and name.lower() in self.URL_ATTRIBUTES:
+            name = name.lower()
+            if value and name in self.URL_ATTRIBUTES:
                 self.urls.extend(REMOTE_URL.findall(value))
+            elif value and name == "style":
+                self.urls.extend(self._css_urls(value))
+            elif value and name == "srcdoc":
+                if self.depth >= 32:
+                    raise ValueError("iframe srcdoc nesting exceeds offline validation limit")
+                nested = _HTMLRuntimeURLs(self.depth + 1)
+                nested.feed(value)
+                nested.close()
+                self.urls.extend(nested.urls)
+
+    handle_startendtag = handle_starttag
 
     def handle_endtag(self, tag):
         if tag.lower() == "script":
             self.in_script = False
+        elif tag.lower() == "style":
+            self.in_style = False
 
     def handle_data(self, data):
         if self.in_script:
             self.urls.extend(REMOTE_URL.findall(_without_js_comments(data)))
+        elif self.in_style:
+            self.urls.extend(self._css_urls(data))
 
 
 def sha256(path: Path) -> str:
