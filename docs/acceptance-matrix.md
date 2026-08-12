@@ -18,9 +18,9 @@
 | AC-12 | manual 人审、auto 有界修复复检 | P6-03、P6-04 | 运行模式/检查 API；检查页 | `tests/e2e/test_ac_12_modes.py` |
 | AC-13 | 达上限进入人工且不虚假完成 | P6-03、P6-05 | 状态 API；检查页 | `tests/e2e/test_ac_13_round_limit.py` |
 | AC-14 | 阻断问题未处置不可交付 | P6-04、P7-01 | 问题处置/交付 API；检查页 | `tests/e2e/test_ac_14_delivery_gate.py` |
-| AC-15 | 仅明确确认后完成 | P7-01、P7-02 | 交付确认 API；交付操作 | `tests/e2e/test_ac_15_explicit_delivery.py` |
-| AC-16 | 交付包内容完整 | P7-02 | 交付 API；结果摘要 | `tests/e2e/test_ac_16_delivery_bundle.py` |
-| AC-17 | 交付后派生与非破坏回退 | P7-03、P7-04 | 派生/回退 API；版本页 | `tests/e2e/test_ac_17_post_delivery.py` |
+| AC-15 | 仅明确确认后完成 | P7-01、P7-02 | 交付确认 API；交付操作 | `tests/e2e/test_ac_15_17_delivery.py::DeliveryJourney::test_ac15_explicit_confirmation_is_only_completion_path` |
+| AC-16 | 交付包内容完整 | P7-02 | 交付 API；结果摘要 | `tests/e2e/test_ac_15_17_delivery.py::DeliveryJourney::test_ac16_bundle_is_complete_runnable_and_hash_verified` |
+| AC-17 | 交付后派生与非破坏回退 | P7-03、P7-04 | 派生/回退 API；版本页 | `tests/e2e/test_ac_15_17_delivery.py::DeliveryJourney::test_ac17_delivery_is_immutable_and_new_candidate_requires_reinspection`; `DeliveryFaultTests::test_post_publish_breakpoints_are_idempotently_recoverable` |
 | AC-18 | 桌面端完成全流程 | P8-01～P8-03 | 全工作区 | `tests/browser/test_ac_18_desktop_journey.py` |
 
 ## 回填规则

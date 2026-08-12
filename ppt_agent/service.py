@@ -525,9 +525,13 @@ class TaskService:
             self.command(task_id,f"to-delivery-{deck_hash[:12]}","advance","user"); state=TaskState.parse(self.get(task_id))
         if state.stage!=state.stage.DELIVERY: raise ConflictError("当前阶段不能交付")
         narrative_hash=self._current_version(task_id,"narrative"); outline_hash=current["outline_hash"]
-        snapshot=self.input_view(task_id); confirmed_at=utcnow()
-        delivery_id=f"delivery-{len(self.versions(task_id,'delivery'))+1}-{deck_hash[:12]}"
-        files={"deck.html":current["html"].encode(),"narrative.md":json.loads(self.version(task_id,narrative_hash))["markdown"].encode(),"outline.md":json.loads(self.version(task_id,outline_hash))["markdown"].encode(),"resource-manifest.json":canonical(snapshot["manifest"]),"result.json":canonical({"task_id":task_id,"deck_hash":deck_hash,"warnings":gate["warnings"],"confirmed_at":confirmed_at})}
+        snapshot=self.input_view(task_id)
+        existing_delivery=next((r for r in self.versions(task_id,"delivery") if json.loads(self.version(task_id,r["hash"]))["deck_hash"]==deck_hash),None)
+        delivery_id=(json.loads(self.version(task_id,existing_delivery["hash"]))["delivery_id"] if existing_delivery else f"delivery-{len(self.versions(task_id,'delivery'))+1}-{deck_hash[:12]}")
+        intent=self.store.delivery_intent(task_id,delivery_id,{"task_id":task_id,"deck_hash":deck_hash})
+        confirmed_at=intent["confirmed_at"]
+        result_summary={"version":delivery_id,"status":{"stage":"delivery","status":"completed"},"description":"当前候选版本已通过检查并由用户明确确认交付"}
+        files={"deck.html":current["html"].encode(),"narrative.md":json.loads(self.version(task_id,narrative_hash))["markdown"].encode(),"outline.md":json.loads(self.version(task_id,outline_hash))["markdown"].encode(),"resource-manifest.json":canonical(snapshot["manifest"]),"result.json":canonical({"task_id":task_id,"deck_hash":deck_hash,"warnings":gate["warnings"],"confirmed_at":confirmed_at,**result_summary})}
         resource_root=self.store.resource_root(task_id)
         for item in snapshot["manifest"].get("resources",[]):
             source=resource_root/Path(item["uri"]).name
@@ -538,7 +542,10 @@ class TaskService:
         self.store.publish_delivery(task_id,delivery_id,files)
         model=DeliveryManifest.parse({"delivery_id":delivery_id,"task_id":task_id,"deck_hash":deck_hash,"files":tuple(files),"confirmed_by":"user","confirmed_at":confirmed_at,"schema_version":"1.0"})
         delivery_hash=self.store.put_version(task_id,"delivery",canonical(model.to_dict()),{"file_hashes":hashes,"warnings":gate["warnings"],"issue_summary":{"unresolved_warnings":len(gate["warnings"]),"blockers":0},"package":delivery_id})
+        if self.store.fault: self.store.fault("after_delivery_fact")
         final=self.command(task_id,f"confirm-delivery-{delivery_hash[:16]}","confirm_delivery","user",{"deck_hash":deck_hash,"delivery_hash":delivery_hash})
+        if self.store.fault: self.store.fault("after_delivery_completed")
+        self.store.clear_delivery_intent(task_id,delivery_id)
         return {"state":final,"delivery":{**model.to_dict(),"hash":delivery_hash,"file_hashes":hashes},"result":self.status_summary(task_id)}
 
     def derive_from_delivery(self,task_id,delivery_hash,prompt,slide_ids=None):

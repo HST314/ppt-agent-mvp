@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib, json, os, re, shutil, threading, uuid
 from pathlib import Path
+from datetime import datetime, timezone
 
 from .errors import ConflictError, NotFoundError, ValidationError
 HASH=re.compile(r"^[0-9a-f]{64}$")
@@ -90,7 +91,10 @@ class WorkspaceStore:
         base=self._task(task_id)/"deliveries"; base.mkdir(exist_ok=True)
         target=base/delivery_id
         with self.lock(task_id):
-            if target.exists(): raise ConflictError("交付版本不可覆盖")
+            if target.exists():
+                existing={str(p.relative_to(target)):p.read_bytes() for p in target.rglob("*") if p.is_file()}
+                if existing != files: raise ConflictError("交付版本不可覆盖")
+                return target
             staging=base/f".{delivery_id}.{uuid.uuid4().hex}.tmp"; staging.mkdir()
             try:
                 for name,content in files.items():
@@ -101,9 +105,23 @@ class WorkspaceStore:
                     path.parent.mkdir(parents=True,exist_ok=True); path.write_bytes(content)
                 if self.fault: self.fault("before_delivery_publish")
                 os.replace(staging,target)
+                if self.fault: self.fault("after_delivery_publish")
             except Exception:
                 shutil.rmtree(staging,ignore_errors=True); raise
         return target
+    def delivery_intent(self,task_id,delivery_id,seed):
+        """Persist the values which must remain stable while a delivery is retried."""
+        with self.lock(task_id):
+            path=self._task(task_id)/"delivery-intents"/f"{delivery_id}.json"
+            if path.exists():
+                value=json.loads(path.read_text())
+                if value.get("seed") != seed: raise ConflictError("交付事务请求冲突")
+                return value
+            value={"seed":seed,"confirmed_at":datetime.now(timezone.utc).isoformat()}
+            self.atomic_json(path,value)
+            return value
+    def clear_delivery_intent(self,task_id,delivery_id):
+        with self.lock(task_id): (self._task(task_id)/"delivery-intents"/f"{delivery_id}.json").unlink(missing_ok=True)
     def delivery_root(self,task_id,delivery_id):
         path=(self._task(task_id)/"deliveries"/delivery_id).resolve()
         if not path.is_dir(): raise NotFoundError("交付不存在")

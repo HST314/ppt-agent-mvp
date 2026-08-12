@@ -31,6 +31,10 @@ class DeliveryJourney(unittest.TestCase):
         self.assertTrue(expected.issubset(manifest["files"]))
         for name,want in manifest["files"].items(): self.assertEqual(hashlib.sha256((root/name).read_bytes()).hexdigest(),want)
         self.assertIn("<html",(root/"deck.html").read_text().lower())
+        result=json.loads((root/"result.json").read_text())
+        self.assertEqual(result["version"],delivery["delivery_id"])
+        self.assertEqual(result["status"],{"stage":"delivery","status":"completed"})
+        self.assertTrue(result["description"])
 
     def test_ac17_delivery_is_immutable_and_new_candidate_requires_reinspection(self):
         deck=self.svc.deck_view("task")["deck"]; delivered=self.svc.confirm_delivery("task",deck["hash"])["delivery"]; root=self.store.delivery_root("task",delivered["delivery_id"]); before=(root/"deck.html").read_bytes()
@@ -55,6 +59,24 @@ class DeliveryFaultTests(unittest.TestCase):
             store=WorkspaceStore(tmp,fault=fault); store.create("task",{"task_id":"task","stage":"created","status":"ready","mode":"manual","sample_confirmed":False,"blockers_resolved":False,"delivery_confirmed":False,"revision":0,"waiting_reason":None,"required_action":None})
             with self.assertRaises(RuntimeError): store.publish_delivery("task","delivery-1",{"deck.html":b"ok"})
             self.assertEqual(list((store._task("task")/"deliveries").iterdir()),[])
+
+    def test_post_publish_breakpoints_are_idempotently_recoverable(self):
+        for breakpoint in ("after_delivery_publish","after_delivery_fact","after_delivery_completed"):
+            with self.subTest(breakpoint=breakpoint), tempfile.TemporaryDirectory() as tmp:
+                armed={"value":True}
+                def fault(point):
+                    if armed["value"] and point==breakpoint: raise RuntimeError("injected")
+                store=WorkspaceStore(tmp,fault=fault); svc=TaskService(store,inspector=PassingInspector()); svc.create("task","manual")
+                svc.import_input("task",{"goal":"发布","audience":"客户","topic":"方案","页数":3})
+                svc.generate_narrative("task"); svc.confirm_narrative("task"); svc.generate_outline("task"); svc.confirm_outline("task")
+                svc.generate_sample("task"); svc.confirm_sample("task"); svc.generate_deck("task"); svc.run_inspection("task",0)
+                deck_hash=svc.deck_view("task")["deck"]["hash"]
+                with self.assertRaises(RuntimeError): svc.confirm_delivery("task",deck_hash)
+                armed["value"]=False
+                recovered=svc.confirm_delivery("task",deck_hash)
+                self.assertEqual(recovered["state"]["status"],"completed")
+                self.assertEqual(len(svc.versions("task","delivery")),1)
+                self.assertEqual(len(list((store._task("task")/"deliveries").iterdir())),1)
 
 
 if __name__=="__main__": unittest.main()
