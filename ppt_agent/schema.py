@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import asdict, dataclass, fields, is_dataclass
+from dataclasses import MISSING, asdict, dataclass, fields, is_dataclass
 from datetime import datetime
 from typing import Any, ClassVar, get_args, get_origin, get_type_hints
 
@@ -22,7 +22,7 @@ def _schema(t):
         hints=get_type_hints(t)
         return {"type":"object","additionalProperties":False,
                 "properties":{f.name:_property_schema(f.name,hints[f.name]) for f in fields(t)},
-                "required":[f.name for f in fields(t)]}
+                "required":[f.name for f in fields(t) if f.default is MISSING and f.default_factory is MISSING]}
     schema = {"type": {str: "string", int: "integer", bool: "boolean", dict: "object"}.get(t, "string")}
     if t is str:
         schema.update({"minLength": 1, "pattern": NON_BLANK})
@@ -36,9 +36,10 @@ def _property_schema(name,t):
     if name.endswith("_hash") or name == "content_hash": prop["pattern"] = HASH.pattern
     if name.endswith("_at"): prop["format"] = "date-time"
     if name == "version": prop["minimum"] = 1
-    enums={"source_format":["json","markdown"],"kind":["sample","deck"],"action":["resolve","waive"],"actor":["user"],"confirmed_by":["user"],"severity":["warning","blocker"]}
+    enums={"source_format":["json","markdown"],"kind":["sample","deck"],"action":["resolve","agent_fix","manual","waive","defer"],"actor":["user","system"],"confirmed_by":["user"],"severity":["warning","blocker"],"level":["element","slide","deck"]}
     if name in enums: prop["enum"]=enums[name]
     if name.endswith("_ids"): prop.update({"minItems":1,"uniqueItems":True,"items":{"type":"string","pattern":ID.pattern}})
+    if name in {"slide_id","element_id"}: prop.update({"minLength":0,"pattern":rf"^(?:{ID.pattern[1:-1]})?$"})
     return prop
 
 def _json_value(value, expected, name):
@@ -53,8 +54,9 @@ def _json_value(value, expected, name):
         return value
     if isinstance(expected,type) and is_dataclass(expected):
         if not isinstance(value,dict): raise ValidationError(f"{name} 类型无效")
-        allowed={f.name for f in fields(expected)}
-        if set(value) != allowed: raise ValidationError(f"{name} 字段无效")
+        model_fields=fields(expected); allowed={f.name for f in model_fields}
+        required={f.name for f in model_fields if f.default is MISSING and f.default_factory is MISSING}
+        if set(value)-allowed or required-set(value): raise ValidationError(f"{name} 字段无效")
         hints=get_type_hints(expected)
         return expected(**{k:_json_value(v,hints[k],f"{name}.{k}") for k,v in value.items()})
     if expected is Any: return value
@@ -100,7 +102,8 @@ class StrictModel:
         if not isinstance(value, dict): raise ValidationError(f"{cls.__name__} 必须是对象")
         allowed = {f.name for f in fields(cls)}
         if set(value) - allowed: raise ValidationError(f"{cls.__name__} 包含未知字段")
-        required = {f.name for f in fields(cls) if f.name != "schema_version"}
+        optional_compat={"level","element_id","evidence","suggestion","target_deck_hash","rationale"}
+        required = {f.name for f in fields(cls) if f.name != "schema_version" and f.name not in optional_compat}
         if required - set(value): raise ValidationError(f"{cls.__name__} 缺少必填字段")
         hints=get_type_hints(cls)
         normalized={name:_json_value(item,hints[name],name) for name,item in value.items()}
@@ -114,7 +117,8 @@ class StrictModel:
         hints = get_type_hints(cls)
         props = {f.name:_property_schema(f.name,hints[f.name]) for f in fields(cls)}
         props["schema_version"]["const"] = "1.0"
-        return {"$schema":"https://json-schema.org/draft/2020-12/schema","title":cls.__name__,"type":"object","additionalProperties":False,"properties":props,"required":[f.name for f in fields(cls) if f.name != "schema_version"]}
+        optional_compat={"level","element_id","evidence","suggestion","target_deck_hash","rationale"}
+        return {"$schema":"https://json-schema.org/draft/2020-12/schema","title":cls.__name__,"type":"object","additionalProperties":False,"properties":props,"required":[f.name for f in fields(cls) if f.name != "schema_version" and f.name not in optional_compat]}
 
 @dataclass(frozen=True)
 class TaskCard(StrictModel):
@@ -153,16 +157,20 @@ class DeckArtifact(StrictModel):
 @dataclass(frozen=True)
 class InspectionIssue:
     issue_id:str; severity:str; code:str; message:str; slide_id:str
+    level:str="slide"; element_id:str=""; evidence:str="未提供独立证据"; suggestion:str="请人工检查并修复"
     def validate(self):
-        if not ID.fullmatch(self.issue_id) or not ID.fullmatch(self.slide_id) or self.severity not in {"warning","blocker"} or not self.code.strip() or not self.message.strip(): raise ValidationError("issue 字段语义无效")
+        if (not ID.fullmatch(self.issue_id) or self.severity not in {"warning","blocker"} or self.level not in {"element","slide","deck"}
+            or not self.code.strip() or not self.message.strip() or not self.evidence.strip() or not self.suggestion.strip()): raise ValidationError("issue 字段语义无效")
+        if self.slide_id and not ID.fullmatch(self.slide_id): raise ValidationError("issue 页面范围无效")
+        if self.element_id and not ID.fullmatch(self.element_id): raise ValidationError("issue 元素范围无效")
 @dataclass(frozen=True)
 class InspectionReport(StrictModel): issues:tuple[InspectionIssue,...]=(); report_id:str=""; task_id:str=""; deck_hash:str=""; passed:bool=False; created_at:str=""
 @dataclass(frozen=True)
 class IssueDisposition(StrictModel):
-    disposition_id:str=""; task_id:str=""; issue_id:str=""; action:str=""; actor:str=""; created_at:str=""
+    disposition_id:str=""; task_id:str=""; issue_id:str=""; action:str=""; actor:str=""; created_at:str=""; target_deck_hash:str="0"*64; rationale:str="未记录依据"
     def __post_init__(self):
         super().__post_init__()
-        if self.action not in {"resolve","waive"} or self.actor != "user": raise ValidationError("问题处置语义无效")
+        if self.action not in {"resolve","agent_fix","manual","waive","defer"} or self.actor not in {"user","system"}: raise ValidationError("问题处置语义无效")
 @dataclass(frozen=True)
 class DeliveryManifest(StrictModel):
     delivery_id:str=""; task_id:str=""; deck_hash:str=""; files:tuple[str,...]=(); confirmed_by:str=""; confirmed_at:str=""

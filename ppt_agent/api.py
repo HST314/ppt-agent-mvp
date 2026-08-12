@@ -15,6 +15,7 @@ VERSION=re.compile(r"^/v1/tasks/([^/]+)/versions/([0-9a-f]{64})$")
 COMPARE=re.compile(r"^/v1/tasks/([^/]+)/versions/compare$")
 PREVIEW=re.compile(r"^/v1/tasks/([^/]+)/preview$")
 ISSUES=re.compile(r"^/v1/tasks/([^/]+)/issues/([^/]+)/disposition$")
+BATCH_ISSUES=re.compile(r"^/v1/tasks/([^/]+)/issues/dispositions/batch$")
 INPUT=re.compile(r"^/v1/tasks/([^/]+)/input$")
 ANSWER=re.compile(r"^/v1/tasks/([^/]+)/clarifications/([^/]+)/answer$")
 WORKSPACE=re.compile(r"^/tasks/([^/]+)$")
@@ -27,6 +28,8 @@ SAMPLES=re.compile(r"^/v1/tasks/([^/]+)/samples(?:/(select|generate|modify|confi
 SAMPLE_PAGE=re.compile(r"^/tasks/([^/]+)/samples$")
 DECKS=re.compile(r"^/v1/tasks/([^/]+)/deck(?:/(generate|modify|rollback|compare))?$")
 DECK_PAGE=re.compile(r"^/tasks/([^/]+)/deck$")
+INSPECTION=re.compile(r"^/v1/tasks/([^/]+)/inspection(?:/(run|mode|delivery-gate))?$")
+INSPECTION_PAGE=re.compile(r"^/tasks/([^/]+)/inspection$")
 
 class App:
     def __init__(self,service): self.service=service
@@ -34,7 +37,7 @@ class App:
         try:
             method=environ["REQUEST_METHOD"]; path=environ["PATH_INFO"]
             size=int(environ.get("CONTENT_LENGTH") or 0); body=json.loads(environ["wsgi.input"].read(size) or b"{}")
-            if method=="GET" and path=="/healthz": return self.reply(start_response,200,{"status":"ok","stage":"P5","runtime_ready":True})
+            if method=="GET" and path=="/healthz": return self.reply(start_response,200,{"status":"ok","stage":"P6","runtime_ready":True})
             if method=="POST" and path=="/v1/tasks":
                 self.exact(body,{"task_id","mode"},{"task_id"}); return self.reply(start_response,201,self.service.create(body["task_id"],body.get("mode","manual")))
             m=TASK.match(path)
@@ -56,6 +59,16 @@ class App:
             if method=="GET" and m:return self.sample_page(start_response,m.group(1))
             m=DECK_PAGE.match(path)
             if method=="GET" and m:return self.deck_page(start_response,m.group(1))
+            m=INSPECTION_PAGE.match(path)
+            if method=="GET" and m:return self.inspection_page(start_response,m.group(1))
+            m=INSPECTION.match(path)
+            if method=="GET" and m and not m.group(2): return self.reply(start_response,200,self.service.inspection_view(m.group(1)))
+            if method=="POST" and m:
+                if m.group(2)=="run": self.exact(body,{"max_rounds","affected_slide_ids"},set()); result=self.service.run_inspection(m.group(1),body.get("max_rounds",2),body.get("affected_slide_ids"))
+                elif m.group(2)=="mode": self.exact(body,{"mode"},{"mode"}); result=self.service.switch_inspection_mode(m.group(1),body["mode"])
+                elif m.group(2)=="delivery-gate": self.exact(body,set(),set()); result=self.service.assert_delivery_gate(m.group(1))
+                else: raise NotFoundError("接口不存在")
+                return self.reply(start_response,200,result)
             m=DECKS.match(path)
             if method=="GET" and m and not m.group(2): return self.reply(start_response,200,self.service.deck_view(m.group(1)))
             if method=="POST" and m:
@@ -106,10 +119,14 @@ class App:
             if method=="GET" and m:return self.reply(start_response,200,{"versions":self.service.versions(m.group(1))})
             m=PREVIEW.match(path)
             if method=="POST" and m:return self.reply(start_response,200,self.service.run_fake_pipeline(m.group(1)))
+            m=BATCH_ISSUES.match(path)
+            if method=="POST" and m:
+                self.exact(body,{"issue_ids","action","rationale"},{"issue_ids","action"})
+                return self.reply(start_response,200,self.service.dispose_issues(m.group(1),body["issue_ids"],body["action"],body.get("rationale","")))
             m=ISSUES.match(path)
             if method=="POST" and m:
-                self.exact(body,{"command_id","action","actor"},{"command_id","action","actor"})
-                payload={"issue_id":m.group(2),"disposition":body["action"]}; return self.reply(start_response,200,self.service.command(m.group(1),body["command_id"],"resolve_blockers",body["actor"],payload))
+                self.exact(body,{"action","rationale","actor"},{"action"})
+                return self.reply(start_response,200,self.service.dispose_issue(m.group(1),m.group(2),body["action"],body.get("rationale",""),body.get("actor","user")))
             raise NotFoundError("接口不存在")
         except DomainError as exc:return self.reply(start_response,exc.status,exc.public())
         except Exception:
@@ -329,6 +346,19 @@ if(r.ok){location.reload();}else{const data=await r.json();out.textContent=(data
         ids=list((deck.get("metadata") or {}).get("page_hashes",{})); options="".join(f'<option value="{esc(s)}">{esc(s)}</option>' for s in ids)
         version_options="".join(f'<option value="{v["hash"]}">v{v["version"]} · {esc(v["summary"])}</option>' for v in versions)
         raw=(f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>完整 HTML 演示稿</title><style>body{{font:16px system-ui;max-width:1280px;margin:24px auto;padding:0 20px;color:#172033}}main{{display:grid;grid-template-columns:360px 1fr;gap:20px}}section{{border:1px solid #ccd3df;border-radius:10px;padding:16px;margin-bottom:16px}}iframe{{width:100%;height:650px;border:1px solid #ccd3df}}textarea,select,input,button{{display:block;width:100%;box-sizing:border-box;margin:8px 0;padding:9px}}li{{margin:10px 0}}.hint{{color:#b42318}}.page-diff{{border-left:4px solid #1570ef;padding:8px;margin:8px 0}}pre{{white-space:pre-wrap;word-break:break-all;background:#0b1020;color:#d1e7ff;padding:8px}}@media(max-width:800px){{main{{grid-template-columns:1fr}}}}</style><h1>完整 HTML 演示稿</h1><p>阶段：{esc(view["state"]["stage"])}；当前版本：v{esc(deck.get("version","-"))}；页数：{len(ids)}；待办：继续修改或进入后续检查。</p><main><div><section><button id="generate">生成完整演示稿</button><label>修改类型<select id="changeType"><option value="visual">纯视觉</option><option value="content">内容/叙事</option></select></label><label>作用域<select id="scope"><option value="global">整稿</option><option value="page">指定页</option><option value="element">指定元素</option></select></label><label>页面<select id="slide"><option value="">请选择</option>{options}</select></label><label>元素 ID<input id="element"></label><textarea id="prompt" placeholder="输入修改要求"></textarea><button id="modify">提交修改</button><output id="result" class="hint" aria-live="polite"></output></section><section><h2>版本时间线</h2><ol>{rows or "<li>尚未生成全稿</li>"}</ol></section><section aria-label="逐页 HTML 差异对比"><h2>逐页 HTML 差异对比</h2><label>左版本<select id="diffLeft">{version_options}</select></label><label>右版本<select id="diffRight">{version_options}</select></label><button id="compare">对比版本</button><div id="diffResult" aria-live="polite"></div></section></div><section><p id="previewLabel">正在预览当前版本</p><iframe id="previewFrame" sandbox="" srcdoc="{esc(deck.get("html",""))}"></iframe></section></main><script>const ID={json.dumps(task_id)},CURRENT={json.dumps(current)},VERSIONS={payload};const result=document.getElementById('result'),frame=document.getElementById('previewFrame'),label=document.getElementById('previewLabel');async function send(path,body){{const r=await fetch('/v1/tasks/'+ID+'/deck/'+path,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body)}});if(r.ok)location.reload();else result.textContent=((await r.json()).error||{{}}).message||'操作失败';}}document.getElementById('generate').onclick=()=>send('generate',{{}});document.getElementById('modify').onclick=()=>{{const scope=document.getElementById('scope').value,slide=document.getElementById('slide').value;send('modify',{{prompt:document.getElementById('prompt').value,change_type:document.getElementById('changeType').value,scope:scope,slide_ids:scope==='global'?[]:[slide],element_id:document.getElementById('element').value||null}})}};document.querySelectorAll('.preview').forEach(b=>b.onclick=()=>{{frame.srcdoc=VERSIONS[b.dataset.hash].html;label.textContent='正在预览历史版本 v'+VERSIONS[b.dataset.hash].version}});document.querySelectorAll('.rollback').forEach(b=>b.onclick=()=>send('rollback',{{hash:b.dataset.hash}}));document.getElementById('compare').onclick=async()=>{{const box=document.getElementById('diffResult');const r=await fetch('/v1/tasks/'+ID+'/deck/compare',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{left:diffLeft.value,right:diffRight.value}})}});const data=await r.json();box.textContent='';if(!r.ok){{box.textContent=(data.error||{{}}).message;return}}for(const page of data.pages){{const article=document.createElement('article');article.className='page-diff';const title=document.createElement('strong');title.textContent=page.slide_id+' · '+page.status;article.appendChild(title);if(page.status!=='unchanged'){{const pre=document.createElement('pre');pre.textContent='左版本：\n'+(page.left_html||'（无）')+'\n\n右版本：\n'+(page.right_html||'（无）');article.appendChild(pre)}}box.appendChild(article)}}}};</script></html>''').encode()
+        start("200 OK",[("Content-Type","text/html; charset=utf-8"),("Content-Security-Policy","default-src 'self'; frame-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"),("Content-Length",str(len(raw)))]); return [raw]
+
+    def inspection_page(self,start,task_id):
+        view=self.service.inspection_view(task_id); esc=self.esc; report=view.get("report") or {}; issues=report.get("issues",[])
+        groups=[]
+        for severity,label in (("blocker","阻断问题"),("warning","普通警告")):
+            rows=[]
+            for issue in [x for x in issues if x["severity"]==severity]:
+                target="整稿" if issue["level"]=="deck" else f'页面 {issue.get("slide_id") or "-"}' + (f' / 元素 {issue["element_id"]}' if issue.get("element_id") else "")
+                rows.append(f'<li data-issue="{esc(issue["issue_id"])}"><button class="locate" data-slide="{esc(issue.get("slide_id",""))}">定位</button> <strong>{esc(target)}</strong>：{esc(issue["message"])}<br>证据：{esc(issue["evidence"])}；建议：{esc(issue["suggestion"])}<label>处置 <select class="action"><option value="agent_fix">Agent 修复</option><option value="manual">手工已处理</option><option value="waive">接受/豁免</option><option value="defer">暂不处理</option></select></label><input class="rationale" placeholder="处置依据"><button class="dispose">保存处置</button></li>')
+            if rows: groups.append(f'<section><h2>{label}（{len(rows)}）</h2><ul>{"".join(rows)}</ul></section>')
+        reason=view.get("waiting_reason") or "无"; deck=view.get("deck") or {}; round_no=(report.get("metadata") or {}).get("round",0)
+        raw=(f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>独立检查与审核</title><style>body{{font:16px system-ui;max-width:1280px;margin:24px auto;padding:0 20px;color:#172033}}main{{display:grid;grid-template-columns:420px 1fr;gap:20px}}section{{border:1px solid #ccd3df;border-radius:10px;padding:14px;margin-bottom:12px}}iframe{{width:100%;height:680px;border:1px solid #ccd3df}}li{{margin:14px 0}}input,select,button{{padding:7px;margin:4px}}.block{{color:#b42318}}@media(max-width:800px){{main{{grid-template-columns:1fr}}}}</style><h1>独立检查与人工审核</h1><p>模式：{esc(view["state"]["mode"])}；修复轮次：{round_no}；等待原因：{esc(reason)}；交付门禁：{'可交付' if view['delivery_allowed'] else '不可交付'}</p><button id="run">执行检查</button><button id="manual">切换 manual（下一动作生效）</button><button id="auto">切换 auto（下一动作生效）</button><output id="result" class="block"></output><main><div>{''.join(groups) or '<section><p>尚无检查问题；请先执行检查。</p></section>'}</div><section><h2>整稿人工浏览</h2><p id="location">整稿预览，无需逐页打勾；问题定位会滚动到对应页面。</p><iframe id="preview" sandbox="" srcdoc="{esc(deck.get('html',''))}"></iframe></section></main><script>const ID={json.dumps(task_id)},result=document.getElementById('result');async function send(path,body){{const r=await fetch('/v1/tasks/'+ID+path,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body)}}),d=await r.json();if(r.ok)location.reload();else result.textContent=(d.error||{{}}).message||'操作失败'}}document.getElementById('run').onclick=()=>send('/inspection/run',{{max_rounds:2}});document.getElementById('manual').onclick=()=>send('/inspection/mode',{{mode:'manual'}});document.getElementById('auto').onclick=()=>send('/inspection/mode',{{mode:'auto'}});document.querySelectorAll('.dispose').forEach(b=>b.onclick=()=>{{const li=b.closest('li');send('/issues/'+li.dataset.issue+'/disposition',{{action:li.querySelector('.action').value,rationale:li.querySelector('.rationale').value}})}});document.querySelectorAll('.locate').forEach(b=>b.onclick=()=>document.getElementById('location').textContent=b.dataset.slide?'已定位：'+b.dataset.slide:'已定位：整稿一致性问题');</script></html>''').encode()
         start("200 OK",[("Content-Type","text/html; charset=utf-8"),("Content-Security-Policy","default-src 'self'; frame-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"),("Content-Length",str(len(raw)))]); return [raw]
 
 def serve(root=".ppt-agent-data",host="127.0.0.1",port=8000):

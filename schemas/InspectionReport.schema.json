@@ -49,8 +49,37 @@
           "slide_id": {
             "title": "slide_id",
             "type": "string",
+            "minLength": 0,
+            "pattern": "^(?:[A-Za-z0-9][A-Za-z0-9_-]{0,127})?$"
+          },
+          "level": {
+            "title": "level",
+            "type": "string",
             "minLength": 1,
-            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+            "pattern": "^[\\s\\S]*\\S[\\s\\S]*$",
+            "enum": [
+              "element",
+              "slide",
+              "deck"
+            ]
+          },
+          "element_id": {
+            "title": "element_id",
+            "type": "string",
+            "minLength": 0,
+            "pattern": "^(?:[A-Za-z0-9][A-Za-z0-9_-]{0,127})?$"
+          },
+          "evidence": {
+            "title": "evidence",
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[\\s\\S]*\\S[\\s\\S]*$"
+          },
+          "suggestion": {
+            "title": "suggestion",
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[\\s\\S]*\\S[\\s\\S]*$"
           }
         },
         "required": [

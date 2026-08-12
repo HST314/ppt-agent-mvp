@@ -36,7 +36,10 @@
       "pattern": "^[\\s\\S]*\\S[\\s\\S]*$",
       "enum": [
         "resolve",
-        "waive"
+        "agent_fix",
+        "manual",
+        "waive",
+        "defer"
       ]
     },
     "actor": {
@@ -45,7 +48,8 @@
       "minLength": 1,
       "pattern": "^[\\s\\S]*\\S[\\s\\S]*$",
       "enum": [
-        "user"
+        "user",
+        "system"
       ]
     },
     "created_at": {
@@ -54,6 +58,18 @@
       "minLength": 1,
       "pattern": "^[\\s\\S]*\\S[\\s\\S]*$",
       "format": "date-time"
+    },
+    "target_deck_hash": {
+      "title": "target_deck_hash",
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "rationale": {
+      "title": "rationale",
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[\\s\\S]*\\S[\\s\\S]*$"
     }
   },
   "required": [

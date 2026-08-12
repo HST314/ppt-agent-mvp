@@ -1,5 +1,5 @@
 openapi: 3.1.0
-info: {title: PPT Agent P4 API, version: 0.6.0}
+info: {title: PPT Agent P6 API, version: 0.8.0}
 components:
   parameters:
     TaskId: {in: path, name: task_id, required: true, schema: {type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$'}}
@@ -9,7 +9,7 @@ components:
       required: [error]
       properties:
         error: {type: object, required: [code, message, diagnostic_id], properties: {code: {type: string}, message: {type: string}, diagnostic_id: {type: string}}}
-    Health: {type: object, required: [status, stage, runtime_ready], properties: {status: {const: ok}, stage: {const: P4}, runtime_ready: {type: boolean}}}
+    Health: {type: object, required: [status, stage, runtime_ready], properties: {status: {const: ok}, stage: {const: P6}, runtime_ready: {type: boolean}}}
     SampleModify: {type: object, additionalProperties: false, required: [prompt], properties: {prompt: {type: string, minLength: 1}, scope: {enum: [global, page, element]}, slide_id: {type: [string, 'null']}, element_id: {type: [string, 'null']}}}
     TaskState:
       type: object
@@ -47,7 +47,25 @@ components:
 paths:
   /healthz:
     get:
-      responses: {'200': {description: Ready, content: {application/json: {schema: {$ref: '#/components/schemas/Health'}, example: {status: ok, stage: P4, runtime_ready: true}}}}}
+      responses: {'200': {description: Ready, content: {application/json: {schema: {$ref: '#/components/schemas/Health'}, example: {status: ok, stage: P6, runtime_ready: true}}}}}
+  /v1/tasks/{task_id}/inspection:
+    get:
+      parameters: [{$ref: '#/components/parameters/TaskId'}]
+      responses: {'200': {description: Current hash-bound report, dispositions and delivery gate, content: {application/json: {schema: {type: object}, example: {report: null, dispositions: [], delivery_allowed: false}}}}, '404': {$ref: '#/components/responses/Error'}}
+  /v1/tasks/{task_id}/inspection/run:
+    post:
+      parameters: [{$ref: '#/components/parameters/TaskId'}]
+      requestBody: {content: {application/json: {schema: {type: object, additionalProperties: false, properties: {max_rounds: {type: integer, minimum: 0, maximum: 10}, affected_slide_ids: {type: array, uniqueItems: true, items: {type: string}}}}}}}
+      responses: {'200': {description: Isolated full or incremental inspection with bounded auto repair, content: {application/json: {schema: {type: object}, example: {rounds: 0, delivery_allowed: false}}}}, '400': {$ref: '#/components/responses/Error'}, '409': {$ref: '#/components/responses/Error'}}
+  /v1/tasks/{task_id}/inspection/mode:
+    post:
+      parameters: [{$ref: '#/components/parameters/TaskId'}]
+      requestBody: {required: true, content: {application/json: {schema: {type: object, additionalProperties: false, required: [mode], properties: {mode: {enum: [manual, auto]}}}}}}
+      responses: {'200': {description: Mode changed for the next action, content: {application/json: {schema: {type: object}, example: {state: {mode: auto}}}}}, '400': {$ref: '#/components/responses/Error'}}
+  /v1/tasks/{task_id}/inspection/delivery-gate:
+    post:
+      parameters: [{$ref: '#/components/parameters/TaskId'}]
+      responses: {'200': {description: Current report has no untreated blocker, content: {application/json: {schema: {type: object}, example: {delivery_allowed: true, warnings: []}}}}, '409': {$ref: '#/components/responses/Error'}}
   /v1/tasks/{task_id}/samples:
     get:
       parameters: [{$ref: '#/components/parameters/TaskId'}]
@@ -165,5 +183,10 @@ paths:
   /v1/tasks/{task_id}/issues/{issue_id}/disposition:
     post:
       parameters: [{$ref: '#/components/parameters/TaskId'}, {in: path, name: issue_id, required: true, schema: {type: string}}]
-      requestBody: {required: true, content: {application/json: {schema: {type: object, additionalProperties: false, required: [command_id, action, actor], properties: {command_id: {type: string}, action: {enum: [resolve, waive]}, actor: {const: user}}}, example: {command_id: disposition-1, action: resolve, actor: user}}}}
-      responses: {'200': {description: Disposed, content: {application/json: {schema: {$ref: '#/components/schemas/TaskState'}, example: *task}}}, '400': {$ref: '#/components/responses/Error'}, '404': {$ref: '#/components/responses/Error'}, '409': {$ref: '#/components/responses/Error'}}
+      requestBody: {required: true, content: {application/json: {schema: {type: object, additionalProperties: false, required: [action], properties: {action: {enum: [agent_fix, manual, waive, defer]}, rationale: {type: string}, actor: {enum: [user, system]}}}, example: {action: waive, rationale: 用户接受该版式风险, actor: user}}}}
+      responses: {'200': {description: Version-bound audited disposition, content: {application/json: {schema: {type: object}, example: {disposition_hash: abc, delivery_allowed: true}}}}, '400': {$ref: '#/components/responses/Error'}, '404': {$ref: '#/components/responses/Error'}, '409': {$ref: '#/components/responses/Error'}}
+  /v1/tasks/{task_id}/issues/dispositions/batch:
+    post:
+      parameters: [{$ref: '#/components/parameters/TaskId'}]
+      requestBody: {required: true, content: {application/json: {schema: {type: object, additionalProperties: false, required: [issue_ids, action], properties: {issue_ids: {type: array, minItems: 1, uniqueItems: true, items: {type: string}}, action: {enum: [agent_fix, manual, waive, defer]}, rationale: {type: string}}}}}}
+      responses: {'200': {description: Explicit same-action batch disposition with returned batch scope, content: {application/json: {schema: {type: object}, example: {batch_scope: [issue-1], disposition_hashes: [abc]}}}}, '400': {$ref: '#/components/responses/Error'}, '409': {$ref: '#/components/responses/Error'}}

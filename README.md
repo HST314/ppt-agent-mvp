@@ -2,7 +2,7 @@
 
 PPT Agent MVP 的需求、实现决策与验收追踪仓库。
 
-P4 HTML 样品页闭环已实现，包括样品推荐与改选、真实 HTML 安全预览、元素/页面/全局修改、版本追踪，以及绑定大纲与样品 hash 的人工确认门禁。产品行为以 `docs/product-contract.md` 为准，实施顺序以 `docs/development-plan.md` 为准。
+P6 独立检查与审核闭环已实现，包括隔离检查输入、元素/页面/整稿三级报告、增量复检、manual/auto 有界修复、问题处置审计及阻断交付门禁。产品行为以 `docs/product-contract.md` 为准，实施顺序以 `docs/development-plan.md` 为准。
 
 ## 本地启动
 
@@ -12,7 +12,7 @@ P4 HTML 样品页闭环已实现，包括样品推荐与改选、真实 HTML 安
 python3 scripts/start.py --data .ppt-agent-data --host 127.0.0.1 --port 8000
 ```
 
-另一个终端访问 `http://127.0.0.1:8000/healthz`，应得到含 `"stage": "P4"`、`"status": "ok"` 和 `"runtime_ready": true` 的 JSON。任务、资料、叙事、大纲和 HTML 样品 API 均由该入口提供。
+另一个终端访问 `http://127.0.0.1:8000/healthz`，应得到含 `"stage": "P6"`、`"status": "ok"` 和 `"runtime_ready": true` 的 JSON。
 
 ## P0 校验
 
@@ -59,3 +59,7 @@ pip install playwright
 python3 -m playwright install chromium
 python3 -m unittest discover -s tests
 ```
+
+## P6 独立检查与审核
+
+`POST /v1/tasks/{task_id}/inspection/run` 执行首次全检或指定页面增量检查；检查 Gateway 仅接收最初大纲和待审 HTML。`POST /inspection/mode` 切换 manual/auto，切换只影响下一动作；auto 在 `max_rounds` 内修复并复检，达到上限进入等待人工且不会虚假完成。`POST /issues/{issue_id}/disposition` 保存 Agent 修复、手工处理、豁免或暂缓的操作者、依据和目标 HTML 版本。`POST /inspection/delivery-gate` 在当前报告过期或存在未处置阻断问题时拒绝交付。`GET /tasks/{task_id}/inspection` 提供分组问题、联动定位、轮次和整稿人工浏览界面。

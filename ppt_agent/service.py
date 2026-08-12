@@ -382,6 +382,107 @@ class TaskService:
         target=json.loads(self.version(task_id,target_hash)); meta=next(v["metadata"] for v in self.versions(task_id,"deck") if v["hash"]==target_hash)
         current_outline=self._current_version(task_id,"outline"); inconsistent=target["outline_hash"]!=current_outline
         return self._record_deck(task_id,meta["html"],target["outline_hash"],{"parent":self._current_version(task_id,"deck"),"rollback_from":target_hash,"summary":f"回退自 {target_hash[:12]}","scope":"global","affected":list(meta["page_hashes"]),"outline_consistent":not inconsistent,"regenerate_required":list(meta["page_hashes"]) if inconsistent else [],"global_rules":meta.get("global_rules",[]),"local_exceptions":meta.get("local_exceptions",{})},"deck_rollback","user")
+
+    def inspection_view(self,task_id):
+        deck=self.deck_view(task_id)["deck"]; reports=self.versions(task_id,"inspection")
+        current=None
+        if reports:
+            record=max(reports,key=lambda r:json.loads(self.version(task_id,r["hash"]))["created_at"]); model=json.loads(self.version(task_id,record["hash"]))
+            current={**model,"hash":record["hash"],"metadata":record["metadata"],"stale":not deck or model["deck_hash"]!=deck["hash"]}
+        dispositions=[]
+        for record in self.versions(task_id,"issue-disposition"):
+            value=json.loads(self.version(task_id,record["hash"]))
+            dispositions.append({**value,"hash":record["hash"],"stale":not deck or value["target_deck_hash"]!=deck["hash"]})
+        active={d["issue_id"]:d for d in dispositions if not d["stale"]}
+        unresolved=[] if not current or current["stale"] else [i for i in current["issues"] if active.get(i["issue_id"],{}).get("action") not in {"resolve","manual","waive"}]
+        blockers=[i for i in unresolved if i["severity"]=="blocker"]
+        return {"state":self.get(task_id),"deck":deck,"report":current,"reports":reports,"dispositions":dispositions,"unresolved":unresolved,"blocking_issues":blockers,"delivery_allowed":bool(current and not current["stale"] and not blockers),"waiting_reason":self.get(task_id).get("waiting_reason")}
+
+    @staticmethod
+    def _normalize_inspection_issues(items):
+        normalized=[]
+        for index,item in enumerate(items):
+            if not isinstance(item,dict): raise ValidationError("检查报告 issue 必须是对象")
+            level=item.get("level") or ("element" if item.get("element_id") else "slide" if item.get("slide_id") else "deck")
+            normalized.append({"issue_id":item.get("issue_id") or f"issue-{index+1}","severity":item.get("severity","warning"),"level":level,"code":item.get("code","quality_issue"),"message":item.get("message","发现质量问题"),"slide_id":item.get("slide_id","") or "","element_id":item.get("element_id","") or "","evidence":item.get("evidence",item.get("message","发现质量问题")),"suggestion":item.get("suggestion","请人工检查并修复")})
+        return normalized
+
+    def _inspect_once(self,task_id,scope,affected,round_number):
+        deck=self.deck_view(task_id)["deck"]
+        if not deck: raise ConflictError("尚未生成全稿")
+        outline=json.loads(self.version(task_id,deck["outline_hash"]))["markdown"]
+        # Deliberately pass only the original outline and review HTML. Generation
+        # dialogue, model self-description, resources and screenshots never cross this boundary.
+        raw=self.inspector.inspect(outline,deck["html"])
+        issues=self._normalize_inspection_issues(raw.get("issues",[])); passed=bool(raw.get("passed",not issues)) and not issues
+        created=utcnow(); seed=canonical({"deck_hash":deck["hash"],"issues":issues,"created_at":created})
+        report=InspectionReport.parse({"report_id":f"report-{digest(seed)[:16]}","task_id":task_id,"deck_hash":deck["hash"],"issues":issues,"passed":passed,"created_at":created,"schema_version":"1.0"})
+        metadata={"deck_hash":deck["hash"],"scope":scope,"affected_slide_ids":affected,"includes_deck_consistency":True,"round":round_number,"model":raw.get("model","unknown"),"input_fields":["original_outline","html"],"excluded_fields":["generation_context","self_description","images","screenshots"]}
+        h=self.store.put_version(task_id,"inspection",canonical(report.to_dict()),metadata)
+        return {**report.to_dict(),"hash":h,"metadata":metadata}
+
+    def _auto_fix(self,task_id,report,round_number):
+        deck=self.deck_view(task_id)["deck"]; affected=list(dict.fromkeys(i["slide_id"] for i in report["issues"] if i["slide_id"]))
+        if not affected: affected=list(deck["metadata"]["page_hashes"])
+        html_text=deck["html"]
+        for slide_id in affected:
+            marker=f'<span data-auto-fix-round="{round_number}" hidden></span>'
+            html_text=re.sub(rf'(<section class="slide" id="{re.escape(slide_id)}"[^>]*>)',rf'\1{marker}',html_text,count=1)
+        return self._record_deck(task_id,html_text,deck["outline_hash"],{"parent":deck["hash"],"summary":f"自动修复第 {round_number} 轮","scope":"page","affected":affected,"outline_consistent":True,"global_rules":deck["metadata"].get("global_rules",[]),"local_exceptions":deck["metadata"].get("local_exceptions",{}),"inspection_report_hash":report["hash"],"auto_fix_round":round_number},"inspection_auto_fix","system")["deck"]
+
+    def run_inspection(self,task_id,max_rounds=2,affected_slide_ids=None):
+        if not isinstance(max_rounds,int) or isinstance(max_rounds,bool) or max_rounds<0 or max_rounds>10: raise ValidationError("max_rounds 必须为 0 到 10 的整数")
+        state=TaskState.parse(self.get(task_id))
+        if state.stage==state.stage.DECK: self.command(task_id,f"to-review-{self._current_version(task_id,'deck')[:12]}","advance","system"); state=TaskState.parse(self.get(task_id))
+        if state.stage!=state.stage.REVIEW: raise ConflictError("当前阶段不能执行检查")
+        deck=self.deck_view(task_id)["deck"]; all_ids=list(deck["metadata"]["page_hashes"]); affected_slide_ids=affected_slide_ids or []
+        if any(x not in all_ids for x in affected_slide_ids): raise ValidationError("增量检查页面不存在")
+        scope="incremental" if affected_slide_ids else "full"; affected=affected_slide_ids or all_ids
+        report=self._inspect_once(task_id,scope,affected,0); rounds=0
+        if state.mode=="auto":
+            while not report["passed"] and rounds<max_rounds:
+                rounds+=1; self._auto_fix(task_id,report,rounds); report=self._inspect_once(task_id,"incremental",affected,rounds)
+        waiting=not report["passed"]
+        current=TaskState.parse(self.get(task_id))
+        new=current.__class__(**{**current.__dict__,"status":current.status.WAITING_FOR_USER if waiting or state.mode=="manual" else current.status.READY,"waiting_reason":"inspection_round_limit" if waiting and state.mode=="auto" else "manual_review" if state.mode=="manual" else None,"required_action":"review_issues" if waiting or state.mode=="manual" else None,"revision":current.revision+1})
+        event={"event_id":digest(f"{task_id}:{report['hash']}:inspection".encode())[:24],"command_id":f"inspection-{report['hash'][:16]}","action":"inspection_complete","actor":"system","request_hash":report["hash"],"at":utcnow(),"from":current.to_dict(),"to":new.to_dict(),"result":{"report_hash":report["hash"],"rounds":rounds,"passed":report["passed"],"mode":state.mode}}
+        self.store.commit(task_id,new.to_dict(),event)
+        return {**self.inspection_view(task_id),"rounds":rounds}
+
+    def switch_inspection_mode(self,task_id,mode):
+        if mode not in {"manual","auto"}: raise ValidationError("mode 只能是 manual 或 auto")
+        self.command(task_id,f"inspection-mode-{mode}-{self.get(task_id)['revision']}",f"switch_{mode}","user")
+        return self.inspection_view(task_id)
+
+    def dispose_issue(self,task_id,issue_id,action,rationale,actor="user"):
+        view=self.inspection_view(task_id); report=view["report"]
+        if not report or report["stale"]: raise ConflictError("当前 HTML 版本没有有效检查报告")
+        issue=next((x for x in report["issues"] if x["issue_id"]==issue_id),None)
+        if not issue: raise ValidationError("检查问题不存在")
+        if action not in {"agent_fix","manual","waive","defer"}: raise ValidationError("问题处置动作无效")
+        if action in {"manual","waive"} and actor!="user": raise ValidationError("手工处理和豁免必须由用户执行")
+        if action=="waive" and (not isinstance(rationale,str) or not rationale.strip()): raise ValidationError("豁免必须填写依据")
+        created=utcnow(); payload={"task_id":task_id,"issue_id":issue_id,"action":action,"actor":actor,"target_deck_hash":report["deck_hash"],"rationale":(rationale or "按当前处置执行").strip(),"created_at":created,"schema_version":"1.0"}
+        model=IssueDisposition.parse({"disposition_id":f"disposition-{digest(canonical(payload))[:16]}",**payload}); h=self.store.put_version(task_id,"issue-disposition",canonical(model.to_dict()),{"report_hash":report["hash"],"severity":issue["severity"],"code":issue["code"]})
+        if action=="agent_fix":
+            self._auto_fix(task_id,report,1)
+        return {**self.inspection_view(task_id),"disposition_hash":h}
+
+    def dispose_issues(self,task_id,issue_ids,action,rationale):
+        if not isinstance(issue_ids,list) or not issue_ids or len(set(issue_ids))!=len(issue_ids): raise ValidationError("批量范围必须是非空且不重复的问题 ID")
+        if action=="agent_fix" and len(issue_ids)>1: raise ValidationError("Agent 修复会生成新 HTML，请逐项执行并复检")
+        view=self.inspection_view(task_id); known={x["issue_id"] for x in (view.get("report") or {}).get("issues",[])}
+        if any(x not in known for x in issue_ids): raise ValidationError("批量范围包含未知问题")
+        hashes=[]
+        for issue_id in issue_ids:
+            result=self.dispose_issue(task_id,issue_id,action,rationale); hashes.append(result["disposition_hash"])
+        return {**self.inspection_view(task_id),"disposition_hashes":hashes,"batch_scope":issue_ids}
+
+    def assert_delivery_gate(self,task_id):
+        view=self.inspection_view(task_id)
+        if view["blocking_issues"]: raise ConflictError("仍有未解决且未豁免的阻断问题，禁止交付")
+        if not view["report"] or view["report"]["stale"]: raise ConflictError("当前 HTML 版本须先完成检查")
+        return {"delivery_allowed":True,"warnings":[x for x in view["unresolved"] if x["severity"]=="warning"]}
     def run_fake_pipeline(self,task_id):
         state=self.get(task_id)
         if state["stage"] != "created": raise ConflictError("fake 全链路只能从空任务启动")
@@ -398,7 +499,7 @@ class TaskService:
         self.command(task_id,"fake-to-review","advance")
         dispositions=[]
         for issue in report.issues:
-            disposition=IssueDisposition.parse({"disposition_id":f"disposition-{issue.issue_id}","task_id":task_id,"issue_id":issue.issue_id,"action":"resolve","actor":"user","created_at":utcnow(),"schema_version":"1.0"})
+            disposition=IssueDisposition.parse({"disposition_id":f"disposition-{issue.issue_id}","task_id":task_id,"issue_id":issue.issue_id,"action":"resolve","actor":"user","created_at":utcnow(),"target_deck_hash":deck_hash,"rationale":"fake 全链路处置","schema_version":"1.0"})
             raw=json.dumps(disposition.to_dict(),sort_keys=True).encode()
             dispositions.append(self.store.put_version(task_id,"issue-disposition",raw,{"issue_id":issue.issue_id}))
         self.command(task_id,"fake-blockers","resolve_blockers","user",{"disposition_hashes":dispositions})
