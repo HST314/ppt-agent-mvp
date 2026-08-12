@@ -1,7 +1,7 @@
 # 当前状态与能力盘点
 
 更新日期：2026-08-11  
-当前边界：P6 实现与自测完成，等待独立复验；尚未进入 P7。
+当前边界：P8 两道门禁已实现；等待固定 Chromium 独立复验结论。
 
 ## 已实现
 
@@ -32,4 +32,4 @@ python3 scripts/start.py --data .ppt-agent-data
 
 ## 尚未开始
 
-P7 交付与恢复已实现并独立验收通过。P8 第一门禁已实现并待独立复验：真实生成/检查/HTML 与分阶段 Skill 可通过显式配置接入，deterministic fake 继续作为 CI 替身；9 类场景、安全和恢复证据见既有 E2E 与 `tests/test_p8_gateways.py`。第二门禁仍须在固定 Chromium 桌面环境完成不可跳过的完整旅程证据。未取得该浏览器证据前，不得宣称整个 MVP 验收完成。
+P7 交付与恢复已实现并独立验收通过。P8 第一门禁提供真实生成/检查/HTML 与分阶段 Skill 适配，deterministic fake 继续作为 CI 替身；9 类场景、安全和恢复证据见既有 E2E 与 `tests/test_p8_gateways.py`。第二门禁由 `tests/browser/test_ac_18_desktop_journey.py` 覆盖创建、输入、规划、样品、全稿、检查、交付及交付后派生的固定 Chromium 完整旅程，`scripts/verify_browser_gate.py` 强制浏览器用例零跳过。

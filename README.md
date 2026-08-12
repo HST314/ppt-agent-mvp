@@ -62,6 +62,16 @@ python3 -m playwright install chromium
 python3 -m unittest discover -s tests
 ```
 
+## P8 固定 Chromium 门禁
+
+浏览器证据固定使用 Playwright 1.54.0（Chromium 139.0.7258.5 / build v1181）。门禁脚本会执行现有 P4、P6 浏览器回归及 AC-18 桌面完整旅程，任一用例跳过即失败：
+
+```bash
+python3 -m pip install -r requirements-browser.txt
+python3 -m playwright install chromium
+python3 scripts/verify_browser_gate.py
+```
+
 ## P6 独立检查与审核
 
 `POST /v1/tasks/{task_id}/inspection/run` 执行首次全检或指定页面增量检查；检查 Gateway 仅接收最初大纲和待审 HTML。`POST /inspection/mode` 切换 manual/auto，切换只影响下一动作；auto 在 `max_rounds` 内修复并复检，达到上限进入等待人工且不会虚假完成。`POST /issues/{issue_id}/disposition` 保存 Agent 修复、手工处理、豁免或暂缓的操作者、依据和目标 HTML 版本。`POST /inspection/delivery-gate` 在当前报告过期或存在未处置阻断问题时拒绝交付。`GET /tasks/{task_id}/inspection` 提供分组问题、联动定位、轮次和整稿人工浏览界面。
