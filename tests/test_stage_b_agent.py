@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from ppt_agent.agent_runtime import AgentRuntime, STAGE_OUTPUT_SCHEMAS, STAGE_PROMPTS, TOOLS
-from ppt_agent.errors import GatewayError, ValidationError
+from ppt_agent.errors import GatewayError, GatewayUnknownResult, ValidationError
 from ppt_agent.model_clients import ModelToolCall, ModelTurn, OpenAIResponsesClient
 from ppt_agent.skill_runtime import SkillRuntime
 
@@ -21,6 +21,14 @@ class ScriptedClient:
     def create(self, **kwargs):
         self.inputs.append(kwargs)
         return self.turns.pop(0)
+
+
+class FailingClient:
+    def __init__(self, error):
+        self.error = error
+
+    def create(self, **kwargs):
+        raise self.error
 
 
 def make_skill(root: Path, files: dict[str, bytes]):
@@ -121,6 +129,32 @@ class StageBAgentTests(unittest.TestCase):
         timed = AgentRuntime(ScriptedClient([ModelTurn('{"markdown":"late"}', "r")]), SkillRuntime.builtin(), timeout_seconds=1, clock=lambda: next(ticks))
         with self.assertRaises(GatewayError) as caught: timed.run("outline", {})
         self.assertEqual(caught.exception.audit[-1]["reason"], "deadline_exceeded")
+
+    def test_unknown_gateway_result_preserves_type_public_semantics_and_audit(self):
+        error = GatewayUnknownResult("模型请求结果未知")
+        public = error.public()
+        runtime = AgentRuntime(FailingClient(error), SkillRuntime.builtin())
+
+        with self.assertRaises(GatewayUnknownResult) as caught:
+            runtime.run("deck", {})
+
+        self.assertIs(caught.exception, error)
+        self.assertEqual(caught.exception.public(), public)
+        self.assertEqual(caught.exception.audit[-1]["reason"], "gateway_unknown_result")
+        self.assertEqual(runtime.last_audit, caught.exception.audit)
+        self.assertEqual(runtime.last_audit[0]["event"], "run")
+
+    def test_gateway_error_keeps_original_exception_and_complete_failure_audit(self):
+        error = GatewayError("模型服务调用失败")
+        runtime = AgentRuntime(FailingClient(error), SkillRuntime.builtin())
+
+        with self.assertRaises(GatewayError) as caught:
+            runtime.run("outline", {})
+
+        self.assertIs(caught.exception, error)
+        self.assertEqual(caught.exception.code, "gateway_error")
+        self.assertEqual(caught.exception.audit[-1], {"event": "terminal", "reason": "gateway_error", "tool_calls": 0})
+        self.assertEqual(runtime.last_audit, caught.exception.audit)
 
     def test_client_extracts_function_calls(self):
         sdk = SimpleNamespace(); sdk.responses = sdk

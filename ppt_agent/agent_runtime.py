@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from .errors import GatewayError, ValidationError
+from .errors import GatewayError, GatewayUnknownResult, ValidationError
 from .skill_runtime import SkillRuntime
 
 
@@ -83,7 +83,14 @@ class AgentRuntime:
         for step in range(1, self.max_steps + 1):
             if self.clock() - started >= self.timeout_seconds:
                 fail("Agent 运行超时，未提交阶段产物", "deadline_exceeded")
-            turn = self.client.create(input=conversation, tools=TOOLS, response_schema=response_schema)
+            try:
+                turn = self.client.create(input=conversation, tools=TOOLS, response_schema=response_schema)
+            except GatewayError as exc:
+                reason = "gateway_unknown_result" if isinstance(exc, GatewayUnknownResult) else "gateway_error"
+                audit.append({"event": "terminal", "reason": reason, "tool_calls": tool_count})
+                self.last_audit = tuple(audit)
+                exc.audit = self.last_audit
+                raise
             if self.clock() - started >= self.timeout_seconds:
                 fail("Agent 运行超时，未提交阶段产物", "deadline_exceeded")
             output = (turn.text or "").encode()
