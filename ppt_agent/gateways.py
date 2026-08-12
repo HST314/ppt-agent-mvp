@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 from .errors import GatewayError, GatewayUnknownResult, ValidationError
+from .agent_runtime import AgentRuntime
+from .skill_runtime import SkillRuntime
 
 class GenerationGateway(Protocol):
     def generate(self, action:str, payload:dict, *, skill:str)->dict: ...
@@ -85,6 +87,58 @@ class ModelHtmlBuilder:
         if action not in {"sample", "deck", "inspection"}: raise ValidationError("HTML Builder action 不在允许列表")
         skill=self.skills.load(action)
         return self.gateway.generate(action + "_html",{"outline":outline,**context},skill=skill["content"])["text"]
+
+class AgentGateway:
+    """Adapts the constrained stage runtime to the existing FSM ports.
+
+    It deliberately exposes no workflow operation to the model.  The service
+    remains the only owner of stages, versions, approvals and commits.
+    """
+    def __init__(self, client, *, skill=None, max_steps=12, timeout_seconds=60, model="agent"):
+        self.client, self.model = client, model
+        self.max_steps, self.timeout_seconds = max_steps, timeout_seconds
+        self.skill_factory = SkillRuntime.builtin if skill is None else lambda: SkillRuntime(skill.root, max_file_bytes=skill.max_file_bytes, max_total_bytes=skill.max_total_bytes)
+        self.runtime = None
+
+    def _run(self, stage, payload):
+        # Read quotas and audit are scoped to one stage invocation.  Reusing a
+        # mutable SkillRuntime would let earlier stages consume later budgets.
+        self.runtime = AgentRuntime(self.client, self.skill_factory(), max_steps=self.max_steps, timeout_seconds=self.timeout_seconds)
+        result = self.runtime.run(stage, payload)
+        return result.value
+
+    def generate(self, action, payload, *, skill=""):
+        if action not in {"narrative", "outline"}:
+            raise ValidationError("Agent 生成阶段无效")
+        return {"text": self._run(action, payload)["markdown"], "model": self.model}
+
+    def build(self, outline, **context):
+        action = context.pop("action", "deck")
+        if action not in {"sample", "deck", "inspection"}:
+            raise ValidationError("Agent HTML 阶段无效")
+        # Inspection repair still generates deck HTML; inspection itself uses
+        # inspect() and can never return a modified artifact.
+        stage = "deck" if action == "inspection" else action
+        return self._run(stage, {"outline": outline, **context})["html"]
+
+    def inspect(self, original_outline, html):
+        value = self._run("inspection", {"original_outline": original_outline, "html": html})
+        return {**value, "model": self.model}
+
+class LockedSkillMetadataLoader:
+    """Metadata-only compatibility port; Skill text is read by Agent tools."""
+    def __init__(self, skill=None): self.skill = skill or SkillRuntime.builtin()
+    def load(self, action):
+        if action not in {"narrative", "outline", "sample", "deck", "inspection"}: raise ValidationError("Skill action 不在允许列表")
+        return {"action": action, "version": self.skill.skill_version, "content": ""}
+
+def agent_gateways_from_config(config):
+    if config.mode == "fake": return {}
+    from .model_clients import model_clients_from_config
+    clients = model_clients_from_config(config); skill = SkillRuntime.builtin()
+    generation = AgentGateway(clients["generation"], skill=skill, max_steps=config.generation.max_steps, timeout_seconds=config.generation.timeout_seconds, model=config.generation.model)
+    inspection = AgentGateway(clients["inspection"], skill=skill, max_steps=config.inspection.max_steps, timeout_seconds=config.inspection.timeout_seconds, model=config.inspection.model)
+    return {"generator": generation, "builder": generation, "inspector": inspection, "skills": LockedSkillMetadataLoader(skill)}
 
 def gateways_from_env():
     mode=os.environ.get("PPT_AGENT_GATEWAY_MODE","fake")
