@@ -86,7 +86,7 @@ python3 scripts/verify_browser_gate.py
 
 ## P7 交付与恢复
 
-`POST /v1/tasks/{task_id}/delivery/confirm` 必须由用户提交当前候选 `deck_hash`，检查报告有效且阻断问题全部解决或豁免后才会完成任务。交付目录包含 HTML、两类 Markdown、冻结资源清单、授权资源、结果摘要和逐文件 hash manifest，并以目录级原子发布避免半交付。`POST /delivery/derive` 从历史交付派生新候选，旧交付保持不可变，新候选必须重新检查和确认。`GET /summary` 输出不含对话或推理的编排摘要；通用 actions 接口提供 pause/resume/cancel/fail/retry，非活动状态不会启动新的生成或检查动作。
+`POST /v1/tasks/{task_id}/delivery/confirm` 必须由用户提交当前候选 `deck_hash`，检查报告有效且阻断问题全部解决或豁免后才会完成任务。交付目录包含冻结的 `deck.html`、可直接打开的离线播放器 `index.html`、包内 Skill 动效资产与翻页逻辑、两类 Markdown、冻结资源清单、授权资源、结果摘要和逐文件 hash manifest，并以目录级原子发布避免半交付。离线播放器支持按钮与 Arrow/PageUp/PageDown/Space/Home/End 键导航，不请求 CDN。`POST /delivery/derive` 从历史交付派生新候选，旧交付保持不可变，新候选必须重新检查和确认。`GET /summary` 输出不含对话或推理的编排摘要；通用 actions 接口提供 pause/resume/cancel/fail/retry，非活动状态不会启动新的生成或检查动作。
 
 ## 阶段 D 离线交付
 

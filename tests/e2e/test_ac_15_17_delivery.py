@@ -27,10 +27,13 @@ class DeliveryJourney(unittest.TestCase):
     def test_ac16_bundle_is_complete_runnable_and_hash_verified(self):
         deck=self.svc.deck_view("task")["deck"]; delivery=self.svc.confirm_delivery("task",deck["hash"])["delivery"]
         root=self.store.delivery_root("task",delivery["delivery_id"]); manifest=json.loads((root/"manifest.json").read_text())
-        expected={"deck.html","narrative.md","outline.md","resource-manifest.json","result.json"}
+        expected={"deck.html","index.html","assets/offline-player.js","assets/motion.min.js","assets/THIRD_PARTY_NOTICES.txt","narrative.md","outline.md","resource-manifest.json","result.json"}
         self.assertTrue(expected.issubset(manifest["files"]))
         for name,want in manifest["files"].items(): self.assertEqual(hashlib.sha256((root/name).read_bytes()).hexdigest(),want)
         self.assertIn("<html",(root/"deck.html").read_text().lower())
+        player=(root/"index.html").read_text()
+        self.assertIn('src="assets/offline-player.js"',player)
+        self.assertIn('src="assets/motion.min.js"',player)
         result=json.loads((root/"result.json").read_text())
         self.assertEqual(result["version"],delivery["delivery_id"])
         self.assertEqual(result["status"],{"stage":"delivery","status":"completed"})

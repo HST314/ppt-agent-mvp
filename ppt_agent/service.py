@@ -13,6 +13,7 @@ from .schema import ClarificationSet, ResourceManifest, TaskCard, TaskInputSnaps
 from .schema import NarrativeDocument, SlideOutline, SampleSelection, DeckArtifact
 from .p3 import changed_slide_ids, narrative_markdown, outline_markdown, parse_outline, requested_slide_count
 from .p4 import controlled_assets, infer_scope, recommend, render, validate_html
+from .offline import offline_assets, offline_player
 
 def utcnow(): return datetime.now(timezone.utc).isoformat()
 def fingerprint(value): return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(",",":")).encode()).hexdigest()
@@ -638,7 +639,7 @@ class TaskService:
         intent=self.store.delivery_intent(task_id,delivery_id,{"task_id":task_id,"deck_hash":deck_hash})
         confirmed_at=intent["confirmed_at"]
         result_summary={"version":delivery_id,"status":{"stage":"delivery","status":"completed"},"description":"当前候选版本已通过检查并由用户明确确认交付"}
-        files={"deck.html":current["html"].encode(),"narrative.md":json.loads(self.version(task_id,narrative_hash))["markdown"].encode(),"outline.md":json.loads(self.version(task_id,outline_hash))["markdown"].encode(),"resource-manifest.json":canonical(snapshot["manifest"]),"result.json":canonical({"task_id":task_id,"deck_hash":deck_hash,"warnings":gate["warnings"],"confirmed_at":confirmed_at,**result_summary})}
+        files={"deck.html":current["html"].encode(),"index.html":offline_player(current["html"]).encode(),"narrative.md":json.loads(self.version(task_id,narrative_hash))["markdown"].encode(),"outline.md":json.loads(self.version(task_id,outline_hash))["markdown"].encode(),"resource-manifest.json":canonical(snapshot["manifest"]),"result.json":canonical({"task_id":task_id,"deck_hash":deck_hash,"warnings":gate["warnings"],"confirmed_at":confirmed_at,**result_summary}),**offline_assets()}
         resource_root=self.store.resource_root(task_id)
         for item in snapshot["manifest"].get("resources",[]):
             relative=Path(item["uri"].removeprefix("resources://"))
