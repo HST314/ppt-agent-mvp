@@ -149,11 +149,16 @@ class TaskService:
         self._require_actionable(task_id)
         view=self._p3_input(task_id); state=TaskState.parse(view["state"])
         skill=self.skills.load("narrative"); prior=self._current_version(task_id,"narrative")
-        text=narrative_markdown(view["task_card"])
-        if prompt: text += f"\n## 修改要求\n{prompt.strip()}\n"
+        if isinstance(self.generator,FakeGenerationGateway):
+            text=narrative_markdown(view["task_card"])
+            if prompt: text += f"\n## 修改要求\n{prompt.strip()}\n"
+            model_name=self.generator.model
+        else:
+            generated=self.generator.generate("narrative",{"task_id":task_id,"task_card":view["task_card"],"prompt":prompt,"scope":scope},skill=skill["content"])
+            text=generated["text"]; model_name=generated.get("model","unknown")
         version=len(self.versions(task_id,"narrative"))+1; content_hash=digest(text.encode())
         model=NarrativeDocument.parse({"document_id":f"narrative-{content_hash[:16]}","task_id":task_id,"version":version,"markdown":text,"content_hash":content_hash,"created_at":now(),"schema_version":"1.0"})
-        metadata={"parent":prior,"action":"generate" if not prior else "regenerate","scope":scope,"summary":"生成整稿叙事结构","skill":{"action":"narrative","version":skill["version"],"hash":digest(skill["content"].encode()),"included":["narrative"],"trimmed":["outline","html","inspection"]},"input_snapshot_hash":view["snapshot_hash"]}
+        metadata={"parent":prior,"action":"generate" if not prior else "regenerate","scope":scope,"summary":"生成整稿叙事结构","model":model_name,"skill":{"action":"narrative","version":skill["version"],"hash":digest(skill["content"].encode()),"included":["narrative"],"trimmed":["outline","html","inspection"]},"input_snapshot_hash":view["snapshot_hash"]}
         h=self._record_p3(task_id,"narrative",model,metadata,"narrative_generate")
         if state.stage in {state.stage.CLARIFICATION,state.stage.CREATED}:
             self.command(task_id,f"narrative-stage-{h[:12]}","advance")
@@ -193,8 +198,12 @@ class TaskService:
             for sid in slide_ids: blocks[sid] += f"\n- 修改要求：{prompt.strip()}"
             prefix=old[:old.index("## [")].rstrip(); text=prefix+"\n\n"+"\n\n".join(blocks[sid] for sid in order)+"\n"
         else:
-            text=outline_markdown(view["task_card"],resources,count)
-            if prompt: text += f"\n<!-- 修改要求：{prompt.strip()} -->\n"
+            if isinstance(self.generator,FakeGenerationGateway):
+                text=outline_markdown(view["task_card"],resources,count)
+                if prompt: text += f"\n<!-- 修改要求：{prompt.strip()} -->\n"
+            else:
+                generated=self.generator.generate("outline",{"task_id":task_id,"task_card":view["task_card"],"narrative":json.loads(self.version(task_id,narrative))["markdown"],"resources":resources,"slide_count":count,"prompt":prompt},skill=skill["content"])
+                text=generated["text"]
         return self.edit_outline(task_id,text,"生成逐页大纲",actor="system",skill=skill)
     def edit_outline(self,task_id,markdown,summary="直接编辑",actor="user",skill=None):
         view=self._p3_input(task_id); expected=requested_slide_count(view["task_card"])
@@ -285,7 +294,8 @@ class TaskService:
         if selection["outline_hash"] != outline: raise ConflictError("样品选择已因大纲变化而失效")
         data=json.loads(self.version(task_id,outline)); rules=[]; assets=controlled_assets(self.input_view(task_id)["manifest"],self.store.resource_root(task_id))
         if prompt: rules.append(prompt.strip())
-        html_text=validate_html(render(data["markdown"],selection["slide_ids"],rules,assets=assets),selection["slide_ids"],assets.values())
+        source=render(data["markdown"],selection["slide_ids"],rules,assets=assets) if isinstance(self.builder,FakeHtmlBuilder) else self.builder.build(data["markdown"],slide_ids=selection["slide_ids"],rules=rules,assets=assets)
+        html_text=validate_html(source,selection["slide_ids"],assets.values())
         version=len(self.versions(task_id,"sample"))+1; content_hash=digest(html_text.encode()); model=DeckArtifact.parse({"artifact_id":f"sample-{content_hash[:16]}","task_id":task_id,"version":version,"kind":"sample","outline_hash":outline,"content_hash":content_hash,"created_at":now(),"schema_version":"1.0"})
         prior=self._current_version(task_id,"sample"); meta={"html":html_text,"selection_hash":selection["hash"],"parent":prior,"summary":"生成真实 HTML 样品","scope":"global","global_rules":rules,"local_exceptions":{},"build":"success"}
         h=self._record_p3(task_id,"sample",model,meta,"sample_generate")
@@ -345,7 +355,8 @@ class TaskService:
         outline=self._current_version(task_id,"outline"); data=json.loads(self.version(task_id,outline)); ids=list(data["slide_ids"])
         sample=sample_view["sample"]; meta=sample["metadata"]
         assets=controlled_assets(self.input_view(task_id)["manifest"],self.store.resource_root(task_id))
-        html_text=validate_html(render(data["markdown"],ids,meta.get("global_rules",[]),meta.get("local_exceptions",{}),assets),ids,assets.values())
+        source=render(data["markdown"],ids,meta.get("global_rules",[]),meta.get("local_exceptions",{}),assets) if isinstance(self.builder,FakeHtmlBuilder) else self.builder.build(data["markdown"],slide_ids=ids,rules=meta.get("global_rules",[]),exceptions=meta.get("local_exceptions",{}),assets=assets)
+        html_text=validate_html(source,ids,assets.values())
         sample_fragments=self._slide_fragments(sample["html"]); deck_fragments=self._slide_fragments(html_text)
         preserved={sid:digest(deck_fragments[sid].encode())==digest(fragment.encode()) for sid,fragment in sample_fragments.items()}
         if not all(preserved.values()): raise ConflictError("确认样品发生未提示变化")

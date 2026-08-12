@@ -14,6 +14,8 @@ python3 scripts/start.py --data .ppt-agent-data --host 127.0.0.1 --port 8000
 
 另一个终端访问 `http://127.0.0.1:8000/healthz`，应得到含 `"stage": "P7"`、`"status": "ok"` 和 `"runtime_ready": true` 的 JSON。
 
+默认使用 deterministic fake，保证 CI 离线稳定。真实能力使用显式环境配置启用：`PPT_AGENT_GATEWAY_MODE=http`、`PPT_AGENT_MODEL_ENDPOINT`、`PPT_AGENT_MODEL`、`PPT_AGENT_SKILL_DIR`，凭证仅通过 `PPT_AGENT_API_KEY` 注入，可选 `PPT_AGENT_MODEL_TIMEOUT`。模型端点须为 HTTPS（本机回环调试除外），生成与独立检查请求使用不同 purpose；连接结果未知时运行内核不会盲目重试。
+
 ## P0 校验
 
 环境要求：Git 与 Python 3.10+。

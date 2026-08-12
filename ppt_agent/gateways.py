@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib, json, os, socket, urllib.error, urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
+from .errors import GatewayError, GatewayUnknownResult, ValidationError
 
 class GenerationGateway(Protocol):
     def generate(self, action:str, payload:dict, *, skill:str)->dict: ...
@@ -10,7 +13,7 @@ class InspectionGateway(Protocol):
 class SkillLoader(Protocol):
     def load(self, action:str)->dict: ...
 class HtmlBuilder(Protocol):
-    def build(self, outline:str)->str: ...
+    def build(self, outline:str, **context)->str: ...
 
 @dataclass
 class FakeSkillLoader:
@@ -30,4 +33,63 @@ class FakeInspectionGateway:
 @dataclass
 class FakeHtmlBuilder:
     version:str="fake-builder-1"
-    def build(self,outline): return f"<!doctype html><html><body>{outline}</body></html>"
+    def build(self,outline,**context): return f"<!doctype html><html><body>{outline}</body></html>"
+
+class DirectorySkillLoader:
+    ACTIONS={"narrative","outline","sample","deck","inspection"}
+    def __init__(self,root): self.root=Path(root).resolve()
+    def load(self,action):
+        if action not in self.ACTIONS: raise ValidationError("Skill action 不在允许列表")
+        path=(self.root/f"{action}.md").resolve()
+        if self.root not in path.parents or not path.is_file(): raise ValidationError(f"缺少 Skill：{action}")
+        content=path.read_text(encoding="utf-8")
+        if not content.strip() or len(content.encode())>256*1024: raise ValidationError("Skill 内容为空或超过 256 KiB")
+        return {"action":action,"version":hashlib.sha256(content.encode()).hexdigest()[:16],"content":content}
+
+class JsonHttpModelGateway:
+    """Vendor-neutral adapter. It never blindly retries an unknown result."""
+    def __init__(self,endpoint,model,api_key="",timeout=30.0,purpose="generation"):
+        if not endpoint.startswith("https://") and not endpoint.startswith("http://127.0.0.1:") and not endpoint.startswith("http://localhost:"):
+            raise ValidationError("模型端点必须使用 HTTPS（本机回环地址除外）")
+        self.endpoint,self.model,self.api_key=endpoint,model,api_key
+        self.timeout,self.purpose=float(timeout),purpose
+    def _call(self,payload):
+        body=json.dumps({"model":self.model,"purpose":self.purpose,**payload},ensure_ascii=False).encode()
+        headers={"Content-Type":"application/json","Accept":"application/json"}
+        if self.api_key: headers["Authorization"]=f"Bearer {self.api_key}"
+        request=urllib.request.Request(self.endpoint,data=body,headers=headers,method="POST")
+        try:
+            with urllib.request.urlopen(request,timeout=self.timeout) as response: raw=response.read(4*1024*1024+1)
+        except urllib.error.HTTPError as exc: raise GatewayError(f"模型服务返回 HTTP {exc.code}") from exc
+        except (TimeoutError,socket.timeout) as exc: raise GatewayError("模型调用超时") from exc
+        except (urllib.error.URLError,ConnectionError,OSError) as exc: raise GatewayUnknownResult("模型调用结果未知，请人工确认后再重试") from exc
+        if len(raw)>4*1024*1024: raise GatewayError("模型响应超过 4 MiB")
+        try: value=json.loads(raw)
+        except (UnicodeDecodeError,json.JSONDecodeError) as exc: raise GatewayError("模型响应不是有效 JSON") from exc
+        if not isinstance(value,dict): raise GatewayError("模型响应必须为 JSON object")
+        return value
+    def generate(self,action,payload,*,skill):
+        value=self._call({"action":action,"input":payload,"skill":skill})
+        if not isinstance(value.get("text"),str) or not value["text"].strip(): raise GatewayError("生成响应缺少 text")
+        return {**value,"model":self.model}
+    def inspect(self,original_outline,html):
+        value=self._call({"original_outline":original_outline,"html":html})
+        if not isinstance(value.get("passed"),bool) or not isinstance(value.get("issues"),list): raise GatewayError("检查响应契约无效")
+        return {**value,"model":self.model}
+
+class ModelHtmlBuilder:
+    version="model-html-v1"
+    def __init__(self,gateway,skill_loader): self.gateway,self.skills=gateway,skill_loader
+    def build(self,outline,**context):
+        skill=self.skills.load("deck")
+        return self.gateway.generate("html",{"outline":outline,**context},skill=skill["content"])["text"]
+
+def gateways_from_env():
+    mode=os.environ.get("PPT_AGENT_GATEWAY_MODE","fake")
+    if mode=="fake": return {}
+    if mode!="http": raise ValidationError("PPT_AGENT_GATEWAY_MODE 只能是 fake 或 http")
+    endpoint=os.environ.get("PPT_AGENT_MODEL_ENDPOINT",""); model=os.environ.get("PPT_AGENT_MODEL",""); skill_root=os.environ.get("PPT_AGENT_SKILL_DIR","")
+    if not endpoint or not model or not skill_root: raise ValidationError("http 模式缺少模型端点、模型名或 Skill 目录")
+    timeout=float(os.environ.get("PPT_AGENT_MODEL_TIMEOUT","30")); key=os.environ.get("PPT_AGENT_API_KEY","")
+    generator=JsonHttpModelGateway(endpoint,model,key,timeout,"generation"); skills=DirectorySkillLoader(skill_root)
+    return {"generator":generator,"inspector":JsonHttpModelGateway(endpoint,model,key,timeout,"independent_inspection"),"skills":skills,"builder":ModelHtmlBuilder(generator,skills)}

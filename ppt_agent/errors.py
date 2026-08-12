@@ -32,3 +32,11 @@ class NotFoundError(DomainError):
 
 class GateError(ConflictError):
     code = "gate_not_satisfied"
+
+class GatewayError(DomainError):
+    code = "gateway_error"
+    status = 502
+
+class GatewayUnknownResult(GatewayError):
+    code = "gateway_unknown_result"
+    status = 503

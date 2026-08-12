@@ -32,4 +32,4 @@ python3 scripts/start.py --data .ppt-agent-data
 
 ## 尚未开始
 
-P7 人工审核交付、P8 完整 E2E/安全验收仍须按开发清单顺序实施。P6 独立复验通过前不得进入 P7。
+P7 交付与恢复已实现并独立验收通过。P8 第一门禁已实现并待独立复验：真实生成/检查/HTML 与分阶段 Skill 可通过显式配置接入，deterministic fake 继续作为 CI 替身；9 类场景、安全和恢复证据见既有 E2E 与 `tests/test_p8_gateways.py`。第二门禁仍须在固定 Chromium 桌面环境完成不可跳过的完整旅程证据。未取得该浏览器证据前，不得宣称整个 MVP 验收完成。
