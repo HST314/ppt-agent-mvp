@@ -1,0 +1,27 @@
+gateway:
+  mode: fake
+
+models:
+  generation:
+    provider: openai_responses
+    model: deepseek-v4-flash-260425
+    api_key_env: ARK_API_KEY
+    base_url_env: ARK_BASE_URL
+    timeout_seconds: 60
+    max_steps: 12
+  inspection:
+    provider: openai_responses
+    model: deepseek-v4-flash-260425
+    api_key_env: ARK_API_KEY
+    base_url_env: ARK_BASE_URL
+    timeout_seconds: 60
+    max_steps: 6
+    fallback_to_generation: true
+
+skills:
+  active: guizang-ppt-skill
+
+capabilities:
+  network_tools: false
+  image_input: false
+  image_generation: false
