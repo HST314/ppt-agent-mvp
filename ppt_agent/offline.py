@@ -5,6 +5,7 @@ import json
 import re
 import stat
 import zipfile
+from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 
@@ -12,7 +13,64 @@ ASSET_ROOT = Path(__file__).with_name("offline_assets")
 
 
 REMOTE_URL = re.compile(r"(?:https?:)?//[^\s\"'<>]+", re.I)
-TEXT_SUFFIXES = {".html", ".htm", ".css", ".js", ".json", ".md", ".txt", ".svg"}
+RUNTIME_TEXT_SUFFIXES = {".html", ".htm", ".css", ".js", ".mjs", ".svg"}
+
+
+def _without_js_comments(source: str) -> str:
+    """Remove JS comments without damaging URL strings in executable code."""
+    output: list[str] = []
+    index = 0
+    quote: str | None = None
+    while index < len(source):
+        char = source[index]
+        following = source[index + 1] if index + 1 < len(source) else ""
+        if quote:
+            output.append(char)
+            if char == "\\" and index + 1 < len(source):
+                index += 1
+                output.append(source[index])
+            elif char == quote:
+                quote = None
+        elif char in {"'", '"', "`"}:
+            quote = char
+            output.append(char)
+        elif char == "/" and following == "/":
+            index += 2
+            while index < len(source) and source[index] not in "\r\n":
+                index += 1
+            output.append("\n")
+        elif char == "/" and following == "*":
+            index += 2
+            while index + 1 < len(source) and source[index:index + 2] != "*/":
+                index += 1
+            index += 1
+        else:
+            output.append(char)
+        index += 1
+    return "".join(output)
+
+
+class _HTMLRuntimeURLs(HTMLParser):
+    URL_ATTRIBUTES = {"src", "href", "action", "poster", "data", "formaction", "srcset"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.urls: list[str] = []
+        self.in_script = False
+
+    def handle_starttag(self, tag, attrs):
+        self.in_script = self.in_script or tag.lower() == "script"
+        for name, value in attrs:
+            if value and name.lower() in self.URL_ATTRIBUTES:
+                self.urls.extend(REMOTE_URL.findall(value))
+
+    def handle_endtag(self, tag):
+        if tag.lower() == "script":
+            self.in_script = False
+
+    def handle_data(self, data):
+        if self.in_script:
+            self.urls.extend(REMOTE_URL.findall(_without_js_comments(data)))
 
 
 def sha256(path: Path) -> str:
@@ -31,9 +89,18 @@ def delivery_files(root: Path) -> list[Path]:
 def external_urls(root: Path) -> dict[str, list[str]]:
     findings: dict[str, list[str]] = {}
     for path in delivery_files(root):
-        if path.suffix.lower() not in TEXT_SUFFIXES:
+        suffix = path.suffix.lower()
+        if suffix not in RUNTIME_TEXT_SUFFIXES:
             continue
-        matches = sorted(set(REMOTE_URL.findall(path.read_text(encoding="utf-8"))))
+        source = path.read_text(encoding="utf-8")
+        if suffix in {".html", ".htm"}:
+            parser = _HTMLRuntimeURLs()
+            parser.feed(source)
+            matches = sorted(set(parser.urls))
+        elif suffix in {".js", ".mjs"}:
+            matches = sorted(set(REMOTE_URL.findall(_without_js_comments(source))))
+        else:
+            matches = sorted(set(REMOTE_URL.findall(re.sub(r"/\*.*?\*/", "", source, flags=re.S))))
         if matches:
             findings[path.relative_to(root).as_posix()] = matches
     return findings
