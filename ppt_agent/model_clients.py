@@ -11,9 +11,17 @@ from .errors import GatewayError, GatewayUnknownResult
 
 
 @dataclass(frozen=True)
+class ModelToolCall:
+    name: str
+    arguments: str
+    call_id: str
+
+
+@dataclass(frozen=True)
 class ModelTurn:
-    text: str
+    text: str | None
     response_id: str | None = None
+    tool_calls: tuple[ModelToolCall, ...] = ()
 
 
 class ResponsesModelClient(Protocol):
@@ -40,10 +48,17 @@ class OpenAIResponsesClient:
         except Exception as exc:
             raise GatewayError("模型服务调用失败") from exc
         text = getattr(response, "output_text", None)
-        if not isinstance(text, str) or not text.strip():
+        calls = []
+        for item in getattr(response, "output", ()) or ():
+            if getattr(item, "type", None) == "function_call":
+                name, arguments, call_id = getattr(item, "name", None), getattr(item, "arguments", None), getattr(item, "call_id", None)
+                if not all(isinstance(value, str) and value for value in (name, arguments, call_id)):
+                    raise GatewayError("模型工具调用契约无效")
+                calls.append(ModelToolCall(name, arguments, call_id))
+        if (not isinstance(text, str) or not text.strip()) and not calls:
             raise GatewayError("模型响应缺少文本结果")
         response_id = getattr(response, "id", None)
-        return ModelTurn(text=text, response_id=response_id if isinstance(response_id, str) else None)
+        return ModelTurn(text=text if isinstance(text, str) else None, response_id=response_id if isinstance(response_id, str) else None, tool_calls=tuple(calls))
 
 
 class FakeResponsesClient:
