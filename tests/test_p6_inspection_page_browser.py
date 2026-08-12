@@ -53,7 +53,7 @@ class InspectionPageBrowserTests(unittest.TestCase):
         self.svc.import_input("task", {"goal":"发布", "audience":"客户", "topic":"方案", "页数":3})
         self.svc.generate_narrative("task"); self.svc.confirm_narrative("task")
         self.svc.generate_outline("task"); self.svc.confirm_outline("task")
-        self.svc.generate_samples("task"); self.svc.confirm_sample("task")
+        self.svc.generate_sample("task"); self.svc.confirm_sample("task")
         self.svc.generate_deck("task"); self.svc.run_inspection("task", 0)
         self.server = make_server("127.0.0.1", 0, App(self.svc), handler_class=QuietHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True); self.thread.start()
