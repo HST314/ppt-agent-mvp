@@ -32,7 +32,7 @@
 | 动作级可观测性 | 通过 | `tests/test_p8_release.py`；JSON `action_metric` | 指标由部署环境采集聚合 |
 | 运维与恢复 | 通过 | `docs/runbook.md`、`tests/e2e/test_ac_15_17_delivery.py` | 文件工作区需由部署方纳入备份 |
 | AC-01～AC-17 | 通过 | 上表逐项测试路径；非浏览器全量门禁 | 无 |
-| AC-18 桌面联合旅程 | 待联合复验 | `tests/browser/test_ac_18_desktop_journey.py`、`scripts/verify_browser_gate.py` | 固定浏览器环境须 0 失败、0 跳过，且不得以 API fetch 代替控件操作 |
+| AC-18 桌面联合旅程 | 通过 | `tests/browser/test_ac_18_desktop_journey.py`、`scripts/verify_browser_gate.py`；2026-08-12 独立复验：Playwright 1.54.0 / Chromium 139.0.7258.5（build v1181），6/6 passed、0 failed、0 skipped | 固定浏览器环境复验须保持 0 失败、0 跳过，且不得以 API fetch 代替控件操作 |
 
 ## 回填规则
 

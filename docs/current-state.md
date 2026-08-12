@@ -1,7 +1,7 @@
 # 当前状态与能力盘点
 
-更新日期：2026-08-11  
-当前边界：P0～P8 后端能力及发布证据已实现；等待 AC-18 固定 Chromium 联合复验结论。
+更新日期：2026-08-12
+当前边界：P0～P8 后端能力及发布证据已实现；AC-18 固定 Chromium 联合复验已通过。
 
 ## 已实现
 
@@ -32,6 +32,6 @@ python3 scripts/start.py --data .ppt-agent-data
 
 健康检查返回 `stage=P8`、`runtime_ready=true`。机器契约见 `docs/openapi.yaml`。
 
-## 待联合复验
+## 联合复验结论
 
-P7 交付与恢复已实现并独立验收通过。P8 第一门禁提供真实生成/检查/HTML 与分阶段 Skill 适配，deterministic fake 继续作为 CI 替身；9 类场景、安全和恢复证据见既有 E2E 与 `tests/test_p8_gateways.py`。第二门禁由 `tests/browser/test_ac_18_desktop_journey.py` 覆盖创建、输入、规划、样品、全稿、检查、交付及交付后派生的固定 Chromium 完整旅程，`scripts/verify_browser_gate.py` 强制浏览器用例零跳过。
+P7 交付与恢复已实现并独立验收通过。P8 第一门禁提供真实生成/检查/HTML 与分阶段 Skill 适配，deterministic fake 继续作为 CI 替身；9 类场景、安全和恢复证据见既有 E2E 与 `tests/test_p8_gateways.py`。第二门禁由 `tests/browser/test_ac_18_desktop_journey.py` 覆盖创建、输入、规划、样品、全稿、检查、交付及交付后派生的固定 Chromium 完整旅程，`scripts/verify_browser_gate.py` 强制浏览器用例零跳过。2026-08-12 独立复验在 Playwright 1.54.0、Chromium 139.0.7258.5（build v1181）环境执行，结果为 6/6 passed、0 failed、0 skipped，AC-18 通过。
