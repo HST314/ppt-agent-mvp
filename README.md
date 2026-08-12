@@ -2,7 +2,7 @@
 
 PPT Agent MVP 的需求、实现决策与验收追踪仓库。
 
-P6 独立检查与审核闭环已实现，包括隔离检查输入、元素/页面/整稿三级报告、增量复检、manual/auto 有界修复、问题处置审计及阻断交付门禁。产品行为以 `docs/product-contract.md` 为准，实施顺序以 `docs/development-plan.md` 为准。
+P7 交付与恢复闭环已实现，包括显式版本绑定确认、原子交付包、逐文件 hash manifest、交付后非破坏派生、暂停/取消/失败恢复门禁及编排状态摘要。产品行为以 `docs/product-contract.md` 为准，实施顺序以 `docs/development-plan.md` 为准。
 
 ## 本地启动
 
@@ -12,7 +12,7 @@ P6 独立检查与审核闭环已实现，包括隔离检查输入、元素/页�
 python3 scripts/start.py --data .ppt-agent-data --host 127.0.0.1 --port 8000
 ```
 
-另一个终端访问 `http://127.0.0.1:8000/healthz`，应得到含 `"stage": "P6"`、`"status": "ok"` 和 `"runtime_ready": true` 的 JSON。
+另一个终端访问 `http://127.0.0.1:8000/healthz`，应得到含 `"stage": "P7"`、`"status": "ok"` 和 `"runtime_ready": true` 的 JSON。
 
 ## P0 校验
 
@@ -63,3 +63,7 @@ python3 -m unittest discover -s tests
 ## P6 独立检查与审核
 
 `POST /v1/tasks/{task_id}/inspection/run` 执行首次全检或指定页面增量检查；检查 Gateway 仅接收最初大纲和待审 HTML。`POST /inspection/mode` 切换 manual/auto，切换只影响下一动作；auto 在 `max_rounds` 内修复并复检，达到上限进入等待人工且不会虚假完成。`POST /issues/{issue_id}/disposition` 保存 Agent 修复、手工处理、豁免或暂缓的操作者、依据和目标 HTML 版本。`POST /inspection/delivery-gate` 在当前报告过期或存在未处置阻断问题时拒绝交付。`GET /tasks/{task_id}/inspection` 提供分组问题、联动定位、轮次和整稿人工浏览界面。
+
+## P7 交付与恢复
+
+`POST /v1/tasks/{task_id}/delivery/confirm` 必须由用户提交当前候选 `deck_hash`，检查报告有效且阻断问题全部解决或豁免后才会完成任务。交付目录包含 HTML、两类 Markdown、冻结资源清单、授权资源、结果摘要和逐文件 hash manifest，并以目录级原子发布避免半交付。`POST /delivery/derive` 从历史交付派生新候选，旧交付保持不可变，新候选必须重新检查和确认。`GET /summary` 输出不含对话或推理的编排摘要；通用 actions 接口提供 pause/resume/cancel/fail/retry，非活动状态不会启动新的生成或检查动作。

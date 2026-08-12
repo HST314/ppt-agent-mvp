@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import hashlib, json, os, re, threading, uuid
+import hashlib, json, os, re, shutil, threading, uuid
 from pathlib import Path
 
 from .errors import ConflictError, NotFoundError, ValidationError
@@ -84,6 +84,30 @@ class WorkspaceStore:
         p=self._task(task_id)/"artifacts"/digest
         if not p.exists(): raise NotFoundError("版本不存在")
         return p.read_bytes()
+    def publish_delivery(self,task_id,delivery_id,files):
+        """Publish an immutable delivery directory only after every file is ready."""
+        if not delivery_id or Path(delivery_id).name != delivery_id: raise ValidationError("delivery_id 格式无效")
+        base=self._task(task_id)/"deliveries"; base.mkdir(exist_ok=True)
+        target=base/delivery_id
+        with self.lock(task_id):
+            if target.exists(): raise ConflictError("交付版本不可覆盖")
+            staging=base/f".{delivery_id}.{uuid.uuid4().hex}.tmp"; staging.mkdir()
+            try:
+                for name,content in files.items():
+                    relative=Path(name)
+                    if relative.is_absolute() or ".." in relative.parts: raise ValidationError("交付文件路径越界")
+                    path=(staging/relative).resolve()
+                    if staging.resolve() not in path.parents: raise ValidationError("交付文件路径越界")
+                    path.parent.mkdir(parents=True,exist_ok=True); path.write_bytes(content)
+                if self.fault: self.fault("before_delivery_publish")
+                os.replace(staging,target)
+            except Exception:
+                shutil.rmtree(staging,ignore_errors=True); raise
+        return target
+    def delivery_root(self,task_id,delivery_id):
+        path=(self._task(task_id)/"deliveries"/delivery_id).resolve()
+        if not path.is_dir(): raise NotFoundError("交付不存在")
+        return path
     @staticmethod
     def _read_events(p): return [json.loads(x) for x in (p/"events.jsonl").read_text().splitlines() if x]
     def events(self,task_id):

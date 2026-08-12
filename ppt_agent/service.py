@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib, json, re
+from pathlib import Path
 from datetime import datetime, timezone
 
 from .errors import ConflictError, ValidationError
@@ -23,6 +24,9 @@ class TaskService:
         if mode not in {"manual","auto"}: raise ValidationError("mode 只能是 manual 或 auto")
         s=TaskState(task_id=task_id,mode=mode); self.store.create(task_id,s.to_dict()); return s.to_dict()
     def get(self,task_id): return self.store.checkpoint(task_id)
+    def _require_actionable(self,task_id):
+        status=self.get(task_id)["status"]
+        if status in {"paused","cancelled","failed","completed"}: raise ConflictError(f"任务状态 {status} 不允许启动新动作")
     def command(self,task_id,command_id,action,actor="system",payload=None):
         request={"action":action,"actor":actor,"payload":payload or {}}
         with self.store.lock(task_id):
@@ -142,6 +146,7 @@ class TaskService:
                 result[kind]={**item,"hash":current,"metadata":meta}
         return result
     def generate_narrative(self,task_id,prompt=None,scope="all"):
+        self._require_actionable(task_id)
         view=self._p3_input(task_id); state=TaskState.parse(view["state"])
         skill=self.skills.load("narrative"); prior=self._current_version(task_id,"narrative")
         text=narrative_markdown(view["task_card"])
@@ -173,6 +178,7 @@ class TaskService:
             self.store.commit(task_id,new.to_dict(),event)
         return self.planning_view(task_id)
     def generate_outline(self,task_id,prompt=None,slide_ids=None):
+        self._require_actionable(task_id)
         view=self._p3_input(task_id); narrative=self._current_version(task_id,"narrative")
         if not narrative: raise ConflictError("须先生成叙事结构")
         state=TaskState.parse(self.get(task_id))
@@ -272,6 +278,7 @@ class TaskService:
         self.store.commit(task_id,new.to_dict(),event)
         return {**self.sample_view(task_id),"selection":{**model.to_dict(),"hash":h,"metadata":{"reasons":reasons}}}
     def generate_sample(self,task_id,prompt=None):
+        self._require_actionable(task_id)
         view=self.sample_view(task_id); selection=view["selection"]
         if not selection: view=self.select_samples(task_id); selection=view["selection"]
         outline=self._current_version(task_id,"outline")
@@ -285,6 +292,7 @@ class TaskService:
         self._invalidate_sample_gate(task_id,h)
         return self.sample_view(task_id)
     def modify_sample(self,task_id,prompt,scope=None,slide_id=None,element_id=None):
+        self._require_actionable(task_id)
         view=self.sample_view(task_id); sample=view["sample"]
         if not sample: raise ConflictError("尚未生成样品")
         if not isinstance(prompt,str) or not prompt.strip(): raise ValidationError("修改 Prompt 不得为空")
@@ -330,6 +338,7 @@ class TaskService:
         self._record_p3(task_id,"deck",model,metadata,action,actor)
         return self.deck_view(task_id)
     def generate_deck(self,task_id):
+        self._require_actionable(task_id)
         sample_view=self.sample_view(task_id); self._require_current_sample_confirmation(task_id)
         state=TaskState.parse(self.get(task_id))
         if state.stage not in {state.stage.SAMPLE,state.stage.DECK}: raise ConflictError("当前阶段不能生成全稿")
@@ -346,6 +355,7 @@ class TaskService:
             result=self.deck_view(task_id)
         return result
     def modify_deck(self,task_id,prompt,change_type="visual",scope=None,slide_ids=None,element_id=None):
+        self._require_actionable(task_id)
         view=self.deck_view(task_id); deck=view["deck"]
         if not deck: raise ConflictError("尚未生成全稿")
         if not isinstance(prompt,str) or not prompt.strip(): raise ValidationError("修改 Prompt 不得为空")
@@ -431,6 +441,7 @@ class TaskService:
         return self._record_deck(task_id,html_text,deck["outline_hash"],{"parent":deck["hash"],"summary":f"自动修复第 {round_number} 轮","scope":"page","affected":affected,"outline_consistent":True,"global_rules":deck["metadata"].get("global_rules",[]),"local_exceptions":deck["metadata"].get("local_exceptions",{}),"inspection_report_hash":report["hash"],"auto_fix_round":round_number},"inspection_auto_fix","system")["deck"]
 
     def run_inspection(self,task_id,max_rounds=2,affected_slide_ids=None):
+        self._require_actionable(task_id)
         if not isinstance(max_rounds,int) or isinstance(max_rounds,bool) or max_rounds<0 or max_rounds>10: raise ValidationError("max_rounds 必须为 0 到 10 的整数")
         state=TaskState.parse(self.get(task_id))
         if state.stage==state.stage.DECK: self.command(task_id,f"to-review-{self._current_version(task_id,'deck')[:12]}","advance","system"); state=TaskState.parse(self.get(task_id))
@@ -485,6 +496,63 @@ class TaskService:
         if view["blocking_issues"]: raise ConflictError("仍有未解决且未豁免的阻断问题，禁止交付")
         if not view["report"] or view["report"]["stale"]: raise ConflictError("当前 HTML 版本须先完成检查")
         return {"delivery_allowed":True,"warnings":[x for x in view["unresolved"] if x["severity"]=="warning"]}
+
+    def delivery_view(self,task_id):
+        deliveries=[]
+        for record in self.versions(task_id,"delivery"):
+            model=json.loads(self.version(task_id,record["hash"]))
+            deliveries.append({**model,"hash":record["hash"],"metadata":record["metadata"]})
+        deliveries.sort(key=lambda item:item["confirmed_at"])
+        return {"state":self.get(task_id),"deliveries":deliveries,"latest":deliveries[-1] if deliveries else None,"summary":self.status_summary(task_id)}
+
+    def status_summary(self,task_id):
+        state=self.get(task_id); latest={}
+        for kind in ("input-snapshot","narrative","outline","sample","deck","inspection","delivery"):
+            records=self.versions(task_id,kind)
+            if records: latest[kind]=records[-1]["hash"]
+        progress={"created":5,"clarification":15,"narrative":30,"outline":45,"sample":60,"deck":72,"review":85,"delivery":95}.get(state["stage"],0)
+        if state["status"]=="completed": progress=100
+        return {"task_id":task_id,"stage":state["stage"],"progress":progress,"status":state["status"],"current_action":state.get("required_action"),"waiting_reason":state.get("waiting_reason"),"human_actions":[state["required_action"]] if state.get("required_action") else [],"latest_artifacts":latest,"error_summary":"task_failed" if state["status"]=="failed" else None}
+
+    def confirm_delivery(self,task_id,deck_hash,actor="user"):
+        if actor!="user": raise ValidationError("交付必须由用户明确确认")
+        state=TaskState.parse(self.get(task_id)); current=self.deck_view(task_id)["deck"]
+        if not current or current["hash"]!=deck_hash: raise ConflictError("确认必须绑定当前候选 HTML 版本")
+        gate=self.assert_delivery_gate(task_id)
+        if not state.blockers_resolved:
+            self.command(task_id,f"delivery-gate-{deck_hash[:12]}","resolve_blockers","user",{"deck_hash":deck_hash}); state=TaskState.parse(self.get(task_id))
+        if state.stage==state.stage.REVIEW:
+            self.command(task_id,f"to-delivery-{deck_hash[:12]}","advance","user"); state=TaskState.parse(self.get(task_id))
+        if state.stage!=state.stage.DELIVERY: raise ConflictError("当前阶段不能交付")
+        narrative_hash=self._current_version(task_id,"narrative"); outline_hash=current["outline_hash"]
+        snapshot=self.input_view(task_id); confirmed_at=utcnow()
+        delivery_id=f"delivery-{len(self.versions(task_id,'delivery'))+1}-{deck_hash[:12]}"
+        files={"deck.html":current["html"].encode(),"narrative.md":json.loads(self.version(task_id,narrative_hash))["markdown"].encode(),"outline.md":json.loads(self.version(task_id,outline_hash))["markdown"].encode(),"resource-manifest.json":canonical(snapshot["manifest"]),"result.json":canonical({"task_id":task_id,"deck_hash":deck_hash,"warnings":gate["warnings"],"confirmed_at":confirmed_at})}
+        resource_root=self.store.resource_root(task_id)
+        for item in snapshot["manifest"].get("resources",[]):
+            source=resource_root/Path(item["uri"]).name
+            if source.is_file() and digest(source.read_bytes())==item["content_hash"]: files[f"resources/{source.name}"]=source.read_bytes()
+        hashes={name:digest(content) for name,content in files.items()}
+        package_manifest={"delivery_id":delivery_id,"task_id":task_id,"deck_hash":deck_hash,"confirmed_by":"user","confirmed_at":confirmed_at,"files":hashes}
+        files["manifest.json"]=canonical(package_manifest); hashes["manifest.json"]=digest(files["manifest.json"])
+        self.store.publish_delivery(task_id,delivery_id,files)
+        model=DeliveryManifest.parse({"delivery_id":delivery_id,"task_id":task_id,"deck_hash":deck_hash,"files":tuple(files),"confirmed_by":"user","confirmed_at":confirmed_at,"schema_version":"1.0"})
+        delivery_hash=self.store.put_version(task_id,"delivery",canonical(model.to_dict()),{"file_hashes":hashes,"warnings":gate["warnings"],"issue_summary":{"unresolved_warnings":len(gate["warnings"]),"blockers":0},"package":delivery_id})
+        final=self.command(task_id,f"confirm-delivery-{delivery_hash[:16]}","confirm_delivery","user",{"deck_hash":deck_hash,"delivery_hash":delivery_hash})
+        return {"state":final,"delivery":{**model.to_dict(),"hash":delivery_hash,"file_hashes":hashes},"result":self.status_summary(task_id)}
+
+    def derive_from_delivery(self,task_id,delivery_hash,prompt,slide_ids=None):
+        record=next((x for x in self.versions(task_id,"delivery") if x["hash"]==delivery_hash),None)
+        if not record: raise ValidationError("交付版本不存在")
+        delivered=json.loads(self.version(task_id,delivery_hash)); current=TaskState.parse(self.get(task_id))
+        if current.status!=current.status.COMPLETED: raise ConflictError("只有已完成任务可从交付派生")
+        deck_record=next(x for x in self.versions(task_id,"deck") if x["hash"]==delivered["deck_hash"])
+        target=json.loads(self.version(task_id,delivered["deck_hash"])); meta=deck_record["metadata"]
+        reopened=TaskState(**{**current.__dict__,"stage":current.stage.DECK,"status":current.status.READY,"delivery_confirmed":False,"blockers_resolved":False,"revision":current.revision+1})
+        event={"event_id":digest(f"{task_id}:derive:{delivery_hash}:{current.revision}".encode())[:24],"command_id":f"derive-{delivery_hash[:16]}-{current.revision}","action":"derive_delivery","actor":"user","request_hash":fingerprint({"prompt":prompt,"slide_ids":slide_ids}),"at":utcnow(),"from":current.to_dict(),"to":reopened.to_dict(),"result":{"delivery_hash":delivery_hash,"deck_hash":delivered["deck_hash"]}}
+        self.store.commit(task_id,reopened.to_dict(),event)
+        self._record_deck(task_id,meta["html"],target["outline_hash"],{"parent":delivered["deck_hash"],"derived_from_delivery":delivery_hash,"summary":"从已交付版本派生候选","scope":"global","affected":[],"outline_consistent":True,"global_rules":meta.get("global_rules",[]),"local_exceptions":meta.get("local_exceptions",{})},"delivery_derive","user")
+        return self.modify_deck(task_id,prompt,scope="page" if slide_ids else "global",slide_ids=slide_ids or [])
     def run_fake_pipeline(self,task_id):
         state=self.get(task_id)
         if state["stage"] != "created": raise ConflictError("fake 全链路只能从空任务启动")

@@ -30,6 +30,8 @@ DECKS=re.compile(r"^/v1/tasks/([^/]+)/deck(?:/(generate|modify|rollback|compare)
 DECK_PAGE=re.compile(r"^/tasks/([^/]+)/deck$")
 INSPECTION=re.compile(r"^/v1/tasks/([^/]+)/inspection(?:/(run|mode|delivery-gate))?$")
 INSPECTION_PAGE=re.compile(r"^/tasks/([^/]+)/inspection$")
+DELIVERY=re.compile(r"^/v1/tasks/([^/]+)/delivery(?:/(confirm|derive))?$")
+SUMMARY=re.compile(r"^/v1/tasks/([^/]+)/summary$")
 
 class App:
     def __init__(self,service): self.service=service
@@ -37,7 +39,7 @@ class App:
         try:
             method=environ["REQUEST_METHOD"]; path=environ["PATH_INFO"]
             size=int(environ.get("CONTENT_LENGTH") or 0); body=json.loads(environ["wsgi.input"].read(size) or b"{}")
-            if method=="GET" and path=="/healthz": return self.reply(start_response,200,{"status":"ok","stage":"P6","runtime_ready":True})
+            if method=="GET" and path=="/healthz": return self.reply(start_response,200,{"status":"ok","stage":"P7","runtime_ready":True})
             if method=="POST" and path=="/v1/tasks":
                 self.exact(body,{"task_id","mode"},{"task_id"}); return self.reply(start_response,201,self.service.create(body["task_id"],body.get("mode","manual")))
             m=TASK.match(path)
@@ -67,6 +69,15 @@ class App:
                 if m.group(2)=="run": self.exact(body,{"max_rounds","affected_slide_ids"},set()); result=self.service.run_inspection(m.group(1),body.get("max_rounds",2),body.get("affected_slide_ids"))
                 elif m.group(2)=="mode": self.exact(body,{"mode"},{"mode"}); result=self.service.switch_inspection_mode(m.group(1),body["mode"])
                 elif m.group(2)=="delivery-gate": self.exact(body,set(),set()); result=self.service.assert_delivery_gate(m.group(1))
+                else: raise NotFoundError("接口不存在")
+                return self.reply(start_response,200,result)
+            m=SUMMARY.match(path)
+            if method=="GET" and m:return self.reply(start_response,200,self.service.status_summary(m.group(1)))
+            m=DELIVERY.match(path)
+            if method=="GET" and m and not m.group(2):return self.reply(start_response,200,self.service.delivery_view(m.group(1)))
+            if method=="POST" and m:
+                if m.group(2)=="confirm": self.exact(body,{"deck_hash","actor"},{"deck_hash"}); result=self.service.confirm_delivery(m.group(1),body["deck_hash"],body.get("actor","user"))
+                elif m.group(2)=="derive": self.exact(body,{"delivery_hash","prompt","slide_ids"},{"delivery_hash","prompt"}); result=self.service.derive_from_delivery(m.group(1),body["delivery_hash"],body["prompt"],body.get("slide_ids"))
                 else: raise NotFoundError("接口不存在")
                 return self.reply(start_response,200,result)
             m=DECKS.match(path)

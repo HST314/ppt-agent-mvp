@@ -175,6 +175,24 @@ paths:
       parameters: [{$ref: '#/components/parameters/TaskId'}]
       requestBody: {required: true, content: {application/json: {schema: {type: object, additionalProperties: false, required: [left, right], properties: {left: {type: string}, right: {type: string}}}, example: {left: 0000000000000000000000000000000000000000000000000000000000000000, right: 0000000000000000000000000000000000000000000000000000000000000000}}}}
       responses: {'200': {description: Comparison result, content: {application/json: {schema: {$ref: '#/components/schemas/Comparison'}, example: {left: '0000000000000000000000000000000000000000000000000000000000000000', right: '0000000000000000000000000000000000000000000000000000000000000000', equal: true}}}}, '400': {$ref: '#/components/responses/Error'}, '404': {$ref: '#/components/responses/Error'}}
+  /v1/tasks/{task_id}/summary:
+    get:
+      parameters: [{$ref: '#/components/parameters/TaskId'}]
+      responses: {'200': {description: Orchestrator-safe status summary without dialogue or reasoning, content: {application/json: {schema: {type: object}, example: {task_id: demo, stage: delivery, progress: 100, status: completed}}}}, '404': {$ref: '#/components/responses/Error'}}
+  /v1/tasks/{task_id}/delivery:
+    get:
+      parameters: [{$ref: '#/components/parameters/TaskId'}]
+      responses: {'200': {description: Immutable delivery history and latest result summary, content: {application/json: {schema: {type: object}, example: {state: {}, deliveries: [], latest: null, summary: {}}}}}, '404': {$ref: '#/components/responses/Error'}}
+  /v1/tasks/{task_id}/delivery/confirm:
+    post:
+      parameters: [{$ref: '#/components/parameters/TaskId'}]
+      requestBody: {required: true, content: {application/json: {schema: {type: object, additionalProperties: false, required: [deck_hash], properties: {deck_hash: {type: string, pattern: '^[0-9a-f]{64}$'}, actor: {enum: [user]}}}}}}
+      responses: {'200': {description: Explicit user-confirmed atomic delivery, content: {application/json: {schema: {type: object}, example: {state: {}, delivery: {}, result: {}}}}}, '400': {$ref: '#/components/responses/Error'}, '409': {$ref: '#/components/responses/Error'}}
+  /v1/tasks/{task_id}/delivery/derive:
+    post:
+      parameters: [{$ref: '#/components/parameters/TaskId'}]
+      requestBody: {required: true, content: {application/json: {schema: {type: object, additionalProperties: false, required: [delivery_hash, prompt], properties: {delivery_hash: {type: string, pattern: '^[0-9a-f]{64}$'}, prompt: {type: string}, slide_ids: {type: array, uniqueItems: true, items: {type: string}}}}}}}
+      responses: {'200': {description: New candidate derived without mutating the prior delivery, content: {application/json: {schema: {type: object}, example: {state: {}, deck: {}, versions: []}}}}, '400': {$ref: '#/components/responses/Error'}, '409': {$ref: '#/components/responses/Error'}}
   /v1/tasks/{task_id}/preview:
     post:
       parameters: [{$ref: '#/components/parameters/TaskId'}]
