@@ -67,8 +67,9 @@ class StageBAgentTests(unittest.TestCase):
             ModelTurn(None, "r1", (ModelToolCall("read_skill_file", json.dumps({"path": "SKILL.md"}), "c1"),)),
             ModelTurn('{"text":"done"}', "r2"),
         ])
-        result = AgentRuntime(client, SkillRuntime.builtin()).run("outline", {"topic": "secret-topic"}, response_schema=SCHEMA)
-        self.assertEqual(result.value, {"text": "done"}); self.assertEqual([x["event"] for x in result.audit], ["model", "tool", "model"])
+        client.turns[-1] = ModelTurn('{"markdown":"done"}', "r2")
+        result = AgentRuntime(client, SkillRuntime.builtin()).run("outline", {"topic": "secret-topic"})
+        self.assertEqual(result.value, {"markdown": "done"}); self.assertEqual([x["event"] for x in result.audit], ["run", "model", "tool", "model", "terminal"])
         self.assertNotIn("secret-topic", json.dumps(result.audit)); self.assertNotIn("content", json.dumps(result.audit))
         self.assertIn("function_call_output", str(client.inputs[1]["input"])); self.assertEqual(client.inputs[0]["tools"], TOOLS)
         system = client.inputs[0]["input"][0]["content"]
@@ -83,13 +84,43 @@ class StageBAgentTests(unittest.TestCase):
                 self.assertTrue(schema["strict"]); self.assertFalse(schema["schema"]["additionalProperties"])
 
     def test_invalid_stage_tool_output_and_limits_fail_closed(self):
-        with self.assertRaises(ValidationError): AgentRuntime(ScriptedClient([]), SkillRuntime.builtin()).run("publish", {}, response_schema=SCHEMA)
+        with self.assertRaises(ValidationError): AgentRuntime(ScriptedClient([]), SkillRuntime.builtin()).run("publish", {})
         bad_tool = ScriptedClient([ModelTurn(None, "r", (ModelToolCall("shell", "{}", "c"),))])
-        with self.assertRaises(ValidationError): AgentRuntime(bad_tool, SkillRuntime.builtin()).run("deck", {}, response_schema=SCHEMA)
+        with self.assertRaises(GatewayError): AgentRuntime(bad_tool, SkillRuntime.builtin()).run("deck", {})
         bad_output = ScriptedClient([ModelTurn('{"wrong":1}', "r")])
-        with self.assertRaises(GatewayError): AgentRuntime(bad_output, SkillRuntime.builtin()).run("deck", {}, response_schema=SCHEMA)
+        with self.assertRaises(GatewayError): AgentRuntime(bad_output, SkillRuntime.builtin()).run("deck", {})
         endless = ScriptedClient([ModelTurn(None, "r", (ModelToolCall("list_skill_files", "{}", f"c{i}"),)) for i in range(2)])
-        with self.assertRaises(GatewayError): AgentRuntime(endless, SkillRuntime.builtin(), max_steps=2).run("sample", {}, response_schema=SCHEMA)
+        with self.assertRaises(GatewayError): AgentRuntime(endless, SkillRuntime.builtin(), max_steps=2).run("sample", {})
+
+    def test_lock_is_closed_and_rechecked_on_every_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); make_skill(root, {"SKILL.md": b"ok"})
+            skill = SkillRuntime(root); (root / "references").mkdir(); (root / "references/unlocked.md").write_text("no")
+            with self.assertRaises(ValidationError): skill.read_skill_file("references/unlocked.md")
+            (root / "SKILL.md").write_text("tampered")
+            with self.assertRaises(ValidationError): skill.read_skill_file("SKILL.md")
+            with self.assertRaises(ValidationError): skill.read_skill_file("bad\0path")
+
+    def test_schema_limits_deadline_and_failure_audit(self):
+        with self.assertRaises(ValidationError):
+            AgentRuntime(ScriptedClient([]), SkillRuntime.builtin()).run("deck", {}, response_schema=SCHEMA)
+        arbitrary = ScriptedClient([ModelTurn('{"passed":false,"issues":[{"arbitrary_secret_field":"x"}]}', "secret-response")])
+        runtime = AgentRuntime(arbitrary, SkillRuntime.builtin())
+        with self.assertRaises(GatewayError) as caught: runtime.run("inspection", {})
+        self.assertEqual(caught.exception.audit[-1]["reason"], "invalid_output")
+        self.assertNotIn("secret-response", json.dumps(caught.exception.audit))
+        huge = AgentRuntime(ScriptedClient([ModelTurn('{"markdown":"' + 'x' * 100 + '"}', "r")]), SkillRuntime.builtin(), max_output_bytes=32)
+        with self.assertRaises(GatewayError) as caught: huge.run("outline", {})
+        self.assertEqual(caught.exception.audit[-1]["reason"], "output_limit")
+        calls = tuple(ModelToolCall("list_skill_files", "{}", f"secret-{i}") for i in range(2))
+        limited = AgentRuntime(ScriptedClient([ModelTurn(None, "r", calls)]), SkillRuntime.builtin(), max_tool_calls=1)
+        with self.assertRaises(GatewayError) as caught: limited.run("sample", {})
+        self.assertEqual(caught.exception.audit[-1]["reason"], "tool_call_limit")
+
+        ticks = iter([0, 0, 2])
+        timed = AgentRuntime(ScriptedClient([ModelTurn('{"markdown":"late"}', "r")]), SkillRuntime.builtin(), timeout_seconds=1, clock=lambda: next(ticks))
+        with self.assertRaises(GatewayError) as caught: timed.run("outline", {})
+        self.assertEqual(caught.exception.audit[-1]["reason"], "deadline_exceeded")
 
     def test_client_extracts_function_calls(self):
         sdk = SimpleNamespace(); sdk.responses = sdk

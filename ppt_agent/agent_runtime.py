@@ -29,7 +29,12 @@ STAGE_OUTPUT_SCHEMAS = {
     "outline": {"name": "outline", "strict": True, "schema": _object_schema({"markdown": {"type": "string"}}, ["markdown"])},
     "sample": {"name": "sample_html", "strict": True, "schema": _object_schema({"html": {"type": "string"}}, ["html"])},
     "deck": {"name": "deck_html", "strict": True, "schema": _object_schema({"html": {"type": "string"}}, ["html"])},
-    "inspection": {"name": "inspection", "strict": True, "schema": _object_schema({"passed": {"type": "boolean"}, "issues": {"type": "array", "items": {"type": "object"}}}, ["passed", "issues"])},
+    "inspection": {"name": "inspection", "strict": True, "schema": _object_schema({"passed": {"type": "boolean"}, "issues": {"type": "array", "items": _object_schema({
+        "issue_id": {"type": "string"}, "severity": {"type": "string", "enum": ["warning", "blocker"]},
+        "level": {"type": "string", "enum": ["element", "slide", "deck"]}, "code": {"type": "string"},
+        "message": {"type": "string"}, "slide_id": {"type": "string"}, "element_id": {"type": "string"},
+        "evidence": {"type": "string"}, "suggestion": {"type": "string"},
+    }, ["issue_id", "severity", "level", "code", "message", "slide_id", "element_id", "evidence", "suggestion"])}}, ["passed", "issues"])},
 }
 PRODUCT_OVERRIDE = """产品规则高于 Skill：你只处理当前阶段，不得推进工作流或请求状态机操作。
 仅允许纯文本输入；禁止联网、图片输入、图片生成、Shell、文件写入、自更新和安装依赖。
@@ -50,45 +55,74 @@ class AgentResult:
 
 
 class AgentRuntime:
-    def __init__(self, client, skill: SkillRuntime, *, max_steps: int = 12, timeout_seconds: float = 60, clock=time.monotonic):
+    def __init__(self, client, skill: SkillRuntime, *, max_steps: int = 12, timeout_seconds: float = 60, clock=time.monotonic, max_output_bytes: int = 1024 * 1024, max_tool_calls: int = 24):
         self.client, self.skill = client, skill
         self.max_steps, self.timeout_seconds, self.clock = max_steps, timeout_seconds, clock
+        self.max_output_bytes, self.max_tool_calls = max_output_bytes, max_tool_calls
+        self.last_audit: tuple[dict, ...] = ()
 
     def run(self, stage: str, payload: dict, *, response_schema: dict | None = None) -> AgentResult:
         if stage not in STAGES:
             raise ValidationError("Agent 阶段不在允许列表")
-        response_schema = response_schema or STAGE_OUTPUT_SCHEMAS[stage]
-        if not isinstance(payload, dict) or not isinstance(response_schema, dict):
-            raise ValidationError("Agent 输入或输出 Schema 无效")
-        started, audit = self.clock(), []
+        if response_schema is not None and response_schema != STAGE_OUTPUT_SCHEMAS[stage]:
+            raise ValidationError("阶段输出 Schema 不允许覆盖")
+        response_schema = STAGE_OUTPUT_SCHEMAS[stage]
+        if not isinstance(payload, dict):
+            raise ValidationError("Agent 输入无效")
+        started, audit, tool_count = self.clock(), [], 0
+        audit.append({"event": "run", "stage": stage, "skill": self.skill.skill_name, "skill_version": self.skill.skill_version, "lock_sha256": hashlib.sha256(json.dumps(self.skill.manifest, sort_keys=True).encode()).hexdigest()})
+        def fail(message: str, reason: str, cause=None):
+            audit.append({"event": "terminal", "reason": reason, "tool_calls": tool_count})
+            self.last_audit = tuple(audit)
+            error = GatewayError(message)
+            error.audit = self.last_audit
+            if cause is not None:
+                raise error from cause
+            raise error
         conversation: list[Any] = [{"role": "system", "content": f"当前阶段：{stage}\n阶段目标：{STAGE_PROMPTS[stage]}\n{PRODUCT_OVERRIDE}"}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}]
         for step in range(1, self.max_steps + 1):
             if self.clock() - started >= self.timeout_seconds:
-                raise GatewayError("Agent 运行超时，未提交阶段产物")
+                fail("Agent 运行超时，未提交阶段产物", "deadline_exceeded")
             turn = self.client.create(input=conversation, tools=TOOLS, response_schema=response_schema)
-            audit.append({"step": step, "event": "model", "response_id": turn.response_id, "output_sha256": hashlib.sha256((turn.text or "").encode()).hexdigest()})
+            if self.clock() - started >= self.timeout_seconds:
+                fail("Agent 运行超时，未提交阶段产物", "deadline_exceeded")
+            output = (turn.text or "").encode()
+            if len(output) > self.max_output_bytes:
+                fail("Agent 最终输出超过大小上限", "output_limit")
+            audit.append({"step": step, "event": "model", "response_id_sha256": hashlib.sha256((turn.response_id or "").encode()).hexdigest(), "output_sha256": hashlib.sha256(output).hexdigest()})
             if turn.tool_calls:
                 for call in turn.tool_calls:
+                    tool_count += 1
+                    if tool_count > self.max_tool_calls:
+                        fail("Agent 工具调用超过上限", "tool_call_limit")
                     try:
                         args = json.loads(call.arguments or "{}")
                     except json.JSONDecodeError as exc:
-                        raise GatewayError("Agent 工具参数不是有效 JSON") from exc
+                        fail("Agent 工具参数不是有效 JSON", "invalid_tool_arguments", exc)
                     if not isinstance(args, dict):
-                        raise GatewayError("Agent 工具参数必须为 object")
-                    result = self.skill.dispatch(call.name, args)
-                    audit.append({"step": step, "event": "tool", "tool": call.name, "call_id": call.call_id, "result_sha256": hashlib.sha256(json.dumps(result, sort_keys=True, ensure_ascii=False).encode()).hexdigest()})
+                        fail("Agent 工具参数必须为 object", "invalid_tool_arguments")
+                    try:
+                        result = self.skill.dispatch(call.name, args)
+                    except (ValidationError, OSError, ValueError) as exc:
+                        fail("Agent 工具调用失败", "tool_error", exc)
+                    audit.append({"step": step, "event": "tool", "tool": call.name, "call_id_sha256": hashlib.sha256((call.call_id or "").encode()).hexdigest(), "path": result.get("path"), "file_sha256": result.get("sha256"), "result_sha256": hashlib.sha256(json.dumps(result, sort_keys=True, ensure_ascii=False).encode()).hexdigest()})
                     conversation.append({"type": "function_call", "name": call.name, "arguments": call.arguments, "call_id": call.call_id})
                     conversation.append({"type": "function_call_output", "call_id": call.call_id, "output": json.dumps(result, ensure_ascii=False)})
                 continue
             try:
                 value = json.loads(turn.text or "")
             except json.JSONDecodeError as exc:
-                raise GatewayError("Agent 最终输出不是有效 JSON") from exc
+                fail("Agent 最终输出不是有效 JSON", "invalid_output", exc)
             if not isinstance(value, dict):
-                raise GatewayError("Agent 最终输出必须为 JSON object")
-            self._validate_schema(value, response_schema.get("schema", response_schema), "output")
-            return AgentResult(value, tuple(audit), turn.response_id)
-        raise GatewayError("Agent 达到最大步数，未提交阶段产物")
+                fail("Agent 最终输出必须为 JSON object", "invalid_output")
+            try:
+                self._validate_schema(value, response_schema.get("schema", response_schema), "output")
+            except GatewayError as exc:
+                fail(exc.message, "invalid_output", exc)
+            audit.append({"event": "terminal", "reason": "success", "tool_calls": tool_count})
+            self.last_audit = tuple(audit)
+            return AgentResult(value, self.last_audit, turn.response_id)
+        fail("Agent 达到最大步数，未提交阶段产物", "max_steps")
 
     def _validate_schema(self, value: Any, schema: dict, path: str) -> None:
         """Small strict subset used as a defensive check after provider validation."""
@@ -103,6 +137,8 @@ class AgentRuntime:
         }.get(expected, True)
         if not valid:
             raise GatewayError(f"Agent 输出不符合 Schema：{path} 类型无效")
+        if "enum" in schema and value not in schema["enum"]:
+            raise GatewayError(f"Agent 输出不符合 Schema：{path} 枚举无效")
         if expected == "object":
             properties, required = schema.get("properties", {}), schema.get("required", [])
             if not all(name in value for name in required):
