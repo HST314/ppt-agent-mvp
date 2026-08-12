@@ -10,7 +10,7 @@ class AC09FullDeckE2E(SampleJourney):
         sample=self.ok("/v1/tasks/journey/samples/generate",{})
         self.ok("/v1/tasks/journey/samples/confirm",{})
         deck=self.ok("/v1/tasks/journey/deck/generate",{})
-        self.assertEqual(deck["state"]["stage"],"deck")
+        self.assertEqual(deck["state"]["stage"],"review")
         self.assertEqual(list(deck["deck"]["metadata"]["page_hashes"]),["slide-1","slide-2","slide-3"])
         self.assertEqual(deck["deck"]["html"].count('data-slide-id="'),3)
         self.assertTrue(all(deck["deck"]["metadata"]["sample_pages_preserved"].values()))

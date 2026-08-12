@@ -1,5 +1,5 @@
 openapi: 3.1.0
-info: {title: PPT Agent P6 API, version: 0.8.0}
+info: {title: PPT Agent P8 API, version: 0.9.0}
 components:
   parameters:
     TaskId: {in: path, name: task_id, required: true, schema: {type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$'}}
@@ -9,7 +9,7 @@ components:
       required: [error]
       properties:
         error: {type: object, required: [code, message, diagnostic_id], properties: {code: {type: string}, message: {type: string}, diagnostic_id: {type: string}}}
-    Health: {type: object, required: [status, stage, runtime_ready], properties: {status: {const: ok}, stage: {const: P6}, runtime_ready: {type: boolean}}}
+    Health: {type: object, required: [status, stage, runtime_ready], properties: {status: {const: ok}, stage: {const: P8}, runtime_ready: {type: boolean}}}
     SampleModify: {type: object, additionalProperties: false, required: [prompt], properties: {prompt: {type: string, minLength: 1}, scope: {enum: [global, page, element]}, slide_id: {type: [string, 'null']}, element_id: {type: [string, 'null']}}}
     TaskState:
       type: object
@@ -47,7 +47,7 @@ components:
 paths:
   /healthz:
     get:
-      responses: {'200': {description: Ready, content: {application/json: {schema: {$ref: '#/components/schemas/Health'}, example: {status: ok, stage: P6, runtime_ready: true}}}}}
+      responses: {'200': {description: Ready, content: {application/json: {schema: {$ref: '#/components/schemas/Health'}, example: {status: ok, stage: P8, runtime_ready: true}}}}}
   /v1/tasks/{task_id}/inspection:
     get:
       parameters: [{$ref: '#/components/parameters/TaskId'}]

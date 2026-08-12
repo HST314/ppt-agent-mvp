@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import html, json, re
+import html, json, logging, re, time, uuid
 from wsgiref.simple_server import make_server
 
 from .errors import DomainError, NotFoundError, ValidationError
@@ -36,10 +36,13 @@ SUMMARY=re.compile(r"^/v1/tasks/([^/]+)/summary$")
 class App:
     def __init__(self,service): self.service=service
     def __call__(self,environ,start_response):
+        started=time.monotonic(); diagnostic_id=uuid.uuid4().hex
         try:
             method=environ["REQUEST_METHOD"]; path=environ["PATH_INFO"]
-            size=int(environ.get("CONTENT_LENGTH") or 0); body=json.loads(environ["wsgi.input"].read(size) or b"{}")
-            if method=="GET" and path=="/healthz": return self.reply(start_response,200,{"status":"ok","stage":"P7","runtime_ready":True})
+            size=int(environ.get("CONTENT_LENGTH") or 0)
+            if size < 0 or size > 2*1024*1024: raise ValidationError("请求体超过 2 MiB 限制")
+            body=json.loads(environ["wsgi.input"].read(size) or b"{}")
+            if method=="GET" and path=="/healthz": return self.reply(start_response,200,{"status":"ok","stage":"P8","runtime_ready":True})
             if method=="POST" and path=="/v1/tasks":
                 self.exact(body,{"task_id","mode"},{"task_id"}); return self.reply(start_response,201,self.service.create(body["task_id"],body.get("mode","manual")))
             m=TASK.match(path)
@@ -139,9 +142,12 @@ class App:
                 self.exact(body,{"action","rationale","actor"},{"action"})
                 return self.reply(start_response,200,self.service.dispose_issue(m.group(1),m.group(2),body["action"],body.get("rationale",""),body.get("actor","user")))
             raise NotFoundError("接口不存在")
-        except DomainError as exc:return self.reply(start_response,exc.status,exc.public())
+        except DomainError as exc:
+            logging.info(json.dumps({"event":"request_complete","diagnostic_id":diagnostic_id,"path":environ.get("PATH_INFO"),"status":exc.status,"duration_ms":round((time.monotonic()-started)*1000,2),"error":exc.code}))
+            return self.reply(start_response,exc.status,exc.public())
         except Exception:
-            exc=DomainError("请求处理失败"); exc.status=500; exc.code="internal_error"; return self.reply(start_response,500,exc.public())
+            logging.exception(json.dumps({"event":"request_failed","diagnostic_id":diagnostic_id,"path":environ.get("PATH_INFO"),"duration_ms":round((time.monotonic()-started)*1000,2)}))
+            exc=DomainError("请求处理失败"); exc.diagnostic_id=diagnostic_id; exc.status=500; exc.code="internal_error"; return self.reply(start_response,500,exc.public())
     @staticmethod
     def exact(body,allowed,required):
         if not isinstance(body,dict) or set(body)-allowed or required-set(body):raise ValidationError("请求字段无效")

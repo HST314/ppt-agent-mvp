@@ -81,8 +81,10 @@ class ModelHtmlBuilder:
     version="model-html-v1"
     def __init__(self,gateway,skill_loader): self.gateway,self.skills=gateway,skill_loader
     def build(self,outline,**context):
-        skill=self.skills.load("deck")
-        return self.gateway.generate("html",{"outline":outline,**context},skill=skill["content"])["text"]
+        action=context.pop("action", "deck")
+        if action not in {"sample", "deck", "inspection"}: raise ValidationError("HTML Builder action 不在允许列表")
+        skill=self.skills.load(action)
+        return self.gateway.generate(action + "_html",{"outline":outline,**context},skill=skill["content"])["text"]
 
 def gateways_from_env():
     mode=os.environ.get("PPT_AGENT_GATEWAY_MODE","fake")

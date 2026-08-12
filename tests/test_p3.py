@@ -70,8 +70,8 @@ class P3Tests(unittest.TestCase):
 
     def test_auto_advances_without_hiding_versions(self):
         self.service.create("auto",mode="auto"); self.service.import_input("auto",{"goal":"发布","audience":"客户","topic":"方案","页数":2})
-        self.service.generate_narrative("auto"); view=self.service.generate_outline("auto")
-        self.assertEqual(view["state"]["stage"],"outline"); self.assertEqual(view["state"]["status"],"ready"); self.assertIsNotNone(view["narrative"]); self.assertIsNotNone(view["outline"])
+        view=self.service.planning_view("auto")
+        self.assertEqual(view["state"]["stage"],"sample"); self.assertEqual(view["state"]["status"],"ready"); self.assertIsNotNone(view["narrative"]); self.assertIsNotNone(view["outline"])
 
     def request(self,path):
         status=[]

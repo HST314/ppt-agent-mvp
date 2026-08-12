@@ -55,7 +55,7 @@ class P4Tests(unittest.TestCase):
         self.assertTrue(view["state"]["sample_confirmed"]); self.assertEqual(view["state"]["stage"],"sample")
         changed=self.s.modify_sample("p4","统一加深背景","global")
         self.assertFalse(changed["state"]["sample_confirmed"]); self.assertIsNone(changed["confirmation"])
-        self.s.create("auto",mode="auto"); self.s.import_input("auto",{"goal":"发布","audience":"客户","topic":"方案","页数":2}); self.s.generate_narrative("auto"); self.s.generate_outline("auto"); self.s.confirm_outline("auto"); self.s.generate_sample("auto")
+        self.s.create("auto",mode="auto"); self.s.import_input("auto",{"goal":"发布","audience":"客户","topic":"方案","页数":2})
         with self.assertRaises(Exception): self.s.command("auto","skip-sample","advance")
     def test_last_success_survives_invalid_modification_and_ui_is_sandboxed(self):
         good=self.s.generate_sample("p4")["sample"]["hash"]

@@ -67,9 +67,11 @@ def scan_resources(root: Path):
         if not path.is_file() or path.suffix.lower() not in IMAGE_SUFFIXES: continue
         resolved=path.resolve()
         if root not in resolved.parents: raise ValidationError("资源路径越权")
+        rel=path.relative_to(root).as_posix()
+        if resolved.stat().st_size > 16*1024*1024:
+            warnings.append({"path":rel,"code":"resource_too_large"}); continue
         data=resolved.read_bytes()
         if not data: warnings.append({"code":"empty_resource","path":str(path.relative_to(root))}); continue
-        rel=path.relative_to(root).as_posix()
         if not valid_image_content(data,path.suffix):
             warnings.append({"code":"invalid_image_content","path":rel}); continue
         h=digest(data); sidecar=path.with_suffix(".md")

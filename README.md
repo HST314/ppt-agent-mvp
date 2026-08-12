@@ -2,7 +2,7 @@
 
 PPT Agent MVP 的需求、实现决策与验收追踪仓库。
 
-P7 交付与恢复闭环已实现，包括显式版本绑定确认、原子交付包、逐文件 hash manifest、交付后非破坏派生、暂停/取消/失败恢复门禁及编排状态摘要。产品行为以 `docs/product-contract.md` 为准，实施顺序以 `docs/development-plan.md` 为准。
+P8 后端发布边界已实现：全写动作生命周期保护、版本 hash 审批、真实 Builder/分阶段 Skill、生成后自动独立检查、有界修复、请求与资源大小限制及结构化错误日志。产品行为以 `docs/product-contract.md` 为准。
 
 ## 本地启动
 
@@ -12,7 +12,7 @@ P7 交付与恢复闭环已实现，包括显式版本绑定确认、原子交�
 python3 scripts/start.py --data .ppt-agent-data --host 127.0.0.1 --port 8000
 ```
 
-另一个终端访问 `http://127.0.0.1:8000/healthz`，应得到含 `"stage": "P7"`、`"status": "ok"` 和 `"runtime_ready": true` 的 JSON。
+另一个终端访问 `http://127.0.0.1:8000/healthz`，应得到含 `"stage": "P8"`、`"status": "ok"` 和 `"runtime_ready": true` 的 JSON。
 
 默认使用 deterministic fake，保证 CI 离线稳定。真实能力使用显式环境配置启用：`PPT_AGENT_GATEWAY_MODE=http`、`PPT_AGENT_MODEL_ENDPOINT`、`PPT_AGENT_MODEL`、`PPT_AGENT_SKILL_DIR`，凭证仅通过 `PPT_AGENT_API_KEY` 注入，可选 `PPT_AGENT_MODEL_TIMEOUT`。模型端点须为 HTTPS（本机回环调试除外），生成与独立检查请求使用不同 purpose；连接结果未知时运行内核不会盲目重试。
 

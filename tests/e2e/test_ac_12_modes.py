@@ -18,7 +18,7 @@ class AC12ModesE2E(SampleJourney):
     def test_manual_suggests_without_fix_and_auto_is_bounded(self):
         inspector=SequenceInspector(1); self.prepare(inspector)
         manual=self.ok("/v1/tasks/journey/inspection/run", {"max_rounds":3})
-        self.assertEqual(manual["rounds"],0); self.assertEqual(len(manual["reports"]),1)
+        self.assertEqual(manual["rounds"],0); self.assertEqual(len(manual["reports"]),2)
         self.ok("/v1/tasks/journey/inspection/mode", {"mode":"auto"})
         auto=self.ok("/v1/tasks/journey/inspection/run", {"max_rounds":2})
         self.assertTrue(auto["report"]["passed"]); self.assertEqual(auto["rounds"],0)
@@ -32,4 +32,3 @@ class AC12ModesE2E(SampleJourney):
         item=disposed["dispositions"][-1]
         self.assertEqual(item["actor"],"user"); self.assertEqual(item["target_deck_hash"],result["deck"]["hash"])
         self.assertTrue(self.ok("/v1/tasks/journey/inspection/delivery-gate", {})["delivery_allowed"])
-
