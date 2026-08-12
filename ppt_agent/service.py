@@ -471,8 +471,10 @@ class TaskService:
     def dispose_issues(self,task_id,issue_ids,action,rationale):
         if not isinstance(issue_ids,list) or not issue_ids or len(set(issue_ids))!=len(issue_ids): raise ValidationError("批量范围必须是非空且不重复的问题 ID")
         if action=="agent_fix" and len(issue_ids)>1: raise ValidationError("Agent 修复会生成新 HTML，请逐项执行并复检")
-        view=self.inspection_view(task_id); known={x["issue_id"] for x in (view.get("report") or {}).get("issues",[])}
-        if any(x not in known for x in issue_ids): raise ValidationError("批量范围包含未知问题")
+        view=self.inspection_view(task_id)
+        issues={x["issue_id"]:x for x in (view.get("report") or {}).get("issues",[])}
+        if any(x not in issues for x in issue_ids): raise ValidationError("批量范围包含未知问题")
+        if len({issues[x]["code"] for x in issue_ids})!=1: raise ValidationError("批量处置仅支持同 code 的同类问题")
         hashes=[]
         for issue_id in issue_ids:
             result=self.dispose_issue(task_id,issue_id,action,rationale); hashes.append(result["disposition_hash"])

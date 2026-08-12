@@ -29,3 +29,21 @@ class AC11InspectionE2E(SampleJourney):
         stale=self.get_json("/v1/tasks/journey/inspection")
         self.assertTrue(stale["report"]["stale"]); self.assertFalse(stale["delivery_allowed"])
 
+    def test_batch_disposition_rejects_mixed_issue_codes(self):
+        self.app.service=TaskService(self.store,inspector=Inspector())
+        self.ok("/v1/tasks/journey/samples/generate", {})
+        self.ok("/v1/tasks/journey/samples/confirm", {})
+        self.ok("/v1/tasks/journey/deck/generate", {})
+        self.ok("/v1/tasks/journey/inspection/run", {"max_rounds":0})
+
+        status,raw=self.call("POST","/v1/tasks/journey/issues/dispositions/batch",{
+            "issue_ids":["element-overflow","slide-density"],
+            "action":"defer",
+            "rationale":"混合类型不应批量处置",
+        })
+
+        self.assertTrue(status.startswith("400"),raw.decode())
+        error=json.loads(raw)["error"]
+        self.assertEqual(error["code"],"validation_error")
+        self.assertIn("同 code",error["message"])
+        self.assertEqual(self.get_json("/v1/tasks/journey/inspection")["dispositions"],[])
