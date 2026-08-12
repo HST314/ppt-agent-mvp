@@ -98,7 +98,7 @@ def controlled_assets(manifest: dict, resource_root):
     assets={}
     for item in manifest.get("resources",[]):
         uri=item.get("uri","")
-        if not re.fullmatch(r"resources://[A-Za-z0-9_.-]+",uri): raise ValidationError("资源引用格式无效")
+        if not re.fullmatch(r"resources://[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*",uri): raise ValidationError("资源引用格式无效")
         path=(resource_root/uri.removeprefix("resources://")).resolve()
         if resource_root.resolve() not in path.parents or not path.is_file(): raise ValidationError("冻结资源不存在或路径越权")
         data=path.read_bytes()

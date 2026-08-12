@@ -23,6 +23,17 @@
 | AC-17 | 交付后派生与非破坏回退 | P7-03、P7-04 | 派生/回退 API；版本页 | `tests/e2e/test_ac_15_17_delivery.py::DeliveryJourney::test_ac17_delivery_is_immutable_and_new_candidate_requires_reinspection`; `DeliveryFaultTests::test_post_publish_breakpoints_are_idempotently_recoverable` |
 | AC-18 | 桌面端完成全流程 | P8-01～P8-03 | 全工作区 | `tests/browser/test_ac_18_desktop_journey.py` |
 
+## P8-06 发布回填（2026-08-12）
+
+| 发布项 | 结论 | 可复验证据 | 遗留限制 |
+|---|---|---|---|
+| 真实 Gateway 与分阶段 Skill | 通过 | `tests/test_p8_gateways.py`、`tests/e2e/test_audit_regressions.py` | CI 使用确定性 fake；真实模型需显式配置 |
+| 安全、资源授权与大小边界 | 通过 | `tests/test_p8_release.py`、`tests/test_p4.py` | 单请求 2 MiB；单资源 16 MiB |
+| 动作级可观测性 | 通过 | `tests/test_p8_release.py`；JSON `action_metric` | 指标由部署环境采集聚合 |
+| 运维与恢复 | 通过 | `docs/runbook.md`、`tests/e2e/test_ac_15_17_delivery.py` | 文件工作区需由部署方纳入备份 |
+| AC-01～AC-17 | 通过 | 上表逐项测试路径；非浏览器全量门禁 | 无 |
+| AC-18 桌面联合旅程 | 待联合复验 | `tests/browser/test_ac_18_desktop_journey.py`、`scripts/verify_browser_gate.py` | 固定浏览器环境须 0 失败、0 跳过，且不得以 API fetch 代替控件操作 |
+
 ## 回填规则
 
 - 文件路径是稳定的预期证据位置；任务实现时创建并将“计划”更新为具体测试名/CI 链接。

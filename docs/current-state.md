@@ -1,7 +1,7 @@
 # 当前状态与能力盘点
 
 更新日期：2026-08-11  
-当前边界：P8 两道门禁已实现；等待固定 Chromium 独立复验结论。
+当前边界：P0～P8 后端能力及发布证据已实现；等待 AC-18 固定 Chromium 联合复验结论。
 
 ## 已实现
 
@@ -9,6 +9,8 @@
 - P2：任务卡、澄清、受控资源扫描及冻结输入快照。
 - P3：叙事与逐页大纲生成、直接编辑、局部影响域、版本及人工确认。
 - P4：样品推荐/改选、真实 HTML、安全沙箱、冻结资源 hash 复核与内嵌、Prompt 作用域识别、精确版本确认门禁。
+- P5～P7：全稿生成与非破坏修改、独立检查和有界修复、显式确认交付、恢复及交付后派生。
+- P8：真实 Gateway/分阶段 Skill、请求与资源大小限制、结构化动作指标、运行手册及验收矩阵。
 
 ## P0-01 基线证据（持续保留）
 
@@ -28,8 +30,8 @@ python3 -m unittest discover -s tests -v
 python3 scripts/start.py --data .ppt-agent-data
 ```
 
-健康检查返回 `stage=P4`、`runtime_ready=true`。机器契约见 `docs/openapi.yaml`。
+健康检查返回 `stage=P8`、`runtime_ready=true`。机器契约见 `docs/openapi.yaml`。
 
-## 尚未开始
+## 待联合复验
 
 P7 交付与恢复已实现并独立验收通过。P8 第一门禁提供真实生成/检查/HTML 与分阶段 Skill 适配，deterministic fake 继续作为 CI 替身；9 类场景、安全和恢复证据见既有 E2E 与 `tests/test_p8_gateways.py`。第二门禁由 `tests/browser/test_ac_18_desktop_journey.py` 覆盖创建、输入、规划、样品、全稿、检查、交付及交付后派生的固定 Chromium 完整旅程，`scripts/verify_browser_gate.py` 强制浏览器用例零跳过。

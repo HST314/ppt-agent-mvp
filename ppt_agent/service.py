@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import hashlib, json, re
+import hashlib, json, logging, re, time
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -510,6 +510,7 @@ class TaskService:
         return self._record_deck(task_id,html_text,deck["outline_hash"],{"parent":deck["hash"],"summary":f"自动修复第 {round_number} 轮","scope":"page","affected":affected,"outline_consistent":True,"global_rules":deck["metadata"].get("global_rules",[]),"local_exceptions":deck["metadata"].get("local_exceptions",{}),"inspection_report_hash":report["hash"],"auto_fix_round":round_number},"deck_auto_fix","system")["deck"]
 
     def run_inspection(self,task_id,max_rounds=2,affected_slide_ids=None):
+        metric_started=time.monotonic()
         self._require_actionable(task_id)
         if not isinstance(max_rounds,int) or isinstance(max_rounds,bool) or max_rounds<0 or max_rounds>10: raise ValidationError("max_rounds 必须为 0 到 10 的整数")
         state=TaskState.parse(self.get(task_id))
@@ -527,6 +528,7 @@ class TaskService:
         new=current.__class__(**{**current.__dict__,"status":current.status.WAITING_FOR_USER if waiting or state.mode=="manual" else current.status.READY,"waiting_reason":"inspection_round_limit" if waiting and state.mode=="auto" else "manual_review" if state.mode=="manual" else None,"required_action":"review_issues" if waiting or state.mode=="manual" else None,"revision":current.revision+1})
         event={"event_id":digest(f"{task_id}:{report['hash']}:inspection".encode())[:24],"command_id":f"inspection-{report['hash'][:16]}","action":"inspection_complete","actor":"system","request_hash":report["hash"],"at":utcnow(),"from":current.to_dict(),"to":new.to_dict(),"result":{"report_hash":report["hash"],"rounds":rounds,"passed":report["passed"],"mode":state.mode}}
         self.store.commit(task_id,new.to_dict(),event)
+        logging.info(json.dumps({"event":"action_metric","action":"inspection_run","task_id":task_id,"duration_ms":round((time.monotonic()-metric_started)*1000,2),"failed":False,"repair_rounds":rounds,"passed":report["passed"]}))
         return {**self.inspection_view(task_id),"rounds":rounds}
 
     def switch_inspection_mode(self,task_id,mode):
@@ -606,8 +608,9 @@ class TaskService:
         files={"deck.html":current["html"].encode(),"narrative.md":json.loads(self.version(task_id,narrative_hash))["markdown"].encode(),"outline.md":json.loads(self.version(task_id,outline_hash))["markdown"].encode(),"resource-manifest.json":canonical(snapshot["manifest"]),"result.json":canonical({"task_id":task_id,"deck_hash":deck_hash,"warnings":gate["warnings"],"confirmed_at":confirmed_at,**result_summary})}
         resource_root=self.store.resource_root(task_id)
         for item in snapshot["manifest"].get("resources",[]):
-            source=resource_root/Path(item["uri"]).name
-            if source.is_file() and digest(source.read_bytes())==item["content_hash"]: files[f"resources/{source.name}"]=source.read_bytes()
+            relative=Path(item["uri"].removeprefix("resources://"))
+            source=resource_root/relative
+            if source.is_file() and digest(source.read_bytes())==item["content_hash"]: files[f"resources/{relative.as_posix()}"]=source.read_bytes()
         hashes={name:digest(content) for name,content in files.items()}
         package_manifest={"delivery_id":delivery_id,"task_id":task_id,"deck_hash":deck_hash,"confirmed_by":"user","confirmed_at":confirmed_at,"files":hashes}
         files["manifest.json"]=canonical(package_manifest); hashes["manifest.json"]=digest(files["manifest.json"])

@@ -37,6 +37,12 @@ class App:
     def __init__(self,service): self.service=service
     def __call__(self,environ,start_response):
         started=time.monotonic(); diagnostic_id=uuid.uuid4().hex
+        response_status=500; failure=True; original_start_response=start_response
+        def measured_start_response(status,headers,exc_info=None):
+            nonlocal response_status, failure
+            response_status=int(status.split()[0]); failure=response_status >= 400
+            return original_start_response(status,headers,exc_info) if exc_info is not None else original_start_response(status,headers)
+        start_response=measured_start_response
         try:
             method=environ["REQUEST_METHOD"]; path=environ["PATH_INFO"]
             size=int(environ.get("CONTENT_LENGTH") or 0)
@@ -148,6 +154,9 @@ class App:
         except Exception:
             logging.exception(json.dumps({"event":"request_failed","diagnostic_id":diagnostic_id,"path":environ.get("PATH_INFO"),"duration_ms":round((time.monotonic()-started)*1000,2)}))
             exc=DomainError("请求处理失败"); exc.diagnostic_id=diagnostic_id; exc.status=500; exc.code="internal_error"; return self.reply(start_response,500,exc.public())
+        finally:
+            path=environ.get("PATH_INFO",""); action=re.sub(r"/v1/tasks/[^/]+", "/v1/tasks/{task_id}", path)
+            logging.info(json.dumps({"event":"action_metric","diagnostic_id":diagnostic_id,"action":f"{environ.get('REQUEST_METHOD','?')} {action}","duration_ms":round((time.monotonic()-started)*1000,2),"failed":failure,"status":response_status}))
     @staticmethod
     def exact(body,allowed,required):
         if not isinstance(body,dict) or set(body)-allowed or required-set(body):raise ValidationError("请求字段无效")
