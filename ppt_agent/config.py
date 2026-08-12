@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import yaml
 from dotenv import load_dotenv
@@ -25,6 +25,17 @@ class ModelConfig:
     def public(self) -> dict:
         value = asdict(self)
         value.pop("api_key")
+        # Keep snapshots safe even if a ModelConfig is constructed outside the
+        # validated YAML loader. Credentials and URL metadata are never public.
+        parsed = urlparse(self.base_url)
+        hostname = parsed.hostname or ""
+        if ":" in hostname and not hostname.startswith("["):
+            hostname = f"[{hostname}]"
+        try:
+            port = f":{parsed.port}" if parsed.port is not None else ""
+        except ValueError:
+            port = ""
+        value["base_url"] = urlunparse((parsed.scheme, f"{hostname}{port}", parsed.path, "", "", ""))
         return value
 
 
@@ -74,14 +85,22 @@ def _model(value: dict, name: str, *, required: bool) -> ModelConfig | None:
     api_key, base_url = os.getenv(api_key_env, ""), os.getenv(base_url_env, "")
     if not api_key or not base_url:
         raise ValidationError(f"models.{name} 引用的环境变量未配置")
-    parsed = urlparse(base_url)
-    if parsed.scheme != "https" and not (parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost"}):
-        raise ValidationError(f"models.{name} Base URL 必须使用 HTTPS（本机回环地址除外）")
     try:
-        timeout = float(value.get("timeout_seconds", 60))
-        max_steps = int(value.get("max_steps", 12))
-    except (TypeError, ValueError) as exc:
-        raise ValidationError(f"models.{name} 的超时或步数无效") from exc
+        parsed = urlparse(base_url)
+        hostname = parsed.hostname
+        parsed.port
+    except ValueError as exc:
+        raise ValidationError(f"models.{name} Base URL 无效") from exc
+    if not hostname or parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+        raise ValidationError(f"models.{name} Base URL 不得缺少主机或包含凭证、查询参数、片段")
+    if parsed.scheme != "https" and not (parsed.scheme == "http" and hostname in {"127.0.0.1", "localhost"}):
+        raise ValidationError(f"models.{name} Base URL 必须使用 HTTPS（本机回环地址除外）")
+    timeout = value.get("timeout_seconds", 60)
+    max_steps = value.get("max_steps", 12)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        raise ValidationError(f"models.{name}.timeout_seconds 必须为 number")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise ValidationError(f"models.{name}.max_steps 必须为 integer")
     if not 1 <= timeout <= 600 or not 1 <= max_steps <= 100:
         raise ValidationError(f"models.{name} 的超时或步数超出范围")
     return ModelConfig(provider, model, api_key_env, base_url_env, timeout, max_steps, api_key, base_url.rstrip("/"))
@@ -120,8 +139,12 @@ def load_config(path: str | Path | None = None, *, env_file: str | Path | None =
         raise ValidationError("models 包含未知字段")
     generation = _model(models.get("generation"), "generation", required=True)
     inspection_raw = models.get("inspection")
-    fallback = bool(inspection_raw and inspection_raw.get("fallback_to_generation", False))
-    fallback_only = isinstance(inspection_raw, dict) and set(inspection_raw) == {"fallback_to_generation"}
+    if inspection_raw is not None:
+        inspection_raw = _mapping(inspection_raw, "models.inspection")
+    fallback = inspection_raw.get("fallback_to_generation", False) if inspection_raw is not None else False
+    if not isinstance(fallback, bool):
+        raise ValidationError("models.inspection.fallback_to_generation 必须为 boolean")
+    fallback_only = inspection_raw is not None and set(inspection_raw) == {"fallback_to_generation"}
     inspection = None if fallback_only else _model(inspection_raw, "inspection", required=False)
     if inspection is None:
         if not fallback:

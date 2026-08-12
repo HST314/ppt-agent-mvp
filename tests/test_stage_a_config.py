@@ -49,6 +49,31 @@ class StageAConfigTests(unittest.TestCase):
         with self.assertRaises(ValidationError) as caught: self.config(AGENT,{"GEN_KEY":"secret-value"})
         self.assertNotIn("secret-value",str(caught.exception.public()))
 
+    def test_rejects_invalid_inspection_and_strict_scalar_types(self):
+        env={"GEN_KEY":"secret","GEN_URL":"https://gen.example/v1"}
+        base="""gateway: {mode: agent}\nmodels:\n  generation:\n    provider: openai_responses\n    model: gen\n    api_key_env: GEN_KEY\n    base_url_env: GEN_URL\n"""
+        invalid=(
+            base + "  inspection: invalid\n",
+            base + "  inspection: {fallback_to_generation: \"false\"}\n",
+            base.replace("    base_url_env: GEN_URL\n", "    base_url_env: GEN_URL\n    max_steps: 1.9\n") + "  inspection: {fallback_to_generation: true}\n",
+        )
+        for text in invalid:
+            with self.subTest(text=text), self.assertRaises(ValidationError):
+                self.config(text,env)
+
+    def test_rejects_unsafe_base_urls_and_redacts_defensively(self):
+        text="""gateway: {mode: agent}\nmodels:\n  generation:\n    provider: openai_responses\n    model: gen\n    api_key_env: GEN_KEY\n    base_url_env: GEN_URL\n  inspection: {fallback_to_generation: true}\n"""
+        for url in ("https:///v1", "https://user:password@example.com/v1", "https://example.com/v1?token=secret", "https://example.com/v1#secret"):
+            with self.subTest(url=url), self.assertRaises(ValidationError):
+                self.config(text,{"GEN_KEY":"secret","GEN_URL":url})
+
+        env={"GEN_KEY":"secret","GEN_URL":"https://gen.example/v1","INSPECT_KEY":"i","INSPECT_URL":"https://inspect.example/v1"}
+        cfg=self.config(AGENT,env)
+        object.__setattr__(cfg.generation,"base_url","https://user:password@example.com/v1?token=secret#fragment")
+        snapshot=str(cfg.public())
+        for secret in ("user", "password", "token", "secret", "fragment"):
+            self.assertNotIn(secret,snapshot)
+
     def test_responses_request_and_error_mapping(self):
         env={"GEN_KEY":"secret","GEN_URL":"https://gen.example/v1","INSPECT_KEY":"i","INSPECT_URL":"https://inspect.example/v1"}
         cfg=self.config(AGENT,env).generation
