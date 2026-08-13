@@ -1,8 +1,14 @@
 const LEGACY_STAGES = new Map([
+  ["input", "created"],
+  ["created", "created"],
+  ["clarification", "clarification"],
+  ["narrative", "narrative"],
   ["outline", "outline"],
   ["samples", "sample"],
+  ["sample", "sample"],
   ["deck", "deck"],
   ["inspection", "review"],
+  ["review", "review"],
   ["delivery", "delivery"],
 ]);
 

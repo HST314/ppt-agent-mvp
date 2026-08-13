@@ -52,6 +52,8 @@ export function button(label, options = {}) {
     type: options.href ? undefined : (options.type || "button"),
     disabled: options.disabled,
     title: options.title,
+    "data-mutates": options.mutates ? "true" : null,
+    "data-allow-completed": options.allowCompleted ? "true" : null,
     onClick: options.onClick,
   });
   if (options.disabled && options.reason) node.setAttribute("aria-description", options.reason);

@@ -4,11 +4,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from starlette.middleware.wsgi import WSGIMiddleware
 
-from ..api import App as LegacyApp
 from ..service import TaskService
 from ..store import WorkspaceStore
 from .errors import install_error_handlers
@@ -36,7 +33,7 @@ def create_app(
 
     app = FastAPI(
         title="PPT Agent MVP Web API",
-        version="1.0.0-step1",
+        version="1.0.0-step2",
         lifespan=lifespan,
         docs_url=None,
         redoc_url=None,
@@ -50,13 +47,9 @@ def create_app(
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "same-origin"
-        response.headers["X-Frame-Options"] = "DENY"
-        if request.url.path.startswith("/legacy/"):
-            response.headers["Content-Security-Policy"] = (
-                "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
-                "img-src 'self' data:; connect-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'self'"
-            )
-        else:
+        is_preview = "/previews/" in request.url.path
+        response.headers["X-Frame-Options"] = "SAMEORIGIN" if is_preview else "DENY"
+        if "Content-Security-Policy" not in response.headers:
             response.headers["Content-Security-Policy"] = (
                 "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
                 "connect-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'"
@@ -68,7 +61,6 @@ def create_app(
         return {"status": "ok", "stage": "P8", "runtime_ready": True, "web_runtime": "fastapi"}
 
     app.mount("/static", StaticFiles(directory=frontend / "static", check_dir=True), name="static")
-    app.mount("/legacy", WSGIMiddleware(LegacyApp(service)))
     app.include_router(jobs.router)
     app.include_router(tasks.router)
     app.include_router(pages.router)

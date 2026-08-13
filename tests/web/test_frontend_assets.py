@@ -20,6 +20,9 @@ class FrontendAssetTests(unittest.TestCase):
         required = [
             "static/js/app.js", "static/js/api.js", "static/js/router.js", "static/js/store.js",
             "static/js/job-tracker.js", "static/js/shell.js", "static/js/components/index.js",
+            "static/js/stages/index.js", "static/js/stages/input.js", "static/js/stages/planning.js",
+            "static/js/stages/sample.js", "static/js/stages/deck.js", "static/js/stages/review.js",
+            "static/js/stages/delivery.js", "static/js/stages/shared.js",
             "static/css/tokens.css", "static/css/base.css", "static/css/layout.css",
             "static/css/components.css", "static/css/stages.css",
         ]
@@ -33,6 +36,10 @@ class FrontendAssetTests(unittest.TestCase):
         self.assertIn("max-width: 1023px", css)
         self.assertIn("max-width: 767px", css)
         self.assertNotIn("overflow-x: auto;", css)
+
+        app = (FRONTEND / "static/js/app.js").read_text()
+        self.assertNotIn("/legacy/", app)
+        self.assertNotIn("兼容阶段界面", app)
 
     def test_untrusted_content_is_not_assigned_to_inner_html(self):
         javascript = "\n".join(path.read_text() for path in (FRONTEND / "static/js").rglob("*.js"))

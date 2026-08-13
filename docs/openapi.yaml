@@ -107,6 +107,16 @@ paths:
     get:
       parameters: [{$ref: '#/components/parameters/TaskId'}]
       responses: {'200': {description: Server-authoritative application shell state and eight-stage navigation, content: {application/json: {schema: {type: object}, example: {task: {task_id: demo, stage: created, status: ready, mode: manual}, summary: {progress: 5}, stages: [{id: created, label: 任务/资料, status: current, lock_reason: null, href: '/tasks/demo?stage=created'}], active_jobs: []}}}}, '404': {$ref: '#/components/responses/Error'}}
+  /v1/tasks/{task_id}/previews/{hash}:
+    get:
+      description: Read-only sandbox source for a sample or deck version owned by the task. The response forbids scripts, is not cached, and can only be framed by the same origin.
+      parameters:
+        - {$ref: '#/components/parameters/TaskId'}
+        - {in: path, name: hash, required: true, schema: {type: string, pattern: '^[0-9a-f]{64}$'}}
+      responses:
+        '200': {description: Sanitized and previously validated HTML artifact, headers: {Cache-Control: {schema: {type: string}, example: 'private, no-store'}, X-Frame-Options: {schema: {type: string}, example: SAMEORIGIN}}, content: {text/html: {schema: {type: string}, example: '<!doctype html><html><body><section class="slide" id="slide-1"></section></body></html>'}}}
+        '400': {$ref: '#/components/responses/Error'}
+        '404': {$ref: '#/components/responses/Error'}
   /v1/tasks/{task_id}/inspection:
     get:
       parameters: [{$ref: '#/components/parameters/TaskId'}]

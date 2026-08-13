@@ -75,6 +75,8 @@ class FastAPIShellBrowserGate(unittest.TestCase):
         page.get_by_role("button", name="创建任务并进入工作台").click()
         page.wait_for_url("**/tasks/browser-shell")
         page.get_by_role("heading", name="任务/资料").wait_for()
+        self.assertFalse(page.locator(".menu-button").is_visible())
+        self.assertFalse(page.locator(".sidebar__close").is_visible())
         self.assertEqual(page.locator(".stage-list > li").count(), 8)
         self.assertEqual(page.locator('[aria-current="step"]').inner_text().splitlines()[0], "1")
         self.assertIn("前置条件", page.locator('.stage-link[aria-disabled="true"]').first.get_attribute("title"))

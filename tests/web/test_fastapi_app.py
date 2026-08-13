@@ -20,7 +20,7 @@ class FastAPIAppTests(unittest.TestCase):
         self.client.__exit__(None, None, None)
         self.tmp.cleanup()
 
-    def test_health_shell_static_and_legacy_routes(self):
+    def test_health_shell_static_and_retired_legacy_routes(self):
         health = self.client.get("/healthz")
         self.assertEqual(health.status_code, 200)
         self.assertEqual(health.json()["web_runtime"], "fastapi")
@@ -43,8 +43,8 @@ class FastAPIAppTests(unittest.TestCase):
 
         self.assertIn("PPT Agent 工作台", self.client.get("/tasks/shell/outline").text)
         legacy = self.client.get("/legacy/tasks/shell")
-        self.assertIn("任务/资料", legacy.text)
-        self.assertIn("unsafe-inline", legacy.headers["content-security-policy"])
+        self.assertEqual(legacy.status_code, 404)
+        self.assertNotIn("unsafe-inline", legacy.headers["content-security-policy"])
 
     def test_existing_api_contract_and_error_envelope(self):
         bad = self.client.post("/v1/tasks", json={"mode": "manual"})
@@ -66,6 +66,19 @@ class FastAPIAppTests(unittest.TestCase):
         self.assertEqual(self.client.get("/v1/tasks/compat/planning").status_code, 200)
         listed = self.client.get("/v1/tasks").json()["tasks"]
         self.assertEqual([item["task_id"] for item in listed], ["compat"])
+
+    def test_preview_is_same_origin_sandbox_content_with_separate_csp(self):
+        self.service.create("preview")
+        digest = self.service.store.put_version(
+            "preview", "deck", b'{}', {"html": "<!doctype html><style>body{color:red}</style><h1>Safe preview</h1>"}
+        )
+        response = self.client.get(f"/v1/tasks/preview/previews/{digest}")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Safe preview", response.text)
+        self.assertEqual(response.headers["x-frame-options"], "SAMEORIGIN")
+        self.assertIn("script-src 'none'", response.headers["content-security-policy"])
+        self.assertIn("style-src 'unsafe-inline'", response.headers["content-security-policy"])
+        self.assertEqual(response.headers["cache-control"], "private, no-store")
 
     def test_job_idempotency_sse_and_terminal_reconciliation(self):
         self.client.post("/v1/tasks", json={"task_id": "jobs", "mode": "manual"})

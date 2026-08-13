@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Request, status
+from fastapi.responses import HTMLResponse
 
-from ...errors import NotFoundError
+from ...errors import NotFoundError, ValidationError
 from ...service import TaskService
 from ..dependencies import job_service, task_service
 from ..jobs import JobService
@@ -43,10 +44,16 @@ def get_task(task_id: str, service: TaskService = Depends(task_service)):
 def get_shell(task_id: str, service: TaskService = Depends(task_service), jobs: JobService = Depends(job_service)):
     state = service.get(task_id)
     summary = service.status_summary(task_id)
+    delivery_available = False
+    if state["stage"] == "review":
+        delivery_available = service.inspection_view(task_id)["delivery_allowed"]
     current_index = next(index for index, item in enumerate(STAGES) if item[0] == state["stage"])
     stages = []
     for index, (key, label, prerequisite) in enumerate(STAGES):
-        item_status = "completed" if index < current_index else "current" if index == current_index else "locked"
+        if key == "delivery" and delivery_available:
+            item_status = "available"
+        else:
+            item_status = "completed" if index < current_index else "current" if index == current_index else "locked"
         stages.append({
             "id": key,
             "label": label,
@@ -245,6 +252,23 @@ async def compare_versions(task_id: str, request: Request, service: TaskService 
 @router.get("/tasks/{task_id}/versions/{digest}")
 def get_version(task_id: str, digest: str, service: TaskService = Depends(task_service)):
     return {"hash": digest, "content": service.version(task_id, digest).decode(errors="replace")}
+
+
+@router.get("/tasks/{task_id}/previews/{digest}", response_class=HTMLResponse, include_in_schema=False)
+def get_preview(task_id: str, digest: str, service: TaskService = Depends(task_service)):
+    if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+        raise ValidationError("预览版本 hash 无效")
+    record = next((item for item in service.versions(task_id) if item["hash"] == digest and item["kind"] in {"sample", "deck"}), None)
+    if not record or not isinstance(record.get("metadata", {}).get("html"), str):
+        raise NotFoundError("预览版本不存在")
+    return HTMLResponse(record["metadata"]["html"], headers={
+        "Content-Security-Policy": (
+            "default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src 'self'; "
+            "font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'"
+        ),
+        "X-Frame-Options": "SAMEORIGIN",
+        "Cache-Control": "private, no-store",
+    })
 
 
 @router.get("/tasks/{task_id}/versions")

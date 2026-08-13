@@ -21,7 +21,7 @@
 | AC-15 | 仅明确确认后完成 | P7-01、P7-02 | 交付确认 API；交付操作 | `tests/e2e/test_ac_15_17_delivery.py::DeliveryJourney::test_ac15_explicit_confirmation_is_only_completion_path` |
 | AC-16 | 交付包内容完整 | P7-02 | 交付 API；结果摘要 | `tests/e2e/test_ac_15_17_delivery.py::DeliveryJourney::test_ac16_bundle_is_complete_runnable_and_hash_verified` |
 | AC-17 | 交付后派生与非破坏回退 | P7-03、P7-04 | 派生/回退 API；版本页 | `tests/e2e/test_ac_15_17_delivery.py::DeliveryJourney::test_ac17_delivery_is_immutable_and_new_candidate_requires_reinspection`; `DeliveryFaultTests::test_post_publish_breakpoints_are_idempotently_recoverable` |
-| AC-18 | 桌面端完成全流程 | P8-01～P8-03 | 全工作区 | `tests/browser/test_ac_18_desktop_journey.py` |
+| AC-18 | 桌面端完成全流程 | P8-01～P8-03 | 全工作区 | `tests/browser/test_ac_18_desktop_journey.py`、`tests/browser/test_fastapi_full_journey.py` |
 
 ## P8-06 发布回填（2026-08-12）
 
@@ -34,16 +34,23 @@
 | AC-01～AC-17 | 通过 | 上表逐项测试路径；非浏览器全量门禁 | 无 |
 | AC-18 桌面联合旅程 | 通过 | `tests/browser/test_ac_18_desktop_journey.py`、`scripts/verify_browser_gate.py`；2026-08-12 独立复验：Playwright 1.54.0 / Chromium 139.0.7258.5（build v1181），6/6 passed、0 failed、0 skipped | 固定浏览器环境复验须保持 0 失败、0 跳过，且不得以 API fetch 代替控件操作 |
 
-## 前端 FastAPI 重构第一步（2026-08-13）
+## 前端 FastAPI 重构（2026-08-13）
 
 | 契约项 | 实现证据 | 自动化证据 |
 |---|---|---|
 | F1 FastAPI 基础设施 | `ppt_agent/web/app.py`、`ppt_agent/web/routes/tasks.py`、`scripts/start.py` | `tests/web/test_fastapi_app.py`、原有 `tests/e2e/**` 全量回归 |
 | F2 设计系统与组件 | `frontend/static/css/**`、`frontend/static/js/components/index.js`、`/components` | `tests/web/test_frontend_assets.py`，四档 Chromium 截图/布局验收 |
-| F3 统一应用壳 | `frontend/index.html`、`frontend/static/js/app.js`、`router.js`、`shell.js` | `tests/web/test_fastapi_app.py::FastAPIAppTests::test_health_shell_static_and_legacy_routes` |
+| F3 统一应用壳 | `frontend/index.html`、`frontend/static/js/app.js`、`router.js`、`shell.js` | `tests/web/test_fastapi_app.py::FastAPIAppTests::test_health_shell_static_and_retired_legacy_routes`、`tests/browser/test_fastapi_shell.py` |
 | F4 Job/SSE | `ppt_agent/web/jobs.py`、`ppt_agent/web/routes/jobs.py`、`frontend/static/js/job-tracker.js` | `tests/web/test_jobs.py`、`tests/web/test_fastapi_app.py::FastAPIAppTests::test_job_idempotency_sse_and_terminal_reconciliation` |
+| F5 任务/资料与澄清 | `frontend/static/js/stages/input.js` | `tests/browser/test_fastapi_full_journey.py`、P2 API/领域回归 |
+| F6 叙事与大纲 | `frontend/static/js/stages/planning.js` | `tests/browser/test_fastapi_full_journey.py`、P3 回归 |
+| F7 样品 | `frontend/static/js/stages/sample.js`、版本预览端点 | `tests/browser/test_fastapi_full_journey.py`、P4 浏览器回归 |
+| F8 全稿 | `frontend/static/js/stages/deck.js` | `tests/browser/test_fastapi_full_journey.py`、AC-09/10 回归 |
+| F9 检查与人工审核 | `frontend/static/js/stages/review.js` | `tests/browser/test_fastapi_full_journey.py`、P6 浏览器回归 |
+| F10 交付与派生 | `frontend/static/js/stages/delivery.js` | `tests/browser/test_fastapi_full_journey.py`、AC-15～17 回归 |
+| F11 旧 UI 下线 | FastAPI 不再挂载 `/legacy/**`；旧业务深链由 `pages.py` 进入统一壳 | `test_health_shell_static_and_retired_legacy_routes`、全量浏览器门禁 |
 
-第一步只迁移首页、任务切换、阶段导航、通用状态和后台任务基础能力。未迁移阶段继续由 `/legacy/tasks/{task_id}/...` 提供兼容交互，并与新壳共享同一 `TaskService`；第二步完成前不删除旧内联页面。
+第二步已迁移 8 阶段全部交互，生成操作统一走持久化 Job；版本、检查、交付与派生继续调用同一 `TaskService`。旧业务深链保留，`/legacy/**` 不再提供页面。
 
 ## 回填规则
 

@@ -15,7 +15,9 @@
 python3 scripts/start.py --data .ppt-agent-data --host 127.0.0.1 --port 8000
 ```
 
-该命令启动 FastAPI/Uvicorn Web 适配层。`/healthz` 的 `web_runtime` 应为 `fastapi`；`/`、`/tasks/{task_id}` 和 `/components` 使用独立 `frontend/` 静态资源。兼容旧交互位于 `/legacy/tasks/{task_id}/...`，与新应用壳复用同一业务服务和数据目录。
+该命令启动 FastAPI/Uvicorn Web 适配层。`/healthz` 的 `web_runtime` 应为 `fastapi`；`/`、`/tasks/{task_id}` 和 `/components` 使用独立 `frontend/` 静态资源。8 阶段交互全部位于统一应用壳；旧 `/tasks/{task_id}/outline|samples|deck|inspection|delivery` 深链会规范化到对应阶段，`/legacy/**` 已下线。
+
+样品、全稿和检查预览由 `/v1/tasks/{task_id}/previews/{hash}` 提供。端点只接受当前任务内 `sample`/`deck` 版本，返回 `no-store`、`SAMEORIGIN` 与禁止脚本的独立 CSP；应用壳 CSP 不允许内联脚本或样式。预览异常时先核对 hash 是否属于当前任务及对应版本，不要绕过端点直接读取工作区文件。
 
 ### Job 与 SSE 恢复
 
@@ -35,6 +37,8 @@ python3 scripts/start.py --data .ppt-agent-data --host 127.0.0.1 --port 8000
 4. 生成全稿；在 manual/auto 模式下完成独立检查和问题处置。
 5. 当前检查未过期且无未处置 blocker 时，由用户绑定当前 `deck_hash` 确认交付。
 6. 对交付目录执行离线打包与校验；如需修改，从历史交付派生新候选并重新检查。
+
+所有生成、修改样品、修改全稿和检查操作从界面创建持久化 Job。短操作（回答、直接编辑、确认、回退、问题处置、交付）直接调用现有 `/v1` 接口；页面刷新后仍以服务端任务、版本和 Job 为权威状态。
 
 ## 测试与离线验收
 

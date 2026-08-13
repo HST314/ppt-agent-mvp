@@ -2,22 +2,17 @@ import { api, ApiError } from "./api.js";
 import { JobTracker } from "./job-tracker.js";
 import { currentRoute, installRouter, navigate } from "./router.js";
 import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js";
+import { clearIdempotencyKey, getOrCreateIdempotencyKey } from "./store.js";
+import { inlineError, setBusy } from "./components/index.js";
+import { renderStage } from "./stages/index.js";
 
 const app = document.getElementById("app");
 const tracker = new JobTracker();
 let renderGeneration = 0;
 let activeController = null;
+let hasUnsavedDraft = false;
+let acceptedLocation = `${window.location.pathname}${window.location.search}${window.location.hash}`;
 
-const STAGE_LEGACY = {
-  created: "",
-  clarification: "",
-  narrative: "outline",
-  outline: "outline",
-  sample: "samples",
-  deck: "deck",
-  review: "inspection",
-  delivery: "delivery",
-};
 const STATUS = {
   ready: ["就绪", "success"],
   running: ["运行中", "primary"],
@@ -27,23 +22,32 @@ const STATUS = {
   failed: ["失败", "danger"],
   completed: ["已完成", "success"],
 };
-const ACTIONS = {
-  answer_clarifications: "回答澄清问题",
-  approve_narrative: "确认叙事结构",
-  confirm_sample: "确认样品",
-  confirm_delivery: "确认最终交付",
-};
 
 applyTheme(preferredTheme());
 installRouter(renderRoute);
+window.addEventListener("beforeunload", (event) => {
+  if (!hasUnsavedDraft) return;
+  event.preventDefault();
+  event.returnValue = "";
+});
 window.addEventListener("online", () => {
   showToast("网络连接已恢复");
-  renderRoute(currentRoute());
+  if (!hasUnsavedDraft) renderRoute(currentRoute());
 });
-window.addEventListener("offline", () => renderRoute(currentRoute()));
+window.addEventListener("offline", () => {
+  showToast("网络连接已断开，已保留当前编辑内容");
+  if (!hasUnsavedDraft) renderRoute(currentRoute());
+});
 renderRoute(currentRoute());
 
 async function renderRoute(route) {
+  const requestedLocation = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  if (requestedLocation !== acceptedLocation && hasUnsavedDraft && !window.confirm("当前阶段有未保存修改，确定离开吗？")) {
+    window.history.pushState({}, "", acceptedLocation);
+    return;
+  }
+  if (requestedLocation !== acceptedLocation) hasUnsavedDraft = false;
+  acceptedLocation = requestedLocation;
   const generation = ++renderGeneration;
   activeController?.abort("navigation");
   activeController = new AbortController();
@@ -58,8 +62,13 @@ async function renderRoute(route) {
 function topbar(context = {}) {
   const theme = document.documentElement.dataset.theme;
   const themeButton = iconButton(theme === "dark" ? "sun" : "moon", theme === "dark" ? "切换浅色主题" : "切换深色主题", () => {
-    applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
-    renderRoute(currentRoute());
+    const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+    applyTheme(next);
+    const nextIcon = next === "dark" ? "sun" : "moon";
+    const label = next === "dark" ? "切换浅色主题" : "切换深色主题";
+    themeButton.replaceChildren(icon(nextIcon));
+    themeButton.setAttribute("aria-label", label);
+    themeButton.title = label;
   });
   const home = element("a", { className: "topbar__brand", href: "/", onClick: intercept }, [
     brandMark(),
@@ -191,6 +200,18 @@ async function renderWorkspace(route, generation) {
     ]);
     replaceApp(page);
     shell.active_jobs.forEach((job) => connectJob(job, route));
+    if (!lockedStage(selected)) {
+      try {
+        const content = await renderStage(selected.id, stageContext(shell, selected, route, generation));
+        if (generation !== renderGeneration) return;
+        enforceTaskActionState(content, shell.task);
+        document.getElementById("stage-content")?.replaceChildren(content);
+      } catch (error) {
+        if (generation === renderGeneration && error?.name !== "AbortError") {
+          document.getElementById("stage-content")?.replaceChildren(inlineError(describeError(error), error?.diagnosticId));
+        }
+      }
+    }
   } catch (error) {
     if (generation === renderGeneration) renderFatal(error, () => renderRoute(currentRoute()), route.taskId);
   }
@@ -249,41 +270,19 @@ function workspaceMain(shell, selected) {
         element("div", {}, [
           element("p", { className: "eyebrow", text: `阶段 ${shell.stages.findIndex((stage) => stage.id === selected.id) + 1} / 8` }),
           element("h1", { text: selected.label }),
-          element("p", { text: locked ? selected.lock_reason : selected.id === current.id ? "这是任务当前的权威阶段。" : `正在查看已完成阶段；当前阶段为“${current.label}”。` }),
+          element("p", { text: locked ? selected.lock_reason : selected.status === "available" ? `该阶段已满足前置门禁；任务当前阶段仍为“${current.label}”。` : selected.id === current.id ? "这是任务当前的权威阶段。" : `正在查看已完成阶段；当前阶段为“${current.label}”。` }),
         ]),
         badge(statusLabel, tone),
       ]),
-      locked ? lockedState(selected, current) : stageOverview(shell, selected),
+      element("div", { id: "active-job-region", "aria-live": "polite" }, shell.active_jobs.map(jobPanel)),
+      element("div", { id: "stage-content" }, locked ? lockedState(selected, current) : [
+        element("div", { className: "skeleton skeleton--title" }),
+        element("div", { className: "card", role: "status" }, [element("span", { className: "sr-only", text: `正在加载${selected.label}` }), element("div", { className: "skeleton skeleton--line" }), element("div", { className: "skeleton skeleton--line" })]),
+      ]),
     ]),
   ]);
   window.requestAnimationFrame(() => main.focus({ preventScroll: true }));
   return main;
-}
-
-function stageOverview(shell, selected) {
-  const summary = shell.summary;
-  const currentAction = ACTIONS[summary.current_action] || summary.current_action || "暂无人工待办";
-  const card = element("section", { className: "card card--raised stage-hero", "aria-labelledby": "state-heading" }, [
-    element("div", { className: "card__header" }, [
-      element("div", {}, [element("h2", { id: "state-heading", text: "任务实时状态" }), element("p", { text: "阶段、状态与待办均来自服务端记录。" })]),
-      badge(`修订 ${shell.task.revision ?? 0}`),
-    ]),
-    progress(summary.progress, `${summary.progress}%`, selected.label),
-    element("dl", { className: "stage-status-grid" }, [
-      stat("当前阶段", shell.stages.find((stage) => stage.status === "current").label),
-      stat("运行模式", shell.task.mode === "auto" ? "自动模式" : "人工模式"),
-      stat("下一项人工动作", currentAction),
-    ]),
-    element("div", { id: "active-job-region", "aria-live": "polite" }, shell.active_jobs.length ? shell.active_jobs.map(jobPanel) : null),
-    element("div", { className: "legacy-note" }, [
-      element("div", {}, [
-        element("strong", { text: "阶段业务操作仍由兼容界面承载" }),
-        element("p", { text: "第一步先完成统一壳与基础能力；现有交互会在第二步逐阶段迁入。" }),
-      ]),
-      button("打开兼容阶段界面", { href: legacyHref(shell.task.task_id, selected.id), kind: "secondary" }),
-    ]),
-  ]);
-  return card;
 }
 
 function lockedState(selected, current) {
@@ -304,17 +303,81 @@ function jobPanel(job) {
     ]),
     progress(value, typeof job.progress === "number" ? `${job.progress}%` : "进度以真实检查点为准", job.current_step || "运行中"),
     element("p", { className: "field__hint", text: "可以安全离开此页；再次打开任务时会自动恢复显示。" }),
+    !["succeeded", "failed", "cancelled", "interrupted"].includes(job.status) ? button(job.cancellation_requested ? "正在取消" : "取消后台任务", { kind: "ghost", disabled: job.cancellation_requested, onClick: async () => {
+      try {
+        const next = await api.cancelJob(job.job_id);
+        updateJobPanel(next);
+      } catch (error) {
+        showToast(describeError(error));
+      }
+    } }) : null,
+    job.error ? inlineError(job.error.message || "后台任务失败", job.error.diagnostic_id) : null,
   ]);
 }
 
-function connectJob(job, route) {
+function connectJob(job, route, storageKey = null) {
   tracker.track(job, {
     onUpdate: (next) => updateJobPanel(next),
     onEvent: (event) => updateJobEvent(event),
     onComplete: (finished) => {
+      if (storageKey) clearIdempotencyKey(storageKey);
       showToast(finished.status === "succeeded" ? "后台任务已完成" : "后台任务已结束，请查看详情");
       renderRoute(route);
     },
+  });
+}
+
+function stageContext(shell, selected, route, generation) {
+  return {
+    taskId: shell.task.task_id,
+    shell,
+    selected,
+    controller: activeController,
+    assertCurrent() {
+      if (generation !== renderGeneration) throw new DOMException("stale view", "AbortError");
+    },
+    setDirty(value) { hasUnsavedDraft = Boolean(value); },
+    refresh: () => renderRoute(currentRoute()),
+    goTo: (stage) => navigate(`/tasks/${encodeURIComponent(shell.task.task_id)}${stage ? `?stage=${encodeURIComponent(stage)}` : ""}`),
+    startJob: (operation, payload, options = {}) => startJob(shell.task.task_id, operation, payload, route, options),
+  };
+}
+
+async function startJob(taskId, operation, payload, route, { buttonNode = null, region = null } = {}) {
+  region?.replaceChildren();
+  setBusy(buttonNode, true, "正在创建后台任务…");
+  const intent = getOrCreateIdempotencyKey(taskId, operation, payload);
+  try {
+    const job = await api.createJob(taskId, { operation, payload, idempotency_key: intent.value });
+    let activeRegion = document.getElementById("active-job-region");
+    if (!activeRegion) activeRegion = region;
+    const existing = document.getElementById(`job-${job.job_id}`);
+    if (existing) existing.replaceWith(jobPanel(job));
+    else activeRegion?.append(jobPanel(job));
+    connectJob(job, route, intent.storageKey);
+    if (buttonNode) {
+      buttonNode.textContent = "后台任务运行中";
+      buttonNode.disabled = true;
+    }
+    return job;
+  } catch (error) {
+    if (region) region.replaceChildren(inlineError(describeError(error), error?.diagnosticId));
+    setBusy(buttonNode, false);
+    return null;
+  }
+}
+
+function lockedStage(stage) {
+  return stage.status === "locked";
+}
+
+function enforceTaskActionState(content, task) {
+  if (!["paused", "cancelled", "failed", "completed"].includes(task.status)) return;
+  content.querySelectorAll('[data-mutates="true"]').forEach((control) => {
+    if (task.status === "completed" && control.dataset.allowCompleted === "true") return;
+    control.disabled = true;
+    control.title = `任务状态 ${task.status} 不允许执行该动作`;
+    control.setAttribute("aria-description", control.title);
   });
 }
 
@@ -418,10 +481,17 @@ function openSettings() {
         element("span", { className: "field__label", text: "主题" }),
         element("p", { className: "field__hint", text: `当前为${current === "dark" ? "深色" : "浅色"}主题。偏好只保存在本机浏览器。` }),
         button(current === "dark" ? "使用浅色主题" : "使用深色主题", { onClick: () => {
-          applyTheme(current === "dark" ? "light" : "dark");
+          const next = current === "dark" ? "light" : "dark";
+          applyTheme(next);
           dialog.close();
           dialog.remove();
-          renderRoute(currentRoute());
+          const toggle = document.querySelector(`button[aria-label="${current === "dark" ? "切换浅色主题" : "切换深色主题"}"]`);
+          if (toggle) {
+            const label = next === "dark" ? "切换浅色主题" : "切换深色主题";
+            toggle.replaceChildren(icon(next === "dark" ? "sun" : "moon"));
+            toggle.setAttribute("aria-label", label);
+            toggle.title = label;
+          }
         } }),
       ]),
       element("div", { className: "field" }, [
@@ -445,17 +515,8 @@ function progress(value, valueLabel, step) {
   return element("div", { className: "progress" }, [element("div", { className: "progress__track" }, bar), element("div", { className: "progress__meta" }, [element("span", { text: step }), element("span", { text: valueLabel })])]);
 }
 
-function stat(label, value) {
-  return element("div", { className: "stat" }, [element("dt", { text: label }), element("dd", { text: value })]);
-}
-
 function heroArt() {
   return element("div", { className: "hero-art", "aria-hidden": "true" }, [element("div", { className: "hero-orb" }), element("div", { className: "slide-stack" }, [element("span"), element("span"), element("span", {}, brandMark())])]);
-}
-
-function legacyHref(taskId, stage) {
-  const suffix = STAGE_LEGACY[stage];
-  return `/legacy/tasks/${encodeURIComponent(taskId)}${suffix ? `/${suffix}` : ""}`;
 }
 
 function operationLabel(operation) {
@@ -475,6 +536,8 @@ function intercept(event) {
   if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
   const anchor = event.currentTarget;
   if (!anchor?.href || anchor.origin !== window.location.origin) return;
+  if (hasUnsavedDraft && !window.confirm("当前阶段有未保存修改，确定离开吗？")) return;
+  hasUnsavedDraft = false;
   event.preventDefault();
   navigate(`${anchor.pathname}${anchor.search}${anchor.hash}`);
 }

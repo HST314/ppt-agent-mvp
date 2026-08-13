@@ -12,9 +12,9 @@ P8 后端发布边界已实现：全写动作生命周期保护、版本 hash �
 python3 scripts/start.py --data .ppt-agent-data --host 127.0.0.1 --port 8000
 ```
 
-默认入口现为 FastAPI + Uvicorn。浏览器打开 `/` 可进入统一应用壳；`/tasks/<task-id>` 支持阶段深链与前进/后退，`/components` 提供基础组件状态演示。兼容期内，旧的内联业务页面仍可从 `/legacy/tasks/<task-id>/...` 访问，所有新旧入口共享同一个 `TaskService`，不会形成第二套业务状态。
+默认入口为 FastAPI + Uvicorn。浏览器打开 `/` 可进入统一应用壳；`/tasks/<task-id>` 支持阶段深链与前进/后退，`/components` 提供基础组件状态演示。任务/资料、澄清、叙事、大纲、样品、全稿、检查、交付和派生均在该应用壳内完成；旧页面深链会规范化到对应阶段，`/legacy/**` 已下线，不再维护第二套页面。
 
-第一步新增的长任务接口如下：
+生成类长任务接口如下：
 
 - `POST /v1/tasks/{task_id}/jobs`：使用 `operation`、`payload` 和 `idempotency_key` 创建持久化 Job；
 - `GET /v1/tasks/{task_id}/jobs?status=active`：刷新后发现活动 Job；
@@ -72,7 +72,7 @@ API 契约见 `docs/openapi.yaml`，内核契约见 `docs/p1-contract.md`。
 
 ## P4 样品闭环
 
-`GET /tasks/{task_id}/samples` 打开安全沙箱预览。样品只内嵌当前冻结 manifest 中、读取时 hash 仍匹配的图片；外链、跨任务路径、未授权 data URL 与主动内容会被拒绝。`POST /v1/tasks/{task_id}/samples/modify` 可只提交 Prompt，并结合当前 `slide_id`/`element_id` 自动判断全局、页面或元素范围；语义冲突或明显歧义返回可理解的校验错误。确认事实原子绑定当前大纲、选择与样品内容版本。
+`GET /tasks/{task_id}/samples` 在统一应用壳中打开安全沙箱预览。预览内容通过只读、同源、按版本 hash 授权的端点加载；该响应允许演示稿内联样式，但明确禁用脚本，应用壳自身仍执行禁止内联脚本/样式的严格 CSP。样品只内嵌当前冻结 manifest 中、读取时 hash 仍匹配的图片；外链、跨任务路径、未授权 data URL 与主动内容会被拒绝。`POST /v1/tasks/{task_id}/samples/modify` 可只提交 Prompt，并结合当前 `slide_id`/`element_id` 自动判断全局、页面或元素范围；语义冲突或明显歧义返回可理解的校验错误。确认事实原子绑定当前大纲、选择与样品内容版本。
 
 样品页脚本对全部控件使用显式 `getElementById` 绑定，不依赖 window 隐式命名属性（`prompt`/`confirm` 会与浏览器原生冲突）。`tests/test_p4_sample_page_browser.py` 在真实 headless Chromium 中执行页面 JavaScript，覆盖自动识别提交、理解依据刷新展示、歧义提示与确认门禁四条交互；该模块需要额外依赖，缺失时自动跳过、不影响全量套件：
 
@@ -84,7 +84,7 @@ python3 -m unittest discover -s tests
 
 ## P8 固定 Chromium 门禁
 
-浏览器证据固定使用 Playwright 1.54.0（Chromium 139.0.7258.5 / build v1181）。门禁脚本会执行现有 P4、P6 浏览器回归及 AC-18 桌面完整旅程，任一用例跳过即失败：
+浏览器证据固定使用 Playwright 1.54.0（Chromium 139.0.7258.5 / build v1181）。门禁脚本会执行 P4、P6 历史回归、应用壳四视口/可访问性门禁，以及 FastAPI 统一应用壳从创建到交付后派生的完整旅程，任一用例跳过即失败：
 
 ```bash
 python3 -m pip install -r requirements-browser.txt
