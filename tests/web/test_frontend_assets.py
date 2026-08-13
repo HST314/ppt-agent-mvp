@@ -41,6 +41,12 @@ class FrontendAssetTests(unittest.TestCase):
         self.assertNotIn("/legacy/", app)
         self.assertNotIn("兼容阶段界面", app)
 
+        input_stage = (FRONTEND / "static/js/stages/input.js").read_text()
+        self.assertIn("没有检测到图片资源", input_stage)
+        self.assertIn("继续无图片", input_stage)
+        self.assertIn("返回准备资源", input_stage)
+        self.assertIn("sessionStorage", input_stage)
+
         retired = (ROOT / "ppt_agent" / "api.py").read_text()
         self.assertNotIn("<html", retired)
         self.assertNotIn("<style", retired)

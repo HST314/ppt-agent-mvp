@@ -183,6 +183,7 @@ class JobRecoveryBrowserGate(unittest.TestCase):
     def start_first_job(self, page):
         page.goto(self.base + "/tasks/recovery?stage=clarification")
         page.get_by_role("heading", name="澄清", exact=True).wait_for()
+        page.get_by_role("dialog", name="没有检测到图片资源").get_by_role("button", name="继续无图片").click()
         page.get_by_role("button", name="生成叙事结构", exact=True).click()
         self.assertTrue(self.service.started.wait(2))
 

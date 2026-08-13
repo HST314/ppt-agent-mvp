@@ -14,6 +14,7 @@ const WARNING_LABELS = {
 export async function render(context) {
   const view = await api.input(context.taskId, context.controller);
   context.assertCurrent();
+  scheduleResourceReminder(view, context);
   return context.selected.id === "clarification" ? clarificationStage(view, context) : inputStage(view, context);
 }
 
@@ -51,7 +52,7 @@ function inputStage(view, context) {
   const primary = [section(view.snapshot ? "更新任务资料" : "创建 / 导入任务卡", form, {
     description: view.snapshot ? "已有快照不会被静默覆盖；重建会明确失效下游内容。" : "填写目标、受众和主题，系统会扫描任务授权资源。",
   })];
-  if (view.snapshot) primary.push(taskCard(view), resources(view));
+  if (view.snapshot) primary.push(taskCard(view), resources(view, context));
   else primary.push(emptyInput());
   return stageGrid(primary, [snapshotCard(view), assumptionsCard(view)]);
 }
@@ -84,7 +85,7 @@ function clarificationStage(view, context) {
       metadataList([["已回答", `${Object.keys(answers).length} / ${questions.length}`], ["当前快照", shortHash(view.snapshot_hash)]]),
       invalidationNotice(invalidated),
     ]),
-    resources(view),
+    resources(view, context),
   ]);
 }
 
@@ -143,7 +144,7 @@ function taskCard(view) {
   ]);
 }
 
-function resources(view) {
+function resources(view, context) {
   const manifest = view.manifest || {};
   const items = manifest.resources || [];
   const warnings = manifest.warnings || [];
@@ -152,9 +153,65 @@ function resources(view) {
       element("strong", { text: item.uri }),
       item.description ? element("p", { text: item.description }) : null,
       element("small", { className: "muted", text: `${item.media_type} · ${shortHash(item.content_hash)}` }),
-    ]))) : element("p", { className: "muted", text: "当前快照没有授权图片资源。" }),
+    ]))) : element("div", { className: "notice notice--warning" }, [
+      element("strong", { text: "未检测到图片资源（可选）" }),
+      element("p", { text: "这不会阻止澄清与生成；如需使用品牌图、产品图或数据截图，请先准备资源并重建快照。" }),
+      button("查看资源准备方法", { kind: "secondary", onClick: () => openResourceReminder(view, context) }),
+    ]),
     warnings.length ? element("ul", { className: "warning-list" }, warnings.map((warning) => element("li", { text: `${warning.path || "资源"}：${WARNING_LABELS[warning.code] || warning.code}` }))) : null,
   ], { description: "仅清单内且 hash 匹配的资源可以进入样品和全稿。" });
+}
+
+function scheduleResourceReminder(view, context) {
+  if (!view.snapshot_hash || (view.manifest?.resources || []).length) return;
+  const key = `ppt-agent:resource-reminder:${context.taskId}:${view.snapshot_hash}`;
+  try {
+    if (window.sessionStorage.getItem(key)) return;
+    window.sessionStorage.setItem(key, "shown");
+  } catch (_error) {
+    // Storage can be unavailable in privacy modes; the reminder still works.
+  }
+  window.requestAnimationFrame(() => {
+    if (document.querySelector("dialog[open]")) return;
+    openResourceReminder(view, context);
+  });
+}
+
+function openResourceReminder(view, context) {
+  const dialogId = `resource-reminder-${context.taskId}`;
+  document.getElementById(dialogId)?.remove();
+  const resourcePath = `<数据目录>/${context.taskId}/resources/`;
+  const close = (nextStage = null) => {
+    dialog.close();
+    dialog.remove();
+    if (nextStage && context.selected.id !== nextStage) context.goTo(nextStage);
+  };
+  const prepare = button("返回准备资源", { kind: "secondary", onClick: () => close("created") });
+  const continueWithoutImages = button("继续无图片", { kind: "primary", onClick: () => close(view.state?.stage === "clarification" ? "clarification" : null) });
+  const dialog = element("dialog", {
+    id: dialogId,
+    "aria-labelledby": `${dialogId}-title`,
+    "aria-describedby": `${dialogId}-description`,
+  }, [
+    element("div", { className: "dialog__body" }, [
+      badge("资源可选", "warning"),
+      element("h2", { id: `${dialogId}-title`, text: "没有检测到图片资源" }),
+      element("p", { id: `${dialogId}-description`, text: "资源为空不是错误，也不会卡住流程。你可以继续生成纯文本演示稿，或先补充品牌图、产品图和数据截图。" }),
+      element("ol", { className: "dialog__steps" }, [
+        element("li", {}, ["将 PNG、JPG、WebP、GIF 或 SVG 放入 ", element("code", { text: resourcePath })]),
+        element("li", {}, ["可为图片添加同名 Markdown 说明，例如 ", element("code", { text: "hero.png + hero.md" })]),
+        element("li", { text: "回到“任务/资料”，勾选“显式重建快照”后重新导入。" }),
+      ]),
+    ]),
+    element("div", { className: "dialog__actions" }, [prepare, continueWithoutImages]),
+  ]);
+  dialog.addEventListener("cancel", (event) => {
+    event.preventDefault();
+    close();
+  });
+  document.body.append(dialog);
+  dialog.showModal();
+  continueWithoutImages.focus();
 }
 
 function snapshotCard(view) {

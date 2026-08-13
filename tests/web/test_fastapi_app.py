@@ -67,6 +67,21 @@ class FastAPIAppTests(unittest.TestCase):
         listed = self.client.get("/v1/tasks").json()["tasks"]
         self.assertEqual([item["task_id"] for item in listed], ["compat"])
 
+    def test_empty_resources_and_unstructured_markdown_return_clarifications(self):
+        self.client.post("/v1/tasks", json={"task_id": "missing-input", "mode": "manual"})
+        imported = self.client.post(
+            "/v1/tasks/missing-input/input",
+            json={"source": "这是一段尚未按任务卡格式整理的说明", "source_format": "markdown"},
+        )
+        self.assertEqual(imported.status_code, 200)
+        self.assertEqual(imported.json()["manifest"]["resources"], [])
+        self.assertEqual(imported.json()["task_card"]["missing"], ["goal", "audience", "topic"])
+
+        view = self.client.get("/v1/tasks/missing-input/input")
+        self.assertEqual(view.status_code, 200)
+        self.assertEqual(len(view.json()["clarification"]["questions"]), 3)
+        self.assertEqual(view.json()["state"]["required_action"], "answer_clarifications")
+
     def test_preview_is_same_origin_sandbox_content_with_separate_csp(self):
         self.service.create("preview")
         digest = self.service.store.put_version(

@@ -79,4 +79,12 @@
 dialog { width: min(32rem, calc(100% - 2rem)); padding: 0; color: var(--color-foreground); background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--radius-md); box-shadow: var(--shadow-md); }
 dialog::backdrop { background: var(--color-overlay); }
 .dialog__body { padding: var(--space-6); }
+.dialog__body > .badge + h2 { margin-top: var(--space-3); }
+.dialog__steps { display: grid; gap: var(--space-2); margin: var(--space-4) 0 0; padding-inline-start: var(--space-5); }
+.dialog__steps code { overflow-wrap: anywhere; }
 .dialog__actions { display: flex; justify-content: flex-end; gap: var(--space-2); padding: var(--space-4) var(--space-6); border-top: 1px solid var(--color-border); }
+
+@media (max-width: 767px) {
+  .dialog__actions { flex-direction: column-reverse; }
+  .dialog__actions .button { width: 100%; }
+}
