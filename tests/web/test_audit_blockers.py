@@ -40,6 +40,9 @@ class AuditBlockerTests(unittest.TestCase):
         self.assertIn("events?after=${track.seq}", source)
         self.assertIn('onTransport?.("polling"', source)
         self.assertIn('onTransport?.("sse"', source)
+        recovery_branch = source.split("if (recovery) {", 1)[1].split("return;", 1)[0]
+        self.assertIn("this.poll(track, true)", recovery_branch)
+        self.assertLess(recovery_branch.index("this.poll(track, true)"), recovery_branch.index("this.scheduleRecovery(track)"))
 
     def test_refresh_recovery_persists_and_clears_job_intent_mapping(self):
         store = (ROOT / "frontend/static/js/store.js").read_text()

@@ -52,6 +52,11 @@ export class JobTracker {
       source.close();
       track.source = null;
       if (recovery) {
+        // A recovered stream can fail again after onopen stopped the fallback
+        // timer. Reinstate polling before spending another bounded probe so an
+        // exhausted recovery budget can never leave the job unobserved.
+        track.callbacks.onTransport?.("polling", { reason: "recovered-stream-error", seq: track.seq });
+        this.poll(track, true);
         this.scheduleRecovery(track);
         return;
       }

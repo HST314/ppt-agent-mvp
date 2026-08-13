@@ -35,7 +35,7 @@ class BlockingNarrativeService(TaskService):
         self.calls += 1
         self.started.set()
         if self.calls == 1:
-            self.release.wait(8)
+            self.release.wait(30)
         return super().generate_narrative(task_id, prompt, scope)
 
 
@@ -116,6 +116,48 @@ class JobRecoveryBrowserGate(unittest.TestCase):
         page.add_init_script(script=script)
         return page
 
+    def new_second_disconnect_page(self):
+        page = self.browser.new_page(viewport={"width": 1280, "height": 900})
+        page.add_init_script(
+            script="""
+            (() => {
+              const nativeFetch = window.fetch.bind(window);
+              window.__streamUrls = [];
+              window.__pollUrls = [];
+              const publish = () => {
+                document.documentElement?.setAttribute("data-test-stream-count", String(window.__streamUrls.length));
+                document.documentElement?.setAttribute("data-test-poll-count", String(window.__pollUrls.length));
+              };
+              window.EventSource = function(url) {
+                const attempt = window.__streamUrls.push(String(url));
+                publish();
+                const fake = {
+                  addEventListener() {},
+                  close() {},
+                  onerror: null,
+                  onopen: null,
+                };
+                if (attempt === 3) {
+                  window.setTimeout(() => fake.onopen?.(new Event("open")), 20);
+                  window.setTimeout(() => fake.onerror?.(new Event("error")), 80);
+                } else {
+                  window.setTimeout(() => fake.onerror?.(new Event("error")), 20);
+                }
+                return fake;
+              };
+              window.fetch = (...args) => {
+                const target = String(args[0]);
+                if (/\/v1\/jobs\/[^/]+$/.test(new URL(target, location.origin).pathname)) {
+                  window.__pollUrls.push(target);
+                  publish();
+                }
+                return nativeFetch(...args);
+              };
+            })();
+            """
+        )
+        return page
+
     def wait_for_session_state(self, page, expected_empty, timeout=6000):
         deadline = time.monotonic() + timeout / 1000
         while time.monotonic() < deadline:
@@ -167,6 +209,32 @@ class JobRecoveryBrowserGate(unittest.TestCase):
         jobs = self.wait_for_job_count(1)
         page.goto(self.base + "/tasks/recovery?stage=narrative")
         page.get_by_role("heading", name="叙事结构", exact=True).wait_for()
+        page.close()
+
+    def test_second_disconnect_exhausts_probes_but_polls_until_terminal(self):
+        page = self.new_second_disconnect_page()
+        self.start_first_job(page)
+
+        # Attempts 1-2 fail, attempt 3 opens and then fails, and attempts 4-5
+        # consume the remaining bounded recovery probes.
+        page.locator('html[data-test-stream-count="5"]').wait_for(timeout=10000)
+        stream_urls = page.evaluate("window.__streamUrls")
+        after_values = [int(parse_qs(urlparse(url).query).get("after", ["0"])[0]) for url in stream_urls]
+        self.assertEqual(len(stream_urls), 5)
+        self.assertEqual(after_values, sorted(after_values))
+
+        polls_before = page.evaluate("window.__pollUrls.length")
+        self.assertGreater(polls_before, 0)
+        page.wait_for_timeout(1300)
+        polls_after = page.evaluate("window.__pollUrls.length")
+        self.assertGreater(polls_after, polls_before)
+        self.assertEqual(self.app.state.job_service.list("recovery")[-1]["status"], "running")
+
+        # With no SSE source left, the live polling loop must observe terminal
+        # state and run the browser completion cleanup.
+        self.service.release.set()
+        self.wait_for_job_count(1)
+        self.wait_for_session_state(page, True)
         page.close()
 
     def test_refresh_terminal_cleanup_allows_same_intent_to_create_a_new_job(self):

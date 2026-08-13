@@ -22,7 +22,7 @@ python3 scripts/start.py --data .ppt-agent-data --host 127.0.0.1 --port 8000
 ### Job 与 SSE 恢复
 
 - 浏览器刷新后会查询 `/v1/tasks/{task_id}/jobs?status=active`，并从持久化的 `job_id ↔ intent storage key` 映射恢复清理责任；终态会同时清理 intent 与映射，下一次同参操作会生成新幂等键。
-- SSE 断开后先执行有界指数退避重连；连续失败才降级轮询。轮询期间继续进行有限 SSE 恢复探测，成功后以 `after=last_seq` 续传并停止轮询，达到探测上限后保持轮询到终态。
+- SSE 断开后先执行有界指数退避重连；连续失败才降级轮询。轮询期间继续进行有限 SSE 恢复探测，成功后以 `after=last_seq` 续传并停止轮询；恢复连接再次断开时立即重启轮询，再消耗剩余探测次数，达到探测上限后保持轮询到终态。
 - 每个任务同时只允许一个写业务状态的活动 Job。相同 `idempotency_key` 与相同请求返回原 Job；同 key 不同请求返回 409。
 - 排队 Job 在服务重启后可重新调度；运行中或已请求取消但结果未知的 Job 会标记为 `interrupted`，必须由用户发起新的明确尝试。
 - 活动 Job 不清理。MVP 终态 Job 至少保留 7 天；当前版本由运维在备份后按 `finished_at` 清理任务目录内的终态 `jobs/*.json` 及同名事件文件，不得清理活动状态。
