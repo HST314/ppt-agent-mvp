@@ -2,7 +2,7 @@ import { api, ApiError } from "./api.js";
 import { JobTracker } from "./job-tracker.js";
 import { currentRoute, installRouter, navigate } from "./router.js";
 import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js";
-import { clearIdempotencyKey, getOrCreateIdempotencyKey } from "./store.js";
+import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js";
 import { inlineError, setBusy } from "./components/index.js";
 import { renderStage } from "./stages/index.js";
 
@@ -200,6 +200,8 @@ async function renderWorkspace(route, generation) {
     ]);
     replaceApp(page);
     shell.active_jobs.forEach((job) => connectJob(job, route));
+    await reconcileStoredIntents(shell.task.task_id, shell.active_jobs, route);
+    if (generation !== renderGeneration) return;
     if (!lockedStage(selected)) {
       try {
         const content = await renderStage(selected.id, stageContext(shell, selected, route, generation));
@@ -316,15 +318,33 @@ function jobPanel(job) {
 }
 
 function connectJob(job, route, storageKey = null) {
+  const recoveredStorageKey = storageKey || storageKeyForJob(job.job_id);
   tracker.track(job, {
     onUpdate: (next) => updateJobPanel(next),
     onEvent: (event) => updateJobEvent(event),
     onComplete: (finished) => {
-      if (storageKey) clearIdempotencyKey(storageKey);
+      if (recoveredStorageKey) clearIdempotencyKey(recoveredStorageKey, finished.job_id);
       showToast(finished.status === "succeeded" ? "后台任务已完成" : "后台任务已结束，请查看详情");
       renderRoute(route);
     },
   });
+}
+
+async function reconcileStoredIntents(taskId, activeJobs, route) {
+  const activeIds = new Set(activeJobs.map((job) => job.job_id));
+  const stored = storedJobIntents(taskId).filter((item) => !activeIds.has(item.jobId));
+  await Promise.all(stored.map(async ({ jobId, storageKey }) => {
+    try {
+      const job = await api.getJob(jobId);
+      if (["succeeded", "failed", "cancelled", "interrupted"].includes(job.status)) {
+        clearIdempotencyKey(storageKey, jobId);
+      } else {
+        connectJob(job, route, storageKey);
+      }
+    } catch (_error) {
+      clearIdempotencyKey(storageKey, jobId);
+    }
+  }));
 }
 
 function stageContext(shell, selected, route, generation) {
@@ -349,6 +369,7 @@ async function startJob(taskId, operation, payload, route, { buttonNode = null, 
   const intent = getOrCreateIdempotencyKey(taskId, operation, payload);
   try {
     const job = await api.createJob(taskId, { operation, payload, idempotency_key: intent.value });
+    bindJobIntent(job, intent.storageKey);
     let activeRegion = document.getElementById("active-job-region");
     if (!activeRegion) activeRegion = region;
     const existing = document.getElementById(`job-${job.job_id}`);

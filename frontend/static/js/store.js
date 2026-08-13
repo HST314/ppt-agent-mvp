@@ -28,8 +28,47 @@ export function getOrCreateIdempotencyKey(taskId, operation, payload) {
   return { storageKey: key, value };
 }
 
-export function clearIdempotencyKey(storageKey) {
+const JOB_INTENT_PREFIX = "ppt-agent:job-intent:";
+
+export function bindJobIntent(job, storageKey) {
+  sessionStorage.setItem(`${JOB_INTENT_PREFIX}${job.job_id}`, JSON.stringify({
+    taskId: job.task_id,
+    storageKey,
+  }));
+}
+
+export function storageKeyForJob(jobId) {
+  const raw = sessionStorage.getItem(`${JOB_INTENT_PREFIX}${jobId}`);
+  if (!raw) return null;
+  try {
+    const record = JSON.parse(raw);
+    return typeof record.storageKey === "string" ? record.storageKey : null;
+  } catch (_error) {
+    sessionStorage.removeItem(`${JOB_INTENT_PREFIX}${jobId}`);
+    return null;
+  }
+}
+
+export function storedJobIntents(taskId) {
+  const records = [];
+  for (let index = 0; index < sessionStorage.length; index += 1) {
+    const key = sessionStorage.key(index);
+    if (!key?.startsWith(JOB_INTENT_PREFIX)) continue;
+    try {
+      const record = JSON.parse(sessionStorage.getItem(key));
+      if (record.taskId === taskId && typeof record.storageKey === "string") {
+        records.push({ jobId: key.slice(JOB_INTENT_PREFIX.length), storageKey: record.storageKey });
+      }
+    } catch (_error) {
+      sessionStorage.removeItem(key);
+    }
+  }
+  return records;
+}
+
+export function clearIdempotencyKey(storageKey, jobId = null) {
   sessionStorage.removeItem(storageKey);
+  if (jobId) sessionStorage.removeItem(`${JOB_INTENT_PREFIX}${jobId}`);
 }
 
 function stableStringify(value) {

@@ -41,16 +41,16 @@
 | F1 FastAPI 基础设施 | `ppt_agent/web/app.py`、`ppt_agent/web/routes/tasks.py`、`scripts/start.py` | `tests/web/test_fastapi_app.py`、原有 `tests/e2e/**` 全量回归 |
 | F2 设计系统与组件 | `frontend/static/css/**`、`frontend/static/js/components/index.js`、`/components` | `tests/web/test_frontend_assets.py`，四档 Chromium 截图/布局验收 |
 | F3 统一应用壳 | `frontend/index.html`、`frontend/static/js/app.js`、`router.js`、`shell.js` | `tests/web/test_fastapi_app.py::FastAPIAppTests::test_health_shell_static_and_retired_legacy_routes`、`tests/browser/test_fastapi_shell.py` |
-| F4 Job/SSE | `ppt_agent/web/jobs.py`、`ppt_agent/web/routes/jobs.py`、`frontend/static/js/job-tracker.js` | `tests/web/test_jobs.py`、`tests/web/test_fastapi_app.py::FastAPIAppTests::test_job_idempotency_sse_and_terminal_reconciliation` |
+| F4 Job/SSE | `ppt_agent/web/jobs.py`、`ppt_agent/web/routes/jobs.py`、`frontend/static/js/job-tracker.js`；短时有界退避后降级轮询，并有限探测 SSE，以最后 `seq` 续传 | `tests/web/test_jobs.py`、`tests/web/test_fastapi_app.py::FastAPIAppTests::test_job_idempotency_sse_and_terminal_reconciliation`、`tests/browser/test_job_recovery.py` |
 | F5 任务/资料与澄清 | `frontend/static/js/stages/input.js` | `tests/browser/test_fastapi_full_journey.py`、P2 API/领域回归 |
 | F6 叙事与大纲 | `frontend/static/js/stages/planning.js` | `tests/browser/test_fastapi_full_journey.py`、P3 回归 |
 | F7 样品 | `frontend/static/js/stages/sample.js`、版本预览端点 | `tests/browser/test_fastapi_full_journey.py`、P4 浏览器回归 |
 | F8 全稿 | `frontend/static/js/stages/deck.js` | `tests/browser/test_fastapi_full_journey.py`、AC-09/10 回归 |
 | F9 检查与人工审核 | `frontend/static/js/stages/review.js` | `tests/browser/test_fastapi_full_journey.py`、P6 浏览器回归 |
 | F10 交付与派生 | `frontend/static/js/stages/delivery.js` | `tests/browser/test_fastapi_full_journey.py`、AC-15～17 回归 |
-| F11 旧 UI 下线 | FastAPI 不再挂载 `/legacy/**`；旧业务深链由 `pages.py` 进入统一壳 | `test_health_shell_static_and_retired_legacy_routes`、全量浏览器门禁 |
+| F11 旧 UI 下线 | `ppt_agent/api.py` 不再包含页面 HTML/CSS/JS；生产 `serve()` 直接运行 FastAPI；旧业务深链由 `pages.py` 进入统一壳，`/legacy/**` 返回 404 | `tests/web/test_audit_blockers.py`、`test_health_shell_static_and_retired_legacy_routes`、迁移后的 AC-18/P4/P6 浏览器回归 |
 
-第二步已迁移 8 阶段全部交互，生成操作统一走持久化 Job；版本、检查、交付与派生继续调用同一 `TaskService`。旧业务深链保留，`/legacy/**` 不再提供页面。
+第二步已迁移 8 阶段全部交互，生成操作统一走持久化 Job；版本、检查、交付与派生继续调用同一 `TaskService`。刷新前会持久化 `job_id ↔ intent storage key`，刷新恢复与终态核对均清理映射，确保同参下一次操作创建新 Job。旧业务深链保留，`/legacy/**` 不再提供页面。
 
 ## 回填规则
 

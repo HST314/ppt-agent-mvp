@@ -1,5 +1,7 @@
 """AC-07: the real API/page journey creates two adjustable HTML samples."""
 
+from pathlib import Path
+
 from .support import SampleJourney
 
 
@@ -13,11 +15,15 @@ class AC07SamplesE2E(SampleJourney):
         self.assertIn('src="data:image/png;base64,', html)
 
         status, page = self.call("GET", "/tasks/journey/samples")
-        rendered = page.decode()
         self.assertTrue(status.startswith("200"))
-        self.assertIn('<iframe sandbox=""', rendered)
-        self.assertIn("提交修改", rendered)
-        self.assertIn("确认样品并生成全稿", rendered)
+        self.assertIn('type="module"', page.decode())
+        module = Path("frontend/static/js/stages/sample.js").read_text()
+        self.assertIn("previewFrame", module)
+        self.assertIn("提交样品修改", module)
+        self.assertIn("确认当前样品并进入全稿", module)
+        preview_status, preview = self.call("GET", f'/v1/tasks/journey/previews/{generated["sample"]["hash"]}')
+        self.assertTrue(preview_status.startswith("200"))
+        self.assertIn(b'data-slide-id="', preview)
 
 
 if __name__ == "__main__":

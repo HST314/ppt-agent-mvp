@@ -41,12 +41,30 @@ class FrontendAssetTests(unittest.TestCase):
         self.assertNotIn("/legacy/", app)
         self.assertNotIn("兼容阶段界面", app)
 
+        retired = (ROOT / "ppt_agent" / "api.py").read_text()
+        self.assertNotIn("<html", retired)
+        self.assertNotIn("<style", retired)
+        self.assertNotIn("<script", retired)
+        self.assertIn("create_app", retired)
+
     def test_untrusted_content_is_not_assigned_to_inner_html(self):
         javascript = "\n".join(path.read_text() for path in (FRONTEND / "static/js").rglob("*.js"))
         self.assertNotIn("innerHTML", javascript)
         self.assertNotIn("outerHTML", javascript)
         self.assertNotRegex(javascript, re.compile(r"insertAdjacentHTML", re.I))
         self.assertIn("fingerprint(stableStringify(payload))", javascript)
+
+    def test_job_transport_and_intent_recovery_are_bounded_and_persistent(self):
+        tracker = (FRONTEND / "static/js/job-tracker.js").read_text()
+        store = (FRONTEND / "static/js/store.js").read_text()
+        app = (FRONTEND / "static/js/app.js").read_text()
+        self.assertIn("maxStreamFailures", tracker)
+        self.assertIn("maxRecoveryAttempts", tracker)
+        self.assertIn("scheduleRecovery", tracker)
+        self.assertIn("events?after=${track.seq}", tracker)
+        self.assertIn("ppt-agent:job-intent:", store)
+        self.assertIn("bindJobIntent(job, intent.storageKey)", app)
+        self.assertIn("reconcileStoredIntents", app)
 
 
 if __name__ == "__main__":

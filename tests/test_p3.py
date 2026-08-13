@@ -1,4 +1,5 @@
 import io, json, tempfile, unittest
+from pathlib import Path
 
 from ppt_agent.api import App
 from ppt_agent.errors import ConflictError, ValidationError
@@ -79,7 +80,10 @@ class P3Tests(unittest.TestCase):
         return status[0],body.decode()
     def test_workspace_has_dual_editors_no_preview(self):
         status,page=self.request("/tasks/task-1/outline")
-        self.assertTrue(status.startswith("200")); self.assertIn("叙事 Markdown",page); self.assertIn("逐页大纲 Markdown",page); self.assertIn("回退",page); self.assertIn("大纲阶段不生成视觉预览",page)
+        self.assertTrue(status.startswith("200")); self.assertIn('type="module"',page)
+        module=Path("frontend/static/js/stages/planning.js").read_text()
+        self.assertIn("Markdown 内容",module); self.assertIn("非破坏回退",Path("frontend/static/js/components/index.js").read_text())
+        self.assertNotIn("previewFrame",module)
 
 
 if __name__ == "__main__": unittest.main()

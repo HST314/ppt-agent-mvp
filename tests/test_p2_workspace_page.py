@@ -1,15 +1,18 @@
-"""P2-05 任务/资料页验收：资源/默认值/阻断展示与完整答题交互 E2E。
+"""P2 task/input regressions for the unified FastAPI application shell."""
 
-E2E 通过 WSGI 应用驱动，模拟页面内 JS 的真实调用序列：
-GET 页面解析问题与选项 -> POST 回答 API -> GET 页面确认状态回显。
-"""
-import io, json, re, tempfile, unittest
+import io
+import json
+from pathlib import Path
+import tempfile
+import unittest
 
 from ppt_agent.api import App
 from ppt_agent.service import TaskService
 from ppt_agent.store import WorkspaceStore
 
+
 PNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class WorkspacePageTests(unittest.TestCase):
@@ -21,114 +24,90 @@ class WorkspacePageTests(unittest.TestCase):
         self.app = App(self.svc)
 
     def tearDown(self):
+        self.app.close()
         self.tmp.cleanup()
 
     def call(self, method, path, body=None):
         raw = json.dumps(body or {}).encode()
         status = []
-        out = b"".join(self.app({"REQUEST_METHOD": method, "PATH_INFO": path, "CONTENT_LENGTH": str(len(raw)), "wsgi.input": io.BytesIO(raw)}, lambda s, h: status.append(s)))
-        return status[0], out
-
-    def page(self):
-        status, raw = self.call("GET", "/tasks/task")
-        self.assertTrue(status.startswith("200"))
-        return raw.decode()
+        result = b"".join(self.app({
+            "REQUEST_METHOD": method,
+            "PATH_INFO": path,
+            "CONTENT_LENGTH": str(len(raw)),
+            "wsgi.input": io.BytesIO(raw),
+        }, lambda value, _headers: status.append(value)))
+        return int(status[0].split()[0]), json.loads(result) if result.startswith((b"{", b"[")) else result.decode()
 
     def import_card(self, source, fmt="json"):
-        status, _ = self.call("POST", "/v1/tasks/task/input", {"source": source, "source_format": fmt})
-        self.assertTrue(status.startswith("200"))
+        status, result = self.call("POST", "/v1/tasks/task/input", {"source": source, "source_format": fmt})
+        self.assertEqual(status, 200)
+        return result
 
-    def answer(self, qid, body):
-        return self.call("POST", f"/v1/tasks/task/clarifications/{qid}/answer", body)
+    def test_empty_state_and_preconditions_come_from_shell_and_stage_module(self):
+        status, shell = self.call("GET", "/v1/tasks/task/shell")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(shell["stages"]), 8)
+        self.assertIn("前置条件", shell["stages"][1]["lock_reason"])
+        module = (ROOT / "frontend/static/js/stages/input.js").read_text()
+        self.assertIn("尚未导入任务卡", module)
+        self.assertIn("请先导入任务卡", module)
 
-    def test_empty_state_shows_preconditions(self):
-        page = self.page()
-        self.assertIn("尚未导入任务卡", page)
-        self.assertIn("尚未导入", page)  # 输入冻结状态
-        self.assertIn("请先导入任务卡", page)  # 主操作
-        self.assertIn("未到达", page)  # 后续阶段只展示前置条件
-        self.assertIn("前置条件：完成任务创建与资料导入", page)
-
-    def test_page_shows_resources_defaults_and_blockers(self):
+    def test_resources_defaults_and_blockers_are_returned_by_authoritative_api(self):
         self.store.put_resource("task", "hero.png", PNG)
         self.store.put_resource("task", "hero.md", "主视觉说明".encode())
         self.store.put_resource("task", "broken.png", b"not-an-image")
-        self.import_card({"goal": "销售汇报"})  # 缺受众、核心主题 -> 阻断
-        page = self.page()
-        # 资源清单与诊断
-        self.assertIn("resources://hero.png", page)
-        self.assertIn("主视觉说明", page)
-        self.assertIn("图片内容无效或已损坏", page)
-        self.assertIn("broken.png", page)
-        # 可见默认值
-        self.assertIn("zh-CN", page)
-        self.assertIn("16:9", page)
-        # 阻断缺失项与运行状态
-        self.assertIn("阻断", page)
-        self.assertIn("受众", page)
-        self.assertIn("核心主题", page)
-        self.assertIn("等待人工", page)
-        self.assertIn("缺少必填信息", page)
-        self.assertIn("回答澄清问题", page)
-        self.assertIn('href="#clarification"', page)  # 直达入口
+        view = self.import_card({"goal": "销售汇报"})
+        self.assertEqual(view["state"]["status"], "waiting_for_user")
+        self.assertEqual(view["task_card"]["defaults"]["language"], "zh-CN")
+        self.assertEqual(view["task_card"]["defaults"]["aspect_ratio"], "16:9")
+        self.assertEqual(view["task_card"]["missing"], ["audience", "topic"])
+        self.assertEqual(view["manifest"]["resources"][0]["uri"], "resources://hero.png")
+        self.assertEqual(view["manifest"]["resources"][0]["description"], "主视觉说明")
+        self.assertIn("invalid_image_content", [item["code"] for item in view["manifest"]["warnings"]])
 
-    def test_keyboard_friendly_markup(self):
-        self.import_card({"goal": "g"})
-        page = self.page()
-        for needle in ("<fieldset", "<legend", 'type="radio"', 'type="submit"', "<label", 'aria-label="任务卡"', 'aria-live="polite"', 'aria-current="step"'):
-            self.assertIn(needle, page)
+    def test_accessible_dynamic_controls_are_external_module_code(self):
+        index = (ROOT / "frontend/index.html").read_text()
+        module = (ROOT / "frontend/static/js/stages/input.js").read_text()
+        components = (ROOT / "frontend/static/js/components/index.js").read_text()
+        self.assertIn('class="skip-link"', index)
+        self.assertIn('aria-live="polite"', index)
+        self.assertIn('type="module"', index)
+        self.assertIn('element("form"', module)
+        self.assertIn("选择回答", module)
+        self.assertIn('element("label"', components)
 
-    def test_full_answer_flow_e2e(self):
-        self.import_card({"goal": "新品介绍"})  # 触发 missing-audience / missing-topic
-        page = self.page()
-        qids = re.findall(r'data-qid="([^"]+)"', page)
-        self.assertEqual(len(qids), 2)
-        # 每题都有可提交的选项与 Other 输入
-        for qid in qids:
-            self.assertIn(f'data-qid="{qid}"', page)
-        self.assertEqual(page.count('value="Other"'), 2)
-        self.assertIn("提交回答", page)
-        # 选项回答
-        status, raw = self.answer(qids[0], {"option": "稍后补充"})
-        self.assertTrue(status.startswith("200"))
-        self.assertFalse(json.loads(raw)["confirmed"])
-        # Other 回答
-        status, raw = self.answer(qids[1], {"option": "Other", "other": "管理层"})
-        self.assertTrue(status.startswith("200"))
-        self.assertTrue(json.loads(raw)["confirmed"])
-        # 状态回写：任务恢复 ready，页面回显回答与确认态
-        _, view = self.call("GET", "/v1/tasks/task/input")
-        view = json.loads(view)
-        self.assertEqual(view["state"]["status"], "ready")
-        self.assertEqual(view["clarification"]["answers"], {qids[0]: "稍后补充", qids[1]: "管理层"})
-        page = self.page()
-        self.assertIn("澄清已确认", page)
-        self.assertIn("管理层", page)
-        self.assertIn("修改回答", page)
-        self.assertIn("资料已可用于下一阶段", page)
-        # 改答产生新回答并标记下游失效
-        status, raw = self.answer(qids[1], {"option": "Other", "other": "经销商"})
-        self.assertTrue(status.startswith("200"))
-        self.assertIn("outline", json.loads(raw)["invalidated"])
-        page = self.page()
-        self.assertIn("经销商", page)
+    def test_full_answer_flow_uses_json_api_and_invalidates_changed_answers(self):
+        view = self.import_card({"goal": "新品介绍"})
+        questions = view["clarification"]["details"]
+        first, second = questions
+        status, partial = self.call("POST", f'/v1/tasks/task/clarifications/{first["question_id"]}/answer', {"option": "稍后补充"})
+        self.assertEqual(status, 200)
+        self.assertFalse(partial["confirmed"])
+        status, done = self.call("POST", f'/v1/tasks/task/clarifications/{second["question_id"]}/answer', {"option": "Other", "other": "管理层"})
+        self.assertEqual(status, 200)
+        self.assertTrue(done["confirmed"])
+        status, changed = self.call("POST", f'/v1/tasks/task/clarifications/{second["question_id"]}/answer', {"option": "Other", "other": "经销商"})
+        self.assertEqual(status, 200)
+        self.assertIn("outline", changed["invalidated"])
 
     def test_other_without_text_rejected(self):
-        self.import_card({"goal": "g"})
-        qids = re.findall(r'data-qid="([^"]+)"', self.page())
-        status, raw = self.answer(qids[0], {"option": "Other"})
-        self.assertTrue(status.startswith("400"))
-        self.assertEqual(json.loads(raw)["error"]["code"], "validation_error")
+        view = self.import_card({"goal": "g"})
+        question_id = view["clarification"]["details"][0]["question_id"]
+        status, result = self.call("POST", f"/v1/tasks/task/clarifications/{question_id}/answer", {"option": "Other"})
+        self.assertEqual(status, 400)
+        self.assertEqual(result["error"]["code"], "validation_error")
 
-    def test_markdown_card_same_page_closure(self):
+    def test_markdown_card_closes_input_stage_without_server_rendered_page(self):
         self.store.put_resource("task", "hero.png", PNG)
         self.store.put_resource("task", "hero.md", "主视觉".encode())
-        self.import_card("演示目标：销售\n受众：客户\n核心主题：新品", "markdown")
-        page = self.page()
-        self.assertIn("销售", page)
-        self.assertIn("resources://hero.png", page)
-        self.assertIn("无缺失项", page)
-        self.assertIn("资料已可用于下一阶段", page)
+        view = self.import_card("演示目标：销售\n受众：客户\n核心主题：新品", "markdown")
+        self.assertEqual(view["task_card"]["goal"], "销售")
+        self.assertEqual(view["task_card"]["missing"], [])
+        self.assertEqual(view["manifest"]["resources"][0]["uri"], "resources://hero.png")
+        status, page = self.call("GET", "/tasks/task")
+        self.assertEqual(status, 200)
+        self.assertIn('type="module"', page)
+        self.assertNotIn("销售", page)
 
 
 if __name__ == "__main__":

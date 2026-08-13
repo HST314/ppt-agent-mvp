@@ -22,7 +22,7 @@ python3 scripts/start.py --data .ppt-agent-data --host 127.0.0.1 --port 8000
 - `GET /v1/jobs/{job_id}/events?after={seq}`：订阅可续传 SSE；
 - `POST /v1/jobs/{job_id}/cancel`：请求取消。
 
-Job 记录位于任务目录的 `jobs/` 下。服务启动时会安全重排队 `queued`，并把结果未知的 `running` 标记为 `interrupted`，不会自动重放外部副作用。前端在 SSE 不可用时自动降级为轮询。
+Job 记录位于任务目录的 `jobs/` 下。服务启动时会安全重排队 `queued`，并把结果未知的 `running` 标记为 `interrupted`，不会自动重放外部副作用。前端对 SSE 使用有界重连；连续失败后降级轮询并有限探测恢复，恢复时从最后 `seq` 续传。刷新前持久化 Job 与 intent key 的映射，终态后可靠清理，避免下一次同参操作命中旧终态 Job。
 
 另一个终端访问 `http://127.0.0.1:8000/healthz`，应得到含 `"stage": "P8"`、`"status": "ok"` 和 `"runtime_ready": true` 的 JSON。
 

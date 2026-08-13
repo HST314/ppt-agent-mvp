@@ -1,5 +1,7 @@
 """AC-09: confirmed samples expand into a complete, independently playable deck."""
 
+from pathlib import Path
+
 from unittest.mock import patch
 
 from .support import SampleJourney
@@ -23,9 +25,10 @@ class AC09FullDeckE2E(SampleJourney):
         self.assertEqual(deck["deck"]["metadata"]["sample_hash"],sample["sample"]["hash"])
         self.assertIn("<!doctype html>",deck["deck"]["html"])
         status,page=self.call("GET","/tasks/journey/deck")
-        rendered=page.decode(); self.assertTrue(status.startswith("200"))
-        self.assertIn('<iframe id="previewFrame" sandbox=""',rendered)
-        self.assertIn("修改类型",rendered); self.assertIn("版本时间线",rendered); self.assertIn("非破坏回退",rendered)
+        self.assertTrue(status.startswith("200")); self.assertIn('type="module"',page.decode())
+        module=Path("frontend/static/js/stages/deck.js").read_text()
+        self.assertIn("previewFrame",module); self.assertIn("修改类型",module)
+        self.assertIn("版本时间线",module); self.assertIn("rollbackDeck",module)
 
     def test_render_failure_is_atomic_before_deck_stage_transition(self):
         self.ok("/v1/tasks/journey/samples/generate",{})

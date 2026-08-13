@@ -1,4 +1,5 @@
 import io, tempfile, unittest
+from pathlib import Path
 
 from ppt_agent.api import App
 from ppt_agent.errors import ConflictError, ValidationError
@@ -62,7 +63,9 @@ class P4Tests(unittest.TestCase):
         with self.assertRaises(ValidationError): self.s.modify_sample("p4","x","page","foreign")
         self.assertEqual(self.s.sample_view("p4")["sample"]["hash"],good)
         status=[]; body=b"".join(App(self.s)({"REQUEST_METHOD":"GET","PATH_INFO":"/tasks/p4/samples","CONTENT_LENGTH":"0","wsgi.input":io.BytesIO()},lambda s,h:status.append((s,h)))).decode()
-        self.assertIn('<iframe sandbox=""',body); self.assertIn("确认样品并生成全稿",body); self.assertTrue(status[0][0].startswith("200"))
+        self.assertIn('type="module"',body); self.assertTrue(status[0][0].startswith("200"))
+        module=Path("frontend/static/js/stages/sample.js").read_text(); components=Path("frontend/static/js/components/index.js").read_text()
+        self.assertIn("确认当前样品并进入全稿",module); self.assertIn('sandbox: allowInspection ? "allow-same-origin" : ""',components)
     def test_selection_and_outline_changes_invalidate_confirmation_and_block_advance(self):
         first=self.s.generate_sample("p4"); self.s.confirm_sample("p4")
         ids=list(first["selection"]["slide_ids"]); ids.reverse()

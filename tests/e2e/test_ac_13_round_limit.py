@@ -1,4 +1,5 @@
 from e2e import test_ac_12_modes
+from pathlib import Path
 
 
 class AC13RoundLimitE2E(test_ac_12_modes.AC12ModesE2E):
@@ -11,5 +12,6 @@ class AC13RoundLimitE2E(test_ac_12_modes.AC12ModesE2E):
         self.assertEqual(result["state"]["status"],"waiting_for_user")
         self.assertEqual(result["state"]["waiting_reason"],"inspection_round_limit")
         status,page=self.call("GET","/tasks/journey/inspection")
-        self.assertTrue(status.startswith("200")); text=page.decode()
-        for token in ("修复轮次：2","不可交付","Agent 修复","整稿人工浏览","定位"): self.assertIn(token,text)
+        self.assertTrue(status.startswith("200")); self.assertIn('type="module"',page.decode())
+        module=Path("frontend/static/js/stages/review.js").read_text()
+        for token in ("修复轮次","暂不可交付","Agent 修复","整稿人工浏览","定位"): self.assertIn(token,module)

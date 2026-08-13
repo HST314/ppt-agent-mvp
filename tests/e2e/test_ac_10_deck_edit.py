@@ -1,5 +1,7 @@
 """AC-10: deck edits expose scope, relationships, versions, comparison data and rollback."""
 
+from pathlib import Path
+
 from unittest.mock import patch
 
 from .support import SampleJourney
@@ -49,6 +51,8 @@ class AC10DeckEditE2E(SampleJourney):
         self.assertTrue(all("left_html" in p and "right_html" in p for p in comparison["pages"]))
         self.assertEqual(comparison["left"]["source"],"deck_generate")
         self.assertEqual(comparison["right"]["operator"],"user")
-        status,page=self.call("GET","/tasks/journey/deck"); rendered=page.decode()
-        self.assertTrue(status.startswith("200")); self.assertIn("来源：deck_generate",rendered); self.assertIn("操作者：user",rendered)
-        self.assertIn("逐页 HTML 差异对比",rendered); self.assertIn("/deck/compare",rendered)
+        status,page=self.call("GET","/tasks/journey/deck")
+        self.assertTrue(status.startswith("200")); self.assertIn('type="module"',page.decode())
+        module=Path("frontend/static/js/stages/deck.js").read_text()
+        self.assertIn("逐页版本对比",module); self.assertIn("compareDeck",module)
+        self.assertIn("versionTimeline",module)

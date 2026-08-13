@@ -48,6 +48,7 @@ class P2Tests(unittest.TestCase):
    raw=json.dumps(body or {}).encode(); status=[]; out=b"".join(app({"REQUEST_METHOD":method,"PATH_INFO":path,"CONTENT_LENGTH":str(len(raw)),"wsgi.input":io.BytesIO(raw)},lambda s,h:status.append(s)))
    return status[0],out
   status,_=call("POST","/v1/tasks/task/input",{"source":{"goal":"g","audience":"a","topic":"t"}}); self.assertTrue(status.startswith("200"))
-  status,page=call("GET","/tasks/task"); self.assertTrue(status.startswith("200")); self.assertIn("任务/资料".encode(),page); self.assertIn(b"aria-label",page)
+  status,page=call("GET","/tasks/task"); self.assertTrue(status.startswith("200")); self.assertIn(b'type="module"',page); self.assertIn(b"aria-live",page)
+  module=Path("frontend/static/js/stages/input.js").read_text(); self.assertIn("任务卡内容",module); self.assertIn("授权资源清单",module)
 
 if __name__=="__main__": unittest.main()
