@@ -1,0 +1,67 @@
+:root {
+  color-scheme: light;
+  --color-primary: #7c3aed;
+  --color-on-primary: #ffffff;
+  --color-secondary: #4f46e5;
+  --color-accent: #db2777;
+  --color-background: #faf5ff;
+  --color-surface: #ffffff;
+  --color-surface-raised: #ffffff;
+  --color-foreground: #0f172a;
+  --color-muted: #f7f3fd;
+  --color-muted-foreground: #526078;
+  --color-border: #e7ddf5;
+  --color-border-strong: #cbbbe4;
+  --color-destructive: #b91c1c;
+  --color-success: #087a55;
+  --color-warning: #9a4b05;
+  --color-ring: #7c3aed;
+  --color-overlay: rgb(15 23 42 / 56%);
+  --gradient-brand: linear-gradient(135deg, #7c3aed 0%, #6366f1 58%, #db2777 100%);
+  --font-display: "Space Grotesk", "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif;
+  --font-body: "DM Sans", "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif;
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.25rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+  --radius-sm: 0.5rem;
+  --radius-md: 0.75rem;
+  --radius-lg: 1rem;
+  --shadow-sm: 0 1px 2px rgb(15 23 42 / 6%);
+  --shadow-md: 0 12px 30px rgb(75 41 123 / 12%);
+  --duration-fast: 160ms;
+  --duration-normal: 240ms;
+  --header-height: 4rem;
+  --sidebar-width: 18rem;
+  --content-max: 90rem;
+  --z-header: 30;
+  --z-drawer: 50;
+  --z-toast: 70;
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+  --color-primary: #a78bfa;
+  --color-on-primary: #1e1236;
+  --color-secondary: #a5b4fc;
+  --color-accent: #f472b6;
+  --color-background: #110d19;
+  --color-surface: #1b1626;
+  --color-surface-raised: #241d31;
+  --color-foreground: #f8f5ff;
+  --color-muted: #272033;
+  --color-muted-foreground: #c6bdd3;
+  --color-border: #3c314c;
+  --color-border-strong: #59476f;
+  --color-destructive: #fca5a5;
+  --color-success: #6ee7b7;
+  --color-warning: #fcd34d;
+  --color-ring: #c4b5fd;
+  --color-overlay: rgb(3 2 8 / 72%);
+  --gradient-brand: linear-gradient(135deg, #a78bfa 0%, #818cf8 58%, #f472b6 100%);
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 30%);
+  --shadow-md: 0 18px 38px rgb(0 0 0 / 34%);
+}

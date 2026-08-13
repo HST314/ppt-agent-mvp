@@ -1,15 +1,16 @@
 openapi: 3.1.0
-info: {title: PPT Agent P8 API, version: 0.9.0}
+info: {title: PPT Agent P8 API, version: 1.0.0-step1}
 components:
   parameters:
     TaskId: {in: path, name: task_id, required: true, schema: {type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$'}}
+    JobId: {in: path, name: job_id, required: true, schema: {type: string, pattern: '^job_[A-Za-z0-9_-]+$'}}
   schemas:
     Error:
       type: object
       required: [error]
       properties:
         error: {type: object, required: [code, message, diagnostic_id], properties: {code: {type: string}, message: {type: string}, diagnostic_id: {type: string}}}
-    Health: {type: object, required: [status, stage, runtime_ready], properties: {status: {const: ok}, stage: {const: P8}, runtime_ready: {type: boolean}}}
+    Health: {type: object, required: [status, stage, runtime_ready, web_runtime], properties: {status: {const: ok}, stage: {const: P8}, runtime_ready: {type: boolean}, web_runtime: {const: fastapi}}}
     SampleModify: {type: object, additionalProperties: false, required: [prompt], properties: {prompt: {type: string, minLength: 1}, scope: {enum: [global, page, element]}, slide_id: {type: [string, 'null']}, element_id: {type: [string, 'null']}}}
     TaskState:
       type: object
@@ -41,12 +42,71 @@ components:
     Comparison: {type: object, required: [left, right, equal], properties: {left: {type: string}, right: {type: string}, equal: {type: boolean}}}
     InputView: {type: object, required: [state, snapshot], properties: {state: {$ref: '#/components/schemas/TaskState'}, snapshot: {type: [object, 'null']}, snapshot_hash: {type: string}, task_card: {type: object}, manifest: {type: object}, clarification: {type: object}, clarification_hash: {type: string}}}
     ClarificationResult: {type: object, required: [state, clarification_hash, questions, answers, invalidated, confirmed], properties: {state: {$ref: '#/components/schemas/TaskState'}, clarification_hash: {type: string}, questions: {type: array}, answers: {type: object}, invalidated: {type: array}, confirmed: {type: boolean}}}
+    JobCreate:
+      type: object
+      additionalProperties: false
+      required: [operation, idempotency_key]
+      properties:
+        operation: {enum: [narrative.generate, outline.generate, samples.generate, samples.modify, deck.generate, deck.modify, inspection.run]}
+        payload: {type: object}
+        idempotency_key: {type: string, minLength: 1, maxLength: 200}
+    Job:
+      type: object
+      required: [job_id, task_id, operation, status, progress, current_step, last_seq, created_at, started_at, finished_at, result, error, cancellation_requested]
+      properties:
+        job_id: {type: string, pattern: '^job_[A-Za-z0-9_-]+$'}
+        task_id: {type: string}
+        operation: {type: string}
+        status: {enum: [queued, running, cancellation_requested, succeeded, failed, cancelled, interrupted]}
+        progress: {type: [integer, 'null'], minimum: 0, maximum: 100}
+        current_step: {type: string}
+        last_seq: {type: integer, minimum: 0}
+        created_at: {type: string, format: date-time}
+        started_at: {type: [string, 'null'], format: date-time}
+        finished_at: {type: [string, 'null'], format: date-time}
+        result: {type: [object, 'null']}
+        error: {type: [object, 'null']}
+        cancellation_requested: {type: boolean}
+    Jobs: {type: object, required: [jobs], properties: {jobs: {type: array, items: {$ref: '#/components/schemas/Job'}}}}
   responses:
     Error: {description: Unified domain error, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}, example: {error: {code: validation_error, message: 请求字段无效, diagnostic_id: abc123}}}}}
 paths:
   /healthz:
     get:
-      responses: {'200': {description: Ready, content: {application/json: {schema: {$ref: '#/components/schemas/Health'}, example: {status: ok, stage: P8, runtime_ready: true}}}}}
+      responses: {'200': {description: Ready, content: {application/json: {schema: {$ref: '#/components/schemas/Health'}, example: {status: ok, stage: P8, runtime_ready: true, web_runtime: fastapi}}}}}
+  /v1/jobs/{job_id}:
+    get:
+      parameters: [{$ref: '#/components/parameters/JobId'}]
+      responses: {'200': {description: Authoritative persistent Job snapshot, content: {application/json: {schema: {$ref: '#/components/schemas/Job'}, example: &job {job_id: job_abc123, task_id: demo, operation: deck.generate, status: queued, progress: 0, current_step: queued, last_seq: 1, created_at: '2026-08-13T00:00:00+00:00', started_at: null, finished_at: null, result: null, error: null, cancellation_requested: false}}}}, '404': {$ref: '#/components/responses/Error'}}
+  /v1/jobs/{job_id}/cancel:
+    post:
+      parameters: [{$ref: '#/components/parameters/JobId'}]
+      requestBody: {content: {application/json: {schema: {type: object, additionalProperties: false}}}}
+      responses: {'200': {description: Cancellation requested or terminal snapshot returned, content: {application/json: {schema: {$ref: '#/components/schemas/Job'}, example: *job}}}, '404': {$ref: '#/components/responses/Error'}}
+  /v1/jobs/{job_id}/events:
+    get:
+      parameters:
+        - {$ref: '#/components/parameters/JobId'}
+        - {in: query, name: after, schema: {type: integer, minimum: 0, default: 0}}
+        - {in: header, name: Last-Event-ID, schema: {type: string}}
+      responses:
+        '200': {description: Ordered resumable Job events and heartbeat, content: {text/event-stream: {schema: {type: string}, example: "id: 1\nevent: queued\ndata: {\"seq\":1,\"type\":\"queued\"}\n\n"}}}
+        '400': {$ref: '#/components/responses/Error'}
+        '404': {$ref: '#/components/responses/Error'}
+  /v1/tasks/{task_id}/jobs:
+    post:
+      parameters: [{$ref: '#/components/parameters/TaskId'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/JobCreate'}}}}
+      responses: {'202': {description: New or idempotently recovered Job, content: {application/json: {schema: {$ref: '#/components/schemas/Job'}, example: *job}}}, '400': {$ref: '#/components/responses/Error'}, '404': {$ref: '#/components/responses/Error'}, '409': {$ref: '#/components/responses/Error'}}
+    get:
+      parameters:
+        - {$ref: '#/components/parameters/TaskId'}
+        - {in: query, name: status, schema: {enum: [active, queued, running, cancellation_requested, succeeded, failed, cancelled, interrupted]}}
+      responses: {'200': {description: Job discovery and history, content: {application/json: {schema: {$ref: '#/components/schemas/Jobs'}, example: {jobs: [*job]}}}}, '404': {$ref: '#/components/responses/Error'}}
+  /v1/tasks/{task_id}/shell:
+    get:
+      parameters: [{$ref: '#/components/parameters/TaskId'}]
+      responses: {'200': {description: Server-authoritative application shell state and eight-stage navigation, content: {application/json: {schema: {type: object}, example: {task: {task_id: demo, stage: created, status: ready, mode: manual}, summary: {progress: 5}, stages: [{id: created, label: 任务/资料, status: current, lock_reason: null, href: '/tasks/demo?stage=created'}], active_jobs: []}}}}, '404': {$ref: '#/components/responses/Error'}}
   /v1/tasks/{task_id}/inspection:
     get:
       parameters: [{$ref: '#/components/parameters/TaskId'}]
@@ -108,6 +168,8 @@ paths:
       requestBody: {required: true, content: {application/json: {schema: {type: object, additionalProperties: false, required: [left, right], properties: {left: {type: string}, right: {type: string}}}}}}
       responses: {'200': {description: Per-slide HTML comparison with added removed modified and unchanged status, content: {application/json: {schema: {type: object, required: [left, right, equal, pages, changed_slide_ids], properties: {left: {type: object}, right: {type: object}, equal: {type: boolean}, pages: {type: array, items: {type: object, required: [slide_id, status, left_html, right_html], properties: {slide_id: {type: string}, status: {enum: [added, removed, modified, unchanged]}, left_html: {type: [string, 'null']}, right_html: {type: [string, 'null']}}}}, changed_slide_ids: {type: array, items: {type: string}}}}, example: {left: {version: 1}, right: {version: 2}, equal: false, pages: [{slide_id: slide-2, status: modified, left_html: '<section></section>', right_html: '<section>changed</section>'}], changed_slide_ids: [slide-2]}}}}, '400': {$ref: '#/components/responses/Error'}}
   /v1/tasks:
+    get:
+      responses: {'200': {description: Recently updated task states for the application shell, content: {application/json: {schema: {type: object, required: [tasks], properties: {tasks: {type: array, items: {$ref: '#/components/schemas/TaskState'}}}}, example: {tasks: [{task_id: demo, stage: created, status: ready, mode: manual, sample_confirmed: false, blockers_resolved: false, delivery_confirmed: false, revision: 0, waiting_reason: null, required_action: null}]}}}}, '500': {$ref: '#/components/responses/Error'}}
     post:
       requestBody: {required: true, content: {application/json: {schema: {type: object, additionalProperties: false, required: [task_id], properties: {task_id: {type: string}, mode: {enum: [manual, auto]}}}, example: {task_id: demo, mode: auto}}}}
       responses: {'201': {description: Created, content: {application/json: {schema: {$ref: '#/components/schemas/TaskState'}, example: &task {task_id: demo, stage: created, status: ready, mode: auto, sample_confirmed: false, blockers_resolved: false, delivery_confirmed: false, revision: 0, waiting_reason: null, required_action: null}}}}, '400': {$ref: '#/components/responses/Error'}, '409': {$ref: '#/components/responses/Error'}}

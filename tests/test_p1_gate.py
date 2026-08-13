@@ -121,7 +121,7 @@ class ApiIntegrationTests(unittest.TestCase):
   for path,item in spec["paths"].items():
    for operation in item.values():
     responses=operation["responses"]; success=next(v for k,v in responses.items() if str(k).startswith("2"))
-    media=success["content"]["application/json"]; self.assertIn("schema",media,path); self.assertIn("example",media,path)
+    media=next(iter(success["content"].values())); self.assertIn("schema",media,path); self.assertIn("example",media,path)
     validate_instance(media["example"],media["schema"],spec)
     if path != "/healthz": self.assertTrue(any(v.get("$ref")=="#/components/responses/Error" for k,v in responses.items() if not str(k).startswith("2")),path)
   with tempfile.TemporaryDirectory() as p:

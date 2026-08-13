@@ -34,6 +34,17 @@
 | AC-01～AC-17 | 通过 | 上表逐项测试路径；非浏览器全量门禁 | 无 |
 | AC-18 桌面联合旅程 | 通过 | `tests/browser/test_ac_18_desktop_journey.py`、`scripts/verify_browser_gate.py`；2026-08-12 独立复验：Playwright 1.54.0 / Chromium 139.0.7258.5（build v1181），6/6 passed、0 failed、0 skipped | 固定浏览器环境复验须保持 0 失败、0 跳过，且不得以 API fetch 代替控件操作 |
 
+## 前端 FastAPI 重构第一步（2026-08-13）
+
+| 契约项 | 实现证据 | 自动化证据 |
+|---|---|---|
+| F1 FastAPI 基础设施 | `ppt_agent/web/app.py`、`ppt_agent/web/routes/tasks.py`、`scripts/start.py` | `tests/web/test_fastapi_app.py`、原有 `tests/e2e/**` 全量回归 |
+| F2 设计系统与组件 | `frontend/static/css/**`、`frontend/static/js/components/index.js`、`/components` | `tests/web/test_frontend_assets.py`，四档 Chromium 截图/布局验收 |
+| F3 统一应用壳 | `frontend/index.html`、`frontend/static/js/app.js`、`router.js`、`shell.js` | `tests/web/test_fastapi_app.py::FastAPIAppTests::test_health_shell_static_and_legacy_routes` |
+| F4 Job/SSE | `ppt_agent/web/jobs.py`、`ppt_agent/web/routes/jobs.py`、`frontend/static/js/job-tracker.js` | `tests/web/test_jobs.py`、`tests/web/test_fastapi_app.py::FastAPIAppTests::test_job_idempotency_sse_and_terminal_reconciliation` |
+
+第一步只迁移首页、任务切换、阶段导航、通用状态和后台任务基础能力。未迁移阶段继续由 `/legacy/tasks/{task_id}/...` 提供兼容交互，并与新壳共享同一 `TaskService`；第二步完成前不删除旧内联页面。
+
 ## 回填规则
 
 - 文件路径是稳定的预期证据位置；任务实现时创建并将“计划”更新为具体测试名/CI 链接。

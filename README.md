@@ -12,6 +12,18 @@ P8 后端发布边界已实现：全写动作生命周期保护、版本 hash �
 python3 scripts/start.py --data .ppt-agent-data --host 127.0.0.1 --port 8000
 ```
 
+默认入口现为 FastAPI + Uvicorn。浏览器打开 `/` 可进入统一应用壳；`/tasks/<task-id>` 支持阶段深链与前进/后退，`/components` 提供基础组件状态演示。兼容期内，旧的内联业务页面仍可从 `/legacy/tasks/<task-id>/...` 访问，所有新旧入口共享同一个 `TaskService`，不会形成第二套业务状态。
+
+第一步新增的长任务接口如下：
+
+- `POST /v1/tasks/{task_id}/jobs`：使用 `operation`、`payload` 和 `idempotency_key` 创建持久化 Job；
+- `GET /v1/tasks/{task_id}/jobs?status=active`：刷新后发现活动 Job；
+- `GET /v1/jobs/{job_id}`：读取权威 Job 快照；
+- `GET /v1/jobs/{job_id}/events?after={seq}`：订阅可续传 SSE；
+- `POST /v1/jobs/{job_id}/cancel`：请求取消。
+
+Job 记录位于任务目录的 `jobs/` 下。服务启动时会安全重排队 `queued`，并把结果未知的 `running` 标记为 `interrupted`，不会自动重放外部副作用。前端在 SSE 不可用时自动降级为轮询。
+
 另一个终端访问 `http://127.0.0.1:8000/healthz`，应得到含 `"stage": "P8"`、`"status": "ok"` 和 `"runtime_ready": true` 的 JSON。
 
 默认配置 `config/ppt-agent.yaml` 使用 deterministic fake：不需要 `.env`、网络或密钥。启动后从任务页依次完成资料导入、澄清、叙事确认、大纲确认、样品确认、全稿、独立检查和最终交付确认。内置 Skill 位于 `ppt_agent/builtin_skills/guizang-ppt/`，运行时只按需读取 `SKILL.md` 与 lock 清单中的 references/assets。

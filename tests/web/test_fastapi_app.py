@@ -1,0 +1,104 @@
+import tempfile
+import time
+import unittest
+
+from fastapi.testclient import TestClient
+
+from ppt_agent.service import TaskService
+from ppt_agent.store import WorkspaceStore
+from ppt_agent.web import create_app
+
+
+class FastAPIAppTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.service = TaskService(WorkspaceStore(self.tmp.name))
+        self.client = TestClient(create_app(self.service))
+        self.client.__enter__()
+
+    def tearDown(self):
+        self.client.__exit__(None, None, None)
+        self.tmp.cleanup()
+
+    def test_health_shell_static_and_legacy_routes(self):
+        health = self.client.get("/healthz")
+        self.assertEqual(health.status_code, 200)
+        self.assertEqual(health.json()["web_runtime"], "fastapi")
+        self.assertEqual(health.headers["x-content-type-options"], "nosniff")
+
+        html = self.client.get("/")
+        self.assertEqual(html.status_code, 200)
+        self.assertIn("PPT Agent 工作台", html.text)
+        self.assertIn("script-src 'self'", html.headers["content-security-policy"])
+        self.assertNotIn("unsafe-inline", html.headers["content-security-policy"])
+        self.assertEqual(self.client.get("/static/js/app.js").status_code, 200)
+
+        created = self.client.post("/v1/tasks", json={"task_id": "shell", "mode": "manual"})
+        self.assertEqual(created.status_code, 201)
+        shell = self.client.get("/v1/tasks/shell/shell").json()
+        self.assertEqual(len(shell["stages"]), 8)
+        self.assertEqual(shell["stages"][0]["status"], "current")
+        self.assertEqual(shell["stages"][1]["status"], "locked")
+        self.assertIn("前置条件", shell["stages"][1]["lock_reason"])
+
+        self.assertIn("PPT Agent 工作台", self.client.get("/tasks/shell/outline").text)
+        legacy = self.client.get("/legacy/tasks/shell")
+        self.assertIn("任务/资料", legacy.text)
+        self.assertIn("unsafe-inline", legacy.headers["content-security-policy"])
+
+    def test_existing_api_contract_and_error_envelope(self):
+        bad = self.client.post("/v1/tasks", json={"mode": "manual"})
+        self.assertEqual(bad.status_code, 400)
+        self.assertEqual(set(bad.json()["error"]), {"code", "message", "diagnostic_id"})
+        self.assertEqual(bad.json()["error"]["code"], "validation_error")
+
+        malformed = self.client.post("/v1/tasks", content="[", headers={"content-type": "application/json"})
+        self.assertEqual(malformed.status_code, 400)
+        self.assertEqual(malformed.json()["error"]["code"], "validation_error")
+        wrong_method = self.client.put("/v1/tasks")
+        self.assertEqual(wrong_method.status_code, 405)
+        self.assertEqual(wrong_method.json()["error"]["code"], "method_not_allowed")
+
+        self.client.post("/v1/tasks", json={"task_id": "compat", "mode": "manual"})
+        imported = self.client.post("/v1/tasks/compat/input", json={"source": {"goal": "发布", "audience": "客户", "topic": "方案"}})
+        self.assertEqual(imported.status_code, 200)
+        self.assertEqual(self.client.get("/v1/tasks/compat/input").status_code, 200)
+        self.assertEqual(self.client.get("/v1/tasks/compat/planning").status_code, 200)
+        listed = self.client.get("/v1/tasks").json()["tasks"]
+        self.assertEqual([item["task_id"] for item in listed], ["compat"])
+
+    def test_job_idempotency_sse_and_terminal_reconciliation(self):
+        self.client.post("/v1/tasks", json={"task_id": "jobs", "mode": "manual"})
+        self.client.post("/v1/tasks/jobs/input", json={"source": {"goal": "发布", "audience": "客户", "topic": "方案"}})
+        payload = {"operation": "narrative.generate", "payload": {}, "idempotency_key": "intent-1"}
+        first = self.client.post("/v1/tasks/jobs/jobs", json=payload)
+        self.assertEqual(first.status_code, 202)
+        job_id = first.json()["job_id"]
+
+        second = self.client.post("/v1/tasks/jobs/jobs", json=payload)
+        self.assertEqual(second.status_code, 202)
+        self.assertEqual(second.json()["job_id"], job_id)
+        conflict = self.client.post("/v1/tasks/jobs/jobs", json={**payload, "payload": {"prompt": "不同请求"}})
+        self.assertEqual(conflict.status_code, 409)
+
+        deadline = time.monotonic() + 3
+        snapshot = None
+        while time.monotonic() < deadline:
+            snapshot = self.client.get(f"/v1/jobs/{job_id}").json()
+            if snapshot["status"] in {"succeeded", "failed"}:
+                break
+            time.sleep(0.02)
+        self.assertEqual(snapshot["status"], "succeeded")
+        self.assertEqual(snapshot["result"]["task_id"], "jobs")
+        self.assertNotIn("payload", snapshot)
+        events = self.client.get(f"/v1/jobs/{job_id}/events?after=0")
+        self.assertEqual(events.status_code, 200)
+        self.assertIn("event: queued", events.text)
+        self.assertIn("event: started", events.text)
+        self.assertIn("event: succeeded", events.text)
+        ids = [int(line.split(":", 1)[1]) for line in events.text.splitlines() if line.startswith("id:")]
+        self.assertEqual(ids, sorted(set(ids)))
+
+
+if __name__ == "__main__":
+    unittest.main()

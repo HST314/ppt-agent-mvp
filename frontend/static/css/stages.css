@@ -1,0 +1,26 @@
+.stage-list { display: grid; gap: var(--space-1); margin: 0; padding: 0; list-style: none; }
+.stage-item { position: relative; }
+.stage-link { width: 100%; min-height: 3.25rem; display: grid; grid-template-columns: 1.8rem minmax(0, 1fr); align-items: center; gap: var(--space-3); padding: var(--space-2) var(--space-3); color: var(--color-foreground); text-decoration: none; border: 1px solid transparent; border-radius: var(--radius-sm); background: transparent; text-align: start; }
+.stage-link:hover { background: var(--color-muted); }
+.stage-link[aria-current="step"] { color: var(--color-primary); background: color-mix(in srgb, var(--color-primary) 10%, var(--color-surface)); border-color: color-mix(in srgb, var(--color-primary) 30%, var(--color-border)); font-weight: 750; }
+.stage-link[aria-disabled="true"] { color: var(--color-muted-foreground); }
+.stage-index { width: 1.7rem; height: 1.7rem; display: grid; place-items: center; border: 1px solid var(--color-border-strong); border-radius: 50%; font-size: 0.75rem; font-weight: 800; }
+.stage-link[data-status="completed"] .stage-index { color: var(--color-on-primary); background: var(--color-success); border-color: var(--color-success); }
+.stage-label { min-width: 0; }
+.stage-label small { display: block; overflow: hidden; color: var(--color-muted-foreground); font-weight: 400; text-overflow: ellipsis; white-space: nowrap; }
+
+.stage-hero { position: relative; overflow: hidden; }
+.stage-hero::after { position: absolute; width: 16rem; height: 16rem; inset: -8rem -6rem auto auto; border-radius: 50%; background: var(--gradient-brand); opacity: 0.08; content: ""; }
+.stage-hero > * { position: relative; z-index: 1; }
+.stage-status-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--space-3); margin: var(--space-5) 0; }
+.stat { padding: var(--space-3); border: 1px solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-muted); }
+.stat dt { color: var(--color-muted-foreground); font-size: 0.78rem; }
+.stat dd { margin: var(--space-1) 0 0; font-weight: 750; overflow-wrap: anywhere; }
+.job-panel { margin-top: var(--space-4); padding: var(--space-4); border: 1px solid color-mix(in srgb, var(--color-primary) 30%, var(--color-border)); border-radius: var(--radius-sm); background: color-mix(in srgb, var(--color-primary) 6%, var(--color-surface)); }
+.job-panel__header { display: flex; justify-content: space-between; gap: var(--space-3); }
+.legacy-note { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-3); margin-top: var(--space-5); padding-top: var(--space-4); border-top: 1px solid var(--color-border); }
+
+@media (max-width: 767px) {
+  .stage-status-grid { grid-template-columns: 1fr; }
+  .legacy-note .button { width: 100%; }
+}

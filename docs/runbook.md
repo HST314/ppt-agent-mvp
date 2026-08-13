@@ -15,6 +15,16 @@
 python3 scripts/start.py --data .ppt-agent-data --host 127.0.0.1 --port 8000
 ```
 
+该命令启动 FastAPI/Uvicorn Web 适配层。`/healthz` 的 `web_runtime` 应为 `fastapi`；`/`、`/tasks/{task_id}` 和 `/components` 使用独立 `frontend/` 静态资源。兼容旧交互位于 `/legacy/tasks/{task_id}/...`，与新应用壳复用同一业务服务和数据目录。
+
+### Job 与 SSE 恢复
+
+- 浏览器刷新后会查询 `/v1/tasks/{task_id}/jobs?status=active`，随后按最后事件序号恢复 SSE；代理不支持 SSE 时每 2 秒轮询 Job 快照。
+- 每个任务同时只允许一个写业务状态的活动 Job。相同 `idempotency_key` 与相同请求返回原 Job；同 key 不同请求返回 409。
+- 排队 Job 在服务重启后可重新调度；运行中或已请求取消但结果未知的 Job 会标记为 `interrupted`，必须由用户发起新的明确尝试。
+- 活动 Job 不清理。MVP 终态 Job 至少保留 7 天；当前版本由运维在备份后按 `finished_at` 清理任务目录内的终态 `jobs/*.json` 及同名事件文件，不得清理活动状态。
+- SSE 事件与 Job 错误只包含步骤、诊断 ID 和业务版本引用，不能写入完整 Prompt、客户资料、密钥或模型推理。
+
 真实 API 使用 `config/ppt-agent.yaml` 的 `gateway.mode: agent`。生成与检查分别配置 `provider: openai_responses`、模型、超时、最大步数，以及保存环境变量名称的 `api_key_env`/`base_url_env`；秘密值只放 `.env`，不要写进 YAML 或日志。检查模型未配置时只有显式 `fallback_to_generation: true` 才允许回退。Skill 根目录为 `ppt_agent/builtin_skills/guizang-ppt/`，以 `SKILL_LOCK.json` 校验并渐进读取。
 
 ## 使用流程
