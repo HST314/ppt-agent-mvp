@@ -72,9 +72,19 @@ function clarificationStage(view, context) {
       element("p", { text: "任务资料已完整，可直接进入叙事结构阶段。" }),
     ])));
   } else {
-    primary.push(section("阻断澄清", element("div", { className: "question-list" }, questions.map((question, index) => questionCard(question, answers[question.question_id], index, context))), {
-      description: "每个问题单独提交；修改既有回答会让绑定旧资料的下游版本失效。",
-    }));
+    const message = actionMessage();
+    const submit = button("提交本轮回答", { kind: "primary", type: "submit", mutates: true });
+    const form = element("form", { className: "clarification-form", onSubmit: async (event) => {
+      event.preventDefault(); const submitted = {};
+      for (const question of questions) {
+        const selected = form.querySelector(`input[name="q-${question.question_id}"]:checked`);
+        const custom = form.querySelector(`[data-other="${question.question_id}"]`);
+        if (custom?.value.trim()) submitted[question.question_id] = { option: "Other", other: custom.value.trim() };
+        else if (selected) submitted[question.question_id] = { option: selected.value };
+      }
+      await runAction({ buttonNode: submit, region: message, action: () => api.answerClarifications(context.taskId, submitted), success: "本轮回答已保存。", refresh: context.refresh }).catch(() => {});
+    } }, [element("div", { className: "question-list" }, questions.map((question, index) => questionCard(question, answers[question.question_id], index))), submit, message]);
+    primary.push(section("需求澄清", form, { description: "请集中回答本轮问题；每题也可在选项下方输入自己的回复。" }));
   }
   if (clarification.confirmed) primary.unshift(nextNarrative(context));
   primary.push(taskCard(view));
@@ -100,31 +110,16 @@ function nextNarrative(context) {
   ]);
 }
 
-function questionCard(question, answer, index, context) {
-  const message = actionMessage();
-  const option = element("select", { className: "select", id: `question-${index}-option` }, [
-    element("option", { value: "", text: "请选择回答" }),
-    ...(question.options || []).map((value) => element("option", { value, text: value, selected: value === answer })),
-    element("option", { value: "Other", text: "Other（自定义）", selected: Boolean(answer && !(question.options || []).includes(answer)) }),
-  ]);
-  const other = element("input", { className: "input", id: `question-${index}-other`, value: answer && !(question.options || []).includes(answer) ? answer : "", placeholder: "请输入自定义回答" });
-  const toggleOther = () => { other.closest(".field").hidden = option.value !== "Other"; };
-  option.addEventListener("change", toggleOther);
-  const submit = button(answer ? "修改回答" : "提交回答", { kind: "primary", type: "submit", mutates: true });
-  const form = element("form", { className: "question-card", "data-qid": question.question_id, onSubmit: async (event) => {
-    event.preventDefault();
-    const payload = { option: option.value };
-    if (option.value === "Other") payload.other = other.value;
-    await runAction({ buttonNode: submit, region: message, action: () => api.answerClarification(context.taskId, question.question_id, payload), success: "回答已保存。", refresh: context.refresh }).catch(() => {});
-  } }, [
+function questionCard(question, answer, index) {
+  const custom = Boolean(answer && !(question.options || []).includes(answer));
+  return element("article", { className: "question-card", "data-qid": question.question_id }, [
     element("div", { className: "question-card__title" }, [badge(question.blocking ? "阻断" : "建议", question.blocking ? "danger" : "warning"), element("h3", { text: question.prompt })]),
-    field("选择回答", option),
-    field("自定义回答", other),
-    submit,
-    message,
+    element("div", { className: "question-options", "aria-label": "选择回答" }, (question.options || []).map((value, optionIndex) => element("label", { className: "question-option" }, [
+      element("input", { type: "radio", name: `q-${question.question_id}`, value, checked: value === answer, id: `question-${index}-${optionIndex}` }),
+      element("span", { text: value }),
+    ]))),
+    field("自己的回复（填写后优先采用）", element("input", { className: "input", "data-other": question.question_id, value: custom ? answer : "", placeholder: "也可以输入更准确的回答" })),
   ]);
-  window.requestAnimationFrame(toggleOther);
-  return form;
 }
 
 function questionDetails(clarification) {

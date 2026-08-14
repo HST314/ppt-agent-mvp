@@ -45,6 +45,7 @@ export const api = {
   input: (taskId, controller) => request(`${taskPath(taskId)}/input`, { controller }),
   importInput: (taskId, payload) => post(`${taskPath(taskId)}/input`, payload),
   answerClarification: (taskId, questionId, payload) => post(`${taskPath(taskId)}/clarifications/${encodeURIComponent(questionId)}/answer`, payload),
+  answerClarifications: (taskId, answers) => post(`${taskPath(taskId)}/clarifications/answers`, { answers }),
   planning: (taskId, controller) => request(`${taskPath(taskId)}/planning`, { controller }),
   editNarrative: (taskId, payload) => post(`${taskPath(taskId)}/narrative`, payload),
   confirmNarrative: (taskId) => post(`${taskPath(taskId)}/narrative/confirm`, {}),

@@ -11,6 +11,14 @@ PNG=b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x0
 JPEG=b"\xff\xd8\xff\xe0JFIF\x00\xff\xd9"
 
 class P2Tests(unittest.TestCase):
+ def test_nested_known_facts_and_batch_answers_update_task_card(self):
+  self.svc.create("nested"); self.svc.create("batch")
+  result=self.svc.import_input("nested",{"goal":"促成审批","topic":"新品","known_facts":{"audience":"管理层"}})
+  self.assertEqual(result["task_card"]["audience"],"管理层"); self.assertTrue(result["clarification"]["confirmed"])
+  result=self.svc.import_input("batch",{"topic":"新品"}); questions=result["clarification"]["details"]
+  submitted={q["question_id"]:{"option":"Other","other":"促成审批" if q["field"]=="goal" else "管理层"} for q in questions}
+  done=self.svc.answer_clarifications("batch",submitted); self.assertTrue(done["confirmed"])
+  view=self.svc.input_view("batch"); self.assertEqual(view["task_card"]["goal"],"促成审批"); self.assertEqual(view["task_card"]["audience"],"管理层")
  def setUp(self): self.tmp=tempfile.TemporaryDirectory(); self.store=WorkspaceStore(self.tmp.name); self.svc=TaskService(self.store); self.svc.create("task")
  def tearDown(self): self.tmp.cleanup()
  def test_json_markdown_normalize_and_block(self):

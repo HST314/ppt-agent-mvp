@@ -70,6 +70,13 @@ class StageBSkillTests(unittest.TestCase):
 
 
 class StageBAgentTests(unittest.TestCase):
+    def test_invalid_tool_call_can_be_corrected_by_model(self):
+        calls = [ModelToolCall("read_skill_file", '{"path":"../secret"}', "bad")]
+        client = ScriptedClient([ModelTurn(None, "r1", calls), ModelTurn('{"markdown":"已纠正"}', "r2")])
+        result = AgentRuntime(client, SkillRuntime.builtin()).run("narrative", {})
+        self.assertEqual(result.value["markdown"], "已纠正")
+        self.assertEqual(result.audit[2]["event"], "tool_error")
+        self.assertIn("tool_validation_error", str(client.inputs[1]["input"]))
     def test_tool_loop_schema_and_secret_free_audit(self):
         client = ScriptedClient([
             ModelTurn(None, "r1", (ModelToolCall("read_skill_file", json.dumps({"path": "SKILL.md"}), "c1"),)),

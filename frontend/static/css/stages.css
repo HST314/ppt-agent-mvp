@@ -114,3 +114,7 @@
   .metadata-list { grid-template-columns: 1fr; gap: var(--space-1); }
   .metadata-list dd + dt { margin-top: var(--space-2); }
 }
+.clarification-form { display: grid; gap: 1.25rem; }
+.question-options { display: grid; grid-template-columns: repeat(auto-fit,minmax(180px,1fr)); gap: .75rem; margin: 1rem 0; }
+.question-option { display: flex; align-items: center; gap: .65rem; padding: .85rem 1rem; border: 1px solid var(--border, #d8dee8); border-radius: .75rem; cursor: pointer; background: var(--surface, #fff); }
+.question-option:has(input:checked) { border-color: var(--primary, #5267df); box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary, #5267df) 18%, transparent); }

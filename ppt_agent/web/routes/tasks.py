@@ -87,6 +87,12 @@ async def answer_clarification(task_id: str, question_id: str, request: Request,
     exact(body, {"option", "other"}, {"option"})
     return service.answer_clarification(task_id, question_id, body)
 
+@router.post("/tasks/{task_id}/clarifications/answers")
+async def answer_clarifications(task_id: str, request: Request, service: TaskService = Depends(task_service)):
+    body = await json_body(request)
+    exact(body, {"answers"}, {"answers"})
+    return service.answer_clarifications(task_id, body["answers"])
+
 
 @router.get("/tasks/{task_id}/planning")
 def get_planning(task_id: str, service: TaskService = Depends(task_service)):

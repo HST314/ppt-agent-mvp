@@ -71,7 +71,7 @@ class AgentRuntime:
         if not isinstance(payload, dict):
             raise ValidationError("Agent 输入无效")
         payload = self._text_only(payload)
-        started, audit, tool_count = self.clock(), [], 0
+        started, audit, tool_count, consecutive_tool_errors = self.clock(), [], 0, 0
         input_json=json.dumps(payload,ensure_ascii=False,sort_keys=True,separators=(",",":"))
         audit.append({"event": "run", "stage": stage, "skill": self.skill.skill_name, "skill_version": self.skill.skill_version, "lock_sha256": hashlib.sha256(json.dumps(self.skill.manifest, sort_keys=True).encode()).hexdigest(), "input_sha256": hashlib.sha256(input_json.encode()).hexdigest(), "config_sha256": hashlib.sha256(PRODUCT_OVERRIDE.encode()).hexdigest()})
         def fail(message: str, reason: str, cause=None):
@@ -88,6 +88,8 @@ class AgentRuntime:
                 fail("Agent 运行超时，未提交阶段产物", "deadline_exceeded")
             try:
                 turn = self.client.create(input=conversation, tools=TOOLS, response_schema=response_schema)
+            except (IndexError, StopIteration) as exc:
+                fail("Agent 未在工具纠错后提交阶段产物", "incomplete_after_tool_error", exc)
             except GatewayError as exc:
                 reason = "gateway_unknown_result" if isinstance(exc, GatewayUnknownResult) else "gateway_error"
                 audit.append({"event": "terminal", "reason": reason, "tool_calls": tool_count})
@@ -105,19 +107,23 @@ class AgentRuntime:
                     tool_count += 1
                     if tool_count > self.max_tool_calls:
                         fail("Agent 工具调用超过上限", "tool_call_limit")
+                    error = None
                     try:
                         args = json.loads(call.arguments or "{}")
-                    except json.JSONDecodeError as exc:
-                        fail("Agent 工具参数不是有效 JSON", "invalid_tool_arguments", exc)
-                    if not isinstance(args, dict):
-                        fail("Agent 工具参数必须为 object", "invalid_tool_arguments")
+                        if not isinstance(args, dict): raise ValidationError("工具参数必须为 object")
+                    except (json.JSONDecodeError, ValidationError) as exc:
+                        args, error = {}, {"ok": False, "error": {"code": "invalid_tool_arguments", "message": str(exc)}}
                     try:
-                        result = self.skill.dispatch(call.name, args)
+                        result = error or self.skill.dispatch(call.name, args)
                     except (ValidationError, OSError, ValueError) as exc:
-                        fail("Agent 工具调用失败", "tool_error", exc)
-                    audit.append({"step": step, "event": "tool", "tool": call.name, "call_id_sha256": hashlib.sha256((call.call_id or "").encode()).hexdigest(), "path": result.get("path"), "file_sha256": result.get("sha256"), "result_sha256": hashlib.sha256(json.dumps(result, sort_keys=True, ensure_ascii=False).encode()).hexdigest()})
+                        result = {"ok": False, "error": {"code": "tool_validation_error", "message": str(exc)}}
+                    failed = result.get("ok") is False
+                    consecutive_tool_errors = consecutive_tool_errors + 1 if failed else 0
+                    audit.append({"step": step, "event": "tool_error" if failed else "tool", "tool": call.name, "error_code": result.get("error", {}).get("code") if failed else None, "call_id_sha256": hashlib.sha256((call.call_id or "").encode()).hexdigest(), "path": result.get("path"), "file_sha256": result.get("sha256"), "result_sha256": hashlib.sha256(json.dumps(result, sort_keys=True, ensure_ascii=False).encode()).hexdigest()})
                     conversation.append({"type": "function_call", "name": call.name, "arguments": call.arguments, "call_id": call.call_id})
                     conversation.append({"type": "function_call_output", "call_id": call.call_id, "output": json.dumps(result, ensure_ascii=False)})
+                    if consecutive_tool_errors >= 3:
+                        fail("Agent 工具调用连续失败", "tool_error_limit")
                 continue
             try:
                 value = json.loads(turn.text or "")

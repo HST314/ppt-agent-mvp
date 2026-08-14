@@ -55,6 +55,12 @@ def parse_task_card(source, source_format):
     for target,names in ALIASES.items():
         for name in names:
             if name in raw and str(raw[name]).strip(): normalized[target]=str(raw[name]).strip(); consumed.add(name); break
+        if target not in normalized:
+            for container in (raw.get("known_facts"), raw.get("task_card"), raw.get("brief")):
+                if isinstance(container,dict):
+                    for name in names:
+                        if name in container and str(container[name]).strip(): normalized[target]=str(container[name]).strip(); break
+                if target in normalized: break
     constraints={k:v for k,v in raw.items() if k not in consumed and k not in {"task_id","schema_version","source_format"}}
     missing=[key for key in ALIASES if key not in normalized]
     return {**normalized,"constraints":constraints,"defaults":DEFAULTS.copy(),"assumptions":[],"missing":missing,"source_format":source_format}
@@ -86,8 +92,13 @@ def scan_resources(root: Path):
     return entries,warnings
 
 def questions_for(card):
-    labels={"goal":"本次演示最主要要达成什么目标？","audience":"演示的主要受众是谁？","topic":"演示的核心主题是什么？"}
-    return [{"question_id":f"missing-{key}","field":key,"prompt":labels[key],"options":["稍后补充","使用 Other 自定义"],"allow_other":True,"blocking":True} for key in card["missing"]]
+    specs={
+      "goal":("这份演示完成后，最希望受众采取什么行动？",["理解并形成共识","批准方案或预算","做出购买决策","用于培训或知识传递"]),
+      "audience":("这份演示主要面向哪类受众？",["公司管理层","客户或潜在客户","项目团队","公众或活动观众"]),
+      "topic":("请确认本次演示聚焦的核心主题。",["产品或服务介绍","项目方案与汇报","行业研究与洞察","培训与知识分享"]),
+    }
+    result=[{"question_id":f"missing-{key}","field":key,"prompt":specs[key][0],"options":specs[key][1],"allow_other":True,"blocking":True} for key in card["missing"]]
+    return result[:6]
 
 def validate_answer(question, answer):
     if not isinstance(answer,dict) or set(answer)-{"option","other"}: raise ValidationError("回答字段无效")
@@ -95,5 +106,7 @@ def validate_answer(question, answer):
     if option=="Other":
         if not isinstance(answer.get("other"),str) or not answer["other"].strip(): raise ValidationError("Other 必须提供自定义回答")
         return answer["other"].strip()
-    if option not in question["options"]: raise ValidationError("回答不在可选项中")
+    # Keep accepting the v1.0.1 deferred-answer token for API compatibility;
+    # new clients no longer present it as a suggested answer.
+    if option != "稍后补充" and option not in question["options"]: raise ValidationError("回答不在可选项中")
     return option
