@@ -1,6 +1,6 @@
-import { api } from "../api.js?v=2026.08.14.2";
-import { badge, button, confirmationDialog, element, field, metadataList, shortHash } from "../components/index.js?v=2026.08.14.2";
-import { actionMessage, invalidationNotice, runAction, section, stageGrid } from "./shared.js?v=2026.08.14.2";
+import { api } from "../api.js?v=2026.08.14.3";
+import { badge, button, confirmationDialog, element, field, metadataList, shortHash } from "../components/index.js?v=2026.08.14.3";
+import { actionMessage, invalidationNotice, runAction, section, stageGrid } from "./shared.js?v=2026.08.14.3";
 
 const FIELD_LABELS = { goal: "演示目标", audience: "主要受众", topic: "核心主题" };
 const WARNING_LABELS = {
@@ -11,6 +11,12 @@ const WARNING_LABELS = {
   resource_too_large: "资源超过大小限制，未纳入清单",
 };
 
+function frozenSourceText(source, format) {
+  if (source === null || source === undefined) return "";
+  if (format === "json" && typeof source === "object") return JSON.stringify(source, null, 2);
+  return String(source);
+}
+
 export async function render(context) {
   const view = await api.input(context.taskId, context.controller);
   context.assertCurrent();
@@ -20,6 +26,9 @@ export async function render(context) {
 
 function inputStage(view, context) {
   const message = actionMessage();
+  const hasSnapshot = Boolean(view.snapshot);
+  const frozenFormat = hasSnapshot ? view.source_format : null;
+  const frozenSource = hasSnapshot ? frozenSourceText(view.source, frozenFormat) : "";
   const format = element("select", { className: "select", id: "task-card-format" }, [
     element("option", { value: "markdown", text: "Markdown" }),
     element("option", { value: "json", text: "JSON" }),
@@ -29,25 +38,70 @@ function inputStage(view, context) {
     id: "task-card-source",
     placeholder: "演示目标：新品发布\n受众：管理层\n核心主题：年度增长",
   });
+  if (hasSnapshot) {
+    if (frozenFormat === "json" || frozenFormat === "markdown") format.value = frozenFormat;
+    source.value = frozenSource;
+  }
   const rebuild = element("input", { type: "checkbox", id: "rebuild-input", disabled: !view.snapshot || !["created", "clarification"].includes(view.state.stage) });
   const submit = button(view.snapshot ? "重建资料快照" : "导入并冻结资料", { kind: "primary", type: "submit", mutates: true });
+  const gateHint = element("p", { className: "field__hint", id: "rebuild-gate-hint", role: "status" });
+  const updateGate = () => {
+    if (!hasSnapshot) {
+      submit.disabled = false;
+      gateHint.textContent = "";
+      return;
+    }
+    if (source.value === frozenSource && format.value === frozenFormat) {
+      submit.disabled = true;
+      gateHint.textContent = "资料未变化，无需重建；修改原文后才可提交。";
+      return;
+    }
+    if (!rebuild.checked) {
+      submit.disabled = true;
+      gateHint.textContent = "资料已修改；请勾选“显式重建快照”后再提交。";
+      return;
+    }
+    submit.disabled = false;
+    gateHint.textContent = "";
+  };
+  source.addEventListener("input", updateGate);
+  format.addEventListener("change", updateGate);
+  rebuild.addEventListener("change", updateGate);
+  const submitImport = () => runAction({
+    buttonNode: submit,
+    region: message,
+    busyLabel: view.snapshot ? "正在重建…" : "正在导入…",
+    action: () => api.importInput(context.taskId, { source: source.value, source_format: format.value, rebuild: rebuild.checked }),
+    success: "资料已冻结，正在进入澄清阶段。",
+    refresh: () => context.goTo(null),
+  });
   const form = element("form", { className: "stage-form", onSubmit: async (event) => {
     event.preventDefault();
-    await runAction({
-      buttonNode: submit,
-      region: message,
-      busyLabel: view.snapshot ? "正在重建…" : "正在导入…",
-      action: () => api.importInput(context.taskId, { source: source.value, source_format: format.value, rebuild: rebuild.checked }),
-      success: "资料已冻结，正在进入澄清阶段。",
-      refresh: () => context.goTo(null),
-    }).catch(() => {});
+    if (submit.disabled) return;
+    if (hasSnapshot) {
+      confirmationDialog({
+        title: "确认重建资料快照？",
+        description: "重建将以新资料替换当前快照，以下下游内容会立即失效：当前澄清问题、已填写的答案、正在进行的澄清生成任务。确认后系统会重新扫描授权资源并重新生成澄清问题。",
+        confirmLabel: "确认重建",
+        danger: true,
+        onConfirm: async () => {
+          await submitImport().catch(() => {});
+          updateGate();
+        },
+      });
+      return;
+    }
+    await submitImport().catch(() => {});
+    updateGate();
   } }, [
     field("任务卡格式", format, { hint: "Markdown 更适合直接填写；JSON 适合结构化导入。" }),
-    field("任务卡内容", source, { hint: "任务资料首次导入即冻结；只有逐页大纲前可显式重建。" }),
+    field("任务卡内容", source, { hint: hasSnapshot ? "已按当前冻结快照回填原始资料；修改后需显式重建。" : "任务资料首次导入即冻结；只有逐页大纲前可显式重建。" }),
     element("label", { className: "check-row", htmlFor: "rebuild-input" }, [rebuild, element("span", { text: "显式重建快照并重新扫描授权资源" })]),
     submit,
+    gateHint,
     message,
   ]);
+  updateGate();
 
   const primary = [section(view.snapshot ? "更新任务资料" : "创建 / 导入任务卡", form, {
     description: view.snapshot ? "已有快照不会被静默覆盖；重建会明确失效下游内容。" : "填写目标、受众和主题，系统会扫描任务授权资源。",
