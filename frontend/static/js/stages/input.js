@@ -1,6 +1,6 @@
-import { api } from "../api.js?v=2026.08.14.1";
-import { badge, button, element, field, metadataList, shortHash } from "../components/index.js?v=2026.08.14.1";
-import { actionMessage, invalidationNotice, runAction, section, stageGrid } from "./shared.js?v=2026.08.14.1";
+import { api } from "../api.js?v=2026.08.14.2";
+import { badge, button, confirmationDialog, element, field, metadataList, shortHash } from "../components/index.js?v=2026.08.14.2";
+import { actionMessage, invalidationNotice, runAction, section, stageGrid } from "./shared.js?v=2026.08.14.2";
 
 const FIELD_LABELS = { goal: "演示目标", audience: "主要受众", topic: "核心主题" };
 const WARNING_LABELS = {
@@ -38,8 +38,8 @@ function inputStage(view, context) {
       region: message,
       busyLabel: view.snapshot ? "正在重建…" : "正在导入…",
       action: () => api.importInput(context.taskId, { source: source.value, source_format: format.value, rebuild: rebuild.checked }),
-      success: "资料已冻结，工作台将刷新到服务端最新状态。",
-      refresh: context.refresh,
+      success: "资料已冻结，正在进入澄清阶段。",
+      refresh: () => context.goTo(null),
     }).catch(() => {});
   } }, [
     field("任务卡格式", format, { hint: "Markdown 更适合直接填写；JSON 适合结构化导入。" }),
@@ -61,11 +61,23 @@ function clarificationStage(view, context) {
   const clarification = view.clarification || {};
   const questions = questionDetails(clarification);
   const answers = clarification.answers || {};
+  const activeJob = (context.shell.active_jobs || []).find((job) => job.operation === "clarification.generate");
+  const status = activeJob ? "generating" : (clarification.status || "ready");
   const primary = [];
   if (!view.snapshot) {
     primary.push(section("尚未导入任务资料", element("p", { text: "请先在“任务/资料”阶段导入任务卡，系统才会生成阻断澄清。" }), {
       actions: [button("返回任务/资料", { href: `/tasks/${encodeURIComponent(context.taskId)}?stage=created`, kind: "primary" })],
     }));
+  } else if (status === "generating") {
+    primary.push(clarificationGenerating(activeJob));
+  } else if (status === "failed") {
+    primary.push(clarificationFailed(clarification, context));
+  } else if (status !== "ready") {
+    primary.push(section("澄清状态暂不可用", element("div", { className: "notice notice--warning", role: "alert" }, [
+      element("strong", { text: "服务返回了无法识别的澄清状态" }),
+      element("p", { text: "为避免提前展示未完成的问题，当前不会渲染答题内容。请刷新后重试。" }),
+      button("刷新状态", { kind: "primary", onClick: context.refresh }),
+    ])));
   } else if (!questions.length) {
     primary.push(section("无需额外澄清", element("div", { className: "success-panel" }, [
       badge("已确认", "success"),
@@ -115,17 +127,80 @@ function clarificationStage(view, context) {
     updateProgress();
     primary.push(section("需求澄清", form, { description: "请一次完成本轮所有阻断问题。每题可选择一个答案，或填写自己的答案。" }));
   }
-  if (clarification.confirmed) primary.unshift(nextNarrative(context));
+  if (status === "ready" && clarification.confirmed) primary.unshift(nextNarrative(context));
   primary.push(taskCard(view));
   const invalidated = clarification.invalidated || [];
   return stageGrid(primary, [
     section("澄清状态", [
-      badge(clarification.confirmed ? "澄清已确认" : "等待回答", clarification.confirmed ? "success" : "warning"),
-      metadataList([["已回答", `${Object.keys(answers).length} / ${questions.length}`], ["当前快照", shortHash(view.snapshot_hash)]]),
+      clarificationStatusBadge(status, clarification),
+      metadataList([
+        status === "ready" ? ["已回答", `${Object.keys(answers).length} / ${questions.length}`] : null,
+        activeJob ? ["生成任务", activeJob.job_id] : null,
+        ["当前快照", shortHash(view.snapshot_hash)],
+      ].filter(Boolean)),
       invalidationNotice(invalidated),
     ]),
     clarificationResources(view, context),
   ], "stage-grid--clarification");
+}
+
+function clarificationGenerating(job) {
+  return section("模型正在阅读任务卡", element("div", { className: "clarification-generating", role: "status", "aria-live": "polite", "aria-atomic": "true" }, [
+    element("div", { className: "clarification-generating__header" }, [
+      badge("AI 生成中", "primary"),
+      element("p", { text: "正在结合原始任务卡、规范化字段和资源摘要整理本轮问题。" }),
+    ]),
+    element("div", { className: "clarification-generating__skeleton", "aria-hidden": "true" }, [
+      element("span", { className: "skeleton skeleton--title" }),
+      element("span", { className: "skeleton skeleton--line" }),
+      element("span", { className: "skeleton skeleton--line" }),
+    ]),
+    element("p", { className: "field__hint", text: job
+      ? "生成任务已持久化，可以安全离开此页；完成后工作台会自动刷新。"
+      : "模型完成前不会显示任何问题。工作台会从服务端重新读取最终结果。" }),
+  ]), { description: "模型完成前不会展示问题，也不会自动切换到系统兜底题。" });
+}
+
+function clarificationFailed(clarification, context) {
+  const error = clarification.error || {};
+  const message = actionMessage();
+  const retry = button("重新生成问题", { kind: "primary", mutates: true, onClick: () => {
+    context.retryClarification({ buttonNode: retry, region: message });
+  } });
+  const fallback = button("使用系统兜底问题", { kind: "secondary", mutates: true, onClick: () => {
+    confirmationDialog({
+      title: "确认使用系统兜底问题？",
+      description: "兜底问题来自确定性缺口检查，不是模型阅读任务卡后生成的内容。仅在暂时无法等待模型恢复时使用。",
+      confirmLabel: "确认使用兜底问题",
+      onConfirm: () => runAction({
+        buttonNode: fallback,
+        region: message,
+        busyLabel: "正在启用兜底问题…",
+        action: () => api.useFallbackClarification(context.taskId),
+        success: "已按你的明确确认启用系统兜底问题。",
+        refresh: context.refresh,
+      }),
+    });
+  } });
+  return section("问题生成失败", [
+    element("div", { className: "clarification-failed", role: "alert" }, [
+      badge("未生成问题", "danger"),
+      element("p", { text: error.message || "模型未能完成本轮澄清问题生成，系统没有自动展示固定问题。" }),
+      metadataList([
+        ["错误代码", error.code || "clarification_generation_failed"],
+        ["诊断 ID", error.diagnostic_id || clarification.diagnostic_id || "—"],
+      ]),
+    ]),
+    element("div", { className: "clarification-failure-actions" }, [retry, fallback]),
+    element("p", { className: "field__hint", text: "建议先重试模型生成；使用兜底问题必须在确认对话框中再次确认。" }),
+    message,
+  ], { description: "模型失败后流程保持关闭，不会静默切换为固定问题。" });
+}
+
+function clarificationStatusBadge(status, clarification) {
+  if (status === "generating") return badge("模型生成中", "primary");
+  if (status === "failed") return badge("生成失败", "danger");
+  return badge(clarification.confirmed ? "澄清已确认" : "等待回答", clarification.confirmed ? "success" : "warning");
 }
 
 function nextNarrative(context) {

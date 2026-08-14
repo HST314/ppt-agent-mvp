@@ -124,6 +124,13 @@
 .clarification-form { display: grid; gap: var(--space-5); }
 .clarification-source { display: flex; align-items: center; gap: var(--space-3); padding-bottom: var(--space-4); border-bottom: 1px solid var(--color-border); }
 .clarification-source p { margin: 0; }
+.clarification-generating, .clarification-failed { display: grid; gap: var(--space-4); padding: var(--space-4); border: 1px solid color-mix(in srgb, var(--color-primary) 30%, var(--color-border)); border-radius: var(--radius-sm); background: color-mix(in srgb, var(--color-primary) 6%, var(--color-surface)); }
+.clarification-generating__header { display: flex; align-items: center; gap: var(--space-3); }
+.clarification-generating__header p, .clarification-failed p { margin: 0; }
+.clarification-generating__skeleton { display: grid; gap: var(--space-2); }
+.clarification-generating__skeleton .skeleton { display: block; }
+.clarification-failed { border-color: color-mix(in srgb, var(--color-destructive) 38%, var(--color-border)); background: color-mix(in srgb, var(--color-destructive) 6%, var(--color-surface)); }
+.clarification-failure-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
 .question-options { display: grid; grid-template-columns: 1fr; gap: var(--space-2); margin: 0 0 var(--space-4); }
 .question-option { min-height: 3.5rem; display: flex; align-items: center; gap: var(--space-3); padding: var(--space-3); border: 1px solid var(--color-border-strong); border-radius: var(--radius-sm); cursor: pointer; background: var(--color-surface); }
 .question-option:hover { border-color: var(--color-primary); }
@@ -144,7 +151,8 @@
 }
 
 @media (max-width: 767px) {
-  .clarification-source, .clarification-submit { align-items: stretch; flex-direction: column; }
+  .clarification-source, .clarification-submit, .clarification-generating__header, .clarification-failure-actions { align-items: stretch; flex-direction: column; }
   .clarification-submit .button { width: 100%; }
+  .clarification-failure-actions .button { width: 100%; }
   .question-card { padding: var(--space-3); }
 }

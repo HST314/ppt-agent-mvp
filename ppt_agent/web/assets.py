@@ -5,7 +5,7 @@ from pathlib import Path
 from fastapi.responses import HTMLResponse
 
 
-FRONTEND_BUILD = "2026.08.14.1"
+FRONTEND_BUILD = "2026.08.14.2"
 
 
 def index_response(frontend_root: Path) -> HTMLResponse:

@@ -13,6 +13,41 @@ from ppt_agent.store import WorkspaceStore
 from ppt_agent.web import create_app
 
 
+def model_question():
+    return {
+        "question_id": "business-decision",
+        "field_path": "decision",
+        "prompt": "本次发布需要管理层批准预算，还是仅同步项目进展？",
+        "helper_text": "这会决定论证结构和数据深度。",
+        "options": [
+            {"value": "approve", "label": "批准预算", "description": "以决策材料为主"},
+            {"value": "update", "label": "同步进展", "description": "以项目状态为主"},
+        ],
+        "allow_other": True,
+        "blocking": True,
+    }
+
+
+class ControlledClarifier:
+    model = "browser-clarifier"
+
+    def __init__(self, *, blocked=False, failures=0):
+        self.release = threading.Event()
+        self.started = threading.Event()
+        self.failures = failures
+        if not blocked:
+            self.release.set()
+
+    def clarify(self, _payload):
+        self.started.set()
+        if not self.release.wait(15):
+            raise RuntimeError("clarifier test timed out")
+        if self.failures:
+            self.failures -= 1
+            raise RuntimeError("model gateway unavailable")
+        return {"questions": [model_question()], "model": self.model}
+
+
 def free_port():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -178,6 +213,81 @@ class FastAPIShellBrowserGate(unittest.TestCase):
         self.assertTrue(self.service.input_view("clarification-round")["clarification"]["confirmed"])
         self.assert_no_page_overflow(page)
         self.assertEqual(errors, [])
+        page.close()
+
+    def test_model_questions_stay_hidden_until_async_job_completes(self):
+        clarifier = ControlledClarifier(blocked=True)
+        self.service.clarifier = clarifier
+        self.service.create("model-wait")
+        page, errors = self.new_page(375, 820)
+        page.goto(self.base + "/tasks/model-wait?stage=created")
+        page.get_by_label("任务卡内容").fill("核心主题：新品发布")
+        page.get_by_role("button", name="导入并冻结资料").click()
+
+        page.get_by_role("heading", name="模型正在阅读任务卡").wait_for()
+        self.assertTrue(clarifier.started.wait(2))
+        self.assertEqual(page.locator("fieldset.question-card").count(), 0)
+        self.assertEqual(page.get_by_text("无需额外澄清", exact=True).count(), 0)
+        self.assertTrue(page.get_by_text("模型完成前不会展示问题，也不会自动切换到系统兜底题。", exact=True).is_visible())
+        self.assertEqual(page.get_by_role("button", name="取消后台任务").count(), 0)
+        self.assert_no_page_overflow(page)
+
+        clarifier.release.set()
+        page.get_by_role("heading", name="需求澄清", exact=True).wait_for()
+        self.assertEqual(page.locator("fieldset.question-card").count(), 1)
+        self.assertTrue(page.get_by_text("AI 生成问题", exact=True).is_visible())
+        self.assertTrue(page.get_by_text("本次发布需要管理层批准预算，还是仅同步项目进展？", exact=True).is_visible())
+        self.assertEqual(errors, [])
+        page.close()
+
+    def test_failed_model_can_retry_or_use_explicit_fallback(self):
+        clarifier = ControlledClarifier(failures=1)
+        self.service.clarifier = clarifier
+        self.service.create("model-retry")
+        page, errors = self.new_page()
+        page.goto(self.base + "/tasks/model-retry?stage=created")
+        page.get_by_label("任务卡内容").fill("核心主题：新品发布")
+        page.get_by_role("button", name="导入并冻结资料").click()
+        page.get_by_role("heading", name="问题生成失败").wait_for()
+        self.assertEqual(page.locator("fieldset.question-card").count(), 0)
+        self.assertTrue(page.get_by_text("model gateway unavailable", exact=True).is_visible())
+
+        clarifier.release.clear()
+        page.get_by_role("button", name="重新生成问题").click()
+        page.get_by_role("heading", name="模型正在阅读任务卡").wait_for()
+        self.assertEqual(page.locator("fieldset.question-card").count(), 0)
+        clarifier.release.set()
+        page.get_by_role("heading", name="需求澄清", exact=True).wait_for()
+        self.assertTrue(page.get_by_text("AI 生成问题", exact=True).is_visible())
+        page.close()
+
+        fallback_clarifier = ControlledClarifier(failures=1)
+        self.service.clarifier = fallback_clarifier
+        self.service.create("model-fallback")
+        page, fallback_errors = self.new_page(375, 820)
+        fallback_requests = []
+        page.on("request", lambda request: fallback_requests.append(request) if request.url.endswith("/clarifications/fallback") else None)
+        page.goto(self.base + "/tasks/model-fallback?stage=created")
+        page.get_by_label("任务卡内容").fill("核心主题：新品发布")
+        page.get_by_role("button", name="导入并冻结资料").click()
+        page.get_by_role("heading", name="问题生成失败").wait_for()
+
+        page.get_by_role("button", name="使用系统兜底问题").click()
+        dialog = page.get_by_role("dialog")
+        dialog.get_by_role("heading", name="确认使用系统兜底问题？").wait_for()
+        dialog.get_by_role("button", name="取消").click()
+        self.assertEqual(fallback_requests, [])
+        self.assertEqual(page.locator("fieldset.question-card").count(), 0)
+
+        page.get_by_role("button", name="使用系统兜底问题").click()
+        page.get_by_role("dialog").get_by_role("button", name="确认使用兜底问题").click()
+        page.get_by_role("heading", name="需求澄清", exact=True).wait_for()
+        self.assertEqual(len(fallback_requests), 1)
+        self.assertEqual(fallback_requests[0].post_data_json, {"confirm": True})
+        self.assertTrue(page.get_by_text("系统补充问题", exact=True).is_visible())
+        self.assert_no_page_overflow(page)
+        self.assertEqual(errors, [])
+        self.assertEqual(fallback_errors, [])
         page.close()
 
 

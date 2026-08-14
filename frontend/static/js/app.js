@@ -1,10 +1,10 @@
-import { api, ApiError } from "./api.js?v=2026.08.14.1";
-import { JobTracker } from "./job-tracker.js?v=2026.08.14.1";
-import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.14.1";
-import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.14.1";
-import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.14.1";
-import { inlineError, setBusy } from "./components/index.js?v=2026.08.14.1";
-import { renderStage } from "./stages/index.js?v=2026.08.14.1";
+import { api, ApiError } from "./api.js?v=2026.08.14.2";
+import { JobTracker } from "./job-tracker.js?v=2026.08.14.2";
+import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.14.2";
+import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.14.2";
+import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.14.2";
+import { inlineError, setBusy } from "./components/index.js?v=2026.08.14.2";
+import { renderStage } from "./stages/index.js?v=2026.08.14.2";
 
 const app = document.getElementById("app");
 const APP_BUILD = document.querySelector('meta[name="app-build"]')?.content || "unknown";
@@ -309,7 +309,7 @@ function jobPanel(job) {
     ]),
     progress(value, typeof job.progress === "number" ? `${job.progress}%` : "进度以真实检查点为准", job.current_step || "运行中"),
     element("p", { className: "field__hint", text: "可以安全离开此页；再次打开任务时会自动恢复显示。" }),
-    !["succeeded", "failed", "cancelled", "interrupted"].includes(job.status) ? button(job.cancellation_requested ? "正在取消" : "取消后台任务", { kind: "ghost", disabled: job.cancellation_requested, onClick: async () => {
+    job.operation !== "clarification.generate" && !["succeeded", "failed", "cancelled", "interrupted"].includes(job.status) ? button(job.cancellation_requested ? "正在取消" : "取消后台任务", { kind: "ghost", disabled: job.cancellation_requested, onClick: async () => {
       try {
         const next = await api.cancelJob(job.job_id);
         updateJobPanel(next);
@@ -364,15 +364,42 @@ function stageContext(shell, selected, route, generation) {
     refresh: () => renderRoute(currentRoute()),
     goTo: (stage) => navigate(`/tasks/${encodeURIComponent(shell.task.task_id)}${stage ? `?stage=${encodeURIComponent(stage)}` : ""}`),
     startJob: (operation, payload, options = {}) => startJob(shell.task.task_id, operation, payload, route, options),
+    retryClarification: (options = {}) => retryClarification(shell.task.task_id, route, options),
   };
 }
 
 async function startJob(taskId, operation, payload, route, { buttonNode = null, region = null } = {}) {
-  region?.replaceChildren();
-  setBusy(buttonNode, true, "正在创建后台任务…");
   const intent = getOrCreateIdempotencyKey(taskId, operation, payload);
+  return startTrackedJob({
+    taskId,
+    route,
+    buttonNode,
+    region,
+    intent,
+    create: () => api.createJob(taskId, { operation, payload, idempotency_key: intent.value }),
+  });
+}
+
+async function retryClarification(taskId, route, { buttonNode = null, region = null } = {}) {
+  const intent = getOrCreateIdempotencyKey(taskId, "clarification.generate", {});
+  const job = await startTrackedJob({
+    taskId,
+    route,
+    buttonNode,
+    region,
+    intent,
+    busyLabel: "正在创建重试任务…",
+    create: () => api.retryClarification(taskId, intent.value),
+  });
+  if (job && !["succeeded", "failed", "cancelled", "interrupted"].includes(job.status)) renderRoute(route);
+  return job;
+}
+
+async function startTrackedJob({ taskId, route, buttonNode, region, intent, create, busyLabel = "正在创建后台任务…" }) {
+  region?.replaceChildren();
+  setBusy(buttonNode, true, busyLabel);
   try {
-    const job = await api.createJob(taskId, { operation, payload, idempotency_key: intent.value });
+    const job = await create();
     bindJobIntent(job, intent.storageKey);
     let activeRegion = document.getElementById("active-job-region");
     if (!activeRegion) activeRegion = region;
@@ -546,7 +573,7 @@ function heroArt() {
 }
 
 function operationLabel(operation) {
-  return ({ "narrative.generate": "生成叙事结构", "outline.generate": "生成逐页大纲", "samples.generate": "生成样品", "samples.modify": "修改样品", "deck.generate": "生成全稿", "deck.modify": "修改全稿", "inspection.run": "执行独立检查" })[operation] || operation;
+  return ({ "clarification.generate": "AI 阅读任务卡并生成问题", "narrative.generate": "生成叙事结构", "outline.generate": "生成逐页大纲", "samples.generate": "生成样品", "samples.modify": "修改样品", "deck.generate": "生成全稿", "deck.modify": "修改全稿", "inspection.run": "执行独立检查" })[operation] || operation;
 }
 
 function stageLabel(stage) {
