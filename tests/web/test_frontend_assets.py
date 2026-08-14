@@ -53,6 +53,18 @@ class FrontendAssetTests(unittest.TestCase):
         self.assertNotIn("<script", retired)
         self.assertIn("create_app", retired)
 
+    def test_every_module_import_and_entry_asset_has_the_same_build_key(self):
+        index = (FRONTEND / "index.html").read_text()
+        build = re.search(r'<meta name="app-build" content="([^"]+)"', index).group(1)
+        self.assertTrue(build)
+        self.assertEqual(set(re.findall(r'[?&]v=([^"\']+)', index)), {build})
+        for module in (FRONTEND / "static/js").rglob("*.js"):
+            source = module.read_text()
+            imports = re.findall(r'(?:from\s+|import\()["\']([^"\']+\.js(?:\?[^"\']*)?)["\']', source)
+            for specifier in imports:
+                with self.subTest(module=module.name, specifier=specifier):
+                    self.assertTrue(specifier.endswith(f"?v={build}"))
+
     def test_untrusted_content_is_not_assigned_to_inner_html(self):
         javascript = "\n".join(path.read_text() for path in (FRONTEND / "static/js").rglob("*.js"))
         self.assertNotIn("innerHTML", javascript)

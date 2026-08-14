@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from ppt_agent.service import TaskService
 from ppt_agent.store import WorkspaceStore
 from ppt_agent.web import create_app
+from ppt_agent.web.assets import FRONTEND_BUILD
 
 
 class FastAPIAppTests(unittest.TestCase):
@@ -31,7 +32,18 @@ class FastAPIAppTests(unittest.TestCase):
         self.assertIn("PPT Agent 工作台", html.text)
         self.assertIn("script-src 'self'", html.headers["content-security-policy"])
         self.assertNotIn("unsafe-inline", html.headers["content-security-policy"])
-        self.assertEqual(self.client.get("/static/js/app.js").status_code, 200)
+        self.assertEqual(html.headers["cache-control"], "no-store")
+        self.assertEqual(html.headers["x-ppt-agent-build"], FRONTEND_BUILD)
+        self.assertIn(f'data-build="{FRONTEND_BUILD}"', html.text)
+        self.assertIn(f'/static/js/app.js?v={FRONTEND_BUILD}', html.text)
+
+        current_asset = self.client.get(f"/static/js/app.js?v={FRONTEND_BUILD}")
+        self.assertEqual(current_asset.status_code, 200)
+        self.assertEqual(current_asset.headers["cache-control"], "public, max-age=31536000, immutable")
+        stale_asset = self.client.get("/static/js/app.js?v=previous-build")
+        self.assertEqual(stale_asset.status_code, 200)
+        self.assertEqual(stale_asset.headers["cache-control"], "no-cache")
+        self.assertEqual(self.client.get("/static/js/app.js").headers["cache-control"], "no-cache")
 
         created = self.client.post("/v1/tasks", json={"task_id": "shell", "mode": "manual"})
         self.assertEqual(created.status_code, 201)

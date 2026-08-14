@@ -11,6 +11,7 @@ from ..store import WorkspaceStore
 from .errors import install_error_handlers
 from .jobs import JobService
 from .routes import jobs, pages, tasks
+from .assets import FRONTEND_BUILD
 
 
 def create_app(
@@ -41,6 +42,7 @@ def create_app(
     app.state.task_service = service
     app.state.job_service = coordinator
     app.state.frontend_root = frontend
+    app.state.frontend_build = FRONTEND_BUILD
 
     @app.middleware("http")
     async def security_headers(request, call_next):
@@ -54,11 +56,17 @@ def create_app(
                 "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
                 "connect-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'"
             )
+        if request.url.path.startswith("/static/"):
+            response.headers["Cache-Control"] = (
+                "public, max-age=31536000, immutable"
+                if request.query_params.get("v") == FRONTEND_BUILD
+                else "no-cache"
+            )
         return response
 
     @app.get("/healthz", tags=["runtime"])
     def health():
-        return {"status": "ok", "stage": "P8", "runtime_ready": True, "web_runtime": "fastapi"}
+        return {"status": "ok", "stage": "P8", "runtime_ready": True, "web_runtime": "fastapi", "frontend_build": FRONTEND_BUILD}
 
     app.mount("/static", StaticFiles(directory=frontend / "static", check_dir=True), name="static")
     app.include_router(jobs.router)

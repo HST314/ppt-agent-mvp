@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from fastapi import APIRouter, Request
-from fastapi.responses import FileResponse
+
+from ..assets import index_response
 
 router = APIRouter(tags=["pages"])
 
 
-def _index(request: Request) -> FileResponse:
-    return FileResponse(request.app.state.frontend_root / "index.html", media_type="text/html; charset=utf-8")
+def _index(request: Request):
+    return index_response(request.app.state.frontend_root)
 
 
 @router.get("/", include_in_schema=False)

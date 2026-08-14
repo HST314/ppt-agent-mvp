@@ -126,6 +126,60 @@ class FastAPIShellBrowserGate(unittest.TestCase):
         self.assertEqual(errors, [])
         page.close()
 
+    def test_clarification_round_is_single_column_atomic_and_keyboard_accessible(self):
+        self.service.create("clarification-round")
+        imported = self.service.import_input("clarification-round", {"topic": "新品发布"})
+        questions = imported["clarification"]["details"]
+        page, errors = self.new_page(375, 820)
+        submitted_requests = []
+        page.on("request", lambda request: submitted_requests.append(request) if request.url.endswith("/clarifications/answers") else None)
+        page.goto(self.base + "/tasks/clarification-round?stage=clarification")
+        page.get_by_role("heading", name="需求澄清", exact=True).wait_for()
+
+        form = page.locator(".clarification-form")
+        cards = form.locator("fieldset.question-card")
+        self.assertEqual(cards.count(), 2)
+        self.assertEqual(form.locator("select").count(), 0)
+        self.assertEqual(form.get_by_role("button", name="提交答案并继续", exact=True).count(), 1)
+        self.assertEqual(form.locator('button[type="submit"]').count(), 1)
+        self.assertEqual(form.get_by_text("已完成 0/2", exact=True).count(), 1)
+        self.assertTrue(page.get_by_text("授权资源（辅助信息）", exact=True).is_visible())
+        self.assertFalse(page.locator(".resource-disclosure").get_attribute("open"))
+        self.assert_no_page_overflow(page)
+        page.locator("html").evaluate("node => node.style.fontSize = '200%'")
+        self.assert_no_page_overflow(page)
+        page.locator("html").evaluate("node => node.style.fontSize = '100%'")
+
+        form.get_by_role("button", name="提交答案并继续", exact=True).click()
+        self.assertEqual(form.get_by_text("请回答此题后再提交本轮答案。", exact=True).count(), 2)
+        self.assertTrue(cards.first.evaluate("node => document.activeElement === node"))
+        self.assertEqual(submitted_requests, [])
+
+        first_radio = cards.first.locator('input[type="radio"]').first
+        first_radio.focus()
+        page.keyboard.press("Space")
+        self.assertTrue(first_radio.is_checked())
+        self.assertEqual(form.get_by_text("已完成 1/2", exact=True).count(), 1)
+        first_other = cards.first.get_by_label("也可以输入自己的答案")
+        first_other.fill("促成采购审批")
+        self.assertFalse(first_radio.is_checked())
+
+        second_other = cards.nth(1).get_by_label("也可以输入自己的答案")
+        second_other.fill("区域经销商")
+        self.assertEqual(form.get_by_text("已完成 2/2", exact=True).count(), 1)
+        form.get_by_role("button", name="提交答案并继续", exact=True).click()
+        page.get_by_role("button", name="生成叙事结构", exact=True).wait_for()
+
+        self.assertEqual(len(submitted_requests), 1)
+        payload = submitted_requests[0].post_data_json["answers"]
+        self.assertEqual(set(payload), {question["question_id"] for question in questions})
+        self.assertEqual(payload[questions[0]["question_id"]], {"option": "Other", "other": "促成采购审批"})
+        self.assertEqual(payload[questions[1]["question_id"]], {"option": "Other", "other": "区域经销商"})
+        self.assertTrue(self.service.input_view("clarification-round")["clarification"]["confirmed"])
+        self.assert_no_page_overflow(page)
+        self.assertEqual(errors, [])
+        page.close()
+
 
 if __name__ == "__main__":
     unittest.main()

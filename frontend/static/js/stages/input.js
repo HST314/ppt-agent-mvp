@@ -1,6 +1,6 @@
-import { api } from "../api.js";
-import { badge, button, element, field, metadataList, shortHash } from "../components/index.js";
-import { actionMessage, invalidationNotice, runAction, section, stageGrid } from "./shared.js";
+import { api } from "../api.js?v=2026.08.14.1";
+import { badge, button, element, field, metadataList, shortHash } from "../components/index.js?v=2026.08.14.1";
+import { actionMessage, invalidationNotice, runAction, section, stageGrid } from "./shared.js?v=2026.08.14.1";
 
 const FIELD_LABELS = { goal: "演示目标", audience: "主要受众", topic: "核心主题" };
 const WARNING_LABELS = {
@@ -14,7 +14,7 @@ const WARNING_LABELS = {
 export async function render(context) {
   const view = await api.input(context.taskId, context.controller);
   context.assertCurrent();
-  scheduleResourceReminder(view, context);
+  if (context.selected.id !== "clarification") scheduleResourceReminder(view, context);
   return context.selected.id === "clarification" ? clarificationStage(view, context) : inputStage(view, context);
 }
 
@@ -73,18 +73,47 @@ function clarificationStage(view, context) {
     ])));
   } else {
     const message = actionMessage();
-    const submit = button("提交本轮回答", { kind: "primary", type: "submit", mutates: true });
+    const progress = element("strong", { className: "clarification-progress", role: "status", "aria-live": "polite" });
+    const cards = questions.map((question, index) => questionCard(question, answers[question.question_id], index));
+    const submit = button("提交答案并继续", { kind: "primary", type: "submit", mutates: true });
+    const updateProgress = () => {
+      const completed = cards.filter((card, index) => readAnswer(card, questions[index])).length;
+      progress.textContent = `已完成 ${completed}/${questions.length}`;
+    };
+    cards.forEach((card) => card.addEventListener("answerchange", updateProgress));
     const form = element("form", { className: "clarification-form", onSubmit: async (event) => {
-      event.preventDefault(); const submitted = {};
-      for (const question of questions) {
-        const selected = form.querySelector(`input[name="q-${question.question_id}"]:checked`);
-        const custom = form.querySelector(`[data-other="${question.question_id}"]`);
-        if (custom?.value.trim()) submitted[question.question_id] = { option: "Other", other: custom.value.trim() };
-        else if (selected) submitted[question.question_id] = { option: selected.value };
+      event.preventDefault();
+      const submitted = {};
+      const missing = [];
+      cards.forEach((card, index) => {
+        const question = questions[index];
+        const answer = readAnswer(card, question);
+        setQuestionError(card, "");
+        if (answer) submitted[question.question_id] = answer;
+        else if (question.blocking) missing.push(card);
+      });
+      if (missing.length) {
+        missing.forEach((card) => setQuestionError(card, "请回答此题后再提交本轮答案。"));
+        missing[0].scrollIntoView({ block: "center" });
+        missing[0].focus({ preventScroll: true });
+        return;
       }
-      await runAction({ buttonNode: submit, region: message, action: () => api.answerClarifications(context.taskId, submitted), success: "本轮回答已保存。", refresh: context.refresh }).catch(() => {});
-    } }, [element("div", { className: "question-list" }, questions.map((question, index) => questionCard(question, answers[question.question_id], index))), submit, message]);
-    primary.push(section("需求澄清", form, { description: "请集中回答本轮问题；每题也可在选项下方输入自己的回复。" }));
+      await runAction({
+        buttonNode: submit,
+        region: message,
+        busyLabel: "正在提交整轮回答…",
+        action: () => api.answerClarifications(context.taskId, submitted),
+        success: "本轮回答已保存，正在刷新任务状态。",
+        refresh: context.refresh,
+      }).catch(() => {});
+    } }, [
+      clarificationSource(clarification),
+      element("div", { className: "question-list" }, cards),
+      element("div", { className: "clarification-submit" }, [progress, submit]),
+      message,
+    ]);
+    updateProgress();
+    primary.push(section("需求澄清", form, { description: "请一次完成本轮所有阻断问题。每题可选择一个答案，或填写自己的答案。" }));
   }
   if (clarification.confirmed) primary.unshift(nextNarrative(context));
   primary.push(taskCard(view));
@@ -95,8 +124,8 @@ function clarificationStage(view, context) {
       metadataList([["已回答", `${Object.keys(answers).length} / ${questions.length}`], ["当前快照", shortHash(view.snapshot_hash)]]),
       invalidationNotice(invalidated),
     ]),
-    resources(view, context),
-  ]);
+    clarificationResources(view, context),
+  ], "stage-grid--clarification");
 }
 
 function nextNarrative(context) {
@@ -111,14 +140,97 @@ function nextNarrative(context) {
 }
 
 function questionCard(question, answer, index) {
-  const custom = Boolean(answer && !(question.options || []).includes(answer));
-  return element("article", { className: "question-card", "data-qid": question.question_id }, [
-    element("div", { className: "question-card__title" }, [badge(question.blocking ? "阻断" : "建议", question.blocking ? "danger" : "warning"), element("h3", { text: question.prompt })]),
-    element("div", { className: "question-options", "aria-label": "选择回答" }, (question.options || []).map((value, optionIndex) => element("label", { className: "question-option" }, [
-      element("input", { type: "radio", name: `q-${question.question_id}`, value, checked: value === answer, id: `question-${index}-${optionIndex}` }),
-      element("span", { text: value }),
-    ]))),
-    field("自己的回复（填写后优先采用）", element("input", { className: "input", "data-other": question.question_id, value: custom ? answer : "", placeholder: "也可以输入更准确的回答" })),
+  const options = normalizedOptions(question.options || []);
+  const answerValue = typeof answer === "string" ? answer : answer?.option === "Other" ? answer.other : answer?.option;
+  const custom = Boolean(answerValue && !options.some((option) => option.value === answerValue));
+  const helperId = `question-${index}-helper`;
+  const errorId = `question-${index}-error`;
+  const otherId = `question-${index}-other`;
+  const other = element("input", {
+    className: "input question-other__input",
+    id: otherId,
+    "data-other": "true",
+    value: custom ? answerValue : "",
+    placeholder: "输入更准确的答案",
+    autocomplete: "off",
+    onInput: (event) => {
+      const card = event.currentTarget.closest("fieldset");
+      if (event.currentTarget.value.trim()) card.querySelectorAll('input[type="radio"]').forEach((radio) => { radio.checked = false; });
+      setQuestionError(card, "");
+      card.dispatchEvent(new CustomEvent("answerchange"));
+    },
+  });
+  const card = element("fieldset", {
+    className: "question-card",
+    "data-qid": question.question_id,
+    "aria-describedby": `${helperId} ${errorId}`,
+    tabIndex: -1,
+  }, [
+    element("legend", { className: "question-card__legend" }, [
+      element("span", { className: "question-number", text: String(index + 1).padStart(2, "0"), "aria-hidden": "true" }),
+      element("span", { text: question.prompt }),
+      element("span", { className: "sr-only", text: question.blocking ? "（必答）" : "（选答）" }),
+    ]),
+    element("p", { className: "question-helper", id: helperId, text: question.helper_text || "请选择一项，也可以填写自己的答案。" }),
+    element("div", { className: "question-options" }, options.map((option, optionIndex) => {
+      const radio = element("input", {
+        type: "radio",
+        name: `q-${index}`,
+        value: option.value,
+        checked: option.value === answerValue,
+        id: `question-${index}-${optionIndex}`,
+        onChange: (event) => {
+          if (!event.currentTarget.checked) return;
+          const fieldset = event.currentTarget.closest("fieldset");
+          fieldset.querySelector("[data-other]").value = "";
+          setQuestionError(fieldset, "");
+          fieldset.dispatchEvent(new CustomEvent("answerchange"));
+        },
+      });
+      return element("label", { className: "question-option", htmlFor: radio.id }, [
+        radio,
+        element("span", { className: "question-option__copy" }, [
+          element("strong", { text: option.label }),
+          option.description ? element("small", { text: option.description }) : null,
+        ]),
+      ]);
+    })),
+    element("div", { className: "question-other" }, [
+      element("label", { className: "field__label", htmlFor: otherId, text: "也可以输入自己的答案" }),
+      other,
+    ]),
+    element("p", { className: "field__error question-error", id: errorId, role: "alert" }),
+  ]);
+  return card;
+}
+
+function normalizedOptions(options) {
+  return options.map((option) => typeof option === "string"
+    ? { value: option, label: option, description: "" }
+    : { value: option.value, label: option.label || option.value, description: option.description || "" });
+}
+
+function readAnswer(card, question) {
+  const custom = card.querySelector("[data-other]")?.value.trim();
+  if (custom && question.allow_other !== false) return { option: "Other", other: custom };
+  const selected = card.querySelector('input[type="radio"]:checked');
+  return selected ? { option: selected.value } : null;
+}
+
+function setQuestionError(card, message) {
+  const error = card.querySelector(".question-error");
+  if (error) error.textContent = message;
+  if (message) card.setAttribute("aria-invalid", "true");
+  else card.removeAttribute("aria-invalid");
+}
+
+function clarificationSource(clarification) {
+  const modelGenerated = clarification.question_source === "model";
+  return element("div", { className: "clarification-source" }, [
+    badge(modelGenerated ? "AI 生成问题" : "系统补充问题", modelGenerated ? "primary" : "warning"),
+    element("p", { className: "muted", text: modelGenerated
+      ? `问题已根据当前任务生成${clarification.question_model ? ` · ${clarification.question_model}` : ""}。`
+      : "这些问题来自确定性缺口检查，用于补齐任务卡中的必要信息。" }),
   ]);
 }
 
@@ -140,10 +252,25 @@ function taskCard(view) {
 }
 
 function resources(view, context) {
+  return section("授权资源清单", resourceContent(view, context), { description: "仅清单内且 hash 匹配的资源可以进入样品和全稿。" });
+}
+
+function clarificationResources(view, context) {
+  const count = (view.manifest?.resources || []).length;
+  return element("details", { className: "card resource-disclosure" }, [
+    element("summary", {}, [
+      element("span", { text: "授权资源（辅助信息）" }),
+      badge(`${count} 项`),
+    ]),
+    element("div", { className: "resource-disclosure__body" }, resourceContent(view, context)),
+  ]);
+}
+
+function resourceContent(view, context) {
   const manifest = view.manifest || {};
   const items = manifest.resources || [];
   const warnings = manifest.warnings || [];
-  return section("授权资源清单", [
+  return [
     items.length ? element("ul", { className: "resource-list" }, items.map((item) => element("li", {}, [
       element("strong", { text: item.uri }),
       item.description ? element("p", { text: item.description }) : null,
@@ -154,7 +281,7 @@ function resources(view, context) {
       button("查看资源准备方法", { kind: "secondary", onClick: () => openResourceReminder(view, context) }),
     ]),
     warnings.length ? element("ul", { className: "warning-list" }, warnings.map((warning) => element("li", { text: `${warning.path || "资源"}：${WARNING_LABELS[warning.code] || warning.code}` }))) : null,
-  ], { description: "仅清单内且 hash 匹配的资源可以进入样品和全稿。" });
+  ];
 }
 
 function scheduleResourceReminder(view, context) {

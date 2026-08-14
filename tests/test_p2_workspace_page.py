@@ -73,7 +73,8 @@ class WorkspacePageTests(unittest.TestCase):
         self.assertIn('aria-live="polite"', index)
         self.assertIn('type="module"', index)
         self.assertIn('element("form"', module)
-        self.assertIn("选择回答", module)
+        self.assertIn('element("fieldset"', module)
+        self.assertIn("提交答案并继续", module)
         self.assertIn('element("label"', components)
 
     def test_full_answer_flow_uses_json_api_and_invalidates_changed_answers(self):

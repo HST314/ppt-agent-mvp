@@ -69,7 +69,6 @@ class DesktopJourney(unittest.TestCase):
         page.get_by_label("任务卡内容").fill('{"goal":"发布方案","audience":"客户","topic":"增长","页数":3}')
         page.get_by_role("button", name="导入并冻结资料").click()
         page.get_by_role("heading", name="澄清", exact=True).wait_for()
-        page.get_by_role("dialog", name="没有检测到图片资源").get_by_role("button", name="继续无图片").click()
 
         page.get_by_role("button", name="生成叙事结构", exact=True).click()
         page.get_by_role("heading", name="叙事结构", exact=True).wait_for()

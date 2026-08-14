@@ -1,12 +1,13 @@
-import { api, ApiError } from "./api.js";
-import { JobTracker } from "./job-tracker.js";
-import { currentRoute, installRouter, navigate } from "./router.js";
-import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js";
-import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js";
-import { inlineError, setBusy } from "./components/index.js";
-import { renderStage } from "./stages/index.js";
+import { api, ApiError } from "./api.js?v=2026.08.14.1";
+import { JobTracker } from "./job-tracker.js?v=2026.08.14.1";
+import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.14.1";
+import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.14.1";
+import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.14.1";
+import { inlineError, setBusy } from "./components/index.js?v=2026.08.14.1";
+import { renderStage } from "./stages/index.js?v=2026.08.14.1";
 
 const app = document.getElementById("app");
+const APP_BUILD = document.querySelector('meta[name="app-build"]')?.content || "unknown";
 const tracker = new JobTracker();
 let renderGeneration = 0;
 let activeController = null;
@@ -76,6 +77,8 @@ function topbar(context = {}) {
   ]);
   const connection = badge(navigator.onLine ? "服务可连接" : "当前离线", navigator.onLine ? "success" : "danger");
   connection.classList.add("badge--connection");
+  const build = badge(`Build ${APP_BUILD}`, "primary");
+  build.classList.add("badge--build");
   const settingsButton = iconButton("settings", "打开设置", openSettings);
   const bar = element("header", { className: "topbar" }, [
     context.onMenu ? iconButton("menu", "打开任务与阶段导航", context.onMenu, "menu-button") : null,
@@ -87,6 +90,7 @@ function topbar(context = {}) {
     ]) : null,
     element("div", { className: "topbar__actions" }, [
       connection,
+      build,
       context.extra || null,
       settingsButton,
       themeButton,
@@ -518,6 +522,7 @@ function openSettings() {
       element("div", { className: "field" }, [
         element("span", { className: "field__label", text: "服务连接" }),
         badge(navigator.onLine ? "浏览器网络在线" : "浏览器当前离线", navigator.onLine ? "success" : "danger"),
+        element("p", { className: "field__hint", text: `前端 Build ${APP_BUILD}` }),
       ]),
     ]),
     element("div", { className: "dialog__actions" }, [button("关闭", { kind: "primary", onClick: () => {
