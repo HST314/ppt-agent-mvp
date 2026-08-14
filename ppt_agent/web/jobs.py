@@ -97,7 +97,7 @@ class JobService:
         path = self._record_path(task_id, job_id)
         if not path.exists():
             raise NotFoundError("Job 不存在")
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))
 
     def _write(self, record: dict[str, Any]) -> None:
         self.store.atomic_json(self._record_path(record["task_id"], record["job_id"]), record)
@@ -109,7 +109,7 @@ class JobService:
             if path.name.endswith(".pending-event.json"):
                 continue
             try:
-                records.append(json.loads(path.read_text()))
+                records.append(json.loads(path.read_text(encoding="utf-8")))
             except (OSError, json.JSONDecodeError):
                 continue
         return sorted(records, key=lambda item: (item["created_at"], item["job_id"]))
@@ -132,12 +132,12 @@ class JobService:
         return event
 
     def _finish_pending(self, pending: Path) -> None:
-        value = json.loads(pending.read_text())
+        value = json.loads(pending.read_text(encoding="utf-8"))
         record, event = value["record"], value["event"]
         path = self._event_path(record["task_id"], record["job_id"])
         existing = {
             item["seq"]
-            for item in (json.loads(line) for line in path.read_text().splitlines() if line)
+            for item in (json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line)
         } if path.exists() else set()
         if event["seq"] not in existing:
             with open(path, "a", encoding="utf-8") as stream:
@@ -166,7 +166,7 @@ class JobService:
                 if path.name.endswith(".pending-event.json"):
                     continue
                 try:
-                    record = json.loads(path.read_text())
+                    record = json.loads(path.read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError):
                     continue
                 if record.get("status") in {"running", "cancellation_requested"}:
@@ -347,7 +347,7 @@ class JobService:
         for task_path in self.store.root.iterdir():
             path = task_path / "jobs" / f"{job_id}.json"
             if path.exists():
-                return self.public(json.loads(path.read_text()))
+                return self.public(json.loads(path.read_text(encoding="utf-8")))
         raise NotFoundError("Job 不存在")
 
     def list(self, task_id: str, status: str | None = None) -> list[dict[str, Any]]:
@@ -378,7 +378,7 @@ class JobService:
         path = self._event_path(snapshot["task_id"], job_id)
         if not path.exists():
             return []
-        events = [json.loads(line) for line in path.read_text().splitlines() if line]
+        events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
         return [event for event in events if event["seq"] > after]
 
     def heartbeat(self, job_id: str) -> dict[str, Any] | None:
@@ -396,7 +396,7 @@ class JobService:
             if not path.is_dir() or not checkpoint.exists():
                 continue
             try:
-                state = json.loads(checkpoint.read_text())
+                state = json.loads(checkpoint.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
             tasks.append({**state, "updated_at": datetime.fromtimestamp(checkpoint.stat().st_mtime, timezone.utc).isoformat()})

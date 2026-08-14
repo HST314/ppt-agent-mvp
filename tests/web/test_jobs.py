@@ -4,6 +4,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from ppt_agent.errors import ConflictError
 from ppt_agent.service import TaskService
@@ -35,6 +36,26 @@ class BlockingService(TaskService):
 
 
 class JobServiceTests(unittest.TestCase):
+    def test_persisted_chinese_job_data_is_always_read_as_utf8(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = TaskService(WorkspaceStore(root))
+            service.create("chinese")
+            service.command("chinese", "to-clarification", "advance")
+            service.command("chinese", "to-narrative", "advance")
+            jobs = JobService(service, executor=DeferredExecutor())
+            created, _ = jobs.create("chinese", "narrative.generate", {"prompt": "生成中文叙事"}, "cn-key")
+            original = Path.read_text
+
+            def windows_read_text(path, *args, **kwargs):
+                if not args and kwargs.get("encoding") is None:
+                    raise UnicodeDecodeError("gbk", b"\xaa", 0, 1, "模拟 Windows 默认编码")
+                return original(path, *args, **kwargs)
+
+            with patch.object(Path, "read_text", windows_read_text):
+                self.assertEqual(jobs.get(created["job_id"])["status"], "queued")
+                self.assertEqual(jobs.events(created["job_id"])[0]["type"], "queued")
+            jobs.close()
+
     def test_queued_cancel_is_terminal_without_invocation(self):
         with tempfile.TemporaryDirectory() as root:
             service = TaskService(WorkspaceStore(root))

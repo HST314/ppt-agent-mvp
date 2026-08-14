@@ -62,7 +62,7 @@ class WorkspaceStore:
         self.recover(task_id)
         p=self._task(task_id)/"checkpoint.json"
         if not p.exists(): raise NotFoundError("任务不存在")
-        return json.loads(p.read_text())
+        return json.loads(p.read_text(encoding="utf-8"))
     def commit(self,task_id,state,event):
         with self.lock(task_id):
             p=self._task(task_id); tx=p/"pending-commit.json"
@@ -80,7 +80,7 @@ class WorkspaceStore:
         with self.lock(task_id):
             p=self._task(task_id); tx=p/"pending-commit.json"
             if tx.exists():
-                data=json.loads(tx.read_text()); saved=self.fault; self.fault=None
+                data=json.loads(tx.read_text(encoding="utf-8")); saved=self.fault; self.fault=None
                 try: self._finish(p,data["state"],data["event"]); tx.unlink()
                 finally: self.fault=saved
     def put_version(self,task_id,kind,content:bytes,metadata):
@@ -90,14 +90,14 @@ class WorkspaceStore:
             if not p.exists():
                 tmp=p.with_name(f".{digest}.tmp"); tmp.write_bytes(content); os.replace(tmp,p)
             vp=self._task(task_id)/"versions"/kind/f"{digest}.json"
-            if vp.exists() and json.loads(vp.read_text()) != metadata: raise ConflictError("历史版本不可覆盖")
+            if vp.exists() and json.loads(vp.read_text(encoding="utf-8")) != metadata: raise ConflictError("历史版本不可覆盖")
             if not vp.exists(): self.atomic_json(vp,metadata)
             return digest
     def versions(self,task_id,kind=None):
         base=self._task(task_id)/"versions"
         if not base.exists(): raise NotFoundError("任务不存在")
         files=(base/kind).glob("*.json") if kind else base.glob("*/*.json")
-        records=[{"kind":p.parent.name,"hash":p.stem,"metadata":json.loads(p.read_text())} for p in files]
+        records=[{"kind":p.parent.name,"hash":p.stem,"metadata":json.loads(p.read_text(encoding="utf-8"))} for p in files]
         def order(record):
             try: artifact=json.loads(self.artifact(task_id,record["hash"]))
             except (json.JSONDecodeError,UnicodeDecodeError): artifact={}
@@ -137,7 +137,7 @@ class WorkspaceStore:
         with self.lock(task_id):
             path=self._task(task_id)/"delivery-intents"/f"{delivery_id}.json"
             if path.exists():
-                value=json.loads(path.read_text())
+                value=json.loads(path.read_text(encoding="utf-8"))
                 if value.get("seed") != seed: raise ConflictError("交付事务请求冲突")
                 return value
             value={"seed":seed,"confirmed_at":datetime.now(timezone.utc).isoformat()}
@@ -150,7 +150,7 @@ class WorkspaceStore:
         if not path.is_dir(): raise NotFoundError("交付不存在")
         return path
     @staticmethod
-    def _read_events(p): return [json.loads(x) for x in (p/"events.jsonl").read_text().splitlines() if x]
+    def _read_events(p): return [json.loads(x) for x in (p/"events.jsonl").read_text(encoding="utf-8").splitlines() if x]
     def events(self,task_id):
         self.recover(task_id)
         p=self._task(task_id)
@@ -165,4 +165,4 @@ class WorkspaceStore:
                 f.flush(); os.fsync(f.fileno())
     def agent_audits(self):
         path=self.root/"agent-audit.jsonl"
-        return [] if not path.exists() else [json.loads(line) for line in path.read_text().splitlines() if line]
+        return [] if not path.exists() else [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]

@@ -1,5 +1,6 @@
 import json,tempfile,threading,unittest
 from pathlib import Path
+from unittest.mock import patch
 from ppt_agent.errors import ConflictError,GateError,ValidationError
 from ppt_agent.fsm import RunStatus,Stage,TaskState,transition
 from ppt_agent.gateways import FakeInspectionGateway
@@ -38,6 +39,16 @@ class StoreTests(unittest.TestCase):
   threads=[threading.Thread(target=self.store.atomic_json,args=(Path(self.tmp.name)/"a"/"checkpoint.json",v)) for v in values]
   [t.start() for t in threads];[t.join() for t in threads]
   parsed=json.loads((Path(self.tmp.name)/"a"/"checkpoint.json").read_text());self.assertIn(parsed,values)
+ def test_persisted_chinese_is_always_read_as_utf8(self):
+  self.store.create("cn",TaskState("cn").to_dict()); digest=self.store.put_version("cn","clarification","中文".encode(),{"title":"中文需求"})
+  original=Path.read_text
+  def windows_read_text(path,*args,**kwargs):
+   if not args and kwargs.get("encoding") is None: raise UnicodeDecodeError("gbk",b"\xaa",0,1,"模拟 Windows 默认编码")
+   return original(path,*args,**kwargs)
+  with patch.object(Path,"read_text",windows_read_text):
+   self.assertEqual(self.store.checkpoint("cn")["task_id"],"cn")
+   self.assertEqual(self.store.versions("cn","clarification")[0]["metadata"]["title"],"中文需求")
+   self.assertEqual(self.store.artifact("cn",digest).decode(),"中文")
 class ServiceTests(unittest.TestCase):
  def test_idempotency_and_fake_delivery(self):
   with tempfile.TemporaryDirectory() as p:
