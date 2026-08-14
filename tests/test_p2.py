@@ -33,6 +33,9 @@ class P2Tests(unittest.TestCase):
   self.assertEqual(card["format_detection"],{"requested":"auto","detected":"json","confidence":"high"})
   with self.assertRaises(ValidationError): parse_task_card('{"goal":"销售"}',"markdown")
   result=self.svc.import_input("task",{"topic":"新品"})
+  view=self.svc.input_view("task")
+  self.assertEqual(view["source"],{"topic":"新品"})
+  self.assertEqual(view["source_format"],"json")
   clarification=result["clarification"]
   self.assertEqual(clarification["question_source"],"fallback")
   self.assertTrue(clarification["diagnostic_id"].startswith("clarification-"))
@@ -53,6 +56,14 @@ class P2Tests(unittest.TestCase):
   frozen=self.svc.input_view("task"); self.assertEqual(frozen["snapshot_hash"],first["snapshot_hash"])
   second=self.svc.import_input("task",{"goal":"g","audience":"a","topic":"t"},rebuild=True)
   self.assertNotEqual(second["snapshot_hash"],first["snapshot_hash"]); self.assertEqual(len(second["manifest"]["resources"]),2)
+ def test_input_view_reads_source_from_current_snapshot_raw_source_hash(self):
+  self.svc.import_input("task","第一版原始资料","markdown")
+  current=self.svc.input_view("task")
+  orphan_hash=self.store.put_version("task","input-source","不属于当前快照".encode(),{"content_type":"text/plain"})
+  self.assertNotEqual(orphan_hash,next(v for v in self.svc.versions("task","input-snapshot") if v["hash"]==current["snapshot_hash"])["metadata"]["raw_source_hash"])
+  view=self.svc.input_view("task")
+  self.assertEqual(view["source"],"第一版原始资料")
+  self.assertEqual(view["source_format"],"markdown")
  def test_no_images_and_path_guards(self):
   resources,warnings=scan_resources(self.store.resource_root("task")); self.assertEqual(resources,[])
   with self.assertRaises(ValidationError): self.store.put_resource("task","../escape.png",b"x")

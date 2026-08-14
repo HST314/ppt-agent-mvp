@@ -91,6 +91,8 @@ class FastAPIAppTests(unittest.TestCase):
 
         view = self.client.get("/v1/tasks/missing-input/input")
         self.assertEqual(view.status_code, 200)
+        self.assertEqual(view.json()["source"], "这是一段尚未按任务卡格式整理的说明")
+        self.assertEqual(view.json()["source_format"], "markdown")
         self.assertEqual(len(view.json()["clarification"]["questions"]), 3)
         self.assertEqual(view.json()["state"]["required_action"], "answer_clarifications")
 

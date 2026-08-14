@@ -110,7 +110,11 @@ class TaskService:
         card=next(v for v in self.versions(task_id,"task-card") if v["hash"]==snapshot["task_card_hash"])
         manifest=next(v for v in self.versions(task_id,"resource-manifest") if v["hash"]==snapshot["resource_manifest_hash"])
         clarification={**json.loads(self.version(task_id,ch)),**cv["metadata"]}
-        return {"state":self.get(task_id),"snapshot":snapshot,"snapshot_hash":item["hash"],"task_card":clarification.get("normalized_task_card",card["metadata"]["normalized"]),"manifest":{**json.loads(self.version(task_id,snapshot["resource_manifest_hash"])),**manifest["metadata"]},"clarification":clarification}
+        task_card=clarification.get("normalized_task_card",card["metadata"]["normalized"])
+        source_format=card["metadata"]["normalized"]["source_format"]
+        raw_source=self.version(task_id,meta["raw_source_hash"]).decode("utf-8")
+        source=json.loads(raw_source) if source_format=="json" else raw_source
+        return {"state":self.get(task_id),"snapshot":snapshot,"snapshot_hash":item["hash"],"source":source,"source_format":source_format,"task_card":task_card,"manifest":{**json.loads(self.version(task_id,snapshot["resource_manifest_hash"])),**manifest["metadata"]},"clarification":clarification}
     def generate_clarification(self,task_id):
         if self.clarifier is None: raise ConflictError("当前为 fake 模式，不能调用澄清模型")
         view=self.input_view(task_id); snapshot_record=next(v for v in self.versions(task_id,"input-snapshot") if v["hash"]==view["snapshot_hash"]); raw_hash=snapshot_record["metadata"]["raw_source_hash"]
