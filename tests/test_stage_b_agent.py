@@ -119,6 +119,22 @@ class StageBAgentTests(unittest.TestCase):
         endless = ScriptedClient([ModelTurn(None, "r", (ModelToolCall("list_skill_files", "{}", f"c{i}"),)) for i in range(2)])
         with self.assertRaises(GatewayError): AgentRuntime(endless, SkillRuntime.builtin(), max_steps=2).run("sample", {})
 
+    def test_schema_failure_gets_one_bounded_correction_with_field_path(self):
+        client = ScriptedClient([
+            ModelTurn('{"questions":[{"question_id":"q"}]}', "bad"),
+            ModelTurn('{"questions":[]}', "fixed"),
+        ])
+        result = AgentRuntime(client, SkillRuntime.builtin()).run("clarification", {})
+        self.assertEqual(result.value, {"questions": []})
+        self.assertEqual(sum(x.get("event") == "schema_correction" for x in result.audit), 1)
+        self.assertIn("output.questions[0] 缺少字段", str(client.inputs[1]["input"]))
+
+        exhausted = ScriptedClient([ModelTurn('{"questions":[{}]}', "bad1"), ModelTurn('{"questions":[{}]}', "bad2")])
+        with self.assertRaises(GatewayError) as caught:
+            AgentRuntime(exhausted, SkillRuntime.builtin()).run("clarification", {})
+        self.assertEqual(caught.exception.audit[-1]["reason"], "invalid_output")
+        self.assertEqual(len(exhausted.inputs), 2)
+
     def test_lock_is_closed_and_rechecked_on_every_read(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); make_skill(root, {"SKILL.md": b"ok"})
@@ -132,7 +148,7 @@ class StageBAgentTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             AgentRuntime(ScriptedClient([]), SkillRuntime.builtin()).run("deck", {}, response_schema=SCHEMA)
         arbitrary = ScriptedClient([ModelTurn('{"passed":false,"issues":[{"arbitrary_secret_field":"x"}]}', "secret-response")])
-        runtime = AgentRuntime(arbitrary, SkillRuntime.builtin())
+        runtime = AgentRuntime(arbitrary, SkillRuntime.builtin(), max_schema_corrections=0)
         with self.assertRaises(GatewayError) as caught: runtime.run("inspection", {})
         self.assertEqual(caught.exception.audit[-1]["reason"], "invalid_output")
         self.assertNotIn("secret-response", json.dumps(caught.exception.audit))

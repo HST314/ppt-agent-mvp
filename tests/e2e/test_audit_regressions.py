@@ -53,6 +53,27 @@ class AuditRegressionTests(SampleJourney):
             self.assertEqual(service.status_summary("current")["latest_artifacts"]["input-snapshot"],second["snapshot_hash"])
             self.assertNotEqual(first["snapshot_hash"],second["snapshot_hash"])
 
+    def test_rebuild_distinguishes_raw_inputs_with_same_normalized_card(self):
+        with tempfile.TemporaryDirectory() as root:
+            service=TaskService(WorkspaceStore(root)); service.create("raw-identity")
+            first=service.import_input("raw-identity","第一份无法结构化的自由文本")
+            second=service.import_input("raw-identity","第二份同样无法结构化的自由文本",rebuild=True)
+            self.assertNotEqual(first["snapshot_hash"],second["snapshot_hash"])
+            self.assertNotEqual(first["clarification_hash"],second["clarification_hash"])
+            self.assertEqual(len(service.versions("raw-identity","input-snapshot")),2)
+
+    def test_failed_rebuild_leaves_no_orphan_versions(self):
+        with tempfile.TemporaryDirectory() as root:
+            service=TaskService(WorkspaceStore(root)); service.create("atomic-rebuild")
+            service.import_input("atomic-rebuild","初始自由文本")
+            before={(v["kind"],v["hash"]) for v in service.versions("atomic-rebuild")}
+            original=service.store.commit
+            service.store.commit=lambda *args,**kwargs: (_ for _ in ()).throw(RuntimeError("commit failed"))
+            with self.assertRaises(RuntimeError):
+                service.import_input("atomic-rebuild","变化后的自由文本",rebuild=True)
+            service.store.commit=original
+            self.assertEqual({(v["kind"],v["hash"]) for v in service.versions("atomic-rebuild")},before)
+
     def test_cancelled_rejects_every_planning_write(self):
         self.app.service.command("journey", "audit-cancel", "cancel", "user")
         for action in (

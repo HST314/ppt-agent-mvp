@@ -65,7 +65,7 @@ class TaskService:
     def events(self,task_id): return self.store.events(task_id)
     def import_input(self,task_id,source,source_format="auto",rebuild=False):
         self._require_actionable(task_id)
-        with self.store.lock(task_id):
+        with self.store.transaction(task_id):
             state=TaskState.parse(self.get(task_id))
             existing=self.versions(task_id,"input-snapshot")
             if existing and not rebuild: raise ConflictError("输入已冻结；采用新资料须显式重建快照")
@@ -82,11 +82,11 @@ class TaskService:
             manifest=ResourceManifest.parse({"manifest_id":f"manifest-{digest(canonical(manifest_seed))[:16]}","task_id":task_id,"resources":schema_resources,"content_hash":digest(canonical(manifest_seed)),"created_at":now(),"schema_version":"1.0"})
             manifest_hash=self.store.put_version(task_id,"resource-manifest",canonical(manifest.to_dict()),{"resources":resources,"warnings":warnings})
             questions=[] if self.clarifier is not None else questions_for(card)
-            diagnostic_id=f"clarification-{digest(canonical({'task_id':task_id,'card':card}))[:16]}"
-            clarification=ClarificationSet.parse({"clarification_id":f"clarification-{digest(canonical({'questions':questions,'diagnostic_id':diagnostic_id}))[:16]}","task_id":task_id,"questions":tuple(q["prompt"] for q in questions),"assumptions":tuple(card["assumptions"]),"confirmed":not questions,"schema_version":"1.0"})
+            diagnostic_id=f"clarification-{digest(canonical({'task_id':task_id,'card':card,'raw_source_hash':raw_source_hash}))[:16]}"
+            clarification=ClarificationSet.parse({"clarification_id":f"clarification-{digest(canonical({'questions':questions,'diagnostic_id':diagnostic_id,'raw_source_hash':raw_source_hash}))[:16]}","task_id":task_id,"questions":tuple(q["prompt"] for q in questions),"assumptions":tuple(card["assumptions"]),"confirmed":not questions,"schema_version":"1.0"})
             clarification_meta={"questions":questions,"details":questions,"answers":{},"invalidated":[],"status":"generating" if self.clarifier is not None else "ready","question_source":None if self.clarifier is not None else "fallback","question_model":None,"diagnostic_id":diagnostic_id,"question_schema_version":"1.0","input_hash":raw_source_hash}
             clarification_hash=self.store.put_version(task_id,"clarification",canonical(clarification.to_dict()),clarification_meta)
-            snapshot=TaskInputSnapshot.parse({"snapshot_id":f"snapshot-{digest((card_hash+manifest_hash).encode())[:16]}","task_id":task_id,"task_card_hash":card_hash,"resource_manifest_hash":manifest_hash,"created_at":now(),"schema_version":"1.0"})
+            snapshot=TaskInputSnapshot.parse({"snapshot_id":f"snapshot-{digest((raw_source_hash+card_hash+manifest_hash).encode())[:16]}","task_id":task_id,"task_card_hash":card_hash,"resource_manifest_hash":manifest_hash,"created_at":now(),"schema_version":"1.0"})
             snapshot_hash=self.store.put_version(task_id,"input-snapshot",canonical(snapshot.to_dict()),{"clarification_hash":clarification_hash,"raw_source_hash":raw_source_hash,"rebuild_of":existing[-1]["hash"] if existing else None})
             waiting=self.clarifier is not None or bool(questions)
             new=TaskState.parse(state.to_dict()); new=TaskState(**{**new.__dict__,"stage":new.stage.CLARIFICATION,"status":new.status.WAITING_FOR_USER if waiting else new.status.READY,"waiting_reason":"clarification_generating" if self.clarifier is not None else "missing_required_input" if questions else None,"required_action":"wait_for_clarification" if self.clarifier is not None else "answer_clarifications" if questions else None,"revision":new.revision+1})

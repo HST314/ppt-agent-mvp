@@ -63,10 +63,13 @@ class AgentResult:
 
 
 class AgentRuntime:
-    def __init__(self, client, skill: SkillRuntime, *, max_steps: int = 12, timeout_seconds: float = 60, clock=time.monotonic, max_output_bytes: int = 1024 * 1024, max_tool_calls: int = 24):
+    def __init__(self, client, skill: SkillRuntime, *, max_steps: int = 12, timeout_seconds: float = 60, clock=time.monotonic, max_output_bytes: int = 1024 * 1024, max_tool_calls: int = 24, max_schema_corrections: int = 1):
         self.client, self.skill = client, skill
         self.max_steps, self.timeout_seconds, self.clock = max_steps, timeout_seconds, clock
         self.max_output_bytes, self.max_tool_calls = max_output_bytes, max_tool_calls
+        if isinstance(max_schema_corrections, bool) or not isinstance(max_schema_corrections, int) or not 0 <= max_schema_corrections <= 2:
+            raise ValidationError("Schema 纠错次数必须是 0 到 2 的整数")
+        self.max_schema_corrections = max_schema_corrections
         self.last_audit: tuple[dict, ...] = ()
 
     def run(self, stage: str, payload: dict, *, response_schema: dict | None = None) -> AgentResult:
@@ -78,7 +81,7 @@ class AgentRuntime:
         if not isinstance(payload, dict):
             raise ValidationError("Agent 输入无效")
         payload = self._text_only(payload)
-        started, audit, tool_count, consecutive_tool_errors = self.clock(), [], 0, 0
+        started, audit, tool_count, consecutive_tool_errors, schema_corrections = self.clock(), [], 0, 0, 0
         input_json=json.dumps(payload,ensure_ascii=False,sort_keys=True,separators=(",",":"))
         audit.append({"event": "run", "stage": stage, "skill": self.skill.skill_name, "skill_version": self.skill.skill_version, "lock_sha256": hashlib.sha256(json.dumps(self.skill.manifest, sort_keys=True).encode()).hexdigest(), "input_sha256": hashlib.sha256(input_json.encode()).hexdigest(), "config_sha256": hashlib.sha256(PRODUCT_OVERRIDE.encode()).hexdigest()})
         def fail(message: str, reason: str, cause=None):
@@ -135,12 +138,22 @@ class AgentRuntime:
             try:
                 value = json.loads(turn.text or "")
             except json.JSONDecodeError as exc:
+                if schema_corrections < self.max_schema_corrections:
+                    schema_corrections += 1
+                    audit.append({"step": step, "event": "schema_correction", "reason": "invalid_json", "attempt": schema_corrections})
+                    conversation.extend([{"role": "assistant", "content": turn.text or ""}, {"role": "user", "content": "上次输出不是有效 JSON。请仅按已提供的 JSON Schema 重新输出完整 JSON；不要调用工具，不要添加解释。"}])
+                    continue
                 fail("Agent 最终输出不是有效 JSON", "invalid_output", exc)
             if not isinstance(value, dict):
                 fail("Agent 最终输出必须为 JSON object", "invalid_output")
             try:
                 self._validate_schema(value, response_schema.get("schema", response_schema), "output")
             except GatewayError as exc:
+                if schema_corrections < self.max_schema_corrections:
+                    schema_corrections += 1
+                    audit.append({"step": step, "event": "schema_correction", "reason": "schema_validation", "attempt": schema_corrections})
+                    conversation.extend([{"role": "assistant", "content": turn.text or ""}, {"role": "user", "content": f"上次输出未通过 Schema 校验：{exc.message}。请仅按已提供的 JSON Schema 重新输出完整 JSON；不要调用工具，不要添加解释。"}])
+                    continue
                 fail(exc.message, "invalid_output", exc)
             audit.append({"event": "terminal", "reason": "success", "tool_calls": tool_count})
             self.last_audit = tuple(audit)
@@ -173,8 +186,9 @@ class AgentRuntime:
             raise GatewayError(f"Agent 输出不符合 Schema：{path} 枚举无效")
         if expected == "object":
             properties, required = schema.get("properties", {}), schema.get("required", [])
-            if not all(name in value for name in required):
-                raise GatewayError(f"Agent 输出不符合 Schema：{path} 缺少字段")
+            missing = [name for name in required if name not in value]
+            if missing:
+                raise GatewayError(f"Agent 输出不符合 Schema：{path} 缺少字段 {','.join(missing)}")
             if schema.get("additionalProperties") is False and set(value) - set(properties):
                 raise GatewayError(f"Agent 输出不符合 Schema：{path} 包含未知字段")
             for name, item in value.items():
