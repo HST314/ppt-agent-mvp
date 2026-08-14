@@ -1,17 +1,17 @@
 gateway:
-  mode: fake
+  mode: agent
 
 models:
   generation:
     provider: openai_responses
-    model: deepseek-v4-flash-260425
+    model: deepseek-v4-flash-ga-260731
     api_key_env: ARK_API_KEY
     base_url_env: ARK_BASE_URL
     timeout_seconds: 60
     max_steps: 12
   inspection:
     provider: openai_responses
-    model: deepseek-v4-flash-260425
+    model: deepseek-v4-flash-ga-260731
     api_key_env: ARK_API_KEY
     base_url_env: ARK_BASE_URL
     timeout_seconds: 60
