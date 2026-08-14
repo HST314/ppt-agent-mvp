@@ -66,7 +66,7 @@ def create_app(
 
     @app.get("/healthz", tags=["runtime"])
     def health():
-        return {"status": "ok", "stage": "P8", "runtime_ready": True, "web_runtime": "fastapi", "frontend_build": FRONTEND_BUILD}
+        return {"status": "ok", "stage": "P8", "runtime_ready": True, "web_runtime": "fastapi", "frontend_build": FRONTEND_BUILD, "clarification_mode":"model" if service.clarifier is not None else "fake"}
 
     app.mount("/static", StaticFiles(directory=frontend / "static", check_dir=True), name="static")
     app.include_router(jobs.router)

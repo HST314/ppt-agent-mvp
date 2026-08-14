@@ -119,6 +119,9 @@ class AgentGateway:
             raise ValidationError("Agent 生成阶段无效")
         return {"text": self._run(action, payload)["markdown"], "model": self.model}
 
+    def clarify(self, payload):
+        return {**self._run("clarification", payload), "model": self.model}
+
     def build(self, outline, **context):
         action = context.pop("action", "deck")
         if action not in {"sample", "deck", "inspection"}:
@@ -145,7 +148,7 @@ def agent_gateways_from_config(config):
     clients = model_clients_from_config(config); skill = SkillRuntime.builtin()
     generation = AgentGateway(clients["generation"], skill=skill, max_steps=config.generation.max_steps, timeout_seconds=config.generation.timeout_seconds, model=config.generation.model)
     inspection = AgentGateway(clients["inspection"], skill=skill, max_steps=config.inspection.max_steps, timeout_seconds=config.inspection.timeout_seconds, model=config.inspection.model)
-    return {"generator": generation, "builder": generation, "inspector": inspection, "skills": LockedSkillMetadataLoader(skill)}
+    return {"generator": generation, "clarifier": generation, "builder": generation, "inspector": inspection, "skills": LockedSkillMetadataLoader(skill)}
 
 def gateways_from_env():
     mode=os.environ.get("PPT_AGENT_GATEWAY_MODE","fake")

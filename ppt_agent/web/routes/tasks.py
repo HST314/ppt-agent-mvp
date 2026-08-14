@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Request, status
 from fastapi.responses import HTMLResponse
 
-from ...errors import NotFoundError, ValidationError
+from ...errors import ConflictError, NotFoundError, ValidationError
 from ...service import TaskService
 from ..dependencies import job_service, task_service
 from ..jobs import JobService
@@ -75,10 +75,25 @@ def get_input(task_id: str, service: TaskService = Depends(task_service)):
 
 
 @router.post("/tasks/{task_id}/input")
-async def import_input(task_id: str, request: Request, service: TaskService = Depends(task_service)):
+async def import_input(task_id: str, request: Request, service: TaskService = Depends(task_service), jobs: JobService = Depends(job_service)):
     body = await json_body(request)
     exact(body, {"source", "source_format", "rebuild"}, {"source"})
-    return service.import_input(task_id, body["source"], body.get("source_format", "auto"), body.get("rebuild", False))
+    result=service.import_input(task_id, body["source"], body.get("source_format", "auto"), body.get("rebuild", False))
+    if result.get("clarification",{}).get("status")=="generating":
+        job,_=jobs.create(task_id,"clarification.generate",{},f"clarification-{result['snapshot_hash']}"); result["clarification"]["job_id"]=job["job_id"]
+    return result
+
+@router.post("/tasks/{task_id}/clarifications/retry")
+async def retry_clarification(task_id: str, request: Request, service: TaskService = Depends(task_service), jobs: JobService = Depends(job_service)):
+    body=await json_body(request); exact(body,{"idempotency_key"},{"idempotency_key"})
+    if service.input_view(task_id).get("clarification",{}).get("status")!="failed": raise ConflictError("仅失败的澄清生成可重试")
+    job,_=jobs.create(task_id,"clarification.generate",{},body["idempotency_key"]); return job
+
+@router.post("/tasks/{task_id}/clarifications/fallback")
+async def fallback_clarification(task_id: str, request: Request, service: TaskService = Depends(task_service)):
+    body=await json_body(request); exact(body,{"confirm"},{"confirm"})
+    if body["confirm"] is not True: raise ValidationError("使用系统兜底问题需要显式确认")
+    return service.use_fallback_clarification(task_id)
 
 
 @router.post("/tasks/{task_id}/clarifications/{question_id}/answer")

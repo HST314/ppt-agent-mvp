@@ -10,9 +10,10 @@ from .errors import GatewayError, GatewayUnknownResult, ValidationError
 from .skill_runtime import SkillRuntime
 
 
-STAGES = {"narrative", "outline", "sample", "deck", "inspection"}
+STAGES = {"clarification", "narrative", "outline", "sample", "deck", "inspection"}
 DATA_IMAGE = "data:image/"
 STAGE_PROMPTS = {
+    "clarification": "完整阅读原始任务卡、规范化结果和资源摘要，仅提出真正阻碍交付的 0 到 5 个上下文相关问题；不得重复询问已知事实。",
     "narrative": "根据任务卡生成叙事结构 Markdown；不要生成逐页 HTML。",
     "outline": "根据已确认叙事生成逐页大纲 Markdown；保持页面标识稳定。",
     "sample": "仅为外层状态机指定的样品页生成完整 HTML，不得扩展到全稿。",
@@ -26,6 +27,12 @@ def _object_schema(properties: dict, required: list[str]) -> dict:
 
 
 STAGE_OUTPUT_SCHEMAS = {
+    "clarification": {"name": "clarification", "strict": True, "schema": _object_schema({"questions": {"type": "array", "items": _object_schema({
+        "question_id": {"type": "string"}, "field_path": {"type": "string"}, "prompt": {"type": "string"},
+        "helper_text": {"type": "string"}, "options": {"type": "array", "items": _object_schema({
+            "value": {"type": "string"}, "label": {"type": "string"}, "description": {"type": "string"}
+        }, ["value", "label", "description"])}, "allow_other": {"type": "boolean"}, "blocking": {"type": "boolean"}
+    }, ["question_id", "field_path", "prompt", "helper_text", "options", "allow_other", "blocking"])}}, ["questions"])},
     "narrative": {"name": "narrative", "strict": True, "schema": _object_schema({"markdown": {"type": "string"}}, ["markdown"])},
     "outline": {"name": "outline", "strict": True, "schema": _object_schema({"markdown": {"type": "string"}}, ["markdown"])},
     "sample": {"name": "sample_html", "strict": True, "schema": _object_schema({"html": {"type": "string"}}, ["html"])},

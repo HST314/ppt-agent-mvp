@@ -19,9 +19,9 @@ def utcnow(): return datetime.now(timezone.utc).isoformat()
 def fingerprint(value): return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(",",":")).encode()).hexdigest()
 
 class TaskService:
-    def __init__(self,store,generator=None,inspector=None,skills=None,builder=None):
-        self.store=store; self.generator=generator or FakeGenerationGateway(); self.inspector=inspector or FakeInspectionGateway(); self.skills=skills or FakeSkillLoader(); self.builder=builder or FakeHtmlBuilder()
-        for gateway in {id(x):x for x in (self.generator,self.inspector,self.builder)}.values():
+    def __init__(self,store,generator=None,inspector=None,skills=None,builder=None,clarifier=None):
+        self.store=store; self.generator=generator or FakeGenerationGateway(); self.inspector=inspector or FakeInspectionGateway(); self.skills=skills or FakeSkillLoader(); self.builder=builder or FakeHtmlBuilder(); self.clarifier=clarifier
+        for gateway in {id(x):x for x in (self.generator,self.inspector,self.builder,self.clarifier) if x is not None}.values():
             if hasattr(gateway,"set_audit_sink"): gateway.set_audit_sink(self.store.append_agent_audit)
     def create(self,task_id,mode="manual"):
         if mode not in {"manual","auto"}: raise ValidationError("mode 只能是 manual 或 auto")
@@ -70,6 +70,8 @@ class TaskService:
             existing=self.versions(task_id,"input-snapshot")
             if existing and not rebuild: raise ConflictError("输入已冻结；采用新资料须显式重建快照")
             if rebuild and state.stage not in {state.stage.CREATED,state.stage.CLARIFICATION}: raise ConflictError("大纲阶段后不可重建输入快照")
+            raw_source=canonical(source) if isinstance(source,dict) else str(source).encode("utf-8")
+            raw_source_hash=self.store.put_version(task_id,"input-source",raw_source,{"content_type":"application/json" if isinstance(source,dict) else "text/plain"})
             card=parse_task_card(source,source_format)
             source_format=card["source_format"]
             card_json={"task_id":task_id,"goal":card.get("goal","待澄清"),"audience":card.get("audience","待澄清"),"topic":card.get("topic","待澄清"),"source_format":source_format,"schema_version":"1.0"}
@@ -79,14 +81,15 @@ class TaskService:
             manifest_seed={"task_id":task_id,"resources":schema_resources,"warnings":warnings}
             manifest=ResourceManifest.parse({"manifest_id":f"manifest-{digest(canonical(manifest_seed))[:16]}","task_id":task_id,"resources":schema_resources,"content_hash":digest(canonical(manifest_seed)),"created_at":now(),"schema_version":"1.0"})
             manifest_hash=self.store.put_version(task_id,"resource-manifest",canonical(manifest.to_dict()),{"resources":resources,"warnings":warnings})
-            questions=questions_for(card)
-            clarification=ClarificationSet.parse({"clarification_id":f"clarification-{digest(canonical(questions))[:16]}","task_id":task_id,"questions":tuple(q["prompt"] for q in questions),"assumptions":tuple(card["assumptions"]),"confirmed":not questions,"schema_version":"1.0"})
+            questions=[] if self.clarifier is not None else questions_for(card)
             diagnostic_id=f"clarification-{digest(canonical({'task_id':task_id,'card':card}))[:16]}"
-            clarification_meta={"questions":questions,"answers":{},"invalidated":[],"question_source":"fallback","question_model":None,"diagnostic_id":diagnostic_id,"question_schema_version":"1.0"}
+            clarification=ClarificationSet.parse({"clarification_id":f"clarification-{digest(canonical({'questions':questions,'diagnostic_id':diagnostic_id}))[:16]}","task_id":task_id,"questions":tuple(q["prompt"] for q in questions),"assumptions":tuple(card["assumptions"]),"confirmed":not questions,"schema_version":"1.0"})
+            clarification_meta={"questions":questions,"details":questions,"answers":{},"invalidated":[],"status":"generating" if self.clarifier is not None else "ready","question_source":None if self.clarifier is not None else "fallback","question_model":None,"diagnostic_id":diagnostic_id,"question_schema_version":"1.0","input_hash":raw_source_hash}
             clarification_hash=self.store.put_version(task_id,"clarification",canonical(clarification.to_dict()),clarification_meta)
             snapshot=TaskInputSnapshot.parse({"snapshot_id":f"snapshot-{digest((card_hash+manifest_hash).encode())[:16]}","task_id":task_id,"task_card_hash":card_hash,"resource_manifest_hash":manifest_hash,"created_at":now(),"schema_version":"1.0"})
-            snapshot_hash=self.store.put_version(task_id,"input-snapshot",canonical(snapshot.to_dict()),{"clarification_hash":clarification_hash,"rebuild_of":existing[-1]["hash"] if existing else None})
-            new=TaskState.parse(state.to_dict()); new=TaskState(**{**new.__dict__,"stage":new.stage.CLARIFICATION,"status":new.status.WAITING_FOR_USER if questions else new.status.READY,"waiting_reason":"missing_required_input" if questions else None,"required_action":"answer_clarifications" if questions else None,"revision":new.revision+1})
+            snapshot_hash=self.store.put_version(task_id,"input-snapshot",canonical(snapshot.to_dict()),{"clarification_hash":clarification_hash,"raw_source_hash":raw_source_hash,"rebuild_of":existing[-1]["hash"] if existing else None})
+            waiting=self.clarifier is not None or bool(questions)
+            new=TaskState.parse(state.to_dict()); new=TaskState(**{**new.__dict__,"stage":new.stage.CLARIFICATION,"status":new.status.WAITING_FOR_USER if waiting else new.status.READY,"waiting_reason":"clarification_generating" if self.clarifier is not None else "missing_required_input" if questions else None,"required_action":"wait_for_clarification" if self.clarifier is not None else "answer_clarifications" if questions else None,"revision":new.revision+1})
             event={"event_id":hashlib.sha256(f"{task_id}:input:{snapshot_hash}".encode()).hexdigest()[:24],"command_id":f"input-{snapshot_hash[:16]}","action":"rebuild_input" if existing else "import_input","actor":"user","request_hash":snapshot_hash,"at":utcnow(),"from":state.to_dict(),"to":new.to_dict(),"result":{"snapshot_hash":snapshot_hash}}
             self.store.commit(task_id,new.to_dict(),event)
             result={"state":new.to_dict(),"snapshot":snapshot.to_dict(),"snapshot_hash":snapshot_hash,"task_card":card,"manifest":{**manifest.to_dict(),"resources":resources,"warnings":warnings},"clarification":{**clarification.to_dict(),"details":questions,**clarification_meta},"clarification_hash":clarification_hash}
@@ -102,12 +105,43 @@ class TaskService:
         # The frozen input points at the initial set; answers are append-only
         # clarification versions, so select the newest committed answer event.
         for event in reversed(self.events(task_id)):
-            if event["action"] == "answer_clarification": ch=event["result"]["clarification_hash"]; break
+            if event["action"] in {"answer_clarification","clarification_generate","clarification_failed","clarification_fallback"}: ch=event["result"]["clarification_hash"]; break
         cv=next(v for v in self.versions(task_id,"clarification") if v["hash"]==ch)
         card=next(v for v in self.versions(task_id,"task-card") if v["hash"]==snapshot["task_card_hash"])
         manifest=next(v for v in self.versions(task_id,"resource-manifest") if v["hash"]==snapshot["resource_manifest_hash"])
         clarification={**json.loads(self.version(task_id,ch)),**cv["metadata"]}
         return {"state":self.get(task_id),"snapshot":snapshot,"snapshot_hash":item["hash"],"task_card":clarification.get("normalized_task_card",card["metadata"]["normalized"]),"manifest":{**json.loads(self.version(task_id,snapshot["resource_manifest_hash"])),**manifest["metadata"]},"clarification":clarification}
+    def generate_clarification(self,task_id):
+        if self.clarifier is None: raise ConflictError("当前为 fake 模式，不能调用澄清模型")
+        view=self.input_view(task_id); snapshot_record=next(v for v in self.versions(task_id,"input-snapshot") if v["hash"]==view["snapshot_hash"]); raw_hash=snapshot_record["metadata"]["raw_source_hash"]
+        payload={"task_id":task_id,"original_input":self.version(task_id,raw_hash).decode("utf-8"),"original_input_sha256":raw_hash,"normalized_task_card":view["task_card"],"candidate_missing_fields":view["task_card"].get("missing",[]),"resource_summary":view["manifest"]}
+        try:
+            value=self.clarifier.clarify(payload); questions=self._validate_model_questions(value.get("questions"),view["task_card"])
+        except Exception as exc:
+            self._record_clarification(task_id,view,[],"failed",None,{"code":"clarification_generation_failed","message":str(exc)},"clarification_failed"); raise
+        return self._record_clarification(task_id,view,questions,"ready",value.get("model"),None,"clarification_generate")
+    def use_fallback_clarification(self,task_id):
+        view=self.input_view(task_id)
+        return self._record_clarification(task_id,view,questions_for(view["task_card"]),"ready",None,None,"clarification_fallback",source="fallback")
+    def _validate_model_questions(self,questions,card):
+        if not isinstance(questions,list) or len(questions)>5: raise ValidationError("澄清模型 questions 必须为 0 到 5 项")
+        required={"question_id","field_path","prompt","helper_text","options","allow_other","blocking"}; seen_ids=set(); seen_paths=set(); known={k for k in ("goal","audience","topic") if k not in card.get("missing",[])}; result=[]
+        for q in questions:
+            if not isinstance(q,dict) or set(q)!=required: raise ValidationError("澄清问题 Schema 无效")
+            if q["question_id"] in seen_ids or q["field_path"] in seen_paths: raise ValidationError("澄清问题存在重复 ID 或字段")
+            if q["field_path"] in known: raise ValidationError("澄清模型重复询问已知事实")
+            if not all(isinstance(q[k],str) and q[k].strip() for k in ("question_id","field_path","prompt","helper_text")) or not isinstance(q["allow_other"],bool) or not isinstance(q["blocking"],bool): raise ValidationError("澄清问题字段无效")
+            if not isinstance(q["options"],list) or any(not isinstance(o,dict) or set(o)!={"value","label","description"} or not all(isinstance(o[k],str) for k in o) or not o["value"].strip() or not o["label"].strip() for o in q["options"]): raise ValidationError("澄清选项 Schema 无效")
+            if len({o["value"] for o in q["options"]})!=len(q["options"]): raise ValidationError("澄清选项重复")
+            seen_ids.add(q["question_id"]); seen_paths.add(q["field_path"]); result.append({**q,"field":q["field_path"]})
+        return result
+    def _record_clarification(self,task_id,view,questions,status,model,error,action,source="model"):
+        meta={"questions":questions,"details":questions,"answers":{},"invalidated":[],"status":status,"question_source":source if status=="ready" else None,"question_model":model,"diagnostic_id":view["clarification"]["diagnostic_id"],"question_schema_version":"1.0","input_hash":view["clarification"]["input_hash"],"normalized_task_card":view["task_card"]}
+        if error: meta["error"]=error
+        artifact=ClarificationSet.parse({"clarification_id":f"clarification-{digest(canonical(meta))[:16]}","task_id":task_id,"questions":tuple(q["prompt"] for q in questions),"assumptions":tuple(),"confirmed":status=="ready" and not questions,"schema_version":"1.0"}); ch=self.store.put_version(task_id,"clarification",canonical(artifact.to_dict()),meta)
+        state=TaskState.parse(self.get(task_id)); failed=status=="failed"; new=TaskState(**{**state.__dict__,"status":state.status.WAITING_FOR_USER if failed or questions else state.status.READY,"waiting_reason":"clarification_failed" if failed else "missing_required_input" if questions else None,"required_action":"retry_clarification" if failed else "answer_clarifications" if questions else None,"revision":state.revision+1})
+        event={"event_id":hashlib.sha256(f"{task_id}:{action}:{ch}".encode()).hexdigest()[:24],"command_id":f"{action}-{ch[:16]}","action":action,"actor":"system" if action!="clarification_fallback" else "user","request_hash":meta["input_hash"],"at":utcnow(),"from":state.to_dict(),"to":new.to_dict(),"result":{"clarification_hash":ch}}
+        self.store.commit(task_id,new.to_dict(),event); return {"clarification_hash":ch,**meta,"confirmed":artifact.confirmed}
     def answer_clarification(self,task_id,question_id,answer):
         return self.answer_clarifications(task_id,{question_id:answer})
     def answer_clarifications(self,task_id,submitted,require_complete=False):
@@ -115,6 +149,7 @@ class TaskService:
         if not isinstance(submitted,dict) or not submitted: raise ValidationError("本轮回答不得为空")
         view=self.input_view(task_id); clarification=view.get("clarification")
         if not clarification: raise ConflictError("尚未生成澄清问题")
+        if clarification.get("status") != "ready": raise ConflictError("澄清问题尚未生成完成")
         details=clarification.get("details",clarification.get("questions",[]))
         by_id={q["question_id"]:q for q in details}; answers=dict(clarification.get("answers",{})); changed=False
         if require_complete:
@@ -127,7 +162,7 @@ class TaskService:
         pending=[q for q in details if q["blocking"] and q["question_id"] not in answers]
         merged=dict(view["task_card"]); merged.update({q["field"]:answers[q["question_id"]] for q in details if q["question_id"] in answers})
         merged["missing"]=[key for key in merged.get("missing",[]) if not merged.get(key)]
-        payload={"questions":details,"answers":answers,"normalized_task_card":merged,"invalidated":(["narrative","outline","sample","deck","inspection","delivery"] if changed else clarification.get("invalidated",[])),**{k:clarification.get(k) for k in ("question_source","question_model","diagnostic_id","question_schema_version")}}
+        payload={"questions":details,"details":details,"answers":answers,"status":"ready","normalized_task_card":merged,"invalidated":(["narrative","outline","sample","deck","inspection","delivery"] if changed else clarification.get("invalidated",[])),**{k:clarification.get(k) for k in ("question_source","question_model","diagnostic_id","question_schema_version","input_hash")}}
         model=ClarificationSet.parse({"clarification_id":f"clarification-{digest(canonical(payload))[:16]}","task_id":task_id,"questions":tuple(q["prompt"] for q in details),"assumptions":tuple(),"confirmed":not pending,"schema_version":"1.0"})
         ch=self.store.put_version(task_id,"clarification",canonical(model.to_dict()),payload)
         state=TaskState.parse(self.get(task_id)); new=TaskState(**{**state.__dict__,"status":state.status.WAITING_FOR_USER if pending else state.status.READY,"waiting_reason":"missing_required_input" if pending else None,"required_action":"answer_clarifications" if pending else None,"revision":state.revision+1})

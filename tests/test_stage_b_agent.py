@@ -105,7 +105,7 @@ class StageBAgentTests(unittest.TestCase):
         self.assertEqual(len(result.audit[0]["input_sha256"]),64)
 
     def test_each_stage_has_a_strict_default_output_schema(self):
-        self.assertEqual(set(STAGE_PROMPTS), {"narrative", "outline", "sample", "deck", "inspection"})
+        self.assertEqual(set(STAGE_PROMPTS), {"clarification", "narrative", "outline", "sample", "deck", "inspection"})
         for stage, schema in STAGE_OUTPUT_SCHEMAS.items():
             with self.subTest(stage=stage):
                 self.assertTrue(schema["strict"]); self.assertFalse(schema["schema"]["additionalProperties"])

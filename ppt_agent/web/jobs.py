@@ -17,6 +17,7 @@ from ..errors import ConflictError, NotFoundError, ValidationError
 TERMINAL = {"succeeded", "failed", "cancelled", "interrupted"}
 ACTIVE = {"queued", "running", "cancellation_requested"}
 OPERATIONS = {
+    "clarification.generate",
     "narrative.generate",
     "outline.generate",
     "samples.generate",
@@ -26,6 +27,7 @@ OPERATIONS = {
     "inspection.run",
 }
 OPERATION_STAGES = {
+    "clarification.generate": {"clarification"},
     "narrative.generate": {"clarification", "narrative"},
     "outline.generate": {"narrative", "outline"},
     "samples.generate": {"outline", "sample"},
@@ -189,6 +191,7 @@ class JobService:
         if not isinstance(payload, dict):
             raise ValidationError("payload 必须为对象")
         allowed = {
+            "clarification.generate": set(),
             "narrative.generate": {"prompt", "scope"},
             "outline.generate": {"prompt", "slide_ids"},
             "samples.generate": {"prompt"},
@@ -317,6 +320,8 @@ class JobService:
                 self._submitted.discard(key)
 
     def _invoke(self, operation: str, task_id: str, payload: dict[str, Any]) -> Any:
+        if operation == "clarification.generate":
+            return self.service.generate_clarification(task_id)
         if operation == "narrative.generate":
             return self.service.generate_narrative(task_id, payload.get("prompt"), payload.get("scope", "all"))
         if operation == "outline.generate":
