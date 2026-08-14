@@ -78,7 +78,7 @@ def get_input(task_id: str, service: TaskService = Depends(task_service)):
 async def import_input(task_id: str, request: Request, service: TaskService = Depends(task_service)):
     body = await json_body(request)
     exact(body, {"source", "source_format", "rebuild"}, {"source"})
-    return service.import_input(task_id, body["source"], body.get("source_format", "json"), body.get("rebuild", False))
+    return service.import_input(task_id, body["source"], body.get("source_format", "auto"), body.get("rebuild", False))
 
 
 @router.post("/tasks/{task_id}/clarifications/{question_id}/answer")
@@ -91,7 +91,7 @@ async def answer_clarification(task_id: str, question_id: str, request: Request,
 async def answer_clarifications(task_id: str, request: Request, service: TaskService = Depends(task_service)):
     body = await json_body(request)
     exact(body, {"answers"}, {"answers"})
-    return service.answer_clarifications(task_id, body["answers"])
+    return service.answer_clarifications(task_id, body["answers"], require_complete=True)
 
 
 @router.get("/tasks/{task_id}/planning")

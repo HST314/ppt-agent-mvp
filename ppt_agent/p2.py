@@ -36,8 +36,22 @@ def valid_image_content(data, suffix):
         return root.tag.rsplit("}",1)[-1].lower()=="svg"
     return False
 
-def parse_task_card(source, source_format):
-    if source_format not in {"json","markdown"}: raise ValidationError("任务卡格式只能是 json 或 markdown")
+def detect_source_format(source):
+    if isinstance(source,dict): return "json"
+    if not isinstance(source,str) or not source.strip(): raise ValidationError("任务卡不得为空")
+    try:
+        value=json.loads(source)
+        if isinstance(value,dict): return "json"
+    except json.JSONDecodeError: pass
+    return "markdown"
+
+def parse_task_card(source, source_format="auto"):
+    if source_format not in {"auto","json","markdown"}: raise ValidationError("任务卡格式只能是 auto、json 或 markdown")
+    requested=source_format
+    detected=detect_source_format(source)
+    if source_format != "auto" and source_format != detected:
+        raise ValidationError(f"任务卡内容识别为 {detected}，与声明的 {source_format} 不一致")
+    source_format=detected
     if source_format == "json":
         if isinstance(source,str):
             try: raw=json.loads(source)
@@ -63,7 +77,7 @@ def parse_task_card(source, source_format):
                 if target in normalized: break
     constraints={k:v for k,v in raw.items() if k not in consumed and k not in {"task_id","schema_version","source_format"}}
     missing=[key for key in ALIASES if key not in normalized]
-    return {**normalized,"constraints":constraints,"defaults":DEFAULTS.copy(),"assumptions":[],"missing":missing,"source_format":source_format}
+    return {**normalized,"constraints":constraints,"defaults":DEFAULTS.copy(),"assumptions":[],"missing":missing,"source_format":source_format,"format_detection":{"requested":requested,"detected":detected,"confidence":"high"}}
 
 def scan_resources(root: Path):
     root=root.resolve(); entries=[]; warnings=[]; seen={}
@@ -97,7 +111,13 @@ def questions_for(card):
       "audience":("这份演示主要面向哪类受众？",["公司管理层","客户或潜在客户","项目团队","公众或活动观众"]),
       "topic":("请确认本次演示聚焦的核心主题。",["产品或服务介绍","项目方案与汇报","行业研究与洞察","培训与知识分享"]),
     }
-    result=[{"question_id":f"missing-{key}","field":key,"prompt":specs[key][0],"options":specs[key][1],"allow_other":True,"blocking":True} for key in card["missing"]]
+    result=[]
+    for key in card["missing"]:
+        prompt, values=specs[key]
+        result.append({"question_id":f"missing-{key}","field_path":key,"field":key,"prompt":prompt,
+          "helper_text":"请选择最符合实际情况的一项，也可以填写自定义答案。",
+          "options":[{"value":value,"label":value,"description":""} for value in values],
+          "allow_other":True,"blocking":True})
     return result[:6]
 
 def validate_answer(question, answer):
@@ -108,5 +128,6 @@ def validate_answer(question, answer):
         return answer["other"].strip()
     # Keep accepting the v1.0.1 deferred-answer token for API compatibility;
     # new clients no longer present it as a suggested answer.
-    if option != "稍后补充" and option not in question["options"]: raise ValidationError("回答不在可选项中")
+    values=[item["value"] if isinstance(item,dict) else item for item in question["options"]]
+    if option != "稍后补充" and option not in values: raise ValidationError("回答不在可选项中")
     return option

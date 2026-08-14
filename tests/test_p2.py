@@ -28,6 +28,23 @@ class P2Tests(unittest.TestCase):
   result=self.svc.import_input("task",{"goal":"销售"},"json")
   self.assertEqual(result["state"]["status"],"waiting_for_user"); self.assertEqual(len(result["clarification"]["details"]),2)
   with self.assertRaises(ConflictError): self.svc.import_input("task",{"goal":"x","audience":"a","topic":"t"})
+ def test_auto_format_detection_rejects_mismatch_and_exposes_source(self):
+  card=parse_task_card('{"goal":"销售","audience":"客户","topic":"新品"}',"auto")
+  self.assertEqual(card["format_detection"],{"requested":"auto","detected":"json","confidence":"high"})
+  with self.assertRaises(ValidationError): parse_task_card('{"goal":"销售"}',"markdown")
+  result=self.svc.import_input("task",{"topic":"新品"})
+  clarification=result["clarification"]
+  self.assertEqual(clarification["question_source"],"fallback")
+  self.assertTrue(clarification["diagnostic_id"].startswith("clarification-"))
+  question=clarification["details"][0]
+  self.assertEqual(set(question),{"question_id","field_path","field","prompt","helper_text","options","allow_other","blocking"})
+  self.assertEqual(set(question["options"][0]),{"value","label","description"})
+ def test_batch_requires_complete_round_without_partial_write(self):
+  result=self.svc.import_input("task",{"topic":"新品"}); questions=result["clarification"]["details"]
+  first=questions[0]
+  with self.assertRaises(ValidationError):
+   self.svc.answer_clarifications("task",{first["question_id"]:{"option":first["options"][0]["value"]}},require_complete=True)
+  self.assertEqual(self.svc.input_view("task")["clarification"]["answers"],{})
  def test_resource_pairing_hash_freeze_and_explicit_rebuild(self):
   self.store.put_resource("task","hero.png",PNG); self.store.put_resource("task","hero.md","主视觉说明".encode())
   first=self.svc.import_input("task",{"goal":"g","audience":"a","topic":"t"})
