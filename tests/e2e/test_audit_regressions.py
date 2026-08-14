@@ -22,6 +22,13 @@ class UnknownOnRecheck:
             return {"passed":False,"issues":[{"issue_id":"x","severity":"warning","slide_id":"slide-1","suggestion":"fix"}]}
         raise GatewayUnknownResult("repair recheck unknown")
 
+class FailOnceClarifier:
+    def __init__(self): self.calls=0
+    def clarify(self,payload):
+        self.calls+=1
+        if self.calls==1: raise RuntimeError("controlled failure")
+        return {"model":"lineage-probe","questions":[{"question_id":"decision","field_path":"decision","prompt":"需要什么决策？","helper_text":"用于确定叙事重点","options":[],"allow_other":True,"blocking":True}]}
+
 
 class AuditRegressionTests(SampleJourney):
     def test_latest_disposition_overrides_older_waiver(self):
@@ -61,6 +68,30 @@ class AuditRegressionTests(SampleJourney):
             self.assertNotEqual(first["snapshot_hash"],second["snapshot_hash"])
             self.assertNotEqual(first["clarification_hash"],second["clarification_hash"])
             self.assertEqual(len(service.versions("raw-identity","input-snapshot")),2)
+
+    def test_failed_a_clarification_does_not_pollute_same_normalized_b_rebuild(self):
+        with tempfile.TemporaryDirectory() as root:
+            clarifier=FailOnceClarifier(); service=TaskService(WorkspaceStore(root),clarifier=clarifier); service.create("lineage")
+            first=service.import_input("lineage","第一份无法结构化的自由文本")
+            with self.assertRaises(RuntimeError): service.generate_clarification("lineage")
+            failed=service.input_view("lineage")["clarification"]
+
+            second=service.import_input("lineage","第二份同样无法结构化的自由文本",rebuild=True)
+            before=service.input_view("lineage")
+            b_hash=next(v["metadata"]["raw_source_hash"] for v in service.versions("lineage","input-snapshot") if v["hash"]==second["snapshot_hash"])
+            self.assertEqual(before["snapshot_hash"],second["snapshot_hash"])
+            self.assertEqual(before["clarification"]["input_hash"],b_hash)
+            self.assertNotEqual(before["clarification"]["diagnostic_id"],failed["diagnostic_id"])
+
+            service.generate_clarification("lineage")
+            after=service.input_view("lineage")
+            self.assertEqual(after["clarification"]["input_hash"],b_hash)
+            self.assertEqual(after["clarification"]["diagnostic_id"],before["clarification"]["diagnostic_id"])
+            generated=[e for e in service.events("lineage") if e["action"]=="clarification_generate"][-1]
+            self.assertEqual(generated["request_hash"],b_hash)
+            self.assertEqual(generated["result"]["input_hash"],b_hash)
+            self.assertEqual(generated["result"]["snapshot_hash"],second["snapshot_hash"])
+            self.assertNotEqual(first["snapshot_hash"],second["snapshot_hash"])
 
     def test_failed_rebuild_leaves_no_orphan_versions(self):
         with tempfile.TemporaryDirectory() as root:

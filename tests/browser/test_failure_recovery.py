@@ -161,6 +161,12 @@ class FailureRecoveryBrowserGate(unittest.TestCase):
         self.assertNotEqual(view["snapshot_hash"], first_snapshot)
         self.assertEqual(view["clarification"]["status"], "ready")
         self.assertEqual(view["clarification"]["question_source"], "model")
+        current_snapshot = next(v for v in self.service.versions("recover", "input-snapshot") if v["hash"] == view["snapshot_hash"])
+        current_input_hash = current_snapshot["metadata"]["raw_source_hash"]
+        self.assertEqual(view["clarification"]["input_hash"], current_input_hash)
+        clarification_event = [e for e in self.service.events("recover") if e["action"] == "clarification_generate"][-1]
+        self.assertEqual(clarification_event["request_hash"], current_input_hash)
+        self.assertEqual(clarification_event["result"]["snapshot_hash"], view["snapshot_hash"])
         self.assertEqual(len(self.service.versions("recover", "input-snapshot")), 2)
         self.assertEqual(self.clarifier.calls, 2)
 

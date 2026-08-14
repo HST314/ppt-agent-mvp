@@ -99,14 +99,22 @@ class TaskService:
     def input_view(self,task_id):
         snapshots=self.versions(task_id,"input-snapshot")
         if not snapshots: return {"state":self.get(task_id),"snapshot":None}
-        current=next((e["result"].get("snapshot_hash") for e in reversed(self.events(task_id)) if e["action"] in {"import_input","rebuild_input"}),None)
+        events=self.events(task_id)
+        input_event_index=next(i for i in range(len(events)-1,-1,-1) if events[i]["action"] in {"import_input","rebuild_input"})
+        current=events[input_event_index]["result"]["snapshot_hash"]
         item=next(v for v in snapshots if v["hash"]==current); snapshot=json.loads(self.version(task_id,item["hash"])); meta=item["metadata"]
         ch=meta["clarification_hash"]
-        # The frozen input points at the initial set; answers are append-only
-        # clarification versions, so select the newest committed answer event.
-        for event in reversed(self.events(task_id)):
-            if event["action"] in {"answer_clarification","clarification_generate","clarification_failed","clarification_fallback"}: ch=event["result"]["clarification_hash"]; break
-        cv=next(v for v in self.versions(task_id,"clarification") if v["hash"]==ch)
+        # Clarification events are append-only, but a rebuild starts a new
+        # lineage.  Only accept events after the current input event whose
+        # artifact is explicitly bound to this snapshot's raw input.
+        clarification_versions={v["hash"]:v for v in self.versions(task_id,"clarification")}
+        for event in reversed(events[input_event_index+1:]):
+            if event["action"] not in {"answer_clarification","clarification_generate","clarification_failed","clarification_fallback"}: continue
+            candidate=event["result"]["clarification_hash"]
+            record=clarification_versions.get(candidate)
+            if record and record["metadata"].get("input_hash")==meta["raw_source_hash"]:
+                ch=candidate; break
+        cv=clarification_versions[ch]
         card=next(v for v in self.versions(task_id,"task-card") if v["hash"]==snapshot["task_card_hash"])
         manifest=next(v for v in self.versions(task_id,"resource-manifest") if v["hash"]==snapshot["resource_manifest_hash"])
         clarification={**json.loads(self.version(task_id,ch)),**cv["metadata"]}
@@ -144,7 +152,7 @@ class TaskService:
         if error: meta["error"]=error
         artifact=ClarificationSet.parse({"clarification_id":f"clarification-{digest(canonical(meta))[:16]}","task_id":task_id,"questions":tuple(q["prompt"] for q in questions),"assumptions":tuple(),"confirmed":status=="ready" and not questions,"schema_version":"1.0"}); ch=self.store.put_version(task_id,"clarification",canonical(artifact.to_dict()),meta)
         state=TaskState.parse(self.get(task_id)); failed=status=="failed"; new=TaskState(**{**state.__dict__,"status":state.status.WAITING_FOR_USER if failed or questions else state.status.READY,"waiting_reason":"clarification_failed" if failed else "missing_required_input" if questions else None,"required_action":"retry_clarification" if failed else "answer_clarifications" if questions else None,"revision":state.revision+1})
-        event={"event_id":hashlib.sha256(f"{task_id}:{action}:{ch}".encode()).hexdigest()[:24],"command_id":f"{action}-{ch[:16]}","action":action,"actor":"system" if action!="clarification_fallback" else "user","request_hash":meta["input_hash"],"at":utcnow(),"from":state.to_dict(),"to":new.to_dict(),"result":{"clarification_hash":ch}}
+        event={"event_id":hashlib.sha256(f"{task_id}:{action}:{ch}".encode()).hexdigest()[:24],"command_id":f"{action}-{ch[:16]}","action":action,"actor":"system" if action!="clarification_fallback" else "user","request_hash":meta["input_hash"],"at":utcnow(),"from":state.to_dict(),"to":new.to_dict(),"result":{"clarification_hash":ch,"snapshot_hash":view["snapshot_hash"],"input_hash":meta["input_hash"]}}
         self.store.commit(task_id,new.to_dict(),event); return {"clarification_hash":ch,**meta,"confirmed":artifact.confirmed}
     def answer_clarification(self,task_id,question_id,answer):
         return self.answer_clarifications(task_id,{question_id:answer})
