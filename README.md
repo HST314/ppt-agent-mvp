@@ -64,7 +64,7 @@ python -m pip install -r requirements.txt
 ### 3. 启动本地服务
 
 ```bash
-python3 scripts/start.py --data .ppt-agent-data --host 127.0.0.1 --port 8000
+python scripts/start.py --data .ppt-agent-data --host 127.0.0.1 --port 8000
 ```
 
 浏览器打开：
