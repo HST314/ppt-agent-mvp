@@ -3,6 +3,7 @@ import tempfile
 import unittest
 
 from ppt_agent.errors import GatewayError, GatewayUnknownResult
+from ppt_agent.audit import bind_agent_audit_context
 from ppt_agent.gateways import AgentGateway, LockedSkillMetadataLoader
 from ppt_agent.model_clients import ModelTurn
 from ppt_agent.service import TaskService
@@ -11,8 +12,8 @@ from ppt_agent.store import WorkspaceStore
 
 
 class ScriptedClient:
-    def __init__(self, *texts): self.turns = [ModelTurn(text, f"r-{index}") for index, text in enumerate(texts)]
-    def create(self, **kwargs): return self.turns.pop(0)
+    def __init__(self, *texts): self.turns = [ModelTurn(text, f"r-{index}") for index, text in enumerate(texts)]; self.inputs=[]
+    def create(self, **kwargs): self.inputs.append(kwargs); return self.turns.pop(0)
 
 
 class RaisingClient:
@@ -26,6 +27,19 @@ def service(root, client):
 
 
 class StageCIntegrationTests(unittest.TestCase):
+    def test_reported_natural_language_input_uses_tool_free_agent_contract(self):
+        with tempfile.TemporaryDirectory() as root:
+            client=ScriptedClient('{"questions":[]}')
+            gateway=AgentGateway(client,skill=SkillRuntime.builtin(),model="provider-contract")
+            svc=TaskService(WorkspaceStore(root),clarifier=gateway)
+            svc.create("reported-input")
+            imported=svc.import_input("reported-input","设计一个用于北工大集成电路学院介绍的ppt","markdown")
+            result=svc.generate_clarification("reported-input")
+            self.assertEqual(result["status"],"ready")
+            self.assertEqual(client.inputs[0]["tools"],[])
+            self.assertIn("北工大集成电路学院介绍",client.inputs[0]["input"][1]["content"])
+            self.assertEqual(imported["task_card"]["missing"],["audience"])
+
     def test_real_mode_narrative_commits_only_current_stage_then_waits_at_manual_gate(self):
         with tempfile.TemporaryDirectory() as root:
             svc = service(root, ScriptedClient('{"markdown":"# 叙事结构\\n"}'))
@@ -75,6 +89,20 @@ class StageCIntegrationTests(unittest.TestCase):
             self.assertEqual(len(persisted),len(first)+1)
             self.assertEqual(persisted[-1]["events"][-1]["reason"],"gateway_unknown_result")
             self.assertIn("input_sha256",persisted[-1]["events"][0])
+
+    def test_agent_audit_is_correlated_to_task_and_job_and_error(self):
+        with tempfile.TemporaryDirectory() as root:
+            store=WorkspaceStore(root)
+            gateway=AgentGateway(RaisingClient(GatewayError("failed")),skill=SkillRuntime.builtin())
+            gateway.set_audit_sink(store.append_agent_audit)
+            with bind_agent_audit_context(task_id="task",job_id="job_123"):
+                with self.assertRaises(GatewayError) as caught:
+                    gateway.generate("narrative",{"task_id":"task"},skill="")
+            audit=store.agent_audits(task_id="task",job_id="job_123")
+            self.assertEqual(len(audit),1)
+            self.assertEqual(audit[0]["audit_id"],caught.exception.agent_audit_id)
+            self.assertEqual(caught.exception.public()["error"]["agent_audit_id"],audit[0]["audit_id"])
+            self.assertNotIn("content",json.dumps(audit))
 
 
 if __name__ == "__main__": unittest.main()

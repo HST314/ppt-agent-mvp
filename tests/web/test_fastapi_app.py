@@ -25,6 +25,8 @@ class FastAPIAppTests(unittest.TestCase):
         health = self.client.get("/healthz")
         self.assertEqual(health.status_code, 200)
         self.assertEqual(health.json()["web_runtime"], "fastapi")
+        self.assertTrue(health.json()["runtime_ready"])
+        self.assertEqual(health.json()["model_capabilities"]["status"],"not_required")
         self.assertEqual(health.headers["x-content-type-options"], "nosniff")
 
         html = self.client.get("/")
@@ -57,6 +59,27 @@ class FastAPIAppTests(unittest.TestCase):
         legacy = self.client.get("/legacy/tasks/shell")
         self.assertEqual(legacy.status_code, 404)
         self.assertNotIn("unsafe-inline", legacy.headers["content-security-policy"])
+
+    def test_failed_startup_model_probe_marks_readiness_unavailable(self):
+        class ProbeFailure:
+            model="probe-model"
+            def set_audit_sink(self,_sink): pass
+            def probe_capabilities(self): raise RuntimeError("provider details must stay private")
+        with tempfile.TemporaryDirectory() as root:
+            service=TaskService(WorkspaceStore(root),generator=ProbeFailure())
+            with TestClient(create_app(service)) as client:
+                health=client.get("/healthz").json()
+        self.assertFalse(health["runtime_ready"])
+        self.assertEqual(health["status"],"unavailable")
+        self.assertEqual(health["model_capabilities"]["error"]["code"],"capability_probe_failed")
+        self.assertNotIn("provider details",str(health))
+
+    def test_task_and_job_scoped_audit_exports_are_filtered(self):
+        self.service.create("audit-export")
+        self.service.store.append_agent_audit({"audit_id":"a1","task_id":"audit-export","job_id":"job_match","events":[]})
+        self.service.store.append_agent_audit({"audit_id":"a2","task_id":"audit-export","job_id":"job_other","events":[]})
+        task=self.client.get("/v1/tasks/audit-export/agent-audits?job_id=job_match")
+        self.assertEqual([item["audit_id"] for item in task.json()["audits"]],["a1"])
 
     def test_existing_api_contract_and_error_envelope(self):
         bad = self.client.post("/v1/tasks", json={"mode": "manual"})

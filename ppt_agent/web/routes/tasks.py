@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Request, status
+from fastapi import APIRouter, Depends, Query, Request, status
 from fastapi.responses import HTMLResponse
 
 from ...errors import ConflictError, NotFoundError, ValidationError
@@ -38,6 +38,11 @@ async def create_task(request: Request, service: TaskService = Depends(task_serv
 @router.get("/tasks/{task_id}")
 def get_task(task_id: str, service: TaskService = Depends(task_service)):
     return service.get(task_id)
+
+
+@router.get("/tasks/{task_id}/agent-audits")
+def get_agent_audits(task_id: str, job_id: str | None = Query(default=None), service: TaskService = Depends(task_service)):
+    return {"audits":service.agent_audits(task_id,job_id)}
 
 
 @router.get("/tasks/{task_id}/shell")

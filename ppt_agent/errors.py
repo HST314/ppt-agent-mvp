@@ -37,6 +37,13 @@ class GatewayError(DomainError):
     code = "gateway_error"
     status = 502
 
+    def public(self) -> dict:
+        payload = super().public()
+        audit_id = getattr(self, "agent_audit_id", None)
+        if audit_id:
+            payload["error"]["agent_audit_id"] = audit_id
+        return payload
+
 class GatewayUnknownResult(GatewayError):
     code = "gateway_unknown_result"
     status = 503

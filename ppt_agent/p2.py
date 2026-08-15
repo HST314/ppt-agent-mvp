@@ -10,6 +10,7 @@ from .errors import ConflictError, ValidationError
 IMAGE_SUFFIXES={".png",".jpg",".jpeg",".webp",".gif",".svg"}
 ALIASES={"goal":("goal","objective","演示目标","目标"),"audience":("audience","受众"),"topic":("topic","核心主题","主题")}
 DEFAULTS={"language":"zh-CN","aspect_ratio":"16:9","sample_count":2}
+PRESENTATION_WORDS=r"(?:ppt|演示文稿|幻灯片|演示)"
 
 def now(): return datetime.now(timezone.utc).isoformat()
 def digest(data): return hashlib.sha256(data).hexdigest()
@@ -45,6 +46,29 @@ def detect_source_format(source):
     except json.JSONDecodeError: pass
     return "markdown"
 
+def infer_natural_language_task_card(source):
+    """Conservatively retain facts explicitly present in a short brief."""
+    if not isinstance(source,str): return {},[]
+    text=re.sub(r"\s+"," ",source).strip()
+    if not text: return {},[]
+    facts={}; assumptions=[]
+    match=re.search(rf"(?:关于|围绕|用于)\s*(.+?)\s*(?:的)?\s*{PRESENTATION_WORDS}\b",text,re.IGNORECASE)
+    if not match:
+        match=re.search(rf"(?:制作|设计|生成|做)\s*(?:一个|一份|一套)?\s*(.+?)\s*(?:的)?\s*{PRESENTATION_WORDS}\b",text,re.IGNORECASE)
+    if not match: return facts,assumptions
+    topic=match.group(1).strip(" ，。,:：的")
+    topic=re.sub(r"^(?:一个|一份|一套)\s*","",topic)
+    if not topic: return facts,assumptions
+    facts["topic"]=topic
+    if topic.endswith("介绍") and topic[:-2].strip():
+        facts["goal"]=f"介绍{topic[:-2].strip()}"
+    elif topic.endswith("汇报") and topic[:-2].strip():
+        facts["goal"]=f"汇报{topic[:-2].strip()}"
+    else:
+        facts["goal"]=f"制作关于{topic}的演示"
+    assumptions.extend(["topic 与 goal 根据原始自然语言中的明确表述提取；未推断受众。"])
+    return facts,assumptions
+
 def parse_task_card(source, source_format="auto"):
     if source_format not in {"auto","json","markdown"}: raise ValidationError("任务卡格式只能是 auto、json 或 markdown")
     requested=source_format
@@ -64,6 +88,11 @@ def parse_task_card(source, source_format="auto"):
         for line in source.splitlines():
             m=re.match(r"^\s*(?:[-*]\s*)?(?:#{1,6}\s*)?([^:：]+?)\s*[:：]\s*(.+?)\s*$",line)
             if m: raw[m.group(1).strip()]=m.group(2).strip()
+    inferred,assumptions=infer_natural_language_task_card(source if isinstance(source,str) else "")
+    applied_inference=False
+    for key,value in inferred.items():
+        if not any(name in raw for name in ALIASES[key]): raw[key]=value; applied_inference=True
+    if not applied_inference: assumptions=[]
     normalized={}
     consumed=set()
     for target,names in ALIASES.items():
@@ -77,7 +106,7 @@ def parse_task_card(source, source_format="auto"):
                 if target in normalized: break
     constraints={k:v for k,v in raw.items() if k not in consumed and k not in {"task_id","schema_version","source_format"}}
     missing=[key for key in ALIASES if key not in normalized]
-    return {**normalized,"constraints":constraints,"defaults":DEFAULTS.copy(),"assumptions":[],"missing":missing,"source_format":source_format,"format_detection":{"requested":requested,"detected":detected,"confidence":"high"}}
+    return {**normalized,"constraints":constraints,"defaults":DEFAULTS.copy(),"assumptions":assumptions,"missing":missing,"source_format":source_format,"format_detection":{"requested":requested,"detected":detected,"confidence":"high"}}
 
 def scan_resources(root: Path):
     root=root.resolve(); entries=[]; warnings=[]; seen={}

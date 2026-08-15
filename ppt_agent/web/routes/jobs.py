@@ -34,6 +34,12 @@ def get_job(job_id: str, jobs: JobService = Depends(job_service)):
     return jobs.get(job_id)
 
 
+@router.get("/jobs/{job_id}/agent-audits")
+def get_job_agent_audits(job_id: str, jobs: JobService = Depends(job_service)):
+    snapshot=jobs.get(job_id)
+    return {"audits":jobs.service.agent_audits(snapshot["task_id"],job_id)}
+
+
 @router.post("/jobs/{job_id}/cancel")
 async def cancel_job(job_id: str, request: Request, jobs: JobService = Depends(job_service)):
     body = await json_body(request)

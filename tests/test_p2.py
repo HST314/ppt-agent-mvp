@@ -11,6 +11,12 @@ PNG=b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x0
 JPEG=b"\xff\xd8\xff\xe0JFIF\x00\xff\xd9"
 
 class P2Tests(unittest.TestCase):
+ def test_short_natural_language_retains_explicit_topic_and_goal(self):
+  card=parse_task_card("设计一个用于北工大集成电路学院介绍的ppt","markdown")
+  self.assertEqual(card["topic"],"北工大集成电路学院介绍")
+  self.assertEqual(card["goal"],"介绍北工大集成电路学院")
+  self.assertEqual(card["missing"],["audience"])
+  self.assertIn("未推断受众",card["assumptions"][0])
  def test_nested_known_facts_and_batch_answers_update_task_card(self):
   self.svc.create("nested"); self.svc.create("batch")
   result=self.svc.import_input("nested",{"goal":"促成审批","topic":"新品","known_facts":{"audience":"管理层"}})

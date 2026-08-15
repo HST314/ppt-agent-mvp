@@ -73,7 +73,9 @@ python scripts/start.py --data .ppt-agent-data --host 127.0.0.1 --port 8000
 - 健康检查：<http://127.0.0.1:8000/healthz>
 - 组件与交互状态：<http://127.0.0.1:8000/components>
 
-看到健康检查中的 `"status": "ok"` 和 `"runtime_ready": true`，说明服务已就绪。
+看到健康检查中的 `"status": "ok"` 和 `"runtime_ready": true`，说明服务已就绪。真实模型模式会在启动时分别验证严格 JSON Schema，以及合法工具调用 → `function_call_output` → 最终结构化结果的完整回合；探测失败时服务仍提供诊断端点，但 `/healthz` 返回 `status=unavailable`、`runtime_ready=false`，不能接收生产流量。
+
+澄清阶段不开放 Skill 工具，模型直接根据冻结原文、规范化任务卡和资源摘要输出问题。其他阶段的工具错误按模型回合计数：同一响应的所有调用会完整返回结果，连续两个没有任何有效调用的错误回合才会失败关闭。
 
 ## 第一次创建 PPT
 

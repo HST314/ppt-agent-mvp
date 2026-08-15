@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ..audit import bind_agent_audit_context
 from ..errors import ConflictError, NotFoundError, ValidationError
 
 
@@ -268,7 +269,8 @@ class JobService:
                     return
                 record.update(status="running", progress=None, current_step="domain_operation", started_at=_now())
                 self._append_event(record, "started", message="业务操作已开始")
-            result = self._invoke(record["operation"], task_id, record["payload"])
+            with bind_agent_audit_context(task_id=task_id, job_id=job_id):
+                result = self._invoke(record["operation"], task_id, record["payload"])
             state = self.service.get(task_id)
             try:
                 artifacts = self.service.status_summary(task_id).get("latest_artifacts", {})

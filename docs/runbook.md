@@ -15,7 +15,7 @@
 python3 scripts/start.py --data .ppt-agent-data --host 127.0.0.1 --port 8000
 ```
 
-该命令启动 FastAPI/Uvicorn Web 适配层。`/healthz` 的 `web_runtime` 应为 `fastapi`；`/`、`/tasks/{task_id}` 和 `/components` 使用独立 `frontend/` 静态资源。8 阶段交互全部位于统一应用壳；旧 `/tasks/{task_id}/outline|samples|deck|inspection|delivery` 深链会规范化到对应阶段，`/legacy/**` 已下线。
+该命令启动 FastAPI/Uvicorn Web 适配层。`/healthz` 的 `web_runtime` 应为 `fastapi`；真实模型模式还必须满足 `runtime_ready=true` 且 `model_capabilities.status=ready`。启动会实际验证严格 JSON Schema，并对启用工具的模型验证一次合法工具调用、工具结果回传和最终结构化输出；任一探测失败都会把 readiness 标记为不可用。`/`、`/tasks/{task_id}` 和 `/components` 使用独立 `frontend/` 静态资源。8 阶段交互全部位于统一应用壳；旧 `/tasks/{task_id}/outline|samples|deck|inspection|delivery` 深链会规范化到对应阶段，`/legacy/**` 已下线。
 
 样品、全稿和检查预览由 `/v1/tasks/{task_id}/previews/{hash}` 提供。端点只接受当前任务内 `sample`/`deck` 版本，返回 `no-store`、`SAMEORIGIN` 与禁止脚本的独立 CSP；应用壳 CSP 不允许内联脚本或样式。预览异常时先核对 hash 是否属于当前任务及对应版本，不要绕过端点直接读取工作区文件。
 
@@ -26,7 +26,7 @@ python3 scripts/start.py --data .ppt-agent-data --host 127.0.0.1 --port 8000
 - 每个任务同时只允许一个写业务状态的活动 Job。相同 `idempotency_key` 与相同请求返回原 Job；同 key 不同请求返回 409。
 - 排队 Job 在服务重启后可重新调度；运行中或已请求取消但结果未知的 Job 会标记为 `interrupted`，必须由用户发起新的明确尝试。
 - 活动 Job 不清理。MVP 终态 Job 至少保留 7 天；当前版本由运维在备份后按 `finished_at` 清理任务目录内的终态 `jobs/*.json` 及同名事件文件，不得清理活动状态。
-- SSE 事件与 Job 错误只包含步骤、诊断 ID 和业务版本引用，不能写入完整 Prompt、客户资料、密钥或模型推理。
+- SSE 事件与 Job 错误只包含步骤、诊断 ID、`agent_audit_id` 和业务版本引用，不能写入完整 Prompt、客户资料、密钥或模型推理。按任务导出脱敏审计使用 `GET /v1/tasks/{task_id}/agent-audits`，可用 `job_id` 查询参数收窄；按 Job 导出使用 `GET /v1/jobs/{job_id}/agent-audits`。工具错误码区分 `invalid_arguments`、`path_not_in_lock`、`quota_exceeded`、`unauthorized_tool` 与其余校验错误。
 
 真实 API 使用 `config/ppt-agent.yaml` 的 `gateway.mode: agent`。生成与检查分别配置 `provider: openai_responses`、模型、超时、最大步数，以及保存环境变量名称的 `api_key_env`/`base_url_env`；秘密值只放 `.env`，不要写进 YAML 或日志。检查模型未配置时只有显式 `fallback_to_generation: true` 才允许回退。Skill 根目录为 `ppt_agent/builtin_skills/guizang-ppt/`，以 `SKILL_LOCK.json` 校验并渐进读取。
 

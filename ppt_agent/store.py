@@ -163,6 +163,9 @@ class WorkspaceStore:
             with open(path,"a",encoding="utf-8") as f:
                 f.write(json.dumps(record,ensure_ascii=False,separators=(",",":"))+"\n")
                 f.flush(); os.fsync(f.fileno())
-    def agent_audits(self):
+    def agent_audits(self,task_id=None,job_id=None):
         path=self.root/"agent-audit.jsonl"
-        return [] if not path.exists() else [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+        records=[] if not path.exists() else [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+        if task_id is not None: records=[record for record in records if record.get("task_id")==task_id]
+        if job_id is not None: records=[record for record in records if record.get("job_id")==job_id]
+        return records

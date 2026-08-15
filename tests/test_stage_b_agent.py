@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from ppt_agent.agent_runtime import AgentRuntime, STAGE_OUTPUT_SCHEMAS, STAGE_PROMPTS, TOOLS
 from ppt_agent.errors import GatewayError, GatewayUnknownResult, ValidationError
+from ppt_agent.gateways import AgentGateway
 from ppt_agent.model_clients import ModelToolCall, ModelTurn, OpenAIResponsesClient
 from ppt_agent.skill_runtime import SkillRuntime
 
@@ -76,7 +77,53 @@ class StageBAgentTests(unittest.TestCase):
         result = AgentRuntime(client, SkillRuntime.builtin()).run("narrative", {})
         self.assertEqual(result.value["markdown"], "已纠正")
         self.assertEqual(result.audit[2]["event"], "tool_error")
-        self.assertIn("tool_validation_error", str(client.inputs[1]["input"]))
+        self.assertIn("path_not_in_lock", str(client.inputs[1]["input"]))
+
+    def test_clarification_has_no_tools_and_rejects_unsolicited_tool_calls(self):
+        client=ScriptedClient([ModelTurn('{"questions":[]}',"r")])
+        result=AgentRuntime(client,SkillRuntime.builtin()).run("clarification",{})
+        self.assertEqual(result.value,{"questions":[]})
+        self.assertEqual(client.inputs[0]["tools"],[])
+        self.assertIn("不提供也不需要任何 Skill 工具",client.inputs[0]["input"][0]["content"])
+
+        bad=ScriptedClient([ModelTurn(None,"r",(ModelToolCall("list_skill_files","{}","c"),))])
+        with self.assertRaises(GatewayError) as caught:
+            AgentRuntime(bad,SkillRuntime.builtin()).run("clarification",{})
+        self.assertEqual(caught.exception.audit[-1]["reason"],"unauthorized_tool")
+
+    def test_tool_error_budget_counts_complete_model_rounds(self):
+        bad_calls=tuple(ModelToolCall("read_skill_file",'{"path":"../secret"}',f"bad-{index}") for index in range(3))
+        recovered=ScriptedClient([ModelTurn(None,"r1",bad_calls),ModelTurn('{"markdown":"已恢复"}',"r2")])
+        result=AgentRuntime(recovered,SkillRuntime.builtin()).run("narrative",{})
+        self.assertEqual(result.value,{"markdown":"已恢复"})
+        feedback=str(recovered.inputs[1]["input"])
+        self.assertEqual(feedback.count("function_call_output"),3)
+        self.assertEqual(sum(item.get("event")=="tool_error" for item in result.audit),3)
+        self.assertEqual(sum(item.get("event")=="tool_error_round" for item in result.audit),1)
+
+        exhausted=ScriptedClient([ModelTurn(None,"r1",bad_calls),ModelTurn(None,"r2",bad_calls)])
+        with self.assertRaises(GatewayError) as caught:
+            AgentRuntime(exhausted,SkillRuntime.builtin()).run("narrative",{})
+        self.assertEqual(caught.exception.audit[-1]["reason"],"tool_error_limit")
+        self.assertEqual(len(exhausted.inputs),2)
+        self.assertEqual(sum(item.get("event")=="tool_error" for item in caught.exception.audit),6)
+
+    def test_startup_probe_checks_schema_then_complete_tool_round(self):
+        client=ScriptedClient([
+            ModelTurn('{"questions":[]}',"clarification"),
+            ModelTurn(None,"tools",(ModelToolCall("list_skill_files","{}","probe-call"),)),
+            ModelTurn('{"markdown":"probe-ok"}',"final"),
+        ])
+        checks=AgentGateway(client,skill=SkillRuntime.builtin()).probe_capabilities()
+        self.assertEqual(checks,{"strict_json_schema":True,"tool_round_trip":True})
+        self.assertEqual(client.inputs[0]["tools"],[])
+        self.assertEqual(client.inputs[1]["tools"],TOOLS)
+        self.assertIn("function_call_output",str(client.inputs[2]["input"]))
+
+    def test_tool_error_codes_are_actionable_and_secret_free(self):
+        self.assertEqual(AgentRuntime._tool_error_code("shell","denied"),"unauthorized_tool")
+        self.assertEqual(AgentRuntime._tool_error_code("read_skill_file","Skill 路径越界"),"path_not_in_lock")
+        self.assertEqual(AgentRuntime._tool_error_code("read_skill_file","Skill 累计读取超过上限"),"quota_exceeded")
     def test_tool_loop_schema_and_secret_free_audit(self):
         client = ScriptedClient([
             ModelTurn(None, "r1", (ModelToolCall("read_skill_file", json.dumps({"path": "SKILL.md"}), "c1"),)),

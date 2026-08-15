@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import hashlib, json, os, socket, urllib.error, urllib.request
+import hashlib, json, os, socket, urllib.error, urllib.request, uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 from .errors import GatewayError, GatewayUnknownResult, ValidationError
 from .agent_runtime import AgentRuntime
+from .audit import current_agent_audit_context
 from .skill_runtime import SkillRuntime
 
 class GenerationGateway(Protocol):
@@ -107,12 +108,41 @@ class AgentGateway:
         # Read quotas and audit are scoped to one stage invocation.  Reusing a
         # mutable SkillRuntime would let earlier stages consume later budgets.
         self.runtime = AgentRuntime(self.client, self.skill_factory(), max_steps=self.max_steps, timeout_seconds=self.timeout_seconds)
+        failure = None
         try:
             result = self.runtime.run(stage, payload)
             return result.value
+        except Exception as exc:
+            failure = exc
+            raise
         finally:
             if self.audit_sink and self.runtime.last_audit:
-                self.audit_sink({"stage":stage,"model":self.model,"events":list(self.runtime.last_audit)})
+                audit_id = f"agent-audit-{uuid.uuid4().hex}"
+                context = current_agent_audit_context()
+                if "task_id" not in context and isinstance(payload.get("task_id"), str):
+                    context["task_id"] = payload["task_id"]
+                self.audit_sink({"audit_id":audit_id,"stage":stage,"model":self.model,**context,"events":list(self.runtime.last_audit)})
+                if failure is not None:
+                    failure.agent_audit_id = audit_id
+
+    def probe_capabilities(self):
+        """Verify strict schema and a complete tool round before readiness."""
+        clarification = AgentRuntime(
+            self.client,
+            self.skill_factory(),
+            max_steps=self.max_steps,
+            timeout_seconds=self.timeout_seconds,
+        ).run("clarification", {"capability_probe": "return_empty_questions"}, capability_probe=True)
+        tools = AgentRuntime(
+            self.client,
+            self.skill_factory(),
+            max_steps=self.max_steps,
+            timeout_seconds=self.timeout_seconds,
+        ).run("narrative", {"capability_probe": "list_skill_files_then_return_markdown"}, capability_probe=True)
+        return {
+            "strict_json_schema": clarification.value == {"questions": []},
+            "tool_round_trip": any(event.get("event") == "tool" for event in tools.audit),
+        }
 
     def generate(self, action, payload, *, skill=""):
         if action not in {"narrative", "outline"}:

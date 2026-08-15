@@ -13,7 +13,12 @@ from .skill_runtime import SkillRuntime
 STAGES = {"clarification", "narrative", "outline", "sample", "deck", "inspection"}
 DATA_IMAGE = "data:image/"
 STAGE_PROMPTS = {
-    "clarification": "完整阅读原始任务卡、规范化结果和资源摘要，仅提出真正阻碍交付的 0 到 5 个上下文相关问题；不得重复询问已知事实。",
+    "clarification": (
+        "直接依据原始任务卡、规范化结果和资源摘要，仅提出真正阻碍交付的 0 到 5 个上下文相关问题；"
+        "不得重复询问已知事实。每个问题必须包含稳定 question_id、目标 field_path、明确 prompt、"
+        "helper_text、0 个或多个带 value/label/description 的 options、allow_other 与 blocking。"
+        "本阶段不提供也不需要任何 Skill 工具，禁止请求工具。"
+    ),
     "narrative": "根据任务卡生成叙事结构 Markdown；不要生成逐页 HTML。",
     "outline": "根据已确认叙事生成逐页大纲 Markdown；保持页面标识稳定。",
     "sample": "仅为外层状态机指定的样品页生成完整 HTML，不得扩展到全稿。",
@@ -47,6 +52,9 @@ STAGE_OUTPUT_SCHEMAS = {
 PRODUCT_OVERRIDE = """产品规则高于 Skill：你只处理当前阶段，不得推进工作流或请求状态机操作。
 仅允许纯文本输入；禁止联网、图片输入、图片生成、Shell、文件写入、自更新和安装依赖。
 按需使用只读 Skill 工具；不要把整个 Skill 一次性读入。最终仅返回符合指定 JSON Schema 的 JSON。"""
+CLARIFICATION_OVERRIDE = """产品规则高于 Skill：你只处理澄清阶段，不得推进工作流或请求状态机操作。
+仅允许纯文本输入；禁止联网、图片输入、图片生成、Shell、文件读写、自更新和安装依赖。
+当前请求没有可用工具；直接依据输入作答。最终仅返回符合指定 JSON Schema 的 JSON。"""
 
 TOOLS = [
     {"type": "function", "name": "list_skill_files", "description": "列出可读取的标准 Skill 文件", "parameters": {"type": "object", "properties": {}, "additionalProperties": False}},
@@ -63,16 +71,19 @@ class AgentResult:
 
 
 class AgentRuntime:
-    def __init__(self, client, skill: SkillRuntime, *, max_steps: int = 12, timeout_seconds: float = 60, clock=time.monotonic, max_output_bytes: int = 1024 * 1024, max_tool_calls: int = 24, max_schema_corrections: int = 1):
+    def __init__(self, client, skill: SkillRuntime, *, max_steps: int = 12, timeout_seconds: float = 60, clock=time.monotonic, max_output_bytes: int = 1024 * 1024, max_tool_calls: int = 24, max_schema_corrections: int = 1, max_tool_error_rounds: int = 2):
         self.client, self.skill = client, skill
         self.max_steps, self.timeout_seconds, self.clock = max_steps, timeout_seconds, clock
         self.max_output_bytes, self.max_tool_calls = max_output_bytes, max_tool_calls
         if isinstance(max_schema_corrections, bool) or not isinstance(max_schema_corrections, int) or not 0 <= max_schema_corrections <= 2:
             raise ValidationError("Schema 纠错次数必须是 0 到 2 的整数")
+        if isinstance(max_tool_error_rounds, bool) or not isinstance(max_tool_error_rounds, int) or not 1 <= max_tool_error_rounds <= 3:
+            raise ValidationError("工具错误轮次必须是 1 到 3 的整数")
         self.max_schema_corrections = max_schema_corrections
+        self.max_tool_error_rounds = max_tool_error_rounds
         self.last_audit: tuple[dict, ...] = ()
 
-    def run(self, stage: str, payload: dict, *, response_schema: dict | None = None) -> AgentResult:
+    def run(self, stage: str, payload: dict, *, response_schema: dict | None = None, capability_probe: bool = False) -> AgentResult:
         if stage not in STAGES:
             raise ValidationError("Agent 阶段不在允许列表")
         if response_schema is not None and response_schema != STAGE_OUTPUT_SCHEMAS[stage]:
@@ -81,9 +92,11 @@ class AgentRuntime:
         if not isinstance(payload, dict):
             raise ValidationError("Agent 输入无效")
         payload = self._text_only(payload)
-        started, audit, tool_count, consecutive_tool_errors, schema_corrections = self.clock(), [], 0, 0, 0
+        stage_tools = [] if stage == "clarification" else TOOLS
+        override = CLARIFICATION_OVERRIDE if stage == "clarification" else PRODUCT_OVERRIDE
+        started, audit, tool_count, tool_error_rounds, schema_corrections = self.clock(), [], 0, 0, 0
         input_json=json.dumps(payload,ensure_ascii=False,sort_keys=True,separators=(",",":"))
-        audit.append({"event": "run", "stage": stage, "skill": self.skill.skill_name, "skill_version": self.skill.skill_version, "lock_sha256": hashlib.sha256(json.dumps(self.skill.manifest, sort_keys=True).encode()).hexdigest(), "input_sha256": hashlib.sha256(input_json.encode()).hexdigest(), "config_sha256": hashlib.sha256(PRODUCT_OVERRIDE.encode()).hexdigest()})
+        audit.append({"event": "run", "stage": stage, "skill": self.skill.skill_name, "skill_version": self.skill.skill_version, "lock_sha256": hashlib.sha256(json.dumps(self.skill.manifest, sort_keys=True).encode()).hexdigest(), "input_sha256": hashlib.sha256(input_json.encode()).hexdigest(), "config_sha256": hashlib.sha256((STAGE_PROMPTS[stage]+override).encode()).hexdigest()})
         def fail(message: str, reason: str, cause=None):
             audit.append({"event": "terminal", "reason": reason, "tool_calls": tool_count})
             self.last_audit = tuple(audit)
@@ -92,12 +105,19 @@ class AgentRuntime:
             if cause is not None:
                 raise error from cause
             raise error
-        conversation: list[Any] = [{"role": "system", "content": f"当前阶段：{stage}\n阶段目标：{STAGE_PROMPTS[stage]}\n{PRODUCT_OVERRIDE}"}, {"role": "user", "content": input_json}]
+        probe_instruction = ""
+        if capability_probe:
+            probe_instruction = (
+                "\n这是启动能力探测：请返回空 questions 数组。"
+                if stage == "clarification"
+                else "\n这是启动能力探测：必须先调用一次 list_skill_files，收到工具结果后再提交符合 Schema 的 JSON。"
+            )
+        conversation: list[Any] = [{"role": "system", "content": f"当前阶段：{stage}\n阶段目标：{STAGE_PROMPTS[stage]}\n{override}{probe_instruction}"}, {"role": "user", "content": input_json}]
         for step in range(1, self.max_steps + 1):
             if self.clock() - started >= self.timeout_seconds:
                 fail("Agent 运行超时，未提交阶段产物", "deadline_exceeded")
             try:
-                turn = self.client.create(input=conversation, tools=TOOLS, response_schema=response_schema)
+                turn = self.client.create(input=conversation, tools=stage_tools, response_schema=response_schema)
             except (IndexError, StopIteration) as exc:
                 fail("Agent 未在工具纠错后提交阶段产物", "incomplete_after_tool_error", exc)
             except GatewayError as exc:
@@ -113,6 +133,9 @@ class AgentRuntime:
                 fail("Agent 最终输出超过大小上限", "output_limit")
             audit.append({"step": step, "event": "model", "response_id_sha256": hashlib.sha256((turn.response_id or "").encode()).hexdigest(), "output_sha256": hashlib.sha256(output).hexdigest()})
             if turn.tool_calls:
+                if not stage_tools:
+                    fail("澄清阶段不允许工具调用", "unauthorized_tool")
+                successful_calls = 0
                 for call in turn.tool_calls:
                     tool_count += 1
                     if tool_count > self.max_tool_calls:
@@ -122,17 +145,23 @@ class AgentRuntime:
                         args = json.loads(call.arguments or "{}")
                         if not isinstance(args, dict): raise ValidationError("工具参数必须为 object")
                     except (json.JSONDecodeError, ValidationError) as exc:
-                        args, error = {}, {"ok": False, "error": {"code": "invalid_tool_arguments", "message": str(exc)}}
+                        args, error = {}, {"ok": False, "error": {"code": "invalid_arguments", "message": str(exc)}}
                     try:
                         result = error or self.skill.dispatch(call.name, args)
                     except (ValidationError, OSError, ValueError) as exc:
-                        result = {"ok": False, "error": {"code": "tool_validation_error", "message": str(exc)}}
+                        result = {"ok": False, "error": {"code": self._tool_error_code(call.name, str(exc)), "message": str(exc)}}
                     failed = result.get("ok") is False
-                    consecutive_tool_errors = consecutive_tool_errors + 1 if failed else 0
+                    if not failed:
+                        successful_calls += 1
                     audit.append({"step": step, "event": "tool_error" if failed else "tool", "tool": call.name, "error_code": result.get("error", {}).get("code") if failed else None, "call_id_sha256": hashlib.sha256((call.call_id or "").encode()).hexdigest(), "path": result.get("path"), "file_sha256": result.get("sha256"), "result_sha256": hashlib.sha256(json.dumps(result, sort_keys=True, ensure_ascii=False).encode()).hexdigest()})
                     conversation.append({"type": "function_call", "name": call.name, "arguments": call.arguments, "call_id": call.call_id})
                     conversation.append({"type": "function_call_output", "call_id": call.call_id, "output": json.dumps(result, ensure_ascii=False)})
-                    if consecutive_tool_errors >= 3:
+                # Budget failed *model rounds*, not individual calls.  Every
+                # call in one response is processed and fed back as one batch.
+                tool_error_rounds = tool_error_rounds + 1 if successful_calls == 0 else 0
+                if successful_calls == 0:
+                    audit.append({"step": step, "event": "tool_error_round", "attempt": tool_error_rounds, "calls": len(turn.tool_calls)})
+                    if tool_error_rounds >= self.max_tool_error_rounds:
                         fail("Agent 工具调用连续失败", "tool_error_limit")
                 continue
             try:
@@ -155,10 +184,22 @@ class AgentRuntime:
                     conversation.extend([{"role": "assistant", "content": turn.text or ""}, {"role": "user", "content": f"上次输出未通过 Schema 校验：{exc.message}。请仅按已提供的 JSON Schema 重新输出完整 JSON；不要调用工具，不要添加解释。"}])
                     continue
                 fail(exc.message, "invalid_output", exc)
+            if capability_probe and stage != "clarification" and not any(item.get("event") == "tool" for item in audit):
+                fail("模型未完成工具能力探测", "capability_probe_failed")
             audit.append({"event": "terminal", "reason": "success", "tool_calls": tool_count})
             self.last_audit = tuple(audit)
             return AgentResult(value, self.last_audit, turn.response_id)
         fail("Agent 达到最大步数，未提交阶段产物", "max_steps")
+
+    @staticmethod
+    def _tool_error_code(name: str, message: str) -> str:
+        if name not in {item["name"] for item in TOOLS}:
+            return "unauthorized_tool"
+        if "上限" in message:
+            return "quota_exceeded"
+        if any(marker in message for marker in ("路径", "白名单", "固定文件", "Asset")):
+            return "path_not_in_lock"
+        return "tool_validation_error"
 
     @classmethod
     def _text_only(cls, value):
