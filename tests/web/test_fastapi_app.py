@@ -1,11 +1,16 @@
+import json
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
 from ppt_agent.errors import GatewayError
+from ppt_agent.gateways import AgentGateway
+from ppt_agent.model_clients import OpenAIResponsesClient
 from ppt_agent.service import TaskService
+from ppt_agent.skill_runtime import SkillRuntime
 from ppt_agent.store import WorkspaceStore
 from ppt_agent.web import create_app
 from ppt_agent.web.assets import FRONTEND_BUILD
@@ -93,6 +98,77 @@ class FastAPIAppTests(unittest.TestCase):
             self.assertEqual(TaskService(WorkspaceStore(root)).runtime_probes(1)[0]["probe_id"],probes[0]["probe_id"])
             self.assertNotIn("provider details",str(health))
             self.assertNotIn("provider details",str(probes))
+
+    def test_real_adapter_unknown_sdk_failures_map_each_probe_layer_and_persist_safely(self):
+        class ProbeSDK:
+            def __init__(self, fail_at):
+                self.responses = self
+                self.fail_at = fail_at
+                self.calls = 0
+
+            def create(self, **_kwargs):
+                self.calls += 1
+                if self.calls == self.fail_at:
+                    raise RuntimeError("raw provider message with secret-key")
+                responses = {
+                    1: SimpleNamespace(output_text="OK", id="provider-basic-id", output=[]),
+                    2: SimpleNamespace(output_text='{"questions":[]}', id="provider-schema-id", output=[]),
+                    3: SimpleNamespace(
+                        output_text="",
+                        id="provider-tool-id",
+                        output=[SimpleNamespace(type="function_call", name="list_skill_files", arguments="{}", call_id="provider-call-id")],
+                    ),
+                    4: SimpleNamespace(output_text='{"markdown":"probe-ok"}', id="provider-final-id", output=[]),
+                }
+                return responses[self.calls]
+
+        config = SimpleNamespace(
+            model="probe-model",
+            api_key="secret-key",
+            base_url="https://provider.example/v1",
+            timeout_seconds=1,
+        )
+        cases = {
+            "basic_response": (1, "probe_basic_response_failed"),
+            "strict_json_schema": (2, "probe_invalid_output"),
+            "tool_round_trip": (3, "probe_tool_round_failed"),
+        }
+        for failed_check, (fail_at, expected_code) in cases.items():
+            with self.subTest(failed_check=failed_check), tempfile.TemporaryDirectory() as root:
+                adapter = OpenAIResponsesClient(config, sdk_client=ProbeSDK(fail_at))
+                gateway = AgentGateway(adapter, skill=SkillRuntime.builtin(), model=config.model)
+                service = TaskService(WorkspaceStore(root), generator=gateway, clarifier=gateway)
+                with TestClient(create_app(service)) as client:
+                    status = client.get("/v1/runtime/status").json()["model_capabilities"]
+                    persisted = client.get("/v1/runtime/probes?limit=1").json()["probes"][0]
+                    client.post("/v1/tasks", json={"task_id": f"probe-{fail_at}", "mode": "manual"})
+                    blocked = client.post(
+                        f"/v1/tasks/probe-{fail_at}/input",
+                        json={"source": {"topic": "probe lineage"}},
+                    ).json()["clarification"]["error"]
+
+                probe_id = status["probe_id"]
+                self.assertEqual(status["failed_check"], failed_check)
+                self.assertEqual(status["error"]["code"], expected_code)
+                self.assertEqual(status["error"]["probe_id"], probe_id)
+                self.assertEqual(persisted["probe_id"], probe_id)
+                self.assertEqual(persisted["failed_check"], failed_check)
+                self.assertEqual(persisted["error"]["code"], expected_code)
+                failure_event = persisted["events"][-1]
+                self.assertEqual(failure_event["error_code"], expected_code)
+                self.assertEqual(failure_event["category"], "sdk_error")
+                self.assertEqual(failure_event["sdk_exception_type"], "RuntimeError")
+                self.assertEqual(blocked["runtime_error_code"], expected_code)
+                self.assertEqual(blocked["failed_check"], failed_check)
+                self.assertEqual(blocked["probe_id"], probe_id)
+
+                restarted = TaskService(WorkspaceStore(root)).runtime_probes(1)[0]
+                self.assertEqual(restarted, persisted)
+                serialized = json.dumps(
+                    {"status": status, "persisted": persisted, "blocked": blocked, "restarted": restarted}
+                )
+                self.assertNotIn("raw provider message", serialized)
+                self.assertNotIn("secret-key", serialized)
 
     def test_unready_clarifier_does_not_enqueue_and_preserves_fallback(self):
         class UnreadyClarifier:

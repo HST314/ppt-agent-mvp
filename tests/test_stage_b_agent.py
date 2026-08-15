@@ -165,6 +165,16 @@ class StageBAgentTests(unittest.TestCase):
         self.assertEqual(caught.exception.code,"probe_tool_round_failed")
         self.assertEqual(caught.exception.failed_check,"tool_round_trip")
 
+        classified=AgentGateway(FailingClient(GatewayError(
+            "模型服务认证失败",
+            code="model_authentication_failed",
+            audit_details={"category":"authentication","sdk_exception_type":"APIStatusError","retryable":False},
+        )),skill=SkillRuntime.builtin())
+        with self.assertRaises(GatewayError) as caught:
+            classified.probe_capabilities(probe_id="runtime-probe-classified")
+        self.assertEqual(caught.exception.code,"model_authentication_failed")
+        self.assertEqual(caught.exception.failed_check,"basic_response")
+
     def test_tool_error_codes_are_actionable_and_secret_free(self):
         self.assertEqual(AgentRuntime._tool_error_code("shell","denied"),"unauthorized_tool")
         self.assertEqual(AgentRuntime._tool_error_code("read_skill_file","Skill 路径越界"),"path_not_in_lock")

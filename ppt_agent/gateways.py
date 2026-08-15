@@ -147,7 +147,13 @@ class AgentGateway:
                 code="capability_probe_failed",
                 audit_details={"category":"sdk_error","sdk_exception_type":type(exc).__name__,"retryable":False},
             )
-            if error.code == "gateway_error" and not error.safe_audit_details():
+            # `OpenAIResponsesClient` deliberately preserves secret-free SDK
+            # metadata on an otherwise unclassified `gateway_error`.  Audit
+            # detail presence does not make that public code actionable: a
+            # probe must still identify which capability check failed.  Codes
+            # already classified by the adapter (auth, rate limit, transport,
+            # etc.) remain untouched.
+            if error.code == "gateway_error":
                 error.code={
                     "basic_response":"probe_basic_response_failed",
                     "strict_json_schema":"probe_invalid_output",
