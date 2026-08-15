@@ -47,6 +47,10 @@ class GatewayError(DomainError):
         retryable: bool = False,
         retry_after_seconds: int | None = None,
         audit_details: dict | None = None,
+        probe_phase: str | None = None,
+        terminal_reason: str | None = None,
+        tool_calls: int | None = None,
+        underlying_code: str | None = None,
     ):
         super().__init__(message)
         if code is not None:
@@ -56,6 +60,10 @@ class GatewayError(DomainError):
         self.retryable = bool(retryable)
         self.retry_after_seconds = retry_after_seconds
         self.audit_details = dict(audit_details or {})
+        self.probe_phase = probe_phase
+        self.terminal_reason = terminal_reason
+        self.tool_calls = tool_calls
+        self.underlying_code = underlying_code
 
     def public(self) -> dict:
         payload = super().public()
@@ -65,6 +73,10 @@ class GatewayError(DomainError):
         audit_id = getattr(self, "agent_audit_id", None)
         if audit_id:
             payload["error"]["agent_audit_id"] = audit_id
+        for key in ("probe_phase", "terminal_reason", "tool_calls", "underlying_code"):
+            value = getattr(self, key, None)
+            if value is not None:
+                payload["error"][key] = value
         return payload
 
     def safe_audit_details(self) -> dict:
@@ -102,6 +114,10 @@ class RuntimeUnavailableError(DomainError):
         diagnostic_id: str | None = None,
         probe_id: str | None = None,
         failed_check: str | None = None,
+        probe_phase: str | None = None,
+        terminal_reason: str | None = None,
+        tool_calls: int | None = None,
+        underlying_code: str | None = None,
     ):
         super().__init__(message)
         if diagnostic_id:
@@ -112,6 +128,10 @@ class RuntimeUnavailableError(DomainError):
         self.agent_audit_id = agent_audit_id
         self.probe_id = probe_id
         self.failed_check = failed_check
+        self.probe_phase = probe_phase
+        self.terminal_reason = terminal_reason
+        self.tool_calls = tool_calls
+        self.underlying_code = underlying_code
 
     def public(self) -> dict:
         payload = super().public()
@@ -126,4 +146,8 @@ class RuntimeUnavailableError(DomainError):
             payload["error"]["probe_id"] = self.probe_id
         if self.failed_check:
             payload["error"]["failed_check"] = self.failed_check
+        for key in ("probe_phase", "terminal_reason", "tool_calls", "underlying_code"):
+            value = getattr(self, key, None)
+            if value is not None:
+                payload["error"][key] = value
         return payload

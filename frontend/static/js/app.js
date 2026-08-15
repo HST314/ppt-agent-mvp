@@ -1,10 +1,10 @@
-import { api, ApiError } from "./api.js?v=2026.08.15.092035798481";
-import { JobTracker } from "./job-tracker.js?v=2026.08.15.092035798481";
-import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.15.092035798481";
-import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.15.092035798481";
-import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.15.092035798481";
-import { inlineError, setBusy } from "./components/index.js?v=2026.08.15.092035798481";
-import { renderStage } from "./stages/index.js?v=2026.08.15.092035798481";
+import { api, ApiError } from "./api.js?v=2026.08.15.155434751550";
+import { JobTracker } from "./job-tracker.js?v=2026.08.15.155434751550";
+import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.15.155434751550";
+import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.15.155434751550";
+import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.15.155434751550";
+import { inlineError, setBusy } from "./components/index.js?v=2026.08.15.155434751550";
+import { renderStage } from "./stages/index.js?v=2026.08.15.155434751550";
 
 const app = document.getElementById("app");
 const APP_BUILD = document.querySelector('meta[name="app-build"]')?.content || "unknown";
@@ -135,9 +135,10 @@ function renderRuntimeBadges(group) {
   const backend = badge(backendLabel, backendTone);
   const model = badge(modelLabel, modelTone);
   const code = runtimeState.health?.model_capabilities?.error?.code;
+  const phase = runtimeState.health?.model_capabilities?.error?.probe_phase;
   const failedCheck = runtimeState.health?.model_capabilities?.failed_check;
   const probeId = runtimeState.health?.model_capabilities?.probe_id;
-  if (code) model.title = [`运行时错误：${code}`,failedCheck ? `失败检查：${runtimeCheckLabel(failedCheck)}` : null,probeId ? `探测 ID：${probeId}` : null].filter(Boolean).join(" · ");
+  if (code) model.title = [`运行时错误：${code}`,failedCheck ? `失败检查：${runtimeCheckLabel(failedCheck)}` : null,phase ? `失败阶段：${runtimePhaseLabel(phase)}` : null,probeId ? `探测 ID：${probeId}` : null].filter(Boolean).join(" · ");
   group.replaceChildren(browser, backend, model);
 }
 
@@ -682,12 +683,19 @@ function renderRuntimeProbeDetails(container) {
   container.replaceChildren(element("dl", { className: "metadata-list", "aria-label": "模型能力探测详情" }, [
     element("div", {}, [element("dt", { text: "探测 ID" }), element("dd", { text: capabilities.probe_id })]),
     capabilities.failed_check ? element("div", {}, [element("dt", { text: "失败检查" }), element("dd", { text: runtimeCheckLabel(capabilities.failed_check) })]) : null,
+    error.probe_phase ? element("div", {}, [element("dt", { text: "失败阶段" }), element("dd", { text: runtimePhaseLabel(error.probe_phase) })]) : null,
+    Number.isInteger(error.tool_calls) ? element("div", {}, [element("dt", { text: "工具调用数" }), element("dd", { text: String(error.tool_calls) })]) : null,
     error.code ? element("div", {}, [element("dt", { text: "运行时错误" }), element("dd", { text: error.code })]) : null,
+    error.underlying_code ? element("div", {}, [element("dt", { text: "底层错误" }), element("dd", { text: error.underlying_code })]) : null,
   ]));
 }
 
 function runtimeCheckLabel(check) {
   return ({ basic_response: "基础文本响应", strict_json_schema: "严格 JSON Schema", tool_round_trip: "工具调用与结果回传", capability_contract: "能力契约" })[check] || check;
+}
+
+function runtimePhaseLabel(phase) {
+  return ({ basic_response: "基础响应", strict_json_schema: "结构化输出", tool_request: "请求工具调用", tool_result: "回传工具结果", tool_final_output: "工具轮最终输出" })[phase] || phase;
 }
 
 function progress(value, valueLabel, step) {

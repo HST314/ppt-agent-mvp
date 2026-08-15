@@ -1,6 +1,6 @@
-import { api } from "../api.js?v=2026.08.15.092035798481";
-import { badge, button, confirmationDialog, element, field, metadataList, shortHash } from "../components/index.js?v=2026.08.15.092035798481";
-import { actionMessage, invalidationNotice, runAction, section, stageGrid } from "./shared.js?v=2026.08.15.092035798481";
+import { api } from "../api.js?v=2026.08.15.155434751550";
+import { badge, button, confirmationDialog, element, field, metadataList, shortHash } from "../components/index.js?v=2026.08.15.155434751550";
+import { actionMessage, invalidationNotice, runAction, section, stageGrid } from "./shared.js?v=2026.08.15.155434751550";
 
 const FIELD_LABELS = { goal: "演示目标", audience: "主要受众", topic: "核心主题" };
 const WARNING_LABELS = {
@@ -245,6 +245,9 @@ function clarificationFailed(clarification, context) {
         ["错误代码", error.code || "clarification_generation_failed"],
         error.runtime_error_code ? ["运行时错误", error.runtime_error_code] : null,
         error.failed_check ? ["失败检查", runtimeCheckLabel(error.failed_check)] : null,
+        error.probe_phase ? ["失败阶段", runtimePhaseLabel(error.probe_phase)] : null,
+        Number.isInteger(error.tool_calls) ? ["工具调用数", String(error.tool_calls)] : null,
+        error.underlying_code ? ["底层错误", error.underlying_code] : null,
         error.probe_id ? ["探测 ID", error.probe_id] : null,
         ["诊断 ID", error.diagnostic_id || "—"],
         ["Agent 审计 ID", error.agent_audit_id || "—"],
@@ -274,6 +277,15 @@ function clarificationRecoveryAdvice(error) {
   if (["model_timeout", "model_connection_error", "gateway_unknown_result"].includes(cause)) {
     return "本次请求结果可能未知。请先使用审计 ID 核对供应商记录，再重新检测模型；不要直接重复提交。";
   }
+  if (cause === "probe_tool_call_missing") {
+    return "模型忽略了强制工具调用。请联系管理员确认模型支持函数调用与 tool_choice，切换到兼容模型后重新检测；不要连续重试。";
+  }
+  if (cause === "probe_tool_round_failed") {
+    return "模型端点未完成工具结果回传。请联系管理员核对 Responses API 续轮格式或切换兼容端点，重新检测通过后再生成。";
+  }
+  if (cause === "probe_tool_final_invalid_output") {
+    return "工具调用已完成，但模型最终输出未通过 JSON Schema。请联系管理员核对模型的结构化输出能力，修复后重新检测。";
+  }
   if (code === "runtime_unavailable") {
     return "模型运行时未通过就绪检查。请在右上角设置中重新检测；仍失败时按运行时错误代码联系管理员。";
   }
@@ -282,6 +294,10 @@ function clarificationRecoveryAdvice(error) {
 
 function runtimeCheckLabel(check) {
   return ({ basic_response: "基础文本响应", strict_json_schema: "严格 JSON Schema", tool_round_trip: "工具调用与结果回传", capability_contract: "能力契约" })[check] || check;
+}
+
+function runtimePhaseLabel(phase) {
+  return ({ basic_response: "基础响应", strict_json_schema: "结构化输出", tool_request: "请求工具调用", tool_result: "回传工具结果", tool_final_output: "工具轮最终输出" })[phase] || phase;
 }
 
 function copyValueButton(label, value) {

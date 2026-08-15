@@ -97,10 +97,32 @@ class AgentRuntime:
         started, audit, tool_count, tool_error_rounds, schema_corrections = self.clock(), [], 0, 0, 0
         input_json=json.dumps(payload,ensure_ascii=False,sort_keys=True,separators=(",",":"))
         audit.append({"event": "run", "stage": stage, "skill": self.skill.skill_name, "skill_version": self.skill.skill_version, "lock_sha256": hashlib.sha256(json.dumps(self.skill.manifest, sort_keys=True).encode()).hexdigest(), "input_sha256": hashlib.sha256(input_json.encode()).hexdigest(), "config_sha256": hashlib.sha256((STAGE_PROMPTS[stage]+override).encode()).hexdigest()})
+        def probe_phase(reason: str) -> str:
+            if stage == "clarification":
+                return "strict_json_schema"
+            if tool_count == 0:
+                return "tool_request"
+            if reason == "invalid_output":
+                return "tool_final_output"
+            return "tool_result"
+
         def fail(message: str, reason: str, cause=None):
-            audit.append({"event": "terminal", "reason": reason, "tool_calls": tool_count})
+            phase = probe_phase(reason) if capability_probe else None
+            terminal = {"event": "terminal", "reason": reason, "tool_calls": tool_count}
+            if phase:
+                terminal["probe_phase"] = phase
+            audit.append(terminal)
             self.last_audit = tuple(audit)
-            error = GatewayError(message, code=self._failure_code(reason, capability_probe))
+            mapped_code = self._failure_code(reason, capability_probe, tool_count)
+            underlying_code = getattr(cause, "code", None)
+            error = GatewayError(
+                message,
+                code=mapped_code,
+                probe_phase=phase,
+                terminal_reason=reason if capability_probe else None,
+                tool_calls=tool_count if capability_probe else None,
+                underlying_code=underlying_code if underlying_code != mapped_code else None,
+            )
             error.audit = self.last_audit
             if cause is not None:
                 raise error from cause
@@ -125,14 +147,44 @@ class AgentRuntime:
             except (IndexError, StopIteration) as exc:
                 fail("Agent 未在工具纠错后提交阶段产物", "incomplete_after_tool_error", exc)
             except GatewayError as exc:
+                phase = probe_phase(exc.code) if capability_probe else None
+                if capability_probe and stage != "clarification" and tool_count > 0:
+                    audit.append({
+                        "event": "terminal",
+                        "reason": "provider_error_after_tool_result",
+                        "probe_phase": "tool_result",
+                        "tool_calls": tool_count,
+                        "underlying_code": exc.code,
+                        **exc.safe_audit_details(),
+                    })
+                    self.last_audit = tuple(audit)
+                    error = GatewayError(
+                        "模型端点未接受工具结果回传，请检查工具续轮兼容性",
+                        code="probe_tool_round_failed",
+                        status=exc.status,
+                        retryable=exc.retryable,
+                        retry_after_seconds=exc.retry_after_seconds,
+                        audit_details=exc.safe_audit_details(),
+                        probe_phase="tool_result",
+                        terminal_reason="provider_error_after_tool_result",
+                        tool_calls=tool_count,
+                        underlying_code=exc.code,
+                    )
+                    error.audit = self.last_audit
+                    raise error from exc
                 audit.append({
                     "event": "terminal",
                     "reason": exc.code,
                     "tool_calls": tool_count,
+                    **({"probe_phase": phase} if phase else {}),
                     **exc.safe_audit_details(),
                 })
                 self.last_audit = tuple(audit)
                 exc.audit = self.last_audit
+                if capability_probe:
+                    exc.probe_phase = phase
+                    exc.terminal_reason = exc.code
+                    exc.tool_calls = tool_count
                 raise
             if self.clock() - started >= self.timeout_seconds:
                 fail("Agent 运行超时，未提交阶段产物", "deadline_exceeded")
@@ -174,6 +226,8 @@ class AgentRuntime:
                     if tool_error_rounds >= self.max_tool_error_rounds:
                         fail("Agent 工具调用连续失败", "tool_error_limit")
                 continue
+            if capability_probe and stage != "clarification" and tool_count == 0:
+                fail("模型忽略了强制工具调用要求", "capability_probe_failed")
             try:
                 value = json.loads(turn.text or "")
             except json.JSONDecodeError as exc:
@@ -202,11 +256,11 @@ class AgentRuntime:
         fail("Agent 达到最大步数，未提交阶段产物", "max_steps")
 
     @staticmethod
-    def _failure_code(reason: str, capability_probe: bool) -> str:
+    def _failure_code(reason: str, capability_probe: bool, tool_calls: int = 0) -> str:
         if not capability_probe:
             return "gateway_error"
         if reason == "invalid_output":
-            return "probe_invalid_output"
+            return "probe_tool_final_invalid_output" if tool_calls > 0 else "probe_invalid_output"
         if reason == "capability_probe_failed":
             return "probe_tool_call_missing"
         if reason == "max_steps":

@@ -12,6 +12,10 @@ export class ApiError extends Error {
     this.runtimeErrorCode = details.runtime_error_code || null;
     this.probeId = details.probe_id || null;
     this.failedCheck = details.failed_check || null;
+    this.probePhase = details.probe_phase || null;
+    this.terminalReason = details.terminal_reason || null;
+    this.toolCalls = Number.isInteger(details.tool_calls) ? details.tool_calls : null;
+    this.underlyingCode = details.underlying_code || null;
     this.status = details.status || 0;
   }
 }

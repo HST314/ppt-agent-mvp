@@ -8,6 +8,7 @@ from ppt_agent.errors import GatewayError, GatewayUnknownResult, ValidationError
 from ppt_agent.model_clients import OpenAIResponsesClient
 
 
+ROOT = Path(__file__).resolve().parents[1]
 AGENT = """gateway: {mode: agent}\nmodels:\n  generation:\n    provider: openai_responses\n    model: gen\n    api_key_env: GEN_KEY\n    base_url_env: GEN_URL\n    timeout_seconds: 30\n    max_steps: 12\n  inspection:\n    provider: openai_responses\n    model: inspect\n    api_key_env: INSPECT_KEY\n    base_url_env: INSPECT_URL\n    timeout_seconds: 20\n    max_steps: 6\n    fallback_to_generation: true\n"""
 
 
@@ -30,6 +31,19 @@ class StageAConfigTests(unittest.TestCase):
     def test_fake_needs_no_secrets(self):
         cfg = self.config("gateway: {mode: fake}\n", {})
         self.assertEqual(cfg.mode, "fake")
+
+    def test_repository_default_config_needs_no_environment(self):
+        with patch.dict(os.environ, {}, clear=True), patch("ppt_agent.config.load_dotenv"):
+            cfg = load_config(ROOT / "config/ppt-agent.yaml")
+        self.assertEqual(cfg.mode, "fake")
+        self.assertIsNone(cfg.generation)
+        self.assertIsNone(cfg.inspection)
+
+        env={"MODEL_API_KEY":"secret","MODEL_BASE_URL":"https://provider.example/v1"}
+        with patch.dict(os.environ,env,clear=True), patch("ppt_agent.config.load_dotenv"):
+            example=load_config(ROOT / "config/ppt-agent.agent.example.yaml")
+        self.assertEqual(example.mode,"agent")
+        self.assertEqual(example.generation.model,"your-generation-model")
 
     def test_separate_models_and_redacted_snapshot(self):
         env={"GEN_KEY":"generation-secret","GEN_URL":"https://gen.example/v1","INSPECT_KEY":"inspection-secret","INSPECT_URL":"https://inspect.example/v1"}

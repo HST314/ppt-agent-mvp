@@ -28,7 +28,7 @@ python3 scripts/start.py --data .ppt-agent-data --host 127.0.0.1 --port 8000
 - 活动 Job 不清理。MVP 终态 Job 至少保留 7 天；当前版本由运维在备份后按 `finished_at` 清理任务目录内的终态 `jobs/*.json` 及同名事件文件，不得清理活动状态。
 - SSE 事件与 Job 错误只包含步骤、诊断 ID、`agent_audit_id` 和业务版本引用，不能写入完整 Prompt、客户资料、密钥或模型推理。按任务导出脱敏审计使用 `GET /v1/tasks/{task_id}/agent-audits`，可用 `job_id` 查询参数收窄；按 Job 导出使用 `GET /v1/jobs/{job_id}/agent-audits`。工具错误码区分 `invalid_arguments`、`path_not_in_lock`、`quota_exceeded`、`unauthorized_tool` 与其余校验错误。
 
-真实 API 使用 `config/ppt-agent.yaml` 的 `gateway.mode: agent`。生成与检查分别配置 `provider: openai_responses`、模型、超时、最大步数，以及保存环境变量名称的 `api_key_env`/`base_url_env`；秘密值只放 `.env`，不要写进 YAML 或日志。检查模型未配置时只有显式 `fallback_to_generation: true` 才允许回退。Skill 根目录为 `ppt_agent/builtin_skills/guizang-ppt/`，以 `SKILL_LOCK.json` 校验并渐进读取。
+仓库默认 `config/ppt-agent.yaml` 使用无需秘密值的 `fake` 模式。真实 API 应复制 `config/ppt-agent.agent.example.yaml` 为本地配置，再设置 `gateway.mode: agent`。生成与检查分别配置 `provider: openai_responses`、模型、超时、最大步数，以及保存环境变量名称的 `api_key_env`/`base_url_env`；秘密值只放 `.env`，不要写进 YAML 或日志。检查模型未配置时只有显式 `fallback_to_generation: true` 才允许回退。Skill 根目录为 `ppt_agent/builtin_skills/guizang-ppt/`，以 `SKILL_LOCK.json` 校验并渐进读取。
 
 ## 使用流程
 
@@ -61,7 +61,7 @@ python3 scripts/verify_offline_delivery.py .ppt-agent-data/tasks/<task-id>/deliv
 - `model_upstream_unavailable`：等待供应商恢复后重新探测；不要以连续提交代替健康检查。
 - `model_timeout` / `model_connection_error`：结果可能未知，不得自动重试；先用 `agent_audit_id`、诊断 ID 和供应商请求记录核对结果。
 - `gateway_error`：无法进一步分类的 SDK/HTTP 故障；根据诊断 ID 检查运行日志，确认原因后再操作。
-- `probe_invalid_output` / `probe_tool_call_missing` / `probe_tool_round_failed` / `probe_step_limit`：分别表示严格 Schema、强制工具调用、工具结果回传或步数边界未满足。结合 `failed_check` 与 `probe_id` 查询 `/v1/runtime/probes`，确认模型能力与端点配置后再重新检测。
+- `probe_invalid_output` / `probe_tool_call_missing` / `probe_tool_round_failed` / `probe_tool_final_invalid_output` / `probe_step_limit`：分别表示严格 Schema 失败、未执行强制工具调用、工具结果回传失败、工具调用后最终 Schema 输出失败或步数边界未满足。结合 `failed_check`、`probe_phase`、`terminal_reason`、`tool_calls`、`underlying_code` 与 `probe_id` 查询 `/v1/runtime/probes`，确认模型能力与端点配置后再重新检测。
 - Skill 校验失败：不要直接修改内置文件；恢复经过评审的 Skill 与 `SKILL_LOCK.json` 配套版本。
 - 离线校验失败：按错误中的 missing/extra/changed 或 URL 文件修复源交付并重新确认，禁止手改已发布目录。
 - 浏览器门禁 skipped：安装锁定 Playwright/Chromium 及系统共享库后重跑，不能把跳过当成功。

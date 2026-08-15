@@ -153,13 +153,37 @@ class AgentGateway:
             # probe must still identify which capability check failed.  Codes
             # already classified by the adapter (auth, rate limit, transport,
             # etc.) remain untouched.
+            original_code = error.code
             if error.code == "gateway_error":
                 error.code={
                     "basic_response":"probe_basic_response_failed",
                     "strict_json_schema":"probe_invalid_output",
                     "tool_round_trip":"probe_tool_round_failed",
                 }[check]
-            record(check,"failed",error_code=error.code,diagnostic_id=error.diagnostic_id,**error.safe_audit_details())
+            terminal = next((item for item in reversed(getattr(error, "audit", ())) if item.get("event") == "terminal"), {})
+            probe_phase = getattr(error, "probe_phase", None) or terminal.get("probe_phase") or {
+                "basic_response": "basic_response",
+                "strict_json_schema": "strict_json_schema",
+                "tool_round_trip": "tool_request",
+            }[check]
+            terminal_reason = getattr(error, "terminal_reason", None) or terminal.get("reason") or original_code
+            tool_calls = getattr(error, "tool_calls", None)
+            if tool_calls is None:
+                tool_calls = terminal.get("tool_calls", 0)
+            underlying_code = getattr(error, "underlying_code", None)
+            if underlying_code is None and original_code != error.code:
+                underlying_code = original_code
+            details = {
+                "probe_phase": probe_phase,
+                "terminal_reason": terminal_reason,
+                "tool_calls": tool_calls,
+                **({"underlying_code": underlying_code} if underlying_code else {}),
+            }
+            error.probe_phase = probe_phase
+            error.terminal_reason = terminal_reason
+            error.tool_calls = tool_calls
+            error.underlying_code = underlying_code
+            record(check,"failed",error_code=error.code,diagnostic_id=error.diagnostic_id,**details,**error.safe_audit_details())
             self.last_probe_audit={**self.last_probe_audit,"status":"failed","failed_check":check}
             error.probe_id=probe_id
             error.failed_check=check

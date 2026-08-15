@@ -170,6 +170,73 @@ class FastAPIAppTests(unittest.TestCase):
                 self.assertNotIn("raw provider message", serialized)
                 self.assertNotIn("secret-key", serialized)
 
+    def test_tool_probe_failure_modes_persist_precise_diagnostics_across_restart(self):
+        class ProbeSDK:
+            def __init__(self, scenario):
+                self.responses = self
+                self.scenario = scenario
+                self.calls = 0
+
+            def create(self, **_kwargs):
+                self.calls += 1
+                common = {
+                    1: SimpleNamespace(output_text="OK", id="provider-basic-id", output=[]),
+                    2: SimpleNamespace(output_text='{"questions":[]}', id="provider-schema-id", output=[]),
+                }
+                if self.calls in common:
+                    return common[self.calls]
+                if self.scenario == "missing":
+                    return SimpleNamespace(output_text="I will not call a tool", id="provider-no-tool-id", output=[])
+                if self.calls == 3:
+                    return SimpleNamespace(
+                        output_text="",
+                        id="provider-tool-id",
+                        output=[SimpleNamespace(type="function_call", name="list_skill_files", arguments="{}", call_id="provider-call-id")],
+                    )
+                return SimpleNamespace(output_text="not-json", id=f"provider-invalid-{self.calls}", output=[])
+
+        cases = {
+            "missing": ("probe_tool_call_missing", "tool_request", "capability_probe_failed", 0),
+            "final_invalid": ("probe_tool_final_invalid_output", "tool_final_output", "invalid_output", 1),
+        }
+        config = SimpleNamespace(
+            model="probe-model",
+            api_key="secret-key",
+            base_url="https://provider.example/v1",
+            timeout_seconds=1,
+        )
+        for scenario, (code, phase, reason, tool_calls) in cases.items():
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as root:
+                adapter = OpenAIResponsesClient(config, sdk_client=ProbeSDK(scenario))
+                gateway = AgentGateway(adapter, skill=SkillRuntime.builtin(), model=config.model)
+                service = TaskService(WorkspaceStore(root), generator=gateway, clarifier=gateway)
+                with TestClient(create_app(service)) as client:
+                    status = client.get("/v1/runtime/status").json()["model_capabilities"]
+                    persisted = client.get("/v1/runtime/probes?limit=1").json()["probes"][0]
+                    client.post("/v1/tasks", json={"task_id": f"probe-{scenario}", "mode": "manual"})
+                    blocked = client.post(
+                        f"/v1/tasks/probe-{scenario}/input",
+                        json={"source": {"goal": "演示", "audience": "客户", "topic": "诊断"}},
+                    ).json()["clarification"]["error"]
+
+                for error in (status["error"], persisted["error"]):
+                    self.assertEqual(error["code"], code)
+                    self.assertEqual(error["probe_phase"], phase)
+                    self.assertEqual(error["terminal_reason"], reason)
+                    self.assertEqual(error["tool_calls"], tool_calls)
+                self.assertEqual(persisted["failed_check"], "tool_round_trip")
+                self.assertEqual(persisted["events"][-1]["probe_phase"], phase)
+                self.assertEqual(blocked["runtime_error_code"], code)
+                self.assertEqual(blocked["probe_phase"], phase)
+                self.assertEqual(blocked["terminal_reason"], reason)
+                self.assertEqual(blocked["tool_calls"], tool_calls)
+                self.assertEqual(TaskService(WorkspaceStore(root)).runtime_probes(1)[0], persisted)
+
+                serialized = json.dumps({"status": status, "persisted": persisted, "blocked": blocked})
+                self.assertNotIn("I will not call a tool", serialized)
+                self.assertNotIn("not-json", serialized)
+                self.assertNotIn("secret-key", serialized)
+
     def test_unready_clarifier_does_not_enqueue_and_preserves_fallback(self):
         class UnreadyClarifier:
             model="unready-model"

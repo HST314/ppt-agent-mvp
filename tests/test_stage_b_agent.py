@@ -156,6 +156,44 @@ class StageBAgentTests(unittest.TestCase):
             missing.probe_capabilities(probe_id="runtime-probe-tools")
         self.assertEqual(caught.exception.code,"probe_tool_call_missing")
         self.assertEqual(caught.exception.failed_check,"tool_round_trip")
+        self.assertEqual(caught.exception.probe_phase,"tool_request")
+        self.assertEqual(caught.exception.terminal_reason,"capability_probe_failed")
+        self.assertEqual(caught.exception.tool_calls,0)
+
+        final_invalid=AgentGateway(ScriptedClient([
+            ModelTurn("OK","basic"),
+            ModelTurn('{"questions":[]}',"strict"),
+            ModelTurn(None,"tool",(ModelToolCall("list_skill_files","{}","call"),)),
+            ModelTurn("not-json","bad-final"),
+            ModelTurn("still-not-json","bad-final-again"),
+        ]),skill=SkillRuntime.builtin())
+        with self.assertRaises(GatewayError) as caught:
+            final_invalid.probe_capabilities(probe_id="runtime-probe-final-invalid")
+        self.assertEqual(caught.exception.code,"probe_tool_final_invalid_output")
+        self.assertEqual(caught.exception.failed_check,"tool_round_trip")
+        self.assertEqual(caught.exception.probe_phase,"tool_final_output")
+        self.assertEqual(caught.exception.terminal_reason,"invalid_output")
+        self.assertEqual(caught.exception.tool_calls,1)
+        self.assertEqual(final_invalid.last_probe_audit["events"][-1]["tool_calls"],1)
+
+        rejected=AgentGateway(ScriptedClient([
+            ModelTurn("OK","basic"),
+            ModelTurn('{"questions":[]}',"strict"),
+            ModelTurn(None,"tool",(ModelToolCall("list_skill_files","{}","call"),)),
+            GatewayError("provider rejected tool output",code="model_request_invalid"),
+        ]),skill=SkillRuntime.builtin())
+        original_create=rejected.client.create
+        def create_or_raise(**kwargs):
+            turn=original_create(**kwargs)
+            if isinstance(turn,Exception): raise turn
+            return turn
+        rejected.client.create=create_or_raise
+        with self.assertRaises(GatewayError) as caught:
+            rejected.probe_capabilities(probe_id="runtime-probe-result-rejected")
+        self.assertEqual(caught.exception.code,"probe_tool_round_failed")
+        self.assertEqual(caught.exception.probe_phase,"tool_result")
+        self.assertEqual(caught.exception.underlying_code,"model_request_invalid")
+        self.assertEqual(caught.exception.tool_calls,1)
 
         bad_calls=(ModelToolCall("shell","{}","bad"),)
         first_call=(ModelToolCall("list_skill_files","{}","first"),)

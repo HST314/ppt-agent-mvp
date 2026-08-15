@@ -175,16 +175,16 @@ gateway:
 先复制一份本地配置，避免直接修改仓库默认值：
 
 ```bash
-cp config/ppt-agent.yaml config/ppt-agent.local.yaml
+cp config/ppt-agent.agent.example.yaml config/ppt-agent.local.yaml
 ```
 
-将 `config/ppt-agent.local.yaml` 中的 `gateway.mode` 改为 `agent`，并检查生成/检查模型的 `model`、`api_key_env`、`base_url_env`、超时和最大步骤数。
+检查 `config/ppt-agent.local.yaml` 中生成/检查模型的 `model`、`api_key_env`、`base_url_env`、超时和最大步骤数。
 
 然后在仓库根目录创建 `.env`。变量名必须与 YAML 中的 `api_key_env` 和 `base_url_env` 一致，例如：
 
 ```dotenv
-ARK_API_KEY=your-api-key
-ARK_BASE_URL=https://your-provider.example/v1
+MODEL_API_KEY=your-api-key
+MODEL_BASE_URL=https://your-provider.example/v1
 ```
 
 `.env` 和 `config/*.local.yaml` 已被 Git 忽略。不要把密钥写入 YAML、Issue、日志或提交记录。

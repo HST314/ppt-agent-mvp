@@ -95,6 +95,10 @@ class FrontendAssetTests(unittest.TestCase):
         self.assertIn("Agent 审计 ID", input_stage)
         self.assertIn("复制探测 ID", input_stage)
         self.assertIn('role: "alert"', input_stage)
+        for label in ("失败阶段", "工具调用数", "底层错误"):
+            self.assertIn(label, app + input_stage)
+        for code in ("probe_tool_call_missing", "probe_tool_round_failed", "probe_tool_final_invalid_output"):
+            self.assertIn(code, input_stage)
 
     def test_untrusted_content_is_not_assigned_to_inner_html(self):
         javascript = "\n".join(path.read_text() for path in (FRONTEND / "static/js").rglob("*.js"))
