@@ -100,7 +100,7 @@ class AgentRuntime:
         def fail(message: str, reason: str, cause=None):
             audit.append({"event": "terminal", "reason": reason, "tool_calls": tool_count})
             self.last_audit = tuple(audit)
-            error = GatewayError(message)
+            error = GatewayError(message, code=self._failure_code(reason, capability_probe))
             error.audit = self.last_audit
             if cause is not None:
                 raise error from cause
@@ -117,7 +117,11 @@ class AgentRuntime:
             if self.clock() - started >= self.timeout_seconds:
                 fail("Agent 运行超时，未提交阶段产物", "deadline_exceeded")
             try:
-                turn = self.client.create(input=conversation, tools=stage_tools, response_schema=response_schema)
+                tool_choice = None
+                if capability_probe and stage != "clarification":
+                    tool_choice = {"type": "function", "name": "list_skill_files"} if tool_count == 0 else "none"
+                request_schema = None if capability_probe and stage != "clarification" and tool_count == 0 else response_schema
+                turn = self.client.create(input=conversation, tools=stage_tools, response_schema=request_schema, tool_choice=tool_choice)
             except (IndexError, StopIteration) as exc:
                 fail("Agent 未在工具纠错后提交阶段产物", "incomplete_after_tool_error", exc)
             except GatewayError as exc:
@@ -139,6 +143,8 @@ class AgentRuntime:
             if turn.tool_calls:
                 if not stage_tools:
                     fail("澄清阶段不允许工具调用", "unauthorized_tool")
+                if capability_probe and tool_count == 0 and (len(turn.tool_calls) != 1 or turn.tool_calls[0].name != "list_skill_files"):
+                    fail("模型未按要求完成确定性工具调用", "capability_probe_failed")
                 successful_calls = 0
                 for call in turn.tool_calls:
                     tool_count += 1
@@ -194,6 +200,24 @@ class AgentRuntime:
             self.last_audit = tuple(audit)
             return AgentResult(value, self.last_audit, turn.response_id)
         fail("Agent 达到最大步数，未提交阶段产物", "max_steps")
+
+    @staticmethod
+    def _failure_code(reason: str, capability_probe: bool) -> str:
+        if not capability_probe:
+            return "gateway_error"
+        if reason == "invalid_output":
+            return "probe_invalid_output"
+        if reason == "capability_probe_failed":
+            return "probe_tool_call_missing"
+        if reason == "max_steps":
+            return "probe_step_limit"
+        if reason == "deadline_exceeded":
+            return "probe_deadline_exceeded"
+        if reason in {"unauthorized_tool", "tool_call_limit", "tool_error_limit", "incomplete_after_tool_error"}:
+            return "probe_tool_round_failed"
+        if reason == "output_limit":
+            return "probe_output_limit"
+        return "capability_probe_failed"
 
     @staticmethod
     def _tool_error_code(name: str, message: str) -> str:

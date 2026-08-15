@@ -84,11 +84,16 @@ class FrontendAssetTests(unittest.TestCase):
             self.assertIn(label, app)
         self.assertIn('role: "status"', app)
         self.assertIn("runtimeSignature", app)
+        self.assertIn("模型能力探测详情", app)
+        self.assertIn("失败检查", app)
+        self.assertIn("探测 ID", app)
+        self.assertIn("runtimeProbes", api)
         self.assertIn('data-requires-runtime="true"', app)
         self.assertIn("model_authentication_failed", input_stage)
         self.assertIn("model_rate_limited", input_stage)
         self.assertIn("model_upstream_unavailable", input_stage)
         self.assertIn("Agent 审计 ID", input_stage)
+        self.assertIn("复制探测 ID", input_stage)
         self.assertIn('role: "alert"', input_stage)
 
     def test_untrusted_content_is_not_assigned_to_inner_html(self):

@@ -5,7 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -107,6 +107,10 @@ def create_app(
     def recheck_runtime():
         service.initialize_runtime()
         return runtime_payload()
+
+    @app.get("/v1/runtime/probes", tags=["runtime"])
+    def runtime_probes(limit: int = Query(default=20,ge=1,le=100)):
+        return {"probes":service.runtime_probes(limit)}
 
     app.mount("/static", StaticFiles(directory=frontend / "static", check_dir=True), name="static")
     app.include_router(jobs.router)

@@ -17,6 +17,11 @@ class P2Tests(unittest.TestCase):
   self.assertEqual(card["goal"],"介绍北工大集成电路学院")
   self.assertEqual(card["missing"],["audience"])
   self.assertIn("未推断受众",card["assumptions"][0])
+  cases={"北工大集成电路学院介绍":("北工大集成电路学院介绍","介绍北工大集成电路学院"),"新品发布":("新品发布","发布新品")}
+  for source,(topic,goal) in cases.items():
+   with self.subTest(source=source):
+    card=parse_task_card(source,"markdown")
+    self.assertEqual(card["topic"],topic); self.assertEqual(card["goal"],goal); self.assertEqual(card["missing"],["audience"])
  def test_nested_known_facts_and_batch_answers_update_task_card(self):
   self.svc.create("nested"); self.svc.create("batch")
   result=self.svc.import_input("nested",{"goal":"促成审批","topic":"新品","known_facts":{"audience":"管理层"}})

@@ -55,18 +55,31 @@ def infer_natural_language_task_card(source):
     match=re.search(rf"(?:关于|围绕|用于)\s*(.+?)\s*(?:的)?\s*{PRESENTATION_WORDS}\b",text,re.IGNORECASE)
     if not match:
         match=re.search(rf"(?:制作|设计|生成|做)\s*(?:一个|一份|一套)?\s*(.+?)\s*(?:的)?\s*{PRESENTATION_WORDS}\b",text,re.IGNORECASE)
-    if not match: return facts,assumptions
-    topic=match.group(1).strip(" ，。,:：的")
-    topic=re.sub(r"^(?:一个|一份|一套)\s*","",topic)
+    if match:
+        topic=match.group(1).strip(" ，。,:：的")
+        topic=re.sub(r"^(?:一个|一份|一套)\s*","",topic)
+    else:
+        # A short, single-line, non-key/value brief is commonly a title.  Keep
+        # that explicit text as the topic, but never infer an audience.
+        title=text.strip(" ，。")
+        title_like=(
+            1 <= len(title) <= 80
+            and "\n" not in source
+            and not re.search(r"[:：\n]",text)
+            and not re.match(r"^(?:[-*#]|\{|\[)",text)
+            and not re.search(r"[！？；!?;]",text)
+        )
+        if not title_like: return facts,assumptions
+        topic=title
     if not topic: return facts,assumptions
     facts["topic"]=topic
-    if topic.endswith("介绍") and topic[:-2].strip():
-        facts["goal"]=f"介绍{topic[:-2].strip()}"
-    elif topic.endswith("汇报") and topic[:-2].strip():
-        facts["goal"]=f"汇报{topic[:-2].strip()}"
-    else:
+    goal_prefixes={"介绍":"介绍","汇报":"汇报","发布":"发布","培训":"培训讲解","复盘":"复盘"}
+    matched_action=next((suffix for suffix in goal_prefixes if topic.endswith(suffix) and topic[:-len(suffix)].strip()),None)
+    if matched_action:
+        facts["goal"]=f"{goal_prefixes[matched_action]}{topic[:-len(matched_action)].strip()}"
+    elif match:
         facts["goal"]=f"制作关于{topic}的演示"
-    assumptions.extend(["topic 与 goal 根据原始自然语言中的明确表述提取；未推断受众。"])
+    assumptions.append("topic 根据原始自然语言中的明确表述提取；仅在标题包含明确动作时提取 goal，未推断受众。")
     return facts,assumptions
 
 def parse_task_card(source, source_format="auto"):

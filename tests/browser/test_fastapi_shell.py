@@ -266,6 +266,10 @@ class FastAPIShellBrowserGate(unittest.TestCase):
         settings.get_by_text("后端可达", exact=True).wait_for()
         settings.get_by_text("模型不可用", exact=True).wait_for()
         self.assertEqual(settings.get_by_text("模型可用", exact=True).count(), 0)
+        self.assertTrue(settings.get_by_text("失败检查", exact=True).is_visible())
+        self.assertTrue(settings.get_by_text("能力契约", exact=True).is_visible())
+        self.assertTrue(settings.get_by_text("探测 ID", exact=True).is_visible())
+        self.assertRegex(settings.locator("dl.metadata-list").inner_text(),r"runtime-probe-[0-9a-f]{32}")
         settings.get_by_role("button", name="关闭").click()
 
         page.get_by_label("任务卡内容").fill("核心主题：新品发布")
@@ -278,6 +282,8 @@ class FastAPIShellBrowserGate(unittest.TestCase):
         self.assertTrue(retry.is_disabled())
         self.assertFalse(page.get_by_role("button", name="使用系统兜底问题").is_disabled())
         self.assertTrue(page.get_by_text("model_authentication_failed", exact=True).is_visible())
+        self.assertTrue(page.get_by_text("能力契约", exact=True).is_visible())
+        self.assertTrue(page.get_by_role("button", name="复制探测 ID").is_visible())
         self.assertTrue(page.get_by_text("这是确定性配置故障", exact=False).is_visible())
 
         page.get_by_role("button", name="使用系统兜底问题").click()

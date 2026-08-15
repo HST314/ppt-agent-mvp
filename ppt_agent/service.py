@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import hashlib, json, logging, re, threading, time
+import hashlib, inspect, json, logging, re, threading, time, uuid
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -37,23 +37,56 @@ class TaskService:
                 with self._runtime_guard:
                     self._runtime_capabilities={"checked":False,"ready":True,"status":"not_required","models":[],"checked_at":utcnow()}
                 return self.runtime_health()
+            probe_id=f"runtime-probe-{uuid.uuid4().hex}"
+            started_at=utcnow()
             with self._runtime_guard:
-                self._runtime_capabilities={"checked":False,"ready":False,"status":"checking","models":[],"checked_at":utcnow()}
-            models=[]
+                self._runtime_capabilities={"checked":False,"ready":False,"status":"checking","models":[],"probe_id":probe_id,"checked_at":started_at}
+            models=[]; probe_events=[]
             try:
-                for gateway in gateways:
-                    checks=gateway.probe_capabilities()
+                for gateway_index,gateway in enumerate(gateways):
+                    method=gateway.probe_capabilities
+                    parameters=inspect.signature(method).parameters
+                    accepts_probe_id="probe_id" in parameters or any(item.kind==inspect.Parameter.VAR_KEYWORD for item in parameters.values())
+                    checks=method(probe_id=probe_id) if accepts_probe_id else method()
+                    audit=getattr(gateway,"last_probe_audit",None)
+                    if isinstance(audit,dict):
+                        probe_events.extend({"gateway_index":gateway_index,"model":str(getattr(gateway,"model","unknown")),**event} for event in audit.get("events",[]) if isinstance(event,dict))
+                    else:
+                        probe_events.append({"event":"probe_check","gateway_index":gateway_index,"model":str(getattr(gateway,"model","unknown")),"check":"capability_contract","status":"succeeded"})
                     if not checks or not all(checks.values()):
-                        raise GatewayError("模型能力探测未满足运行契约")
+                        failed_check=next((key for key,value in (checks or {}).items() if not value),"capability_contract")
+                        error=GatewayError("模型能力探测未满足运行契约",code="capability_probe_failed")
+                        error.failed_check=failed_check
+                        error.probe_id=probe_id
+                        raise error
                     models.append({"model":gateway.model,"checks":checks})
             except Exception as exc:
-                public=exc.public()["error"] if hasattr(exc,"public") else {"code":"capability_probe_failed","diagnostic_id":hashlib.sha256(str(type(exc)).encode()).hexdigest()[:24]}
+                audit=getattr(gateway,"last_probe_audit",None) if "gateway" in locals() else None
+                if isinstance(audit,dict):
+                    for event in audit.get("events",[]):
+                        enriched={"gateway_index":gateway_index,"model":str(getattr(gateway,"model","unknown")),**event}
+                        if enriched not in probe_events: probe_events.append(enriched)
+                failed_check=getattr(exc,"failed_check",None) or "capability_contract"
+                if not isinstance(exc,GatewayError):
+                    exc=GatewayError(
+                        "模型能力探测发生无法分类的 SDK 故障",
+                        code="capability_probe_failed",
+                        audit_details={"category":"sdk_error","sdk_exception_type":type(exc).__name__,"retryable":False},
+                    )
+                public=exc.public()["error"]
                 error={key:public[key] for key in ("code","diagnostic_id","retryable","retry_after_seconds","agent_audit_id") if key in public}
+                error.update({"probe_id":probe_id,"failed_check":failed_check})
+                if not any(event.get("status")=="failed" for event in probe_events):
+                    probe_events.append({"event":"probe_check","gateway_index":gateway_index,"model":str(getattr(gateway,"model","unknown")),"check":failed_check,"status":"failed","error_code":error["code"],"diagnostic_id":error["diagnostic_id"],**exc.safe_audit_details()})
+                completed_at=utcnow()
+                self.store.append_runtime_probe({"probe_id":probe_id,"status":"failed","started_at":started_at,"completed_at":completed_at,"models":models,"failed_check":failed_check,"error":error,"events":probe_events})
                 with self._runtime_guard:
-                    self._runtime_capabilities={"checked":True,"ready":False,"status":"unavailable","models":models,"error":error,"checked_at":utcnow()}
+                    self._runtime_capabilities={"checked":True,"ready":False,"status":"unavailable","models":models,"probe_id":probe_id,"failed_check":failed_check,"error":error,"checked_at":completed_at}
                 return self.runtime_health()
+            completed_at=utcnow()
+            self.store.append_runtime_probe({"probe_id":probe_id,"status":"succeeded","started_at":started_at,"completed_at":completed_at,"models":models,"events":probe_events})
             with self._runtime_guard:
-                self._runtime_capabilities={"checked":True,"ready":True,"status":"ready","models":models,"checked_at":utcnow()}
+                self._runtime_capabilities={"checked":True,"ready":True,"status":"ready","models":models,"probe_id":probe_id,"checked_at":completed_at}
             return self.runtime_health()
     def runtime_health(self):
         with self._runtime_guard:
@@ -76,13 +109,17 @@ class TaskService:
         if capabilities.get("ready"):
             return
         error=capabilities.get("error",{})
+        failed_check=error.get("failed_check") or capabilities.get("failed_check")
         raise RuntimeUnavailableError(
             runtime_error_code=error.get("code"),
             retryable=error.get("retryable") is True,
             retry_after_seconds=error.get("retry_after_seconds"),
             agent_audit_id=error.get("agent_audit_id"),
             diagnostic_id=error.get("diagnostic_id"),
+            probe_id=error.get("probe_id") or (capabilities.get("probe_id") if failed_check else None),
+            failed_check=failed_check,
         )
+    def runtime_probes(self,limit=20): return self.store.runtime_probes(limit)
     def record_runtime_failure(self,error):
         if not isinstance(error,GatewayError): return
         public=error.public()["error"]

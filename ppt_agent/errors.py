@@ -100,6 +100,8 @@ class RuntimeUnavailableError(DomainError):
         retry_after_seconds: int | None = None,
         agent_audit_id: str | None = None,
         diagnostic_id: str | None = None,
+        probe_id: str | None = None,
+        failed_check: str | None = None,
     ):
         super().__init__(message)
         if diagnostic_id:
@@ -108,6 +110,8 @@ class RuntimeUnavailableError(DomainError):
         self.retryable = bool(retryable)
         self.retry_after_seconds = retry_after_seconds
         self.agent_audit_id = agent_audit_id
+        self.probe_id = probe_id
+        self.failed_check = failed_check
 
     def public(self) -> dict:
         payload = super().public()
@@ -118,4 +122,8 @@ class RuntimeUnavailableError(DomainError):
             payload["error"]["retry_after_seconds"] = self.retry_after_seconds
         if self.agent_audit_id:
             payload["error"]["agent_audit_id"] = self.agent_audit_id
+        if self.probe_id:
+            payload["error"]["probe_id"] = self.probe_id
+        if self.failed_check:
+            payload["error"]["failed_check"] = self.failed_check
         return payload

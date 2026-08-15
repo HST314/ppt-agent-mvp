@@ -15,7 +15,7 @@
 python3 scripts/start.py --data .ppt-agent-data --host 127.0.0.1 --port 8000
 ```
 
-该命令启动 FastAPI/Uvicorn Web 适配层。`/livez` 只检查 Web 进程存活并始终以 200 表示存活；`/readyz` 检查真实模型运行契约，未就绪时返回 503。兼容端点 `/healthz` 与 readiness 使用相同的 200/503 语义；浏览器轮询 `/v1/runtime/status`，该端点固定返回 200，并通过 `runtime_ready` 表达模型状态，避免预期的未就绪状态污染浏览器控制台。真实模型模式必须满足 `runtime_ready=true` 且 `model_capabilities.status=ready`。启动会实际验证严格 JSON Schema，并对启用工具的模型验证一次合法工具调用、工具结果回传和最终结构化输出；任一探测失败都会把 readiness 标记为不可用，依赖模型的 Job 在入队和执行前都会关闭失败。修复配置或等待供应商恢复后，在工作台“显示与连接”执行显式重新检测。`/`、`/tasks/{task_id}` 和 `/components` 使用独立 `frontend/` 静态资源。8 阶段交互全部位于统一应用壳；旧 `/tasks/{task_id}/outline|samples|deck|inspection|delivery` 深链会规范化到对应阶段，`/legacy/**` 已下线。
+该命令启动 FastAPI/Uvicorn Web 适配层。`/livez` 只检查 Web 进程存活并始终以 200 表示存活；`/readyz` 检查真实模型运行契约，未就绪时返回 503。兼容端点 `/healthz` 与 readiness 使用相同的 200/503 语义；浏览器轮询 `/v1/runtime/status`，该端点固定返回 200，并通过 `runtime_ready` 表达模型状态，避免预期的未就绪状态污染浏览器控制台。真实模型模式必须满足 `runtime_ready=true` 且 `model_capabilities.status=ready`。启动按顺序验证基础文本响应、严格 JSON Schema、强制函数调用与结果回传；任一检查失败即停止，状态中保留 `probe_id`、`failed_check` 与精确业务错误码，依赖模型的 Job 在入队和执行前都会关闭失败。脱敏且可跨重启读取的探测记录由 `GET /v1/runtime/probes` 导出，只保存检查状态、HTTP/SDK 类别、request-id 哈希和响应 ID 哈希。修复配置或等待供应商恢复后，在工作台“显示与连接”执行显式重新检测。`/`、`/tasks/{task_id}` 和 `/components` 使用独立 `frontend/` 静态资源。8 阶段交互全部位于统一应用壳；旧 `/tasks/{task_id}/outline|samples|deck|inspection|delivery` 深链会规范化到对应阶段，`/legacy/**` 已下线。
 
 样品、全稿和检查预览由 `/v1/tasks/{task_id}/previews/{hash}` 提供。端点只接受当前任务内 `sample`/`deck` 版本，返回 `no-store`、`SAMEORIGIN` 与禁止脚本的独立 CSP；应用壳 CSP 不允许内联脚本或样式。预览异常时先核对 hash 是否属于当前任务及对应版本，不要绕过端点直接读取工作区文件。
 
@@ -61,6 +61,7 @@ python3 scripts/verify_offline_delivery.py .ppt-agent-data/tasks/<task-id>/deliv
 - `model_upstream_unavailable`：等待供应商恢复后重新探测；不要以连续提交代替健康检查。
 - `model_timeout` / `model_connection_error`：结果可能未知，不得自动重试；先用 `agent_audit_id`、诊断 ID 和供应商请求记录核对结果。
 - `gateway_error`：无法进一步分类的 SDK/HTTP 故障；根据诊断 ID 检查运行日志，确认原因后再操作。
+- `probe_invalid_output` / `probe_tool_call_missing` / `probe_tool_round_failed` / `probe_step_limit`：分别表示严格 Schema、强制工具调用、工具结果回传或步数边界未满足。结合 `failed_check` 与 `probe_id` 查询 `/v1/runtime/probes`，确认模型能力与端点配置后再重新检测。
 - Skill 校验失败：不要直接修改内置文件；恢复经过评审的 Skill 与 `SKILL_LOCK.json` 配套版本。
 - 离线校验失败：按错误中的 missing/extra/changed 或 URL 文件修复源交付并重新确认，禁止手改已发布目录。
 - 浏览器门禁 skipped：安装锁定 Playwright/Chromium 及系统共享库后重跑，不能把跳过当成功。

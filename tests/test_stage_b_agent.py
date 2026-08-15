@@ -114,15 +114,56 @@ class StageBAgentTests(unittest.TestCase):
 
     def test_startup_probe_checks_schema_then_complete_tool_round(self):
         client=ScriptedClient([
+            ModelTurn("OK","basic"),
             ModelTurn('{"questions":[]}',"clarification"),
             ModelTurn(None,"tools",(ModelToolCall("list_skill_files","{}","probe-call"),)),
             ModelTurn('{"markdown":"probe-ok"}',"final"),
         ])
-        checks=AgentGateway(client,skill=SkillRuntime.builtin()).probe_capabilities()
-        self.assertEqual(checks,{"strict_json_schema":True,"tool_round_trip":True})
+        gateway=AgentGateway(client,skill=SkillRuntime.builtin())
+        checks=gateway.probe_capabilities(probe_id="runtime-probe-test")
+        self.assertEqual(checks,{"basic_response":True,"strict_json_schema":True,"tool_round_trip":True})
         self.assertEqual(client.inputs[0]["tools"],[])
-        self.assertEqual(client.inputs[1]["tools"],TOOLS)
-        self.assertIn("function_call_output",str(client.inputs[2]["input"]))
+        self.assertIsNone(client.inputs[0]["response_schema"])
+        self.assertEqual(client.inputs[1]["tools"],[])
+        self.assertEqual(client.inputs[2]["tools"],TOOLS)
+        self.assertEqual(client.inputs[2]["tool_choice"],{"type":"function","name":"list_skill_files"})
+        self.assertIsNone(client.inputs[2]["response_schema"])
+        self.assertEqual(client.inputs[3]["tool_choice"],"none")
+        self.assertEqual(client.inputs[3]["response_schema"],STAGE_OUTPUT_SCHEMAS["narrative"])
+        self.assertIn("function_call_output",str(client.inputs[3]["input"]))
+        self.assertEqual(gateway.last_probe_audit["probe_id"],"runtime-probe-test")
+        self.assertEqual([event["status"] for event in gateway.last_probe_audit["events"]],["started","succeeded"]*3)
+
+    def test_probe_failures_keep_failed_check_stable_code_and_secret_free_trace(self):
+        basic=AgentGateway(ScriptedClient([ModelTurn(None,"empty")]),skill=SkillRuntime.builtin())
+        with self.assertRaises(GatewayError) as caught:
+            basic.probe_capabilities(probe_id="runtime-probe-basic")
+        self.assertEqual(caught.exception.code,"probe_basic_response_failed")
+        self.assertEqual(caught.exception.failed_check,"basic_response")
+
+        gateway=AgentGateway(ScriptedClient([ModelTurn("OK","basic"),ModelTurn('{"wrong":1}',"bad"),ModelTurn('{"wrong":1}',"bad-again")]),skill=SkillRuntime.builtin())
+        with self.assertRaises(GatewayError) as caught:
+            gateway.probe_capabilities(probe_id="runtime-probe-schema")
+        self.assertEqual(caught.exception.code,"probe_invalid_output")
+        self.assertEqual(caught.exception.failed_check,"strict_json_schema")
+        self.assertEqual(caught.exception.probe_id,"runtime-probe-schema")
+        self.assertEqual(gateway.last_probe_audit["failed_check"],"strict_json_schema")
+        serialized=json.dumps(gateway.last_probe_audit)
+        self.assertNotIn('{"wrong":1}',serialized)
+
+        missing=AgentGateway(ScriptedClient([ModelTurn("OK","basic"),ModelTurn('{"questions":[]}',"strict"),ModelTurn('{"markdown":"skipped"}',"no-tool")]),skill=SkillRuntime.builtin())
+        with self.assertRaises(GatewayError) as caught:
+            missing.probe_capabilities(probe_id="runtime-probe-tools")
+        self.assertEqual(caught.exception.code,"probe_tool_call_missing")
+        self.assertEqual(caught.exception.failed_check,"tool_round_trip")
+
+        bad_calls=(ModelToolCall("shell","{}","bad"),)
+        first_call=(ModelToolCall("list_skill_files","{}","first"),)
+        broken=AgentGateway(ScriptedClient([ModelTurn("OK","basic"),ModelTurn('{"questions":[]}',"strict"),ModelTurn(None,"first",first_call),ModelTurn(None,"bad-1",bad_calls),ModelTurn(None,"bad-2",bad_calls)]),skill=SkillRuntime.builtin())
+        with self.assertRaises(GatewayError) as caught:
+            broken.probe_capabilities(probe_id="runtime-probe-broken-tools")
+        self.assertEqual(caught.exception.code,"probe_tool_round_failed")
+        self.assertEqual(caught.exception.failed_check,"tool_round_trip")
 
     def test_tool_error_codes_are_actionable_and_secret_free(self):
         self.assertEqual(AgentRuntime._tool_error_code("shell","denied"),"unauthorized_tool")
@@ -243,11 +284,13 @@ class StageBAgentTests(unittest.TestCase):
         self.assertEqual(runtime.last_audit, caught.exception.audit)
 
     def test_client_extracts_function_calls(self):
-        sdk = SimpleNamespace(); sdk.responses = sdk
-        sdk.create = lambda **kwargs: SimpleNamespace(output_text="", id="r", output=[SimpleNamespace(type="function_call", name="read_skill_file", arguments='{"path":"SKILL.md"}', call_id="c")])
+        sdk = SimpleNamespace(); sdk.responses = sdk; requests=[]
+        sdk.create = lambda **kwargs: (requests.append(kwargs) or SimpleNamespace(output_text="", id="r", output=[SimpleNamespace(type="function_call", name="read_skill_file", arguments='{"path":"SKILL.md"}', call_id="c")]))
         config = SimpleNamespace(model="m", api_key="k", base_url="https://example.com", timeout_seconds=1)
-        turn = OpenAIResponsesClient(config, sdk_client=sdk).create(input=[])
+        choice={"type":"function","name":"read_skill_file"}
+        turn = OpenAIResponsesClient(config, sdk_client=sdk).create(input=[],tools=TOOLS,tool_choice=choice)
         self.assertEqual(turn.tool_calls[0].name, "read_skill_file")
+        self.assertEqual(requests[0]["tool_choice"],choice)
 
     def test_client_classifies_http_failures_and_only_audits_safe_metadata(self):
         expected = {

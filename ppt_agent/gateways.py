@@ -101,6 +101,7 @@ class AgentGateway:
         self.skill_factory = SkillRuntime.builtin if skill is None else lambda: SkillRuntime(skill.root, max_file_bytes=skill.max_file_bytes, max_total_bytes=skill.max_total_bytes)
         self.runtime = None
         self.audit_sink = None
+        self.last_probe_audit = None
 
     def set_audit_sink(self, sink): self.audit_sink = sink
 
@@ -131,24 +132,82 @@ class AgentGateway:
                 if failure is not None:
                     failure.agent_audit_id = audit_id
 
-    def probe_capabilities(self):
-        """Verify strict schema and a complete tool round before readiness."""
-        clarification = AgentRuntime(
-            self.client,
-            self.skill_factory(),
-            max_steps=self.max_steps,
-            timeout_seconds=self.timeout_seconds,
-        ).run("clarification", {"capability_probe": "return_empty_questions"}, capability_probe=True)
-        tools = AgentRuntime(
-            self.client,
-            self.skill_factory(),
-            max_steps=self.max_steps,
-            timeout_seconds=self.timeout_seconds,
-        ).run("narrative", {"capability_probe": "list_skill_files_then_return_markdown"}, capability_probe=True)
-        return {
-            "strict_json_schema": clarification.value == {"questions": []},
-            "tool_round_trip": any(event.get("event") == "tool" for event in tools.audit),
-        }
+    def probe_capabilities(self, *, probe_id=None):
+        """Run three isolated provider checks and retain a secret-free trace."""
+        probe_id = probe_id or f"runtime-probe-{uuid.uuid4().hex}"
+        events = []
+
+        def record(check, status, **details):
+            events.append({"event":"probe_check","check":check,"status":status,**details})
+            self.last_probe_audit={"probe_id":probe_id,"model":self.model,"status":"failed" if status=="failed" else "checking","events":list(events)}
+
+        def failed(check, exc):
+            error = exc if isinstance(exc, GatewayError) else GatewayError(
+                "模型能力探测发生无法分类的 SDK 故障",
+                code="capability_probe_failed",
+                audit_details={"category":"sdk_error","sdk_exception_type":type(exc).__name__,"retryable":False},
+            )
+            if error.code == "gateway_error" and not error.safe_audit_details():
+                error.code={
+                    "basic_response":"probe_basic_response_failed",
+                    "strict_json_schema":"probe_invalid_output",
+                    "tool_round_trip":"probe_tool_round_failed",
+                }[check]
+            record(check,"failed",error_code=error.code,diagnostic_id=error.diagnostic_id,**error.safe_audit_details())
+            self.last_probe_audit={**self.last_probe_audit,"status":"failed","failed_check":check}
+            error.probe_id=probe_id
+            error.failed_check=check
+            if error is exc:
+                raise error
+            raise error from exc
+
+        check="basic_response"
+        record(check,"started")
+        try:
+            basic=self.client.create(
+                input=[{"role":"system","content":"运行时连接探测。只返回 OK。"},{"role":"user","content":"OK"}],
+                tools=[],
+                response_schema=None,
+            )
+            if not isinstance(basic.text,str) or not basic.text.strip():
+                raise GatewayError("模型基础响应缺少文本结果")
+            record(check,"succeeded",response_id_sha256=hashlib.sha256((basic.response_id or "").encode()).hexdigest())
+        except Exception as exc:
+            failed(check,exc)
+
+        check="strict_json_schema"
+        record(check,"started")
+        try:
+            clarification = AgentRuntime(
+                self.client,
+                self.skill_factory(),
+                max_steps=self.max_steps,
+                timeout_seconds=self.timeout_seconds,
+            ).run("clarification", {"capability_probe": "return_empty_questions"}, capability_probe=True)
+            if clarification.value != {"questions": []}:
+                raise GatewayError("模型未按探测契约返回空问题集",code="probe_invalid_output")
+            record(check,"succeeded",response_id_sha256=hashlib.sha256((clarification.response_id or "").encode()).hexdigest())
+        except Exception as exc:
+            failed(check,exc)
+
+        check="tool_round_trip"
+        record(check,"started")
+        try:
+            tools = AgentRuntime(
+                self.client,
+                self.skill_factory(),
+                max_steps=self.max_steps,
+                timeout_seconds=self.timeout_seconds,
+            ).run("narrative", {"capability_probe": "list_skill_files_then_return_markdown"}, capability_probe=True)
+            if not any(event.get("event") == "tool" for event in tools.audit):
+                raise GatewayError("模型未完成强制工具调用",code="probe_tool_call_missing")
+            record(check,"succeeded",response_id_sha256=hashlib.sha256((tools.response_id or "").encode()).hexdigest())
+        except Exception as exc:
+            failed(check,exc)
+
+        checks={"basic_response":True,"strict_json_schema":True,"tool_round_trip":True}
+        self.last_probe_audit={"probe_id":probe_id,"model":self.model,"status":"succeeded","checks":checks,"events":list(events)}
+        return checks
 
     def generate(self, action, payload, *, skill=""):
         if action not in {"narrative", "outline"}:

@@ -26,7 +26,7 @@ class ModelTurn:
 
 
 class ResponsesModelClient(Protocol):
-    def create(self, *, input: Any, tools: list[dict] | None = None, response_schema: dict | None = None) -> ModelTurn: ...
+    def create(self, *, input: Any, tools: list[dict] | None = None, response_schema: dict | None = None, tool_choice: Any = None) -> ModelTurn: ...
 
 
 class OpenAIResponsesClient:
@@ -36,10 +36,12 @@ class OpenAIResponsesClient:
         self.config = config
         self._client = sdk_client or OpenAI(api_key=config.api_key, base_url=config.base_url, timeout=config.timeout_seconds, max_retries=0)
 
-    def create(self, *, input: Any, tools: list[dict] | None = None, response_schema: dict | None = None) -> ModelTurn:
+    def create(self, *, input: Any, tools: list[dict] | None = None, response_schema: dict | None = None, tool_choice: Any = None) -> ModelTurn:
         request: dict[str, Any] = {"model": self.config.model, "input": input}
         if tools:
             request["tools"] = tools
+        if tool_choice is not None:
+            request["tool_choice"] = tool_choice
         if response_schema:
             request["text"] = {"format": {"type": "json_schema", **response_schema}}
         try:
@@ -153,7 +155,7 @@ class FakeResponsesClient:
     def __init__(self, text: str = "fake-response"):
         self.text = text
 
-    def create(self, *, input: Any, tools: list[dict] | None = None, response_schema: dict | None = None) -> ModelTurn:
+    def create(self, *, input: Any, tools: list[dict] | None = None, response_schema: dict | None = None, tool_choice: Any = None) -> ModelTurn:
         return ModelTurn(self.text, "fake-response-id")
 
 

@@ -1,6 +1,6 @@
-import { api } from "../api.js?v=2026.08.15.084125796211";
-import { badge, button, confirmationDialog, element, field, metadataList, shortHash } from "../components/index.js?v=2026.08.15.084125796211";
-import { actionMessage, invalidationNotice, runAction, section, stageGrid } from "./shared.js?v=2026.08.15.084125796211";
+import { api } from "../api.js?v=2026.08.15.092035798481";
+import { badge, button, confirmationDialog, element, field, metadataList, shortHash } from "../components/index.js?v=2026.08.15.092035798481";
+import { actionMessage, invalidationNotice, runAction, section, stageGrid } from "./shared.js?v=2026.08.15.092035798481";
 
 const FIELD_LABELS = { goal: "演示目标", audience: "主要受众", topic: "核心主题" };
 const WARNING_LABELS = {
@@ -244,10 +244,13 @@ function clarificationFailed(clarification, context) {
       metadataList([
         ["错误代码", error.code || "clarification_generation_failed"],
         error.runtime_error_code ? ["运行时错误", error.runtime_error_code] : null,
+        error.failed_check ? ["失败检查", runtimeCheckLabel(error.failed_check)] : null,
+        error.probe_id ? ["探测 ID", error.probe_id] : null,
         ["诊断 ID", error.diagnostic_id || "—"],
         ["Agent 审计 ID", error.agent_audit_id || "—"],
       ].filter(Boolean)),
       error.agent_audit_id ? copyValueButton("复制审计 ID", error.agent_audit_id) : null,
+      error.probe_id ? copyValueButton("复制探测 ID", error.probe_id) : null,
     ]),
     element("div", { className: "clarification-failure-actions" }, [retry, fallback]),
     element("p", { className: "field__hint", text: advice }),
@@ -277,11 +280,15 @@ function clarificationRecoveryAdvice(error) {
   return "请先复制诊断信息并联系管理员核对运行日志；确认模型恢复后再重新生成。使用系统兜底问题仍需明确确认。";
 }
 
+function runtimeCheckLabel(check) {
+  return ({ basic_response: "基础文本响应", strict_json_schema: "严格 JSON Schema", tool_round_trip: "工具调用与结果回传", capability_contract: "能力契约" })[check] || check;
+}
+
 function copyValueButton(label, value) {
   const control = button(label, { kind: "ghost", onClick: async () => {
     try {
       await navigator.clipboard.writeText(value);
-      control.textContent = "已复制审计 ID";
+      control.textContent = "已复制";
       window.setTimeout(() => { control.textContent = label; }, 1800);
     } catch (_error) {
       control.textContent = "复制失败，请手动选择";

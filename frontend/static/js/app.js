@@ -1,10 +1,10 @@
-import { api, ApiError } from "./api.js?v=2026.08.15.084125796211";
-import { JobTracker } from "./job-tracker.js?v=2026.08.15.084125796211";
-import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.15.084125796211";
-import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.15.084125796211";
-import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.15.084125796211";
-import { inlineError, setBusy } from "./components/index.js?v=2026.08.15.084125796211";
-import { renderStage } from "./stages/index.js?v=2026.08.15.084125796211";
+import { api, ApiError } from "./api.js?v=2026.08.15.092035798481";
+import { JobTracker } from "./job-tracker.js?v=2026.08.15.092035798481";
+import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.15.092035798481";
+import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.15.092035798481";
+import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.15.092035798481";
+import { inlineError, setBusy } from "./components/index.js?v=2026.08.15.092035798481";
+import { renderStage } from "./stages/index.js?v=2026.08.15.092035798481";
 
 const app = document.getElementById("app");
 const APP_BUILD = document.querySelector('meta[name="app-build"]')?.content || "unknown";
@@ -135,7 +135,9 @@ function renderRuntimeBadges(group) {
   const backend = badge(backendLabel, backendTone);
   const model = badge(modelLabel, modelTone);
   const code = runtimeState.health?.model_capabilities?.error?.code;
-  if (code) model.title = `运行时错误：${code}`;
+  const failedCheck = runtimeState.health?.model_capabilities?.failed_check;
+  const probeId = runtimeState.health?.model_capabilities?.probe_id;
+  if (code) model.title = [`运行时错误：${code}`,failedCheck ? `失败检查：${runtimeCheckLabel(failedCheck)}` : null,probeId ? `探测 ID：${probeId}` : null].filter(Boolean).join(" · ");
   group.replaceChildren(browser, backend, model);
 }
 
@@ -161,6 +163,7 @@ async function refreshRuntimeStatus(recheck = false) {
 
 function updateRuntimeUI() {
   document.querySelectorAll("[data-runtime-status]").forEach(renderRuntimeBadges);
+  document.querySelectorAll("[data-runtime-probe-details]").forEach(renderRuntimeProbeDetails);
   document.querySelectorAll('[data-requires-runtime="true"]').forEach((control) => {
     if (runtimeState.runtimeReady) {
       if (control.dataset.runtimeDisabled === "true") {
@@ -636,6 +639,7 @@ function openSettings() {
         element("span", { className: "field__label", text: "服务连接" }),
         runtimeStatusBadges(),
         element("p", { className: "field__hint", text: runtimeVersionText() }),
+        runtimeProbeDetails(),
         button("重新检测模型", { onClick: async (event) => {
           const control = event.currentTarget;
           setBusy(control, true, "正在重新检测…");
@@ -660,6 +664,30 @@ function runtimeVersionText() {
   const commit = runtimeState.health?.backend_commit || "unknown";
   const config = runtimeState.health?.config_summary_sha256 || "unknown";
   return `前端 Build ${APP_BUILD} · 后端 ${commit.slice(0, 12)} · 配置 ${config.slice(0, 12)}`;
+}
+
+function runtimeProbeDetails() {
+  const container = element("div", { "data-runtime-probe-details": "true" });
+  renderRuntimeProbeDetails(container);
+  return container;
+}
+
+function renderRuntimeProbeDetails(container) {
+  const capabilities = runtimeState.health?.model_capabilities;
+  if (!capabilities?.probe_id) {
+    container.replaceChildren();
+    return;
+  }
+  const error = capabilities.error || {};
+  container.replaceChildren(element("dl", { className: "metadata-list", "aria-label": "模型能力探测详情" }, [
+    element("div", {}, [element("dt", { text: "探测 ID" }), element("dd", { text: capabilities.probe_id })]),
+    capabilities.failed_check ? element("div", {}, [element("dt", { text: "失败检查" }), element("dd", { text: runtimeCheckLabel(capabilities.failed_check) })]) : null,
+    error.code ? element("div", {}, [element("dt", { text: "运行时错误" }), element("dd", { text: error.code })]) : null,
+  ]));
+}
+
+function runtimeCheckLabel(check) {
+  return ({ basic_response: "基础文本响应", strict_json_schema: "严格 JSON Schema", tool_round_trip: "工具调用与结果回传", capability_contract: "能力契约" })[check] || check;
 }
 
 function progress(value, valueLabel, step) {

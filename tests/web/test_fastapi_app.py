@@ -76,16 +76,23 @@ class FastAPIAppTests(unittest.TestCase):
                 live_response=client.get("/livez")
                 browser_status_response=client.get("/v1/runtime/status")
                 health=health_response.json()
-        self.assertEqual(health_response.status_code,503)
-        self.assertEqual(ready_response.status_code,503)
-        self.assertEqual(live_response.status_code,200)
-        self.assertEqual(browser_status_response.status_code,200)
-        self.assertFalse(browser_status_response.json()["runtime_ready"])
-        self.assertEqual(live_response.json()["status"],"ok")
-        self.assertFalse(health["runtime_ready"])
-        self.assertEqual(health["status"],"unavailable")
-        self.assertEqual(health["model_capabilities"]["error"]["code"],"capability_probe_failed")
-        self.assertNotIn("provider details",str(health))
+                probes=client.get("/v1/runtime/probes?limit=1").json()["probes"]
+            self.assertEqual(health_response.status_code,503)
+            self.assertEqual(ready_response.status_code,503)
+            self.assertEqual(live_response.status_code,200)
+            self.assertEqual(browser_status_response.status_code,200)
+            self.assertFalse(browser_status_response.json()["runtime_ready"])
+            self.assertEqual(live_response.json()["status"],"ok")
+            self.assertFalse(health["runtime_ready"])
+            self.assertEqual(health["status"],"unavailable")
+            self.assertEqual(health["model_capabilities"]["error"]["code"],"capability_probe_failed")
+            self.assertEqual(health["model_capabilities"]["failed_check"],"capability_contract")
+            self.assertRegex(health["model_capabilities"]["probe_id"],r"^runtime-probe-[0-9a-f]{32}$")
+            self.assertEqual(probes[0]["probe_id"],health["model_capabilities"]["probe_id"])
+            self.assertEqual(probes[0]["events"][-1]["sdk_exception_type"],"RuntimeError")
+            self.assertEqual(TaskService(WorkspaceStore(root)).runtime_probes(1)[0]["probe_id"],probes[0]["probe_id"])
+            self.assertNotIn("provider details",str(health))
+            self.assertNotIn("provider details",str(probes))
 
     def test_unready_clarifier_does_not_enqueue_and_preserves_fallback(self):
         class UnreadyClarifier:
@@ -110,6 +117,8 @@ class FastAPIAppTests(unittest.TestCase):
                 error=imported.json()["clarification"]["error"]
                 self.assertEqual(error["code"],"runtime_unavailable")
                 self.assertEqual(error["runtime_error_code"],"model_authentication_failed")
+                self.assertEqual(error["failed_check"],"capability_contract")
+                self.assertRegex(error["probe_id"],r"^runtime-probe-[0-9a-f]{32}$")
                 retry=client.post(
                     "/v1/tasks/unready/clarifications/retry",
                     json={"idempotency_key":"unready-retry"},
@@ -198,13 +207,13 @@ class FastAPIAppTests(unittest.TestCase):
         )
         self.assertEqual(imported.status_code, 200)
         self.assertEqual(imported.json()["manifest"]["resources"], [])
-        self.assertEqual(imported.json()["task_card"]["missing"], ["goal", "audience", "topic"])
+        self.assertEqual(imported.json()["task_card"]["missing"], ["goal", "audience"])
 
         view = self.client.get("/v1/tasks/missing-input/input")
         self.assertEqual(view.status_code, 200)
         self.assertEqual(view.json()["source"], "这是一段尚未按任务卡格式整理的说明")
         self.assertEqual(view.json()["source_format"], "markdown")
-        self.assertEqual(len(view.json()["clarification"]["questions"]), 3)
+        self.assertEqual(len(view.json()["clarification"]["questions"]), 2)
         self.assertEqual(view.json()["state"]["required_action"], "answer_clarifications")
 
     def test_preview_is_same_origin_sandbox_content_with_separate_csp(self):

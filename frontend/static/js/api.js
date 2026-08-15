@@ -10,6 +10,8 @@ export class ApiError extends Error {
     this.retryable = details.retryable === true;
     this.retryAfterSeconds = details.retry_after_seconds || null;
     this.runtimeErrorCode = details.runtime_error_code || null;
+    this.probeId = details.probe_id || null;
+    this.failedCheck = details.failed_check || null;
     this.status = details.status || 0;
   }
 }
@@ -44,6 +46,7 @@ export async function request(path, options = {}) {
 export const api = {
   runtimeStatus: () => runtimeStatus(),
   recheckRuntime: () => runtimeStatus(true),
+  runtimeProbes: (limit = 20) => request(`/v1/runtime/probes?limit=${encodeURIComponent(limit)}`),
   listTasks: (controller) => request("/v1/tasks", { controller }),
   createTask: (payload) => request("/v1/tasks", { method: "POST", body: payload }),
   shell: (taskId, controller) => request(`/v1/tasks/${encodeURIComponent(taskId)}/shell`, { controller }),
