@@ -1,7 +1,7 @@
 import tempfile
 import unittest
 
-from ppt_agent.errors import ValidationError
+from ppt_agent.errors import GatewayError, ValidationError
 from ppt_agent.service import TaskService
 from ppt_agent.store import WorkspaceStore
 
@@ -43,6 +43,24 @@ class ClarificationModelTests(unittest.TestCase):
         service=self.service(Clarifier(error=RuntimeError("timeout"))); service.import_input("task",{"topic":"新品"})
         with self.assertRaises(RuntimeError): service.generate_clarification("task")
         result=service.use_fallback_clarification("task"); self.assertEqual(result["question_source"],"fallback"); self.assertTrue(result["details"])
+    def test_gateway_error_semantics_and_correlation_survive_in_clarification(self):
+        error=GatewayError(
+            "模型服务请求过于频繁，请等待后重新探测",
+            code="model_rate_limited",
+            retryable=True,
+            retry_after_seconds=23,
+        )
+        error.agent_audit_id="agent-audit-safe"
+        service=self.service(Clarifier(error=error)); service.import_input("task",{"topic":"新品"})
+        with self.assertRaises(GatewayError) as caught:
+            service.generate_clarification("task")
+        self.assertIs(caught.exception,error)
+        persisted=service.input_view("task")["clarification"]["error"]
+        self.assertEqual(persisted["code"],"model_rate_limited")
+        self.assertEqual(persisted["diagnostic_id"],error.diagnostic_id)
+        self.assertEqual(persisted["agent_audit_id"],"agent-audit-safe")
+        self.assertTrue(persisted["retryable"])
+        self.assertEqual(persisted["retry_after_seconds"],23)
 
 
 if __name__ == "__main__": unittest.main()

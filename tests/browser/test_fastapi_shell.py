@@ -8,6 +8,7 @@ import unittest
 import uvicorn
 from playwright.sync_api import sync_playwright
 
+from ppt_agent.errors import GatewayError
 from ppt_agent.service import TaskService
 from ppt_agent.store import WorkspaceStore
 from ppt_agent.web import create_app
@@ -240,6 +241,53 @@ class FastAPIShellBrowserGate(unittest.TestCase):
         self.assertEqual(errors, [])
         page.close()
 
+    def test_unready_model_is_not_shown_as_green_and_fallback_remains_available(self):
+        class UnreadyClarifier:
+            model = "unready-browser-model"
+            calls = 0
+            def probe_capabilities(self):
+                raise GatewayError(
+                    "模型服务认证失败，请联系管理员检查凭据",
+                    code="model_authentication_failed",
+                )
+            def clarify(self, _payload):
+                self.calls += 1
+                raise AssertionError("unready model must not be called")
+
+        clarifier = UnreadyClarifier()
+        self.service.clarifier = clarifier
+        self.service.initialize_runtime()
+        self.service.create("runtime-unready")
+        page, errors = self.new_page(375, 820, "reduce")
+        page.goto(self.base + "/tasks/runtime-unready?stage=created")
+        page.get_by_role("button", name="打开设置").click()
+        settings = page.get_by_role("dialog")
+        settings.get_by_text("浏览器在线", exact=True).wait_for()
+        settings.get_by_text("后端可达", exact=True).wait_for()
+        settings.get_by_text("模型不可用", exact=True).wait_for()
+        self.assertEqual(settings.get_by_text("模型可用", exact=True).count(), 0)
+        settings.get_by_role("button", name="关闭").click()
+
+        page.get_by_label("任务卡内容").fill("核心主题：新品发布")
+        page.get_by_role("button", name="导入并冻结资料").click()
+        page.get_by_role("heading", name="问题生成失败").wait_for()
+        retry = page.get_by_role("button", name="重新生成问题")
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not retry.is_disabled():
+            time.sleep(0.01)
+        self.assertTrue(retry.is_disabled())
+        self.assertFalse(page.get_by_role("button", name="使用系统兜底问题").is_disabled())
+        self.assertTrue(page.get_by_text("model_authentication_failed", exact=True).is_visible())
+        self.assertTrue(page.get_by_text("这是确定性配置故障", exact=False).is_visible())
+
+        page.get_by_role("button", name="使用系统兜底问题").click()
+        page.get_by_role("dialog").get_by_role("button", name="确认使用兜底问题").click()
+        page.get_by_role("heading", name="需求澄清", exact=True).wait_for()
+        self.assertEqual(clarifier.calls, 0)
+        self.assert_no_page_overflow(page)
+        self.assertEqual(errors, [])
+        page.close()
+
     def test_failed_model_can_retry_or_use_explicit_fallback(self):
         clarifier = ControlledClarifier(failures=1)
         self.service.clarifier = clarifier
@@ -250,7 +298,7 @@ class FastAPIShellBrowserGate(unittest.TestCase):
         page.get_by_role("button", name="导入并冻结资料").click()
         page.get_by_role("heading", name="问题生成失败").wait_for()
         self.assertEqual(page.locator("fieldset.question-card").count(), 0)
-        self.assertTrue(page.get_by_text("model gateway unavailable", exact=True).is_visible())
+        self.assertTrue(page.get_by_text("澄清问题生成失败", exact=True).is_visible())
 
         clarifier.release.clear()
         page.get_by_role("button", name="重新生成问题").click()

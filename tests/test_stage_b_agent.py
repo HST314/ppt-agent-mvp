@@ -1,9 +1,13 @@
+import hashlib
 import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+
+import httpx
+from openai import APIConnectionError, APIStatusError, APITimeoutError
 
 from ppt_agent.agent_runtime import AgentRuntime, STAGE_OUTPUT_SCHEMAS, STAGE_PROMPTS, TOOLS
 from ppt_agent.errors import GatewayError, GatewayUnknownResult, ValidationError
@@ -244,6 +248,62 @@ class StageBAgentTests(unittest.TestCase):
         config = SimpleNamespace(model="m", api_key="k", base_url="https://example.com", timeout_seconds=1)
         turn = OpenAIResponsesClient(config, sdk_client=sdk).create(input=[])
         self.assertEqual(turn.tool_calls[0].name, "read_skill_file")
+
+    def test_client_classifies_http_failures_and_only_audits_safe_metadata(self):
+        expected = {
+            400: ("model_request_invalid", False),
+            401: ("model_authentication_failed", False),
+            403: ("model_permission_denied", False),
+            404: ("model_not_found", False),
+            429: ("model_rate_limited", True),
+            500: ("model_upstream_unavailable", True),
+        }
+        config = SimpleNamespace(model="m", api_key="secret-key", base_url="https://example.com", timeout_seconds=1)
+        for status, (code, retryable) in expected.items():
+            with self.subTest(status=status):
+                request = httpx.Request("POST", "https://provider.example/v1/responses")
+                response = httpx.Response(
+                    status,
+                    request=request,
+                    headers={"x-request-id": "provider-request-secret", "retry-after": "17"},
+                )
+                failure = APIStatusError("raw provider failure secret", response=response, body={"secret": "raw-body"})
+                sdk = SimpleNamespace(); sdk.responses = sdk
+                sdk.create = lambda **_kwargs: (_ for _ in ()).throw(failure)
+                with self.assertRaises(GatewayError) as caught:
+                    OpenAIResponsesClient(config, sdk_client=sdk).create(input=[])
+                public = caught.exception.public()["error"]
+                audit = caught.exception.safe_audit_details()
+                self.assertEqual(public["code"], code)
+                self.assertEqual(public["retryable"], retryable)
+                self.assertEqual(audit["http_status"], status)
+                self.assertEqual(audit["sdk_exception_type"], "APIStatusError")
+                self.assertEqual(
+                    audit["provider_request_id_sha256"],
+                    hashlib.sha256(b"provider-request-secret").hexdigest(),
+                )
+                self.assertNotIn("provider-request-secret", json.dumps({"public": public, "audit": audit}))
+                self.assertNotIn("raw provider failure", json.dumps({"public": public, "audit": audit}))
+                if status == 429:
+                    self.assertEqual(public["retry_after_seconds"], 17)
+
+    def test_client_distinguishes_timeout_connection_and_unknown_sdk_failures(self):
+        config = SimpleNamespace(model="m", api_key="secret-key", base_url="https://example.com", timeout_seconds=1)
+        request = httpx.Request("POST", "https://provider.example/v1/responses")
+        cases = [
+            (APITimeoutError(request=request), GatewayUnknownResult, "model_timeout", "timeout"),
+            (APIConnectionError(request=request), GatewayUnknownResult, "model_connection_error", "connection"),
+            (RuntimeError("raw sdk secret"), GatewayError, "gateway_error", "sdk_error"),
+        ]
+        for failure, error_type, code, category in cases:
+            with self.subTest(code=code):
+                sdk = SimpleNamespace(); sdk.responses = sdk
+                sdk.create = lambda **_kwargs: (_ for _ in ()).throw(failure)
+                with self.assertRaises(error_type) as caught:
+                    OpenAIResponsesClient(config, sdk_client=sdk).create(input=[])
+                self.assertEqual(caught.exception.code, code)
+                self.assertEqual(caught.exception.safe_audit_details()["category"], category)
+                self.assertNotIn("raw sdk secret", json.dumps(caught.exception.public()))
 
 
 if __name__ == "__main__": unittest.main()

@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Query, Request, status
 from fastapi.responses import HTMLResponse
 
-from ...errors import ConflictError, NotFoundError, ValidationError
+from ...errors import ConflictError, NotFoundError, RuntimeUnavailableError, ValidationError
 from ...service import TaskService
 from ..dependencies import job_service, task_service
 from ..jobs import JobService
@@ -85,7 +85,11 @@ async def import_input(task_id: str, request: Request, service: TaskService = De
     exact(body, {"source", "source_format", "rebuild"}, {"source"})
     result=service.import_input(task_id, body["source"], body.get("source_format", "auto"), body.get("rebuild", False))
     if result.get("clarification",{}).get("status")=="generating":
-        job,_=jobs.create(task_id,"clarification.generate",{},f"clarification-{result['snapshot_hash']}"); result["clarification"]["job_id"]=job["job_id"]
+        try:
+            job,_=jobs.create(task_id,"clarification.generate",{},f"clarification-{result['snapshot_hash']}"); result["clarification"]["job_id"]=job["job_id"]
+        except RuntimeUnavailableError as error:
+            result["clarification"]=service.fail_clarification_for_runtime(task_id,error)
+            result["state"]=service.get(task_id)
     return result
 
 @router.post("/tasks/{task_id}/clarifications/retry")

@@ -1,6 +1,6 @@
-import { api } from "../api.js?v=2026.08.14.3";
-import { badge, button, element, field, formatTime, metadataList, shortHash, versionTimeline } from "../components/index.js?v=2026.08.14.3";
-import { actionMessage, codeBlock, draftGuard, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.14.3";
+import { api } from "../api.js?v=2026.08.15.084125796211";
+import { badge, button, element, field, formatTime, metadataList, shortHash, versionTimeline } from "../components/index.js?v=2026.08.15.084125796211";
+import { actionMessage, codeBlock, draftGuard, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.15.084125796211";
 
 export async function render(context) {
   const view = await api.planning(context.taskId, context.controller);
@@ -115,7 +115,7 @@ function generationPanel(kind, document, context) {
   const prompt = element("textarea", { className: "textarea", id: `${kind}-prompt`, placeholder: document ? "描述希望调整的结构或内容" : "可选：补充生成要求" });
   let slides = null;
   if (kind === "outline") slides = element("input", { className: "input", id: "outline-slide-ids", placeholder: "例如 slide-2, slide-4" });
-  const generate = button(document ? `按要求修改${stageLabel(kind)}` : `生成${stageLabel(kind)}`, { kind: "primary", mutates: true });
+  const generate = button(document ? `按要求修改${stageLabel(kind)}` : `生成${stageLabel(kind)}`, { kind: "primary", mutates: true, requiresRuntime: true });
   generate.addEventListener("click", async () => {
     const payload = { prompt: prompt.value || null };
     if (kind === "narrative") payload.scope = "all";

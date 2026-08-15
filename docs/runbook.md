@@ -15,7 +15,7 @@
 python3 scripts/start.py --data .ppt-agent-data --host 127.0.0.1 --port 8000
 ```
 
-该命令启动 FastAPI/Uvicorn Web 适配层。`/healthz` 的 `web_runtime` 应为 `fastapi`；真实模型模式还必须满足 `runtime_ready=true` 且 `model_capabilities.status=ready`。启动会实际验证严格 JSON Schema，并对启用工具的模型验证一次合法工具调用、工具结果回传和最终结构化输出；任一探测失败都会把 readiness 标记为不可用。`/`、`/tasks/{task_id}` 和 `/components` 使用独立 `frontend/` 静态资源。8 阶段交互全部位于统一应用壳；旧 `/tasks/{task_id}/outline|samples|deck|inspection|delivery` 深链会规范化到对应阶段，`/legacy/**` 已下线。
+该命令启动 FastAPI/Uvicorn Web 适配层。`/livez` 只检查 Web 进程存活并始终以 200 表示存活；`/readyz` 检查真实模型运行契约，未就绪时返回 503。兼容端点 `/healthz` 与 readiness 使用相同的 200/503 语义；浏览器轮询 `/v1/runtime/status`，该端点固定返回 200，并通过 `runtime_ready` 表达模型状态，避免预期的未就绪状态污染浏览器控制台。真实模型模式必须满足 `runtime_ready=true` 且 `model_capabilities.status=ready`。启动会实际验证严格 JSON Schema，并对启用工具的模型验证一次合法工具调用、工具结果回传和最终结构化输出；任一探测失败都会把 readiness 标记为不可用，依赖模型的 Job 在入队和执行前都会关闭失败。修复配置或等待供应商恢复后，在工作台“显示与连接”执行显式重新检测。`/`、`/tasks/{task_id}` 和 `/components` 使用独立 `frontend/` 静态资源。8 阶段交互全部位于统一应用壳；旧 `/tasks/{task_id}/outline|samples|deck|inspection|delivery` 深链会规范化到对应阶段，`/legacy/**` 已下线。
 
 样品、全稿和检查预览由 `/v1/tasks/{task_id}/previews/{hash}` 提供。端点只接受当前任务内 `sample`/`deck` 版本，返回 `no-store`、`SAMEORIGIN` 与禁止脚本的独立 CSP；应用壳 CSP 不允许内联脚本或样式。预览异常时先核对 hash 是否属于当前任务及对应版本，不要绕过端点直接读取工作区文件。
 
@@ -46,6 +46,7 @@ python3 scripts/start.py --data .ppt-agent-data --host 127.0.0.1 --port 8000
 ```bash
 python3 -m unittest discover -s tests -v
 python3 scripts/verify_browser_gate.py
+python3 scripts/update_frontend_build.py --check
 python3 scripts/build_offline_bundle.py .ppt-agent-data/tasks/<task-id>/deliveries/<delivery-id>
 python3 scripts/verify_offline_delivery.py .ppt-agent-data/tasks/<task-id>/deliveries/<delivery-id>.zip
 ```
@@ -55,13 +56,16 @@ python3 scripts/verify_offline_delivery.py .ppt-agent-data/tasks/<task-id>/deliv
 ## 故障排查
 
 - 启动时报配置错误：确认 YAML 字段白名单、`gateway.mode`，以及 YAML 引用的环境变量均已在 `.env` 配置。
-- `gateway_error`：根据诊断 ID 检查端点、证书和超时；修正后再由用户重试。
-- `gateway_unknown_result`：不得自动重试，先查供应商请求记录和任务摘要，避免产生重复候选。
+- `model_authentication_failed` / `model_permission_denied` / `model_not_found` / `model_request_invalid`：属于确定性配置故障，修复凭据、权限、模型名或 Responses/Schema 兼容性后重新探测，不要连续重试。
+- `model_rate_limited`：遵守响应中的 `retry_after_seconds`（如有），等待后重新探测。
+- `model_upstream_unavailable`：等待供应商恢复后重新探测；不要以连续提交代替健康检查。
+- `model_timeout` / `model_connection_error`：结果可能未知，不得自动重试；先用 `agent_audit_id`、诊断 ID 和供应商请求记录核对结果。
+- `gateway_error`：无法进一步分类的 SDK/HTTP 故障；根据诊断 ID 检查运行日志，确认原因后再操作。
 - Skill 校验失败：不要直接修改内置文件；恢复经过评审的 Skill 与 `SKILL_LOCK.json` 配套版本。
 - 离线校验失败：按错误中的 missing/extra/changed 或 URL 文件修复源交付并重新确认，禁止手改已发布目录。
 - 浏览器门禁 skipped：安装锁定 Playwright/Chromium 及系统共享库后重跑，不能把跳过当成功。
 
-模型调用超时返回 `gateway_error`；连接在请求发出后中断返回 `gateway_unknown_result`。两者都带诊断 ID 且不暴露密钥或供应商原始异常。未知结果不得自动重试：操作人员先查供应商请求记录，再通过任务摘要确认最后成功版本，最后由用户选择重试、修改输入或人工处理。
+所有模型故障都保留稳定业务码与诊断 ID；Agent 路径还会返回可关联的 `agent_audit_id`。脱敏审计只保存 HTTP 状态、SDK 异常类型、可重试标志和供应商 request-id 哈希，不保存密钥、完整 Prompt、原始响应或内部推理。超时与连接中断属于结果可能未知，操作人员必须先查供应商记录和任务摘要，最后由用户选择重试、修改输入或人工处理。
 
 备份应复制整个数据目录并保留权限；恢复时先停止服务，将备份复制到新目录后以 `--data` 指向该目录启动。内核会重放 `pending-commit.json` 完成原子提交；交付目录和历史版本不可覆盖。恢复后运行测试，并抽查 `/summary`、版本列表、事件列表与交付 manifest hash。
 

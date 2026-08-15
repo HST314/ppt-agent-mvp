@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import hashlib
+import json
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from ..service import TaskService
@@ -11,7 +14,7 @@ from ..store import WorkspaceStore
 from .errors import install_error_handlers
 from .jobs import JobService
 from .routes import jobs, pages, tasks
-from .assets import FRONTEND_BUILD
+from .assets import FRONTEND_BUILD, backend_commit
 
 
 def create_app(
@@ -25,11 +28,12 @@ def create_app(
     frontend = frontend.resolve()
     if not (frontend / "index.html").is_file():
         raise RuntimeError(f"frontend assets missing: {frontend}")
-    coordinator = JobService(service)
+    coordinator = JobService(service, defer_queued_recovery=True)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         service.initialize_runtime()
+        coordinator.resume_recovered_queued()
         yield
         coordinator.close()
 
@@ -44,6 +48,21 @@ def create_app(
     app.state.job_service = coordinator
     app.state.frontend_root = frontend
     app.state.frontend_build = FRONTEND_BUILD
+
+    def runtime_payload():
+        capabilities=service.runtime_health()
+        config_summary=service.runtime_config_summary()
+        return {
+            "status": "ok" if capabilities["ready"] else "unavailable",
+            "stage": "P8",
+            "runtime_ready": capabilities["ready"],
+            "web_runtime": "fastapi",
+            "frontend_build": FRONTEND_BUILD,
+            "backend_commit": backend_commit(),
+            "config_summary_sha256": hashlib.sha256(json.dumps(config_summary,sort_keys=True,separators=(",",":")).encode()).hexdigest(),
+            "clarification_mode":"model" if service.clarifier is not None else "fake",
+            "model_capabilities":capabilities,
+        }
 
     @app.middleware("http")
     async def security_headers(request, call_next):
@@ -65,10 +84,29 @@ def create_app(
             )
         return response
 
+    @app.get("/livez", tags=["runtime"])
+    def live():
+        payload=runtime_payload()
+        return {key:payload[key] for key in ("status","web_runtime","frontend_build","backend_commit","config_summary_sha256")} | {"status":"ok"}
+
+    @app.get("/readyz", tags=["runtime"])
+    def ready():
+        payload=runtime_payload()
+        return JSONResponse(status_code=200 if payload["runtime_ready"] else 503,content=payload)
+
     @app.get("/healthz", tags=["runtime"])
     def health():
-        capabilities=service.runtime_health()
-        return {"status": "ok" if capabilities["ready"] else "unavailable", "stage": "P8", "runtime_ready": capabilities["ready"], "web_runtime": "fastapi", "frontend_build": FRONTEND_BUILD, "clarification_mode":"model" if service.clarifier is not None else "fake","model_capabilities":capabilities}
+        payload=runtime_payload()
+        return JSONResponse(status_code=200 if payload["runtime_ready"] else 503,content=payload)
+
+    @app.get("/v1/runtime/status", tags=["runtime"])
+    def runtime_status():
+        return runtime_payload()
+
+    @app.post("/v1/runtime/recheck", tags=["runtime"])
+    def recheck_runtime():
+        service.initialize_runtime()
+        return runtime_payload()
 
     app.mount("/static", StaticFiles(directory=frontend / "static", check_dir=True), name="static")
     app.include_router(jobs.router)

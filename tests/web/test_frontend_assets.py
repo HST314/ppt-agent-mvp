@@ -1,4 +1,6 @@
 import re
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -64,6 +66,30 @@ class FrontendAssetTests(unittest.TestCase):
             for specifier in imports:
                 with self.subTest(module=module.name, specifier=specifier):
                     self.assertTrue(specifier.endswith(f"?v={build}"))
+
+    def test_frontend_build_key_is_fresh_for_current_asset_content(self):
+        subprocess.run(
+            [sys.executable, str(ROOT / "scripts/update_frontend_build.py"), "--check"],
+            cwd=ROOT,
+            check=True,
+        )
+
+    def test_runtime_status_is_server_backed_and_recovery_is_actionable(self):
+        app = (FRONTEND / "static/js/app.js").read_text()
+        api = (FRONTEND / "static/js/api.js").read_text()
+        input_stage = (FRONTEND / "static/js/stages/input.js").read_text()
+        self.assertIn('fetch("/livez"', api)
+        self.assertIn('fetch(recheck ? "/v1/runtime/recheck" : "/v1/runtime/status"', api)
+        for label in ("浏览器在线", "后端可达", "模型可用", "模型不可用"):
+            self.assertIn(label, app)
+        self.assertIn('role: "status"', app)
+        self.assertIn("runtimeSignature", app)
+        self.assertIn('data-requires-runtime="true"', app)
+        self.assertIn("model_authentication_failed", input_stage)
+        self.assertIn("model_rate_limited", input_stage)
+        self.assertIn("model_upstream_unavailable", input_stage)
+        self.assertIn("Agent 审计 ID", input_stage)
+        self.assertIn('role: "alert"', input_stage)
 
     def test_untrusted_content_is_not_assigned_to_inner_html(self):
         javascript = "\n".join(path.read_text() for path in (FRONTEND / "static/js").rglob("*.js"))

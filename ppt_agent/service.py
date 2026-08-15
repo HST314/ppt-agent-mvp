@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import hashlib, json, logging, re, time
+import hashlib, json, logging, re, threading, time
 from pathlib import Path
 from datetime import datetime, timezone
 
-from .errors import ConflictError, GatewayError, ValidationError
+from .errors import ConflictError, GatewayError, RuntimeUnavailableError, ValidationError
 from .fsm import TaskState, transition
 from .gateways import FakeGenerationGateway, FakeHtmlBuilder, FakeInspectionGateway, FakeSkillLoader
 from .schema import DeliveryManifest, InspectionReport, IssueDisposition
@@ -22,27 +22,78 @@ class TaskService:
     def __init__(self,store,generator=None,inspector=None,skills=None,builder=None,clarifier=None):
         self.store=store; self.generator=generator or FakeGenerationGateway(); self.inspector=inspector or FakeInspectionGateway(); self.skills=skills or FakeSkillLoader(); self.builder=builder or FakeHtmlBuilder(); self.clarifier=clarifier
         self._runtime_capabilities={"checked":False,"ready":True,"status":"not_required","models":[]}
+        self._runtime_guard=threading.RLock()
+        self._runtime_probe_guard=threading.Lock()
         for gateway in {id(x):x for x in (self.generator,self.inspector,self.builder,self.clarifier) if x is not None}.values():
             if hasattr(gateway,"set_audit_sink"): gateway.set_audit_sink(self.store.append_agent_audit)
+        if self._runtime_gateways():
+            self._runtime_capabilities={"checked":False,"ready":False,"status":"not_checked","models":[]}
+    def _runtime_gateways(self):
+        return list({id(x):x for x in (self.generator,self.inspector,self.builder,self.clarifier) if hasattr(x,"probe_capabilities")}.values())
     def initialize_runtime(self):
-        gateways=list({id(x):x for x in (self.generator,self.inspector,self.builder,self.clarifier) if hasattr(x,"probe_capabilities")}.values())
-        if not gateways:
-            self._runtime_capabilities={"checked":False,"ready":True,"status":"not_required","models":[]}
-            return self._runtime_capabilities
-        models=[]
-        try:
-            for gateway in gateways:
-                checks=gateway.probe_capabilities()
-                if not checks or not all(checks.values()):
-                    raise GatewayError("模型能力探测未满足运行契约")
-                models.append({"model":gateway.model,"checks":checks})
-        except Exception as exc:
-            public=exc.public()["error"] if hasattr(exc,"public") else {"code":"capability_probe_failed","diagnostic_id":hashlib.sha256(str(type(exc)).encode()).hexdigest()[:24]}
-            self._runtime_capabilities={"checked":True,"ready":False,"status":"unavailable","models":models,"error":{"code":public["code"],"diagnostic_id":public["diagnostic_id"]}}
-            return self._runtime_capabilities
-        self._runtime_capabilities={"checked":True,"ready":True,"status":"ready","models":models}
-        return self._runtime_capabilities
-    def runtime_health(self): return self._runtime_capabilities
+        with self._runtime_probe_guard:
+            gateways=self._runtime_gateways()
+            if not gateways:
+                with self._runtime_guard:
+                    self._runtime_capabilities={"checked":False,"ready":True,"status":"not_required","models":[],"checked_at":utcnow()}
+                return self.runtime_health()
+            with self._runtime_guard:
+                self._runtime_capabilities={"checked":False,"ready":False,"status":"checking","models":[],"checked_at":utcnow()}
+            models=[]
+            try:
+                for gateway in gateways:
+                    checks=gateway.probe_capabilities()
+                    if not checks or not all(checks.values()):
+                        raise GatewayError("模型能力探测未满足运行契约")
+                    models.append({"model":gateway.model,"checks":checks})
+            except Exception as exc:
+                public=exc.public()["error"] if hasattr(exc,"public") else {"code":"capability_probe_failed","diagnostic_id":hashlib.sha256(str(type(exc)).encode()).hexdigest()[:24]}
+                error={key:public[key] for key in ("code","diagnostic_id","retryable","retry_after_seconds","agent_audit_id") if key in public}
+                with self._runtime_guard:
+                    self._runtime_capabilities={"checked":True,"ready":False,"status":"unavailable","models":models,"error":error,"checked_at":utcnow()}
+                return self.runtime_health()
+            with self._runtime_guard:
+                self._runtime_capabilities={"checked":True,"ready":True,"status":"ready","models":models,"checked_at":utcnow()}
+            return self.runtime_health()
+    def runtime_health(self):
+        with self._runtime_guard:
+            return json.loads(json.dumps(self._runtime_capabilities))
+    def runtime_config_summary(self):
+        gateways=self._runtime_gateways()
+        gateway_summaries=[]
+        for gateway in gateways:
+            summary={"model":str(getattr(gateway,"model","unknown")),"type":type(gateway).__name__}
+            config=getattr(getattr(gateway,"client",None),"config",None)
+            if config is not None and hasattr(config,"public"):
+                summary["config"]=config.public()
+            gateway_summaries.append(summary)
+        return {
+            "mode":"agent" if gateways else "fake",
+            "gateways":sorted(gateway_summaries,key=lambda item:(item["model"],item["type"])),
+        }
+    def require_runtime_ready(self):
+        capabilities=self.runtime_health()
+        if capabilities.get("ready"):
+            return
+        error=capabilities.get("error",{})
+        raise RuntimeUnavailableError(
+            runtime_error_code=error.get("code"),
+            retryable=error.get("retryable") is True,
+            retry_after_seconds=error.get("retry_after_seconds"),
+            agent_audit_id=error.get("agent_audit_id"),
+            diagnostic_id=error.get("diagnostic_id"),
+        )
+    def record_runtime_failure(self,error):
+        if not isinstance(error,GatewayError): return
+        public=error.public()["error"]
+        safe={key:public[key] for key in ("code","diagnostic_id","retryable","retry_after_seconds","agent_audit_id") if key in public}
+        with self._runtime_guard:
+            current=self._runtime_capabilities
+            self._runtime_capabilities={**current,"checked":True,"ready":False,"status":"unavailable","error":safe,"checked_at":utcnow()}
+    def record_runtime_success(self):
+        with self._runtime_guard:
+            if self._runtime_capabilities.get("ready"):
+                self._runtime_capabilities.pop("last_failure",None)
     def agent_audits(self,task_id,job_id=None):
         self.store.checkpoint(task_id)
         return self.store.agent_audits(task_id=task_id,job_id=job_id)
@@ -153,13 +204,16 @@ class TaskService:
         try:
             value=self.clarifier.clarify(payload); questions=self._validate_model_questions(value.get("questions"),view["task_card"])
         except Exception as exc:
-            error={"code":"clarification_generation_failed","message":str(exc)}
-            if getattr(exc,"agent_audit_id",None): error["agent_audit_id"]=exc.agent_audit_id
+            error=exc.public()["error"] if hasattr(exc,"public") else {"code":"clarification_generation_failed","message":"澄清问题生成失败","diagnostic_id":hashlib.sha256(f"{task_id}:{type(exc).__name__}".encode()).hexdigest()[:24]}
             self._record_clarification(task_id,view,[],"failed",None,error,"clarification_failed"); raise
         return self._record_clarification(task_id,view,questions,"ready",value.get("model"),None,"clarification_generate")
     def use_fallback_clarification(self,task_id):
         view=self.input_view(task_id)
         return self._record_clarification(task_id,view,questions_for(view["task_card"]),"ready",None,None,"clarification_fallback",source="fallback")
+    def fail_clarification_for_runtime(self,task_id,error):
+        view=self.input_view(task_id)
+        public=error.public()["error"] if hasattr(error,"public") else {"code":"runtime_unavailable","message":"模型运行时尚未就绪","diagnostic_id":hashlib.sha256(f"{task_id}:runtime".encode()).hexdigest()[:24]}
+        return self._record_clarification(task_id,view,[],"failed",None,public,"clarification_failed")
     def _validate_model_questions(self,questions,card):
         if not isinstance(questions,list) or len(questions)>5: raise ValidationError("澄清模型 questions 必须为 0 到 5 项")
         required={"question_id","field_path","prompt","helper_text","options","allow_other","blocking"}; seen_ids=set(); seen_paths=set(); known={k for k in ("goal","audience","topic") if k not in card.get("missing",[])}; result=[]

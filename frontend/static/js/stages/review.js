@@ -1,6 +1,6 @@
-import { api } from "../api.js?v=2026.08.14.3";
-import { badge, button, element, field, metadataList, previewFrame, previewUrl, shortHash } from "../components/index.js?v=2026.08.14.3";
-import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.14.3";
+import { api } from "../api.js?v=2026.08.15.084125796211";
+import { badge, button, element, field, metadataList, previewFrame, previewUrl, shortHash } from "../components/index.js?v=2026.08.15.084125796211";
+import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.15.084125796211";
 
 export async function render(context) {
   const view = await api.inspection(context.taskId, context.controller);
@@ -47,7 +47,7 @@ function inspectionControls(view, context) {
   const slides = element("input", { className: "input", id: "inspection-slides", placeholder: "留空为全检；或 slide-2, slide-4" });
   const saveMode = button("保存模式", { kind: "secondary", mutates: true });
   saveMode.addEventListener("click", () => runAction({ buttonNode: saveMode, region: message, action: () => api.setInspectionMode(context.taskId, mode.value), success: "检查模式将在下一项动作生效。", refresh: context.refresh }).catch(() => {}));
-  const run = button("执行独立检查", { kind: "primary", mutates: true });
+  const run = button("执行独立检查", { kind: "primary", mutates: true, requiresRuntime: true });
   run.addEventListener("click", () => context.startJob("inspection.run", { max_rounds: Number(rounds.value), affected_slide_ids: parseSlideIds(slides.value) }, { buttonNode: run, region: message }));
   return section("检查设置", [
     element("div", { className: "form-grid" }, [field("检查模式", mode), field("最大自动修复轮数", rounds), field("增量检查页面", slides)]),

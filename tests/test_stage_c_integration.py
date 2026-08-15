@@ -93,7 +93,19 @@ class StageCIntegrationTests(unittest.TestCase):
     def test_agent_audit_is_correlated_to_task_and_job_and_error(self):
         with tempfile.TemporaryDirectory() as root:
             store=WorkspaceStore(root)
-            gateway=AgentGateway(RaisingClient(GatewayError("failed")),skill=SkillRuntime.builtin())
+            failure=GatewayError(
+                "failed",
+                code="model_authentication_failed",
+                audit_details={
+                    "category":"authentication",
+                    "http_status":401,
+                    "sdk_exception_type":"APIStatusError",
+                    "provider_request_id_sha256":"a"*64,
+                    "retryable":False,
+                    "raw_provider_error":"must-not-persist",
+                },
+            )
+            gateway=AgentGateway(RaisingClient(failure),skill=SkillRuntime.builtin())
             gateway.set_audit_sink(store.append_agent_audit)
             with bind_agent_audit_context(task_id="task",job_id="job_123"):
                 with self.assertRaises(GatewayError) as caught:
@@ -102,7 +114,11 @@ class StageCIntegrationTests(unittest.TestCase):
             self.assertEqual(len(audit),1)
             self.assertEqual(audit[0]["audit_id"],caught.exception.agent_audit_id)
             self.assertEqual(caught.exception.public()["error"]["agent_audit_id"],audit[0]["audit_id"])
+            self.assertEqual(audit[0]["error_code"],"model_authentication_failed")
+            self.assertEqual(audit[0]["events"][-1]["http_status"],401)
+            self.assertEqual(audit[0]["events"][-1]["category"],"authentication")
             self.assertNotIn("content",json.dumps(audit))
+            self.assertNotIn("must-not-persist",json.dumps(audit))
 
 
 if __name__ == "__main__": unittest.main()

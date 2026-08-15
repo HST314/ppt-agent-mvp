@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from .errors import GatewayError, GatewayUnknownResult, ValidationError
+from .errors import GatewayError, ValidationError
 from .skill_runtime import SkillRuntime
 
 
@@ -121,8 +121,12 @@ class AgentRuntime:
             except (IndexError, StopIteration) as exc:
                 fail("Agent 未在工具纠错后提交阶段产物", "incomplete_after_tool_error", exc)
             except GatewayError as exc:
-                reason = "gateway_unknown_result" if isinstance(exc, GatewayUnknownResult) else "gateway_error"
-                audit.append({"event": "terminal", "reason": reason, "tool_calls": tool_count})
+                audit.append({
+                    "event": "terminal",
+                    "reason": exc.code,
+                    "tool_calls": tool_count,
+                    **exc.safe_audit_details(),
+                })
                 self.last_audit = tuple(audit)
                 exc.audit = self.last_audit
                 raise

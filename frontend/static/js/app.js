@@ -1,10 +1,10 @@
-import { api, ApiError } from "./api.js?v=2026.08.14.3";
-import { JobTracker } from "./job-tracker.js?v=2026.08.14.3";
-import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.14.3";
-import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.14.3";
-import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.14.3";
-import { inlineError, setBusy } from "./components/index.js?v=2026.08.14.3";
-import { renderStage } from "./stages/index.js?v=2026.08.14.3";
+import { api, ApiError } from "./api.js?v=2026.08.15.084125796211";
+import { JobTracker } from "./job-tracker.js?v=2026.08.15.084125796211";
+import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.15.084125796211";
+import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.15.084125796211";
+import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.15.084125796211";
+import { inlineError, setBusy } from "./components/index.js?v=2026.08.15.084125796211";
+import { renderStage } from "./stages/index.js?v=2026.08.15.084125796211";
 
 const app = document.getElementById("app");
 const APP_BUILD = document.querySelector('meta[name="app-build"]')?.content || "unknown";
@@ -13,6 +13,8 @@ let renderGeneration = 0;
 let activeController = null;
 let hasUnsavedDraft = false;
 let acceptedLocation = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+let runtimeProbe = null;
+let runtimeState = { browserOnline: navigator.onLine, backendReachable: null, runtimeReady: null, health: null };
 
 const STATUS = {
   ready: ["就绪", "success"],
@@ -33,13 +35,18 @@ window.addEventListener("beforeunload", (event) => {
 });
 window.addEventListener("online", () => {
   showToast("网络连接已恢复");
+  refreshRuntimeStatus();
   if (!hasUnsavedDraft) renderRoute(currentRoute());
 });
 window.addEventListener("offline", () => {
   showToast("网络连接已断开，已保留当前编辑内容");
+  runtimeState = { browserOnline: false, backendReachable: false, runtimeReady: false, health: null };
+  updateRuntimeUI();
   if (!hasUnsavedDraft) renderRoute(currentRoute());
 });
 renderRoute(currentRoute());
+refreshRuntimeStatus();
+window.setInterval(() => refreshRuntimeStatus(), 15_000);
 
 async function renderRoute(route) {
   const requestedLocation = `${window.location.pathname}${window.location.search}${window.location.hash}`;
@@ -75,8 +82,7 @@ function topbar(context = {}) {
     brandMark(),
     element("span", { className: "topbar__title", text: "PPT Agent" }),
   ]);
-  const connection = badge(navigator.onLine ? "服务可连接" : "当前离线", navigator.onLine ? "success" : "danger");
-  connection.classList.add("badge--connection");
+  const connection = runtimeStatusBadges();
   const build = badge(`Build ${APP_BUILD}`, "primary");
   build.classList.add("badge--build");
   const settingsButton = iconButton("settings", "打开设置", openSettings);
@@ -97,6 +103,80 @@ function topbar(context = {}) {
     ]),
   ]);
   return bar;
+}
+
+function runtimeStatusBadges() {
+  const group = element("div", { className: "runtime-status badge--connection", "data-runtime-status": "true", role: "status", "aria-live": "polite" });
+  renderRuntimeBadges(group);
+  return group;
+}
+
+function renderRuntimeBadges(group) {
+  const browserLabel = runtimeState.browserOnline ? "浏览器在线" : "浏览器离线";
+  const browserTone = runtimeState.browserOnline ? "success" : "danger";
+  const backendLabel = runtimeState.backendReachable === null ? "后端检测中" : runtimeState.backendReachable ? "后端可达" : "后端不可达";
+  const backendTone = runtimeState.backendReachable === null ? "warning" : runtimeState.backendReachable ? "success" : "danger";
+  let modelLabel = "模型检测中";
+  let modelTone = "warning";
+  if (runtimeState.health?.clarification_mode === "fake" && runtimeState.runtimeReady) {
+    modelLabel = "模型：本地模式";
+    modelTone = "primary";
+  } else if (runtimeState.runtimeReady === true) {
+    modelLabel = "模型可用";
+    modelTone = "success";
+  } else if (runtimeState.runtimeReady === false) {
+    modelLabel = "模型不可用";
+    modelTone = "danger";
+  }
+  const signature = JSON.stringify([browserLabel, browserTone, backendLabel, backendTone, modelLabel, modelTone]);
+  if (group.dataset.runtimeSignature === signature) return;
+  group.dataset.runtimeSignature = signature;
+  const browser = badge(browserLabel, browserTone);
+  const backend = badge(backendLabel, backendTone);
+  const model = badge(modelLabel, modelTone);
+  const code = runtimeState.health?.model_capabilities?.error?.code;
+  if (code) model.title = `运行时错误：${code}`;
+  group.replaceChildren(browser, backend, model);
+}
+
+async function refreshRuntimeStatus(recheck = false) {
+  if (runtimeProbe && !recheck) return runtimeProbe;
+  if (!navigator.onLine) {
+    runtimeState = { browserOnline: false, backendReachable: false, runtimeReady: false, health: null };
+    updateRuntimeUI();
+    return runtimeState;
+  }
+  runtimeProbe = api[recheck ? "recheckRuntime" : "runtimeStatus"]().then((result) => {
+    runtimeState = {
+      browserOnline: navigator.onLine,
+      backendReachable: result.backendReachable,
+      runtimeReady: result.runtimeReady,
+      health: result.ready || result.live,
+    };
+    updateRuntimeUI();
+    return runtimeState;
+  }).finally(() => { runtimeProbe = null; });
+  return runtimeProbe;
+}
+
+function updateRuntimeUI() {
+  document.querySelectorAll("[data-runtime-status]").forEach(renderRuntimeBadges);
+  document.querySelectorAll('[data-requires-runtime="true"]').forEach((control) => {
+    if (runtimeState.runtimeReady) {
+      if (control.dataset.runtimeDisabled === "true") {
+        control.disabled = false;
+        delete control.dataset.runtimeDisabled;
+        control.removeAttribute("aria-description");
+        control.title = "";
+      }
+      return;
+    }
+    if (!control.disabled) control.dataset.runtimeDisabled = "true";
+    control.disabled = true;
+    const reason = runtimeState.backendReachable === false ? "后端服务当前不可达" : "模型运行时不可用，请先重新检测";
+    control.title = reason;
+    control.setAttribute("aria-description", reason);
+  });
 }
 
 async function renderHome(generation) {
@@ -212,6 +292,7 @@ async function renderWorkspace(route, generation) {
         if (generation !== renderGeneration) return;
         enforceTaskActionState(content, shell.task);
         document.getElementById("stage-content")?.replaceChildren(content);
+        updateRuntimeUI();
       } catch (error) {
         if (generation === renderGeneration && error?.name !== "AbortError") {
           document.getElementById("stage-content")?.replaceChildren(inlineError(describeError(error), error?.diagnosticId));
@@ -399,6 +480,10 @@ async function startTrackedJob({ taskId, route, buttonNode, region, intent, crea
   region?.replaceChildren();
   setBusy(buttonNode, true, busyLabel);
   try {
+    await refreshRuntimeStatus();
+    if (!runtimeState.runtimeReady) {
+      throw new ApiError("模型运行时不可用，请先在连接状态中重新检测", { code: "runtime_unavailable", status: 503 });
+    }
     const job = await create();
     bindJobIntent(job, intent.storageKey);
     let activeRegion = document.getElementById("active-job-region");
@@ -415,6 +500,7 @@ async function startTrackedJob({ taskId, route, buttonNode, region, intent, crea
   } catch (error) {
     if (region) region.replaceChildren(inlineError(describeError(error), error?.diagnosticId));
     setBusy(buttonNode, false);
+    updateRuntimeUI();
     return null;
   }
 }
@@ -548,8 +634,16 @@ function openSettings() {
       ]),
       element("div", { className: "field" }, [
         element("span", { className: "field__label", text: "服务连接" }),
-        badge(navigator.onLine ? "浏览器网络在线" : "浏览器当前离线", navigator.onLine ? "success" : "danger"),
-        element("p", { className: "field__hint", text: `前端 Build ${APP_BUILD}` }),
+        runtimeStatusBadges(),
+        element("p", { className: "field__hint", text: runtimeVersionText() }),
+        button("重新检测模型", { onClick: async (event) => {
+          const control = event.currentTarget;
+          setBusy(control, true, "正在重新检测…");
+          await refreshRuntimeStatus(true);
+          control.disabled = false;
+          control.textContent = "重新检测模型";
+          showToast(runtimeState.runtimeReady ? "模型运行时已就绪" : "模型仍不可用，请按错误代码检查配置");
+        } }),
       ]),
     ]),
     element("div", { className: "dialog__actions" }, [button("关闭", { kind: "primary", onClick: () => {
@@ -560,6 +654,12 @@ function openSettings() {
   document.body.append(dialog);
   dialog.addEventListener("cancel", () => window.setTimeout(() => dialog.remove(), 0), { once: true });
   dialog.showModal();
+}
+
+function runtimeVersionText() {
+  const commit = runtimeState.health?.backend_commit || "unknown";
+  const config = runtimeState.health?.config_summary_sha256 || "unknown";
+  return `前端 Build ${APP_BUILD} · 后端 ${commit.slice(0, 12)} · 配置 ${config.slice(0, 12)}`;
 }
 
 function progress(value, valueLabel, step) {
@@ -583,6 +683,7 @@ function stageLabel(stage) {
 function replaceApp(node) {
   app.replaceChildren(node);
   app.setAttribute("aria-busy", "false");
+  updateRuntimeUI();
 }
 
 function intercept(event) {

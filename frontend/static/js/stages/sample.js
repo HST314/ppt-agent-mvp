@@ -1,6 +1,6 @@
-import { api } from "../api.js?v=2026.08.14.3";
-import { badge, button, element, field, metadataList, previewFrame, previewUrl, shortHash, versionTimeline } from "../components/index.js?v=2026.08.14.3";
-import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.14.3";
+import { api } from "../api.js?v=2026.08.15.084125796211";
+import { badge, button, element, field, metadataList, previewFrame, previewUrl, shortHash, versionTimeline } from "../components/index.js?v=2026.08.15.084125796211";
+import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.15.084125796211";
 
 export async function render(context) {
   const [view, planning] = await Promise.all([
@@ -53,7 +53,7 @@ function sampleStage(view, planning, context) {
     await runAction({ buttonNode: confirm, region: confirmMessage, busyLabel: "正在确认…", action: () => api.confirmSample(context.taskId), success: "当前样品已按 outline、selection 和内容 hash 绑定确认。", refresh: context.refresh }).catch(() => {});
   });
   const generateDeckMessage = actionMessage();
-  const generateDeck = view.confirmation ? button("生成完整演示稿", { kind: "primary", mutates: true, onClick: () => context.startJob("deck.generate", {}, { buttonNode: generateDeck, region: generateDeckMessage }) }) : null;
+  const generateDeck = view.confirmation ? button("生成完整演示稿", { kind: "primary", mutates: true, requiresRuntime: true, onClick: () => context.startJob("deck.generate", {}, { buttonNode: generateDeck, region: generateDeckMessage }) }) : null;
 
   return stageGrid([
     section("样品页选择", selectionForm, {
@@ -107,7 +107,7 @@ function generationPanel(view, context) {
   ]);
   const slide = element("input", { className: "input", id: "sample-slide", placeholder: "slide-2" });
   const target = element("input", { className: "input", id: "sample-element", placeholder: "title" });
-  const submit = button(sample ? "提交样品修改" : "生成 HTML 样品", { kind: "primary", mutates: true });
+  const submit = button(sample ? "提交样品修改" : "生成 HTML 样品", { kind: "primary", mutates: true, requiresRuntime: true });
   submit.addEventListener("click", async () => {
     if (!sample) {
       await context.startJob("samples.generate", { prompt: prompt.value || null }, { buttonNode: submit, region: message });

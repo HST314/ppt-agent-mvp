@@ -1,6 +1,6 @@
-import { api } from "../api.js?v=2026.08.14.3";
-import { badge, button, confirmationDialog, element, field, metadataList, shortHash } from "../components/index.js?v=2026.08.14.3";
-import { actionMessage, invalidationNotice, runAction, section, stageGrid } from "./shared.js?v=2026.08.14.3";
+import { api } from "../api.js?v=2026.08.15.084125796211";
+import { badge, button, confirmationDialog, element, field, metadataList, shortHash } from "../components/index.js?v=2026.08.15.084125796211";
+import { actionMessage, invalidationNotice, runAction, section, stageGrid } from "./shared.js?v=2026.08.15.084125796211";
 
 const FIELD_LABELS = { goal: "演示目标", audience: "主要受众", topic: "核心主题" };
 const WARNING_LABELS = {
@@ -218,7 +218,8 @@ function clarificationGenerating(job) {
 function clarificationFailed(clarification, context) {
   const error = clarification.error || {};
   const message = actionMessage();
-  const retry = button("重新生成问题", { kind: "primary", mutates: true, onClick: () => {
+  const advice = clarificationRecoveryAdvice(error);
+  const retry = button("重新生成问题", { kind: "primary", mutates: true, requiresRuntime: true, onClick: () => {
     context.retryClarification({ buttonNode: retry, region: message });
   } });
   const fallback = button("使用系统兜底问题", { kind: "secondary", mutates: true, onClick: () => {
@@ -242,13 +243,51 @@ function clarificationFailed(clarification, context) {
       element("p", { text: error.message || "模型未能完成本轮澄清问题生成，系统没有自动展示固定问题。" }),
       metadataList([
         ["错误代码", error.code || "clarification_generation_failed"],
-        ["诊断 ID", error.diagnostic_id || clarification.diagnostic_id || "—"],
-      ]),
+        error.runtime_error_code ? ["运行时错误", error.runtime_error_code] : null,
+        ["诊断 ID", error.diagnostic_id || "—"],
+        ["Agent 审计 ID", error.agent_audit_id || "—"],
+      ].filter(Boolean)),
+      error.agent_audit_id ? copyValueButton("复制审计 ID", error.agent_audit_id) : null,
     ]),
     element("div", { className: "clarification-failure-actions" }, [retry, fallback]),
-    element("p", { className: "field__hint", text: "建议先重试模型生成；使用兜底问题必须在确认对话框中再次确认。" }),
+    element("p", { className: "field__hint", text: advice }),
     message,
   ], { description: "模型失败后流程保持关闭，不会静默切换为固定问题。" });
+}
+
+function clarificationRecoveryAdvice(error) {
+  const code = error.code || "clarification_generation_failed";
+  const cause = error.runtime_error_code || code;
+  if (["model_authentication_failed", "model_permission_denied", "model_not_found", "model_request_invalid"].includes(cause)) {
+    return "这是确定性配置故障。请联系管理员修复模型凭据、权限、模型名或结构化输出配置，再从连接状态执行“重新检测模型”；不要连续重试。";
+  }
+  if (cause === "model_rate_limited") {
+    const wait = error.retry_after_seconds ? `至少等待 ${error.retry_after_seconds} 秒后` : "等待限流窗口结束后";
+    return `${wait}重新检测模型，确认恢复后再生成；不要连续点击重试。`;
+  }
+  if (cause === "model_upstream_unavailable") {
+    return "上游模型服务暂时异常。请稍后重新检测，确认“模型可用”后再生成。";
+  }
+  if (["model_timeout", "model_connection_error", "gateway_unknown_result"].includes(cause)) {
+    return "本次请求结果可能未知。请先使用审计 ID 核对供应商记录，再重新检测模型；不要直接重复提交。";
+  }
+  if (code === "runtime_unavailable") {
+    return "模型运行时未通过就绪检查。请在右上角设置中重新检测；仍失败时按运行时错误代码联系管理员。";
+  }
+  return "请先复制诊断信息并联系管理员核对运行日志；确认模型恢复后再重新生成。使用系统兜底问题仍需明确确认。";
+}
+
+function copyValueButton(label, value) {
+  const control = button(label, { kind: "ghost", onClick: async () => {
+    try {
+      await navigator.clipboard.writeText(value);
+      control.textContent = "已复制审计 ID";
+      window.setTimeout(() => { control.textContent = label; }, 1800);
+    } catch (_error) {
+      control.textContent = "复制失败，请手动选择";
+    }
+  } });
+  return control;
 }
 
 function clarificationStatusBadge(status, clarification) {
@@ -259,7 +298,7 @@ function clarificationStatusBadge(status, clarification) {
 
 function nextNarrative(context) {
   const message = actionMessage();
-  const start = button("生成叙事结构", { kind: "primary", mutates: true });
+  const start = button("生成叙事结构", { kind: "primary", mutates: true, requiresRuntime: true });
   start.addEventListener("click", () => context.startJob("narrative.generate", { prompt: null, scope: "all" }, { buttonNode: start, region: message }));
   return section("资料已可用于下一阶段", [
     element("p", { text: "阻断澄清已完成。生成叙事结构后，任务会进入需要人工确认的叙事阶段。" }),

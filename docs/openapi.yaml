@@ -9,8 +9,9 @@ components:
       type: object
       required: [error]
       properties:
-        error: {type: object, required: [code, message, diagnostic_id], properties: {code: {type: string}, message: {type: string}, diagnostic_id: {type: string}, agent_audit_id: {type: string}}}
-    Health: {type: object, required: [status, stage, runtime_ready, web_runtime, model_capabilities], properties: {status: {enum: [ok, unavailable]}, stage: {const: P8}, runtime_ready: {type: boolean}, web_runtime: {const: fastapi}, model_capabilities: {type: object}}}
+        error: {type: object, required: [code, message, diagnostic_id], properties: {code: {type: string}, message: {type: string}, diagnostic_id: {type: string}, agent_audit_id: {type: string}, runtime_error_code: {type: string}, retryable: {type: boolean}, retry_after_seconds: {type: integer, minimum: 0}}}
+    Health: {type: object, required: [status, stage, runtime_ready, web_runtime, frontend_build, backend_commit, config_summary_sha256, clarification_mode, model_capabilities], properties: {status: {enum: [ok, unavailable]}, stage: {const: P8}, runtime_ready: {type: boolean}, web_runtime: {const: fastapi}, frontend_build: {type: string}, backend_commit: {type: string}, config_summary_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}, clarification_mode: {enum: [model, fake]}, model_capabilities: {type: object}}}
+    Liveness: {type: object, required: [status, web_runtime, frontend_build, backend_commit, config_summary_sha256], properties: {status: {const: ok}, web_runtime: {const: fastapi}, frontend_build: {type: string}, backend_commit: {type: string}, config_summary_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}}}
     AgentAudits: {type: object, required: [audits], properties: {audits: {type: array, items: {type: object}}}}
     SampleModify: {type: object, additionalProperties: false, required: [prompt], properties: {prompt: {type: string, minLength: 1}, scope: {enum: [global, page, element]}, slide_id: {type: [string, 'null']}, element_id: {type: [string, 'null']}}}
     TaskState:
@@ -72,9 +73,21 @@ components:
   responses:
     Error: {description: Unified domain error, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}, example: {error: {code: validation_error, message: 请求字段无效, diagnostic_id: abc123}}}}}
 paths:
+  /livez:
+    get:
+      responses: {'200': {description: Process is alive; does not claim model readiness, content: {application/json: {schema: {$ref: '#/components/schemas/Liveness'}, example: {status: ok, web_runtime: fastapi, frontend_build: generated-build-id, backend_commit: unknown, config_summary_sha256: '0000000000000000000000000000000000000000000000000000000000000000'}}}}}
+  /readyz:
+    get:
+      responses: {'200': {description: Model runtime is ready, content: {application/json: {schema: {$ref: '#/components/schemas/Health'}, example: &health {status: ok, stage: P8, runtime_ready: true, web_runtime: fastapi, frontend_build: generated-build-id, backend_commit: unknown, config_summary_sha256: '0000000000000000000000000000000000000000000000000000000000000000', clarification_mode: fake, model_capabilities: {checked: false, ready: true, status: not_required, models: []}}}}}, '503': {description: Model runtime is unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/Health'}}}}}
   /healthz:
     get:
-      responses: {'200': {description: Ready, content: {application/json: {schema: {$ref: '#/components/schemas/Health'}, example: {status: ok, stage: P8, runtime_ready: true, web_runtime: fastapi, model_capabilities: {checked: false, ready: true, status: not_required, models: []}}}}}}
+      responses: {'200': {description: Backward-compatible readiness response, content: {application/json: {schema: {$ref: '#/components/schemas/Health'}, example: *health}}}, '503': {description: Model runtime is unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/Health'}}}}}
+  /v1/runtime/status:
+    get:
+      responses: {'200': {description: Browser-safe runtime status; inspect runtime_ready instead of the HTTP status, content: {application/json: {schema: {$ref: '#/components/schemas/Health'}, example: *health}}}, '500': {$ref: '#/components/responses/Error'}}
+  /v1/runtime/recheck:
+    post:
+      responses: {'200': {description: Capability probe completed; inspect runtime_ready for the result, content: {application/json: {schema: {$ref: '#/components/schemas/Health'}, example: *health}}}}
   /v1/jobs/{job_id}:
     get:
       parameters: [{$ref: '#/components/parameters/JobId'}]
@@ -102,7 +115,7 @@ paths:
     post:
       parameters: [{$ref: '#/components/parameters/TaskId'}]
       requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/JobCreate'}}}}
-      responses: {'202': {description: New or idempotently recovered Job, content: {application/json: {schema: {$ref: '#/components/schemas/Job'}, example: *job}}}, '400': {$ref: '#/components/responses/Error'}, '404': {$ref: '#/components/responses/Error'}, '409': {$ref: '#/components/responses/Error'}}
+      responses: {'202': {description: New or idempotently recovered Job, content: {application/json: {schema: {$ref: '#/components/schemas/Job'}, example: *job}}}, '400': {$ref: '#/components/responses/Error'}, '404': {$ref: '#/components/responses/Error'}, '409': {$ref: '#/components/responses/Error'}, '503': {$ref: '#/components/responses/Error'}}
     get:
       parameters:
         - {$ref: '#/components/parameters/TaskId'}

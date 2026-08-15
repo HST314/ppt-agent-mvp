@@ -1,6 +1,6 @@
-import { api } from "../api.js?v=2026.08.14.3";
-import { badge, button, element, field, metadataList, previewFrame, previewUrl, shortHash, versionTimeline } from "../components/index.js?v=2026.08.14.3";
-import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.14.3";
+import { api } from "../api.js?v=2026.08.15.084125796211";
+import { badge, button, element, field, metadataList, previewFrame, previewUrl, shortHash, versionTimeline } from "../components/index.js?v=2026.08.15.084125796211";
+import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.15.084125796211";
 
 export async function render(context) {
   const view = await api.deck(context.taskId, context.controller);
@@ -11,7 +11,7 @@ export async function render(context) {
 function deckStage(view, context) {
   const deck = view.deck;
   const generationMessage = actionMessage();
-  const generate = button(deck ? "重新生成完整演示稿" : "生成完整演示稿", { kind: "primary", mutates: true });
+  const generate = button(deck ? "重新生成完整演示稿" : "生成完整演示稿", { kind: "primary", mutates: true, requiresRuntime: true });
   generate.addEventListener("click", () => context.startJob("deck.generate", {}, { buttonNode: generate, region: generationMessage }));
 
   const previewRegion = element("div", { className: "deck-preview" });
@@ -55,7 +55,7 @@ function modificationPanel(deck, context) {
   const scope = element("select", { className: "select", id: "deck-scope" }, [element("option", { value: "global", text: "整稿" }), element("option", { value: "page", text: "指定页面" }), element("option", { value: "element", text: "指定元素" })]);
   const slides = element("input", { className: "input", id: "deck-slide-ids", placeholder: "slide-2, slide-4" });
   const target = element("input", { className: "input", id: "deck-element-id", placeholder: "title" });
-  const submit = button("提交全稿修改", { kind: "primary", type: "submit", mutates: true });
+  const submit = button("提交全稿修改", { kind: "primary", type: "submit", mutates: true, requiresRuntime: true });
   const form = element("form", { onSubmit: async (event) => {
     event.preventDefault();
     const payload = {

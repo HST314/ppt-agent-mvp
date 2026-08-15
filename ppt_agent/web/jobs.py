@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from ..audit import bind_agent_audit_context
-from ..errors import ConflictError, NotFoundError, ValidationError
+from ..errors import ConflictError, GatewayError, NotFoundError, RuntimeUnavailableError, ValidationError
 
 
 TERMINAL = {"succeeded", "failed", "cancelled", "interrupted"}
@@ -71,13 +71,16 @@ class JobService:
     execution metadata and references needed to refresh the business view.
     """
 
-    def __init__(self, service, *, executor: ThreadPoolExecutor | None = None):
+    def __init__(self, service, *, executor: ThreadPoolExecutor | None = None, defer_queued_recovery: bool = False):
         self.service = service
         self.store = service.store
         self.executor = executor or ThreadPoolExecutor(max_workers=4, thread_name_prefix="ppt-job")
         self._guard = threading.RLock()
         self._submitted: set[str] = set()
+        self._recovered_queued: list[tuple[str, str]] = []
         self._recover()
+        if not defer_queued_recovery:
+            self.resume_recovered_queued()
 
     def close(self) -> None:
         self.executor.shutdown(wait=False, cancel_futures=False)
@@ -182,6 +185,12 @@ class JobService:
                         self._append_event(record, "interrupted", message=record["error"]["message"])
                 elif record.get("status") == "queued":
                     queued.append((record["task_id"], record["job_id"]))
+        self._recovered_queued.extend(queued)
+
+    def resume_recovered_queued(self) -> None:
+        """Resume queued records only after the application probes readiness."""
+        with self._guard:
+            queued, self._recovered_queued = self._recovered_queued, []
         for task_id, job_id in queued:
             self._submit(task_id, job_id)
 
@@ -218,6 +227,7 @@ class JobService:
                 if previous["fingerprint"] != fingerprint:
                     raise ConflictError("相同 idempotency_key 对应了不同请求")
                 return self.public(previous), False
+            self.service.require_runtime_ready()
             if state["status"] in {"paused", "cancelled", "failed", "completed"}:
                 raise ConflictError("当前任务状态不能启动长任务")
             if state["stage"] not in OPERATION_STAGES[operation]:
@@ -269,8 +279,17 @@ class JobService:
                     return
                 record.update(status="running", progress=None, current_step="domain_operation", started_at=_now())
                 self._append_event(record, "started", message="业务操作已开始")
+            # Readiness can change after enqueue or while a queued job is being
+            # recovered. Never cross the model boundary without a fresh gate.
+            try:
+                self.service.require_runtime_ready()
+            except RuntimeUnavailableError as error:
+                if record["operation"] == "clarification.generate":
+                    self.service.fail_clarification_for_runtime(task_id, error)
+                raise
             with bind_agent_audit_context(task_id=task_id, job_id=job_id):
                 result = self._invoke(record["operation"], task_id, record["payload"])
+            self.service.record_runtime_success()
             state = self.service.get(task_id)
             try:
                 artifacts = self.service.status_summary(task_id).get("latest_artifacts", {})
@@ -295,6 +314,8 @@ class JobService:
                 )
                 self._append_event(record, "succeeded", message="业务操作已完成")
         except Exception as error:
+            if isinstance(error, GatewayError):
+                self.service.record_runtime_failure(error)
             with self._guard:
                 try:
                     record = self._read(task_id, job_id)
@@ -314,7 +335,7 @@ class JobService:
                         finished_at=_now(),
                         error=public,
                     )
-                    self._append_event(record, "failed", message=public["message"])
+                    self._append_event(record, "failed", message=public["message"], error=public)
                 except Exception:
                     pass
         finally:

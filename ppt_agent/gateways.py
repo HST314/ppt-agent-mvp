@@ -121,7 +121,13 @@ class AgentGateway:
                 context = current_agent_audit_context()
                 if "task_id" not in context and isinstance(payload.get("task_id"), str):
                     context["task_id"] = payload["task_id"]
-                self.audit_sink({"audit_id":audit_id,"stage":stage,"model":self.model,**context,"events":list(self.runtime.last_audit)})
+                failure_context = {}
+                if failure is not None:
+                    failure_context = {
+                        "diagnostic_id": getattr(failure, "diagnostic_id", None),
+                        "error_code": getattr(failure, "code", "internal_error"),
+                    }
+                self.audit_sink({"audit_id":audit_id,"stage":stage,"model":self.model,**context,**failure_context,"events":list(self.runtime.last_audit)})
                 if failure is not None:
                     failure.agent_audit_id = audit_id
 

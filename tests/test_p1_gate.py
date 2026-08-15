@@ -123,7 +123,7 @@ class ApiIntegrationTests(unittest.TestCase):
     responses=operation["responses"]; success=next(v for k,v in responses.items() if str(k).startswith("2"))
     media=next(iter(success["content"].values())); self.assertIn("schema",media,path); self.assertIn("example",media,path)
     validate_instance(media["example"],media["schema"],spec)
-    if path != "/healthz": self.assertTrue(any(v.get("$ref")=="#/components/responses/Error" for k,v in responses.items() if not str(k).startswith("2")),path)
+    if path not in {"/healthz","/livez","/readyz","/v1/runtime/recheck"}: self.assertTrue(any(v.get("$ref")=="#/components/responses/Error" for k,v in responses.items() if not str(k).startswith("2")),path)
   with tempfile.TemporaryDirectory() as p:
    app=App(TaskService(WorkspaceStore(p))); self.assertEqual(self.call(app,"POST","/v1/tasks",{"task_id":"t","mode":"auto"})[0],201)
    code,result=self.call(app,"POST","/v1/tasks/t/preview"); self.assertEqual(code,404)

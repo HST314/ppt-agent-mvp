@@ -6,6 +6,10 @@ export class ApiError extends Error {
     this.name = "ApiError";
     this.code = details.code || "request_failed";
     this.diagnosticId = details.diagnostic_id || null;
+    this.agentAuditId = details.agent_audit_id || null;
+    this.retryable = details.retryable === true;
+    this.retryAfterSeconds = details.retry_after_seconds || null;
+    this.runtimeErrorCode = details.runtime_error_code || null;
     this.status = details.status || 0;
   }
 }
@@ -38,6 +42,8 @@ export async function request(path, options = {}) {
 }
 
 export const api = {
+  runtimeStatus: () => runtimeStatus(),
+  recheckRuntime: () => runtimeStatus(true),
   listTasks: (controller) => request("/v1/tasks", { controller }),
   createTask: (payload) => request("/v1/tasks", { method: "POST", body: payload }),
   shell: (taskId, controller) => request(`/v1/tasks/${encodeURIComponent(taskId)}/shell`, { controller }),
@@ -76,6 +82,27 @@ export const api = {
   createJob: (taskId, payload) => request(`/v1/tasks/${encodeURIComponent(taskId)}/jobs`, { method: "POST", body: payload }),
   cancelJob: (jobId) => request(`/v1/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST", body: {} }),
 };
+
+async function runtimeStatus(recheck = false) {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort("timeout"), 8000);
+  try {
+    const live = await fetch("/livez", { signal: controller.signal, cache: "no-store" });
+    const liveData = await live.json().catch(() => ({}));
+    if (!live.ok) return { backendReachable: false, runtimeReady: false, live: liveData, ready: null };
+    const ready = await fetch(recheck ? "/v1/runtime/recheck" : "/v1/runtime/status", {
+      method: recheck ? "POST" : "GET",
+      signal: controller.signal,
+      cache: "no-store",
+    });
+    const readyData = await ready.json().catch(() => ({}));
+    return { backendReachable: true, runtimeReady: readyData.runtime_ready === true, live: liveData, ready: readyData };
+  } catch (_error) {
+    return { backendReachable: false, runtimeReady: false, live: null, ready: null };
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
 
 function taskPath(taskId) {
   return `/v1/tasks/${encodeURIComponent(taskId)}`;

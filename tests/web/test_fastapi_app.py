@@ -4,6 +4,7 @@ import unittest
 
 from fastapi.testclient import TestClient
 
+from ppt_agent.errors import GatewayError
 from ppt_agent.service import TaskService
 from ppt_agent.store import WorkspaceStore
 from ppt_agent.web import create_app
@@ -27,6 +28,8 @@ class FastAPIAppTests(unittest.TestCase):
         self.assertEqual(health.json()["web_runtime"], "fastapi")
         self.assertTrue(health.json()["runtime_ready"])
         self.assertEqual(health.json()["model_capabilities"]["status"],"not_required")
+        self.assertRegex(health.json()["backend_commit"],r"^(unknown|[0-9a-fA-F]{7,40})$")
+        self.assertRegex(health.json()["config_summary_sha256"],r"^[0-9a-f]{64}$")
         self.assertEqual(health.headers["x-content-type-options"], "nosniff")
 
         html = self.client.get("/")
@@ -68,11 +71,96 @@ class FastAPIAppTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             service=TaskService(WorkspaceStore(root),generator=ProbeFailure())
             with TestClient(create_app(service)) as client:
-                health=client.get("/healthz").json()
+                health_response=client.get("/healthz")
+                ready_response=client.get("/readyz")
+                live_response=client.get("/livez")
+                browser_status_response=client.get("/v1/runtime/status")
+                health=health_response.json()
+        self.assertEqual(health_response.status_code,503)
+        self.assertEqual(ready_response.status_code,503)
+        self.assertEqual(live_response.status_code,200)
+        self.assertEqual(browser_status_response.status_code,200)
+        self.assertFalse(browser_status_response.json()["runtime_ready"])
+        self.assertEqual(live_response.json()["status"],"ok")
         self.assertFalse(health["runtime_ready"])
         self.assertEqual(health["status"],"unavailable")
         self.assertEqual(health["model_capabilities"]["error"]["code"],"capability_probe_failed")
         self.assertNotIn("provider details",str(health))
+
+    def test_unready_clarifier_does_not_enqueue_and_preserves_fallback(self):
+        class UnreadyClarifier:
+            model="unready-model"
+            calls=0
+            def set_audit_sink(self,_sink): pass
+            def probe_capabilities(self):
+                raise GatewayError(
+                    "模型服务认证失败，请联系管理员检查凭据",
+                    code="model_authentication_failed",
+                )
+            def clarify(self,_payload):
+                self.calls += 1
+                raise AssertionError("unready model must not be invoked")
+        with tempfile.TemporaryDirectory() as root:
+            clarifier=UnreadyClarifier()
+            service=TaskService(WorkspaceStore(root),clarifier=clarifier)
+            with TestClient(create_app(service)) as client:
+                client.post("/v1/tasks",json={"task_id":"unready","mode":"manual"})
+                imported=client.post("/v1/tasks/unready/input",json={"source":{"topic":"新品"}})
+                self.assertEqual(imported.status_code,200)
+                error=imported.json()["clarification"]["error"]
+                self.assertEqual(error["code"],"runtime_unavailable")
+                self.assertEqual(error["runtime_error_code"],"model_authentication_failed")
+                retry=client.post(
+                    "/v1/tasks/unready/clarifications/retry",
+                    json={"idempotency_key":"unready-retry"},
+                )
+                self.assertEqual(retry.status_code,503)
+                self.assertEqual(retry.json()["error"]["code"],"runtime_unavailable")
+                self.assertEqual(retry.json()["error"]["diagnostic_id"],error["diagnostic_id"])
+                self.assertEqual(client.get("/v1/tasks/unready/jobs").json()["jobs"],[])
+                fallback=client.post("/v1/tasks/unready/clarifications/fallback",json={"confirm":True})
+                self.assertEqual(fallback.status_code,200)
+                self.assertEqual(fallback.json()["question_source"],"fallback")
+            self.assertEqual(clarifier.calls,0)
+
+    def test_classified_job_failure_degrades_readiness_and_keeps_public_error(self):
+        class RateLimitedGateway:
+            model="rate-limited-model"
+            def set_audit_sink(self,_sink): pass
+            def probe_capabilities(self): return {"strict_json_schema":True}
+            def generate(self,_action,_payload,*,skill):
+                raise GatewayError(
+                    "模型服务请求过于频繁，请等待后重新探测",
+                    code="model_rate_limited",
+                    retryable=True,
+                    retry_after_seconds=11,
+                )
+        with tempfile.TemporaryDirectory() as root:
+            service=TaskService(WorkspaceStore(root),generator=RateLimitedGateway())
+            with TestClient(create_app(service)) as client:
+                client.post("/v1/tasks",json={"task_id":"rate-limited","mode":"manual"})
+                client.post(
+                    "/v1/tasks/rate-limited/input",
+                    json={"source":{"goal":"演示","audience":"客户","topic":"方案"}},
+                )
+                created=client.post(
+                    "/v1/tasks/rate-limited/jobs",
+                    json={"operation":"narrative.generate","payload":{},"idempotency_key":"rate-key"},
+                )
+                self.assertEqual(created.status_code,202)
+                job_id=created.json()["job_id"]
+                deadline=time.monotonic()+2
+                while time.monotonic()<deadline:
+                    job=client.get(f"/v1/jobs/{job_id}").json()
+                    if job["status"]=="failed": break
+                    time.sleep(0.01)
+                self.assertEqual(job["status"],"failed")
+                self.assertEqual(job["error"]["code"],"model_rate_limited")
+                self.assertTrue(job["error"]["retryable"])
+                self.assertEqual(job["error"]["retry_after_seconds"],11)
+                ready=client.get("/readyz")
+                self.assertEqual(ready.status_code,503)
+                self.assertEqual(ready.json()["model_capabilities"]["error"]["code"],"model_rate_limited")
 
     def test_task_and_job_scoped_audit_exports_are_filtered(self):
         self.service.create("audit-export")

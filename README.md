@@ -198,6 +198,8 @@ python3 scripts/start.py --data .ppt-agent-data --host 127.0.0.1 --port 8000
 
 真实模式要求兼容 Responses API 的模型端点。Base URL 必须使用 HTTPS，本机回环调试地址除外。生成与检查推荐使用独立模型配置；如果检查模型回退到生成模型，必须在配置中显式开启。
 
+启动后用 `/livez` 检查 Web 进程存活，用 `/readyz` 检查真实模型运行契约；模型认证、模型名、限流、上游故障或能力探测失败时 `/readyz` 返回 503，依赖模型的 Job 不会入队。修复配置或等待上游恢复后，可从工作台“显示与连接”执行一次显式重新检测。`/healthz` 保留兼容用途，并与 readiness 使用相同的 200/503 语义。
+
 ## 工作流与架构
 
 ```text
@@ -248,6 +250,8 @@ python3 -m pip install -r requirements-browser.txt
 python3 -m playwright install chromium
 python3 scripts/verify_browser_gate.py
 ```
+
+修改任何 `frontend/` HTML、CSS 或 JavaScript 后，提交前运行 `python3 scripts/update_frontend_build.py` 生成新的不可复用资源版本；`python3 scripts/update_frontend_build.py --check` 是防止旧 Build 号误导部署识别的门禁。
 
 浏览器门禁锁定 Playwright 1.54.0 与 Chromium build v1181。验收时不应把 skipped 当作通过。
 

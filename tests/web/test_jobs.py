@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from ppt_agent.errors import ConflictError
+from ppt_agent.errors import ConflictError, GatewayError
 from ppt_agent.service import TaskService
 from ppt_agent.store import WorkspaceStore
 from ppt_agent.web.jobs import JobService
@@ -36,6 +36,80 @@ class BlockingService(TaskService):
 
 
 class JobServiceTests(unittest.TestCase):
+    def test_agent_runtime_starts_closed_before_capability_probe(self):
+        class ModelGateway:
+            model = "model"
+            def set_audit_sink(self, _sink): pass
+            def probe_capabilities(self): return {"strict_json_schema": True}
+        with tempfile.TemporaryDirectory() as root:
+            service = TaskService(WorkspaceStore(root), generator=ModelGateway())
+            self.assertEqual(service.runtime_health()["status"], "not_checked")
+            self.assertFalse(service.runtime_health()["ready"])
+            service.initialize_runtime()
+            self.assertTrue(service.runtime_health()["ready"])
+
+    def test_runtime_is_rechecked_before_a_queued_job_crosses_model_boundary(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = TaskService(WorkspaceStore(root))
+            service.create("gated")
+            service.command("gated", "to-clarification", "advance")
+            service.command("gated", "to-narrative", "advance")
+            executor = DeferredExecutor()
+            jobs = JobService(service, executor=executor)
+            created, _ = jobs.create("gated", "narrative.generate", {}, "gate-key")
+            service.record_runtime_failure(GatewayError("auth", code="model_authentication_failed"))
+            with patch.object(service, "generate_narrative", wraps=service.generate_narrative) as generate:
+                function, args = executor.calls.pop(0)
+                function(*args)
+            self.assertFalse(generate.called)
+            failed = jobs.get(created["job_id"])
+            self.assertEqual(failed["status"], "failed")
+            self.assertEqual(failed["error"]["code"], "runtime_unavailable")
+            self.assertEqual(failed["error"]["runtime_error_code"], "model_authentication_failed")
+            jobs.close()
+
+    def test_recovered_queued_job_can_wait_for_startup_readiness_probe(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = TaskService(WorkspaceStore(root))
+            service.create("deferred")
+            service.command("deferred", "to-clarification", "advance")
+            service.command("deferred", "to-narrative", "advance")
+            first = JobService(service, executor=DeferredExecutor())
+            created, _ = first.create("deferred", "narrative.generate", {}, "deferred-key")
+            first.close()
+
+            executor = DeferredExecutor()
+            recovered = JobService(service, executor=executor, defer_queued_recovery=True)
+            self.assertEqual(recovered.get(created["job_id"])["status"], "queued")
+            self.assertEqual(executor.calls, [])
+            recovered.resume_recovered_queued()
+            self.assertEqual(len(executor.calls), 1)
+            recovered.close()
+
+    def test_queued_clarification_closes_when_runtime_degrades_before_execution(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = TaskService(WorkspaceStore(root))
+            service.create("clarification-gated")
+            service.import_input("clarification-gated", {"topic": "新品"})
+            executor = DeferredExecutor()
+            jobs = JobService(service, executor=executor)
+            created, _ = jobs.create(
+                "clarification-gated",
+                "clarification.generate",
+                {},
+                "clarification-gate-key",
+            )
+            failure = GatewayError("auth", code="model_authentication_failed")
+            service.record_runtime_failure(failure)
+            function, args = executor.calls.pop(0)
+            function(*args)
+            clarification = service.input_view("clarification-gated")["clarification"]
+            self.assertEqual(clarification["status"], "failed")
+            self.assertEqual(clarification["error"]["code"], "runtime_unavailable")
+            self.assertEqual(clarification["error"]["diagnostic_id"], failure.diagnostic_id)
+            self.assertEqual(jobs.get(created["job_id"])["status"], "failed")
+            jobs.close()
+
     def test_persisted_chinese_job_data_is_always_read_as_utf8(self):
         with tempfile.TemporaryDirectory() as root:
             service = TaskService(WorkspaceStore(root))
