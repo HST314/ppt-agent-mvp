@@ -1,4 +1,4 @@
-import { api } from "./api.js?v=2026.08.16.113005185829";
+import { api } from "./api.js?v=2026.08.17.031746330253";
 
 const TERMINAL = new Set(["succeeded", "failed", "cancelled", "interrupted"]);
 const EVENT_TYPES = ["queued", "started", "progress", "checkpoint", "succeeded", "failed", "cancelled", "interrupted", "heartbeat"];
@@ -80,8 +80,12 @@ export class JobTracker {
     const event = JSON.parse(message.data);
     if (event.seq <= track.seq) return;
     track.seq = event.seq;
+    if (event.type === "heartbeat") {
+      track.callbacks.onTransport?.("heartbeat", { at: event.at, seq: track.seq });
+      return;
+    }
     track.callbacks.onEvent?.(event);
-    if (TERMINAL.has(event.type)) this.reconcile(track);
+    if (TERMINAL.has(event.type) || event.type === "started" || event.type === "checkpoint") this.reconcile(track);
   }
 
   poll(track, immediate = false) {

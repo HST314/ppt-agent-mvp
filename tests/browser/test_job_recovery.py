@@ -72,8 +72,8 @@ class JobRecoveryBrowserGate(unittest.TestCase):
         self.thread.join(5)
         self.tmp.cleanup()
 
-    def new_page(self, *, fail_first_streams=0):
-        page = self.browser.new_page(viewport={"width": 1280, "height": 900})
+    def new_page(self, *, fail_first_streams=0, width=1280, height=900):
+        page = self.browser.new_page(viewport={"width": width, "height": height})
         script = """
             (() => {
               const failFirst = __FAIL_FIRST__;
@@ -236,6 +236,39 @@ class JobRecoveryBrowserGate(unittest.TestCase):
         self.service.release.set()
         self.wait_for_job_count(1)
         self.wait_for_session_state(page, True)
+        page.close()
+
+    def test_job_panel_separates_transport_business_timing_and_cancel_feedback(self):
+        page = self.new_page(width=375, height=820)
+        self.start_first_job(page)
+        panel = page.locator(".job-panel")
+        panel.wait_for()
+
+        panel.get_by_text("等待模型生成叙事结构", exact=True).first.wait_for()
+        self.assertTrue(panel.get_by_text("业务进度", exact=True).is_visible())
+        panel.get_by_text("进度通道已连接", exact=True).wait_for()
+        panel.locator(".job-panel__deadline").filter(has_text="硬截止").wait_for()
+        self.assertIn("已用时", panel.inner_text())
+
+        elapsed = panel.locator(".job-panel__elapsed")
+        before = elapsed.inner_text()
+        page.wait_for_timeout(2200)
+        self.assertNotEqual(elapsed.inner_text(), before)
+
+        job = self.app.state.job_service.list("recovery")[-1]
+        self.app.state.job_service.heartbeat(job["job_id"])
+        panel.locator(".job-panel__transport").filter(has_text="进度通道正常").wait_for()
+        self.assertEqual(panel.locator(".job-panel__business-step").inner_text(), "等待模型生成叙事结构")
+
+        panel.get_by_role("button", name="取消后台任务", exact=True).click()
+        panel.get_by_text("正在取消：等待当前安全停止点", exact=True).first.wait_for()
+        panel.get_by_text("取消请求已送达；正在等待当前安全停止点，期间不会提交新的业务结果。", exact=True).wait_for()
+        self.assertTrue(panel.get_by_role("button", name="已请求取消", exact=True).is_disabled())
+        self.assertTrue(page.locator("body").evaluate("node => node.scrollWidth <= node.clientWidth"))
+
+        self.service.release.set()
+        jobs = self.wait_for_job_count(1)
+        self.assertEqual(jobs[-1]["status"], "cancelled")
         page.close()
 
     def test_refresh_terminal_cleanup_allows_same_intent_to_create_a_new_job(self):

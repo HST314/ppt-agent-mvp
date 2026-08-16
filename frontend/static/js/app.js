@@ -1,14 +1,15 @@
-import { api, ApiError } from "./api.js?v=2026.08.16.113005185829";
-import { JobTracker } from "./job-tracker.js?v=2026.08.16.113005185829";
-import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.16.113005185829";
-import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.16.113005185829";
-import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.16.113005185829";
-import { inlineError, setBusy } from "./components/index.js?v=2026.08.16.113005185829";
-import { renderStage } from "./stages/index.js?v=2026.08.16.113005185829";
+import { api, ApiError } from "./api.js?v=2026.08.17.031746330253";
+import { JobTracker } from "./job-tracker.js?v=2026.08.17.031746330253";
+import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.17.031746330253";
+import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.17.031746330253";
+import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.17.031746330253";
+import { inlineError, setBusy } from "./components/index.js?v=2026.08.17.031746330253";
+import { renderStage } from "./stages/index.js?v=2026.08.17.031746330253";
 
 const app = document.getElementById("app");
 const APP_BUILD = document.querySelector('meta[name="app-build"]')?.content || "unknown";
 const tracker = new JobTracker();
+const jobTransports = new Map();
 let renderGeneration = 0;
 let activeController = null;
 let hasUnsavedDraft = false;
@@ -65,6 +66,7 @@ window.addEventListener("offline", () => {
 renderRoute(currentRoute());
 refreshRuntimeStatus();
 window.setInterval(() => refreshRuntimeStatus(), 15_000);
+window.setInterval(refreshJobClocks, 1000);
 
 async function renderRoute(route) {
   const requestedLocation = `${window.location.pathname}${window.location.search}${window.location.hash}`;
@@ -405,15 +407,49 @@ function lockedState(selected, current) {
 }
 
 function jobPanel(job) {
-  const value = typeof job.progress === "number" ? job.progress : 0;
+  const hasProgress = typeof job.progress === "number";
+  const transport = jobTransports.get(job.job_id) || "正在连接进度通道";
+  const businessStep = jobBusinessStep(job);
   return element("section", { className: "job-panel", id: `job-${job.job_id}`, "aria-label": "活动后台任务" }, [
     element("div", { className: "job-panel__header" }, [
-      element("div", {}, [element("strong", { text: operationLabel(job.operation) }), element("p", { text: job.current_step || "正在准备" })]),
-      badge(job.status === "queued" ? "排队中" : "执行中", "primary"),
+      element("div", {}, [
+        element("strong", { text: operationLabel(job.operation) }),
+        element("span", { className: "job-panel__section-label", text: "业务进度" }),
+        element("p", { className: "job-panel__business-step", text: businessStep }),
+      ]),
+      badge(jobStatus(job).label, jobStatus(job).tone),
     ]),
-    progress(value, typeof job.progress === "number" ? `${job.progress}%` : "进度以真实检查点为准", job.current_step || "运行中"),
+    progress(hasProgress ? job.progress : null, hasProgress ? `${job.progress}%` : "等待下一业务检查点", businessStep),
+    element("dl", { className: "job-panel__meta" }, [
+      element("div", {}, [
+        element("dt", { text: job.started_at ? "已用时" : "等待时长" }),
+        element("dd", {
+          className: "job-panel__elapsed",
+          "data-started-at": job.started_at || job.created_at,
+          text: formatDuration(elapsedSeconds(job.started_at || job.created_at)),
+        }),
+      ]),
+      element("div", {}, [
+        element("dt", { text: "阶段时限" }),
+        element("dd", {
+          className: "job-panel__deadline",
+          "data-deadline-at": job.deadline_at || "",
+          "data-deadline-seconds": job.deadline_seconds ?? "",
+          text: deadlineLabel(job.deadline_at, job.deadline_seconds),
+        }),
+      ]),
+      element("div", {}, [
+        element("dt", { text: "传输状态" }),
+        element("dd", { className: "job-panel__transport", text: transport }),
+      ]),
+    ]),
+    job.status === "cancellation_requested" || job.cancellation_requested ? element("p", {
+      className: "job-panel__cancel-feedback",
+      role: "status",
+      text: "取消请求已送达；正在等待当前安全停止点，期间不会提交新的业务结果。",
+    }) : null,
     element("p", { className: "field__hint", text: "可以安全离开此页；再次打开任务时会自动恢复显示。" }),
-    job.operation !== "clarification.generate" && !["succeeded", "failed", "cancelled", "interrupted"].includes(job.status) ? button(job.cancellation_requested ? "正在取消" : "取消后台任务", { kind: "ghost", disabled: job.cancellation_requested, onClick: async () => {
+    job.operation !== "clarification.generate" && !["succeeded", "failed", "cancelled", "interrupted"].includes(job.status) ? button(job.cancellation_requested ? "已请求取消" : "取消后台任务", { kind: "ghost", disabled: job.cancellation_requested, onClick: async () => {
       try {
         const next = await api.cancelJob(job.job_id);
         updateJobPanel(next);
@@ -455,7 +491,9 @@ function connectJob(job, route, storageKey = null) {
   tracker.track(job, {
     onUpdate: (next) => updateJobPanel(next),
     onEvent: (event) => updateJobEvent(event),
+    onTransport: (state, details) => updateJobTransport(job.job_id, state, details),
     onComplete: (finished) => {
+      jobTransports.delete(finished.job_id);
       if (recoveredStorageKey) clearIdempotencyKey(recoveredStorageKey, finished.job_id);
       const label = operationLabel(finished.operation);
       if (finished.status === "succeeded") showToast(`${label}已完成`);
@@ -578,10 +616,104 @@ function updateJobPanel(job) {
 function updateJobEvent(event) {
   const panel = document.getElementById(`job-${event.job_id}`);
   if (!panel) return;
-  const text = panel.querySelector(".job-panel__header p");
-  if (text && event.message) text.textContent = event.message;
+  if (event.type === "heartbeat") return;
+  const text = panel.querySelector(".job-panel__business-step");
+  if (text && event.message && event.type === "checkpoint") text.textContent = event.message;
   const bar = panel.querySelector(".progress__bar");
-  if (bar && typeof event.progress === "number") bar.style.setProperty("--progress", `${event.progress}%`);
+  if (bar && typeof event.progress === "number") {
+    bar.classList.remove("progress__bar--indeterminate");
+    bar.style.setProperty("--progress", `${event.progress}%`);
+    bar.setAttribute("aria-valuenow", String(event.progress));
+    panel.querySelector(".progress__value").textContent = `${event.progress}%`;
+  }
+}
+
+function updateJobTransport(jobId, state, details = {}) {
+  const labels = {
+    sse: details.recovered ? "进度通道已恢复" : "进度通道已连接",
+    heartbeat: `进度通道正常${details.at ? ` · ${formatClock(details.at)}` : ""}`,
+    "sse-retry": "进度通道重连中",
+    polling: "进度通道重连中 · 状态轮询可用",
+    "sse-recovery": "正在恢复实时进度通道",
+  };
+  const label = labels[state] || "正在确认进度通道";
+  jobTransports.set(jobId, label);
+  const output = document.getElementById(`job-${jobId}`)?.querySelector(".job-panel__transport");
+  if (output) output.textContent = label;
+}
+
+function refreshJobClocks() {
+  document.querySelectorAll(".job-panel__elapsed").forEach((output) => {
+    output.textContent = formatDuration(elapsedSeconds(output.dataset.startedAt));
+  });
+  document.querySelectorAll(".job-panel__deadline").forEach((output) => {
+    output.textContent = deadlineLabel(output.dataset.deadlineAt, Number(output.dataset.deadlineSeconds) || null);
+  });
+}
+
+function elapsedSeconds(value) {
+  const started = Date.parse(value || "");
+  return Number.isFinite(started) ? Math.max(0, Math.floor((Date.now() - started) / 1000)) : 0;
+}
+
+function formatDuration(seconds) {
+  const total = Math.max(0, Math.floor(seconds || 0));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const remainder = total % 60;
+  return hours ? `${hours}时 ${minutes}分 ${remainder}秒` : minutes ? `${minutes}分 ${remainder}秒` : `${remainder}秒`;
+}
+
+function deadlineLabel(deadlineAt, deadlineSeconds) {
+  const deadline = Date.parse(deadlineAt || "");
+  if (!Number.isFinite(deadline)) return deadlineSeconds ? `启动后最长 ${formatDuration(deadlineSeconds)}` : "等待后端下发";
+  const remaining = Math.ceil((deadline - Date.now()) / 1000);
+  if (remaining <= 0) return `硬截止 ${formatClock(deadlineAt)} · 已到达，等待任务结束`;
+  return `硬截止 ${formatClock(deadlineAt)} · 剩余 ${formatDuration(remaining)}`;
+}
+
+function formatClock(value) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "时间未知" : new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(date);
+}
+
+function jobStatus(job) {
+  if (job.status === "queued") return { label: "排队中", tone: "warning" };
+  if (job.status === "cancellation_requested" || job.cancellation_requested) return { label: "正在取消", tone: "warning" };
+  if (job.status === "failed") return { label: "失败", tone: "danger" };
+  if (job.status === "cancelled") return { label: "已取消", tone: "danger" };
+  if (job.status === "succeeded") return { label: "已完成", tone: "success" };
+  return { label: "执行中", tone: "primary" };
+}
+
+function jobBusinessStep(job) {
+  if (job.status === "queued") return "等待执行资源";
+  if (job.status === "cancellation_requested" || job.cancellation_requested) return "正在取消：等待当前安全停止点";
+  const terminal = {
+    succeeded: "业务操作已完成",
+    failed: "业务操作失败",
+    cancelled: "业务操作已取消，未提交新结果",
+    interrupted: "业务操作被中断",
+  };
+  if (terminal[job.status]) return terminal[job.status];
+  const operations = {
+    "clarification.generate": "AI 正在阅读任务卡并生成澄清问题",
+    "narrative.generate": "等待模型生成叙事结构",
+    "outline.generate": "等待模型生成并校验逐页大纲",
+    "samples.generate": "等待模型生成、校验并保存 HTML 样品",
+    "samples.modify": "等待模型修改、校验并保存 HTML 样品",
+    "deck.generate": "等待模型生成、校验并保存完整演示稿",
+    "deck.modify": "等待模型修改、校验并保存完整演示稿",
+    "inspection.run": "正在执行质量检查并保存报告",
+  };
+  const steps = {
+    waiting_model: "等待模型响应",
+    skill_loading: "正在读取 Skill 与任务资料",
+    validating_html: "正在校验 HTML 与页面结构",
+    saving_result: "正在保存版本与业务状态",
+  };
+  if (steps[job.current_step]) return steps[job.current_step];
+  return operations[job.operation] || "业务操作执行中";
 }
 
 function renderComponents() {
@@ -747,9 +879,17 @@ function runtimePhaseLabel(phase) {
 }
 
 function progress(value, valueLabel, step) {
-  const bar = element("div", { className: "progress__bar", role: "progressbar", "aria-valuemin": "0", "aria-valuemax": "100", "aria-valuenow": String(value), "aria-label": step });
-  bar.style.setProperty("--progress", `${Math.max(0, Math.min(100, value))}%`);
-  return element("div", { className: "progress" }, [element("div", { className: "progress__track" }, bar), element("div", { className: "progress__meta" }, [element("span", { text: step }), element("span", { text: valueLabel })])]);
+  const determinate = typeof value === "number";
+  const bar = element("div", {
+    className: `progress__bar ${determinate ? "" : "progress__bar--indeterminate"}`,
+    role: "progressbar",
+    "aria-valuemin": determinate ? "0" : null,
+    "aria-valuemax": determinate ? "100" : null,
+    "aria-valuenow": determinate ? String(value) : null,
+    "aria-label": step,
+  });
+  if (determinate) bar.style.setProperty("--progress", `${Math.max(0, Math.min(100, value))}%`);
+  return element("div", { className: "progress" }, [element("div", { className: "progress__track" }, bar), element("div", { className: "progress__meta" }, [element("span", { text: step }), element("span", { className: "progress__value", text: valueLabel })])]);
 }
 
 function heroArt() {

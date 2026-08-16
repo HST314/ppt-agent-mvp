@@ -122,6 +122,11 @@ class FrontendAssetTests(unittest.TestCase):
         self.assertIn("reconcileStoredIntents", app)
         self.assertIn("latestJobFailure", app)
         self.assertIn("前往本阶段操作区重试", app)
+        heartbeat_branch = tracker.split('if (event.type === "heartbeat") {', 1)[1].split("return;", 1)[0]
+        self.assertIn('onTransport?.("heartbeat"', heartbeat_branch)
+        self.assertNotIn("onEvent", heartbeat_branch)
+        for token in ("job-panel__business-step", "job-panel__elapsed", "job-panel__deadline", "job-panel__transport", "job-panel__cancel-feedback"):
+            self.assertIn(token, app)
 
 
 if __name__ == "__main__":

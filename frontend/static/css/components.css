@@ -62,6 +62,11 @@
 .progress { display: grid; gap: var(--space-2); }
 .progress__track { height: 0.55rem; overflow: hidden; border-radius: 999px; background: var(--color-muted); }
 .progress__bar { height: 100%; width: var(--progress, 0%); background: var(--gradient-brand); border-radius: inherit; }
+.progress__bar--indeterminate { width: 42%; }
+@media (prefers-reduced-motion: no-preference) {
+  .progress__bar--indeterminate { animation: progress-indeterminate 1.6s ease-in-out infinite; }
+  @keyframes progress-indeterminate { from { transform: translateX(-110%); } to { transform: translateX(250%); } }
+}
 .progress__meta { display: flex; justify-content: space-between; gap: var(--space-3); color: var(--color-muted-foreground); font-size: 0.85rem; }
 
 .toast-region { position: fixed; z-index: var(--z-toast); inset: auto max(var(--space-4), env(safe-area-inset-right)) max(var(--space-4), env(safe-area-inset-bottom)) auto; width: min(24rem, calc(100vw - 2rem)); display: grid; gap: var(--space-2); }
