@@ -285,6 +285,17 @@ class TaskService:
             # 模型在后续轮次返回 0 题 = 提前确认；此前轮次的答案已合并进任务卡，同步冻结。
             self._freeze_task_card(task_id,view["task_card"],result["clarification_hash"])
         return result
+
+    def recover_clarification_failure(self,task_id,error):
+        """Normalize deadline/persistence/provider failures to one retry state."""
+        view=self.input_view(task_id)
+        if (view.get("state",{}).get("waiting_reason")=="clarification_failed"
+            and view.get("clarification",{}).get("status")=="failed"):
+            return view["clarification"]
+        code = "clarification_infrastructure_failure"
+        if error.__class__.__name__ == "ExecutionDeadlineExceeded": code = "stage_deadline_exceeded"
+        elif isinstance(error,OSError): code = "job_persistence_error"
+        return self._record_clarification(task_id,view,[],"failed",None,{"code":code,"message":"澄清服务暂时不可用，请重试或使用兜底问题"},"clarification_failed")
     def use_fallback_clarification(self,task_id):
         view=self.input_view(task_id)
         return self._record_clarification(task_id,view,questions_for(view["task_card"]),"ready",None,None,"clarification_fallback",source="fallback")
@@ -596,6 +607,7 @@ class TaskService:
         self.store.commit(task_id,new.to_dict(),event)
         return {**self.sample_view(task_id),"selection":{**model.to_dict(),"hash":h,"metadata":{"reasons":reasons}}}
     def generate_sample(self,task_id,prompt=None):
+        from .execution import progress
         self._require_actionable(task_id)
         view=self.sample_view(task_id); selection=view["selection"]
         if not selection: view=self.select_samples(task_id); selection=view["selection"]
@@ -604,6 +616,7 @@ class TaskService:
         data=json.loads(self.version(task_id,outline)); rules=[]; assets=controlled_assets(self.input_view(task_id)["manifest"],self.store.resource_root(task_id))
         if prompt: rules.append(prompt.strip())
         source=render(data["markdown"],selection["slide_ids"],rules,assets=assets) if isinstance(self.builder,FakeHtmlBuilder) else self.builder.build(data["markdown"],action="sample",slide_ids=selection["slide_ids"],rules=rules,assets=assets)
+        progress("validating_html", "校验 HTML")
         html_text=validate_html(source,selection["slide_ids"],assets.values())
         version=len(self.versions(task_id,"sample"))+1; content_hash=digest(html_text.encode()); model=DeckArtifact.parse({"artifact_id":f"sample-{content_hash[:16]}","task_id":task_id,"version":version,"kind":"sample","outline_hash":outline,"content_hash":content_hash,"created_at":now(),"schema_version":"1.0"})
         prior=self._current_version(task_id,"sample"); meta={"html":html_text,"selection_hash":selection["hash"],"parent":prior,"summary":"生成真实 HTML 样品","scope":"global","global_rules":rules,"local_exceptions":{},"build":"success"}

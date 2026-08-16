@@ -181,7 +181,7 @@ class AgentRuntime:
         self.last_audit: tuple[dict, ...] = ()
 
     def run(self, stage: str, payload: dict, *, response_schema: dict | None = None, capability_probe: bool = False) -> AgentResult:
-        from .execution import checkpoint
+        from .execution import checkpoint, interruptible, progress, remaining_seconds
         if stage not in STAGES:
             raise ValidationError("Agent 阶段不在允许列表")
         allowed_schemas = (STAGE_OUTPUT_SCHEMAS[stage], STAGE_PROVIDER_SCHEMAS[stage])
@@ -262,7 +262,21 @@ class AgentRuntime:
                 if capability_probe and stage != "clarification":
                     tool_choice = {"type": "function", "name": "list_skill_files"} if tool_count == 0 else "none"
                 request_schema = None if capability_probe and stage != "clarification" and tool_count == 0 else provider_schema
-                turn = self.client.create(input=conversation, tools=request_tools, response_schema=request_schema, tool_choice=tool_choice)
+                progress("waiting_model", f"等待模型响应（第 {step} 轮）")
+                kwargs = {
+                    "input": conversation,
+                    "tools": request_tools,
+                    "response_schema": request_schema,
+                    "tool_choice": tool_choice,
+                }
+                remaining = remaining_seconds(self.timeout_seconds)
+                # Clients that support a request timeout receive the absolute
+                # stage remainder. Legacy/test clients keep their old signature.
+                try:
+                    turn = interruptible(lambda: self.client.create(**kwargs, timeout_seconds=remaining))
+                except TypeError as exc:
+                    if "timeout_seconds" not in str(exc): raise
+                    turn = interruptible(lambda: self.client.create(**kwargs))
             except (IndexError, StopIteration) as exc:
                 fail("Agent 未在工具纠错后提交阶段产物", "incomplete_after_tool_error", exc)
             except GatewayError as exc:
@@ -321,6 +335,7 @@ class AgentRuntime:
                 request_tool_names = {tool["name"] for tool in request_tools}
                 for call in turn.tool_calls:
                     checkpoint()
+                    progress("skill_loading", f"读取 Skill：{call.name}")
                     tool_count += 1
                     if tool_count > self.max_tool_calls:
                         fail("Agent 工具调用超过上限", "tool_call_limit")

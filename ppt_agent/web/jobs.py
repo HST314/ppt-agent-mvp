@@ -104,6 +104,9 @@ class JobService:
 
     def _read(self, task_id: str, job_id: str) -> dict[str, Any]:
         path = self._record_path(task_id, job_id)
+        pending = self._root(task_id) / f"{job_id}.pending-event.json"
+        if pending.exists():
+            self._finish_pending(pending)
         if not path.exists():
             raise NotFoundError("Job 不存在")
         return json.loads(path.read_text(encoding="utf-8"))
@@ -172,7 +175,7 @@ class JobService:
                 try:
                     self._finish_pending(pending)
                 except (OSError, KeyError, json.JSONDecodeError):
-                    continue
+                    logging.exception("Job WAL recovery failed", extra={"pending": str(pending)})
             for path in jobs.glob("job_*.json"):
                 if path.name.endswith(".pending-event.json"):
                     continue
@@ -288,7 +291,14 @@ class JobService:
                 record.update(status="running", progress=None, current_step="domain_operation", started_at=started.isoformat(), deadline_at=(started + timedelta(seconds=record.get("deadline_seconds", OPERATION_BUDGET_SECONDS[record["operation"]]))).isoformat())
                 self._append_event(record, "started", message="业务操作已开始")
             deadline = time.monotonic() + record.get("deadline_seconds", OPERATION_BUDGET_SECONDS[record["operation"]])
-            with execution_scope(lambda: self._read(task_id, job_id).get("cancellation_requested", False), deadline):
+            def publish_progress(step, message):
+                with self._guard:
+                    current = self._read(task_id, job_id)
+                    if current["status"] not in ACTIVE:
+                        return
+                    current["current_step"] = step
+                    self._append_event(current, "checkpoint", message=message or step)
+            with execution_scope(lambda: self._read(task_id, job_id).get("cancellation_requested", False), deadline, publish_progress):
                 # Readiness can change after enqueue or while a queued job is being
                 # recovered. Never cross the model boundary without a fresh gate.
                 try:
@@ -330,6 +340,14 @@ class JobService:
         except Exception as error:
             if isinstance(error, GatewayError):
                 self.service.record_runtime_failure(error)
+            if record.get("operation") == "clarification.generate" and not isinstance(error, ExecutionCancelled):
+                try:
+                    # Recovery is deliberately outside the expired execution
+                    # scope, otherwise its own task commit would be rejected.
+                    with execution_scope(None, None):
+                        self.service.recover_clarification_failure(task_id, error)
+                except Exception:
+                    logging.exception("clarification recovery failed", extra={"job_id": job_id})
             with self._guard:
                 try:
                     record = self._read(task_id, job_id)
@@ -359,7 +377,7 @@ class JobService:
                     )
                     self._append_event(record, "failed", message=public["message"], error=public)
                 except Exception:
-                    pass
+                    logging.exception("failed to persist terminal Job state", extra={"job_id": job_id, "task_id": task_id})
         finally:
             with self._guard:
                 self._submitted.discard(key)
@@ -398,7 +416,7 @@ class JobService:
         for task_path in self.store.root.iterdir():
             path = task_path / "jobs" / f"{job_id}.json"
             if path.exists():
-                return self.public(json.loads(path.read_text(encoding="utf-8")))
+                return self.public(self._read(task_path.name, job_id))
         raise NotFoundError("Job 不存在")
 
     def list(self, task_id: str, status: str | None = None) -> list[dict[str, Any]]:
@@ -417,7 +435,9 @@ class JobService:
 
     def cancel(self, job_id: str) -> dict[str, Any]:
         snapshot = self.get(job_id)
-        with self._guard:
+        # Same task lock as domain publication: cancellation and commit have a
+        # single observable order and can no longer cross after_prepare.
+        with self._guard, self.store.lock(snapshot["task_id"]):
             record = self._read(snapshot["task_id"], job_id)
             if record["status"] in TERMINAL:
                 return self.public(record)

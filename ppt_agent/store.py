@@ -70,9 +70,13 @@ class WorkspaceStore:
         if not p.exists(): raise NotFoundError("任务不存在")
         return json.loads(p.read_text(encoding="utf-8"))
     def commit(self,task_id,state,event):
-        from .execution import checkpoint
-        checkpoint()
+        from .execution import checkpoint, progress
+        progress("saving_result", "保存业务结果")
         with self.lock(task_id):
+            # Cancellation and publication share this task lock. A cancel that
+            # wins the lock makes publication fail; a completed commit is
+            # ordered before the cancellation request and cannot be half-seen.
+            checkpoint()
             p=self._task(task_id); tx=p/"pending-commit.json"
             self.atomic_json(tx,{"state":state,"event":event})
             if self.fault: self.fault("after_prepare")
@@ -93,8 +97,8 @@ class WorkspaceStore:
                 finally: self.fault=saved
     def put_version(self,task_id,kind,content:bytes,metadata):
         from .execution import checkpoint
-        checkpoint()
         with self.lock(task_id):
+            checkpoint()
             if not kind or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in kind): raise ValidationError("版本 kind 格式无效")
             digest=self.digest(content); p=self._task(task_id)/"artifacts"/digest
             if not p.exists():
