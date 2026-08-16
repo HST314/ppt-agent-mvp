@@ -1,4 +1,6 @@
 import json
+import errno
+import os
 import tempfile
 import threading
 import time
@@ -163,6 +165,25 @@ class JobServiceTests(unittest.TestCase):
             self.assertEqual(error["agent_audit_id"], "agent-audit-probe")
             self.assertTrue(error["probe_id"])
 
+    def test_atomic_json_retries_transient_replace_and_cleans_temp_file(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = WorkspaceStore(root)
+            target = Path(root) / "value.json"
+            real_replace = os.replace
+            attempts = 0
+
+            def flaky_replace(source, destination):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise PermissionError(errno.EACCES, "busy")
+                return real_replace(source, destination)
+
+            with patch("ppt_agent.store.os.replace", side_effect=flaky_replace):
+                store.atomic_json(target, {"ok": True})
+            self.assertEqual(json.loads(target.read_text()), {"ok": True})
+            self.assertEqual(list(Path(root).glob(".*.tmp")), [])
+
     def test_persisted_chinese_job_data_is_always_read_as_utf8(self):
         with tempfile.TemporaryDirectory() as root:
             service = TaskService(WorkspaceStore(root))
@@ -232,9 +253,10 @@ class JobServiceTests(unittest.TestCase):
             self.assertEqual(requested["status"], "cancellation_requested")
             service.release.set()
             deadline = time.monotonic() + 2
-            while time.monotonic() < deadline and jobs.get(first["job_id"])["status"] not in {"succeeded", "failed"}:
+            while time.monotonic() < deadline and jobs.get(first["job_id"])["status"] not in {"succeeded", "failed", "cancelled"}:
                 time.sleep(0.02)
-            self.assertEqual(jobs.get(first["job_id"])["status"], "succeeded")
+            self.assertEqual(jobs.get(first["job_id"])["status"], "cancelled")
+            self.assertEqual(jobs.events(first["job_id"])[-1]["type"], "cancelled")
             jobs.close()
 
     def test_running_job_becomes_interrupted_on_restart(self):

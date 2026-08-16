@@ -6,13 +6,15 @@ import logging
 import os
 import threading
 import uuid
+import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from ..audit import bind_agent_audit_context
 from ..errors import ConflictError, GatewayError, NotFoundError, RuntimeUnavailableError, ValidationError
+from ..execution import ExecutionCancelled, ExecutionDeadlineExceeded, execution_scope
 
 
 TERMINAL = {"succeeded", "failed", "cancelled", "interrupted"}
@@ -37,6 +39,7 @@ OPERATION_STAGES = {
     "deck.modify": {"deck", "review"},
     "inspection.run": {"deck", "review"},
 }
+OPERATION_BUDGET_SECONDS = {"clarification.generate":180,"narrative.generate":240,"outline.generate":240,"samples.generate":300,"samples.modify":300,"deck.generate":600,"deck.modify":600,"inspection.run":300}
 
 
 class ActiveJobConflict(ConflictError):
@@ -142,9 +145,11 @@ class JobService:
         record, event = value["record"], value["event"]
         path = self._event_path(record["task_id"], record["job_id"])
         existing = {
-            item["seq"]
+            item["seq"]: item
             for item in (json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line)
-        } if path.exists() else set()
+        } if path.exists() else {}
+        if event["seq"] in existing and existing[event["seq"]] != event:
+            raise OSError("Job 事件序号冲突")
         if event["seq"] not in existing:
             with open(path, "a", encoding="utf-8") as stream:
                 stream.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
@@ -253,6 +258,8 @@ class JobService:
                 "result": None,
                 "error": None,
                 "cancellation_requested": False,
+                "deadline_seconds": OPERATION_BUDGET_SECONDS[operation],
+                "deadline_at": None,
             }
             self._write(record)
             self._append_event(record, "queued", message="任务已进入执行队列")
@@ -277,19 +284,24 @@ class JobService:
                     record.update(status="cancelled", current_step="cancelled", finished_at=_now())
                     self._append_event(record, "cancelled", message="任务已取消")
                     return
-                record.update(status="running", progress=None, current_step="domain_operation", started_at=_now())
+                started = datetime.now(timezone.utc)
+                record.update(status="running", progress=None, current_step="domain_operation", started_at=started.isoformat(), deadline_at=(started + timedelta(seconds=record.get("deadline_seconds", OPERATION_BUDGET_SECONDS[record["operation"]]))).isoformat())
                 self._append_event(record, "started", message="业务操作已开始")
-            # Readiness can change after enqueue or while a queued job is being
-            # recovered. Never cross the model boundary without a fresh gate.
-            try:
-                self.service.require_runtime_ready()
-            except RuntimeUnavailableError as error:
-                if record["operation"] == "clarification.generate":
-                    self.service.fail_clarification_for_runtime(task_id, error)
-                raise
-            with bind_agent_audit_context(task_id=task_id, job_id=job_id):
-                result = self._invoke(record["operation"], task_id, record["payload"])
-            self.service.record_runtime_success()
+            deadline = time.monotonic() + record.get("deadline_seconds", OPERATION_BUDGET_SECONDS[record["operation"]])
+            with execution_scope(lambda: self._read(task_id, job_id).get("cancellation_requested", False), deadline):
+                # Readiness can change after enqueue or while a queued job is being
+                # recovered. Never cross the model boundary without a fresh gate.
+                try:
+                    self.service.require_runtime_ready()
+                except RuntimeUnavailableError as error:
+                    if record["operation"] == "clarification.generate":
+                        self.service.fail_clarification_for_runtime(task_id, error)
+                    raise
+                with bind_agent_audit_context(task_id=task_id, job_id=job_id):
+                    result = self._invoke(record["operation"], task_id, record["payload"])
+                self.service.record_runtime_success()
+                from ..execution import checkpoint
+                checkpoint()
             state = self.service.get(task_id)
             try:
                 artifacts = self.service.status_summary(task_id).get("latest_artifacts", {})
@@ -304,6 +316,8 @@ class JobService:
             }
             with self._guard:
                 record = self._read(task_id, job_id)
+                if record.get("cancellation_requested"):
+                    raise ExecutionCancelled()
                 record.update(
                     status="succeeded",
                     progress=100,
@@ -319,16 +333,24 @@ class JobService:
             with self._guard:
                 try:
                     record = self._read(task_id, job_id)
+                    if isinstance(error, ExecutionCancelled):
+                        record.update(status="cancelled", progress=None, current_step="cancelled", finished_at=_now(), error=None)
+                        self._append_event(record, "cancelled", message="任务已取消，未提交业务结果")
+                        return
                     public = error.public()["error"] if hasattr(error, "public") else {
                         "code": "internal_error",
                         "message": "后台任务执行失败",
                         "diagnostic_id": uuid.uuid4().hex,
                     }
+                    if isinstance(error, OSError):
+                        public = {"code":"job_persistence_error","message":"Job 持久化失败，请重试","errno":error.errno}
                     if not hasattr(error, "public"):
                         logging.exception(
                             "background Job failed",
-                            extra={"job_id": job_id, "task_id": task_id, "diagnostic_id": public["diagnostic_id"]},
+                            extra={"job_id": job_id, "task_id": task_id, "diagnostic_id": public.get("diagnostic_id")},
                         )
+                    if isinstance(error, ExecutionDeadlineExceeded):
+                        public = {"code":"stage_deadline_exceeded","message":"阶段执行超过硬截止时间"}
                     record.update(
                         status="failed",
                         current_step="failed",
@@ -366,6 +388,7 @@ class JobService:
         keys = (
             "job_id", "task_id", "operation", "status", "progress", "current_step", "last_seq",
             "created_at", "started_at", "finished_at", "result", "error", "cancellation_requested",
+            "deadline_seconds", "deadline_at",
         )
         return {key: record.get(key) for key in keys}
 

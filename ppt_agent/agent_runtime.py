@@ -181,6 +181,7 @@ class AgentRuntime:
         self.last_audit: tuple[dict, ...] = ()
 
     def run(self, stage: str, payload: dict, *, response_schema: dict | None = None, capability_probe: bool = False) -> AgentResult:
+        from .execution import checkpoint
         if stage not in STAGES:
             raise ValidationError("Agent 阶段不在允许列表")
         allowed_schemas = (STAGE_OUTPUT_SCHEMAS[stage], STAGE_PROVIDER_SCHEMAS[stage])
@@ -242,8 +243,10 @@ class AgentRuntime:
             )
         conversation: list[Any] = [{"role": "system", "content": f"当前阶段：{stage}\n阶段目标：{STAGE_PROMPTS[stage]}\n{override}\n{tool_contract}{probe_instruction}\n{_output_contract(local_schema)}"}, {"role": "user", "content": input_json}]
         for step in range(1, self.max_steps + 1):
+            checkpoint()
             if self.clock() - started >= self.timeout_seconds:
                 fail("Agent 运行超时，未提交阶段产物", "deadline_exceeded")
+            checkpoint()
             try:
                 tool_choice = None
                 request_tools = stage_tools
@@ -302,6 +305,7 @@ class AgentRuntime:
                     exc.terminal_reason = exc.code
                     exc.tool_calls = tool_count
                 raise
+            checkpoint()
             if self.clock() - started >= self.timeout_seconds:
                 fail("Agent 运行超时，未提交阶段产物", "deadline_exceeded")
             output = (turn.text or "").encode()
@@ -316,6 +320,7 @@ class AgentRuntime:
                 successful_calls, failed_calls = 0, 0
                 request_tool_names = {tool["name"] for tool in request_tools}
                 for call in turn.tool_calls:
+                    checkpoint()
                     tool_count += 1
                     if tool_count > self.max_tool_calls:
                         fail("Agent 工具调用超过上限", "tool_call_limit")

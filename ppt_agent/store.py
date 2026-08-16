@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import hashlib, json, os, re, shutil, threading, uuid
+import errno, hashlib, json, os, re, shutil, threading, time, uuid
 from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime, timezone
@@ -39,8 +39,14 @@ class WorkspaceStore:
     def digest(data: bytes): return hashlib.sha256(data).hexdigest()
     def atomic_json(self,path,data):
         path.parent.mkdir(parents=True,exist_ok=True); raw=json.dumps(data,ensure_ascii=False,sort_keys=True,separators=(",",":")).encode(); tmp=path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-        with open(tmp,"xb") as f: f.write(raw); f.flush(); os.fsync(f.fileno())
-        os.replace(tmp,path); return self.digest(raw)
+        try:
+            with open(tmp,"xb") as f: f.write(raw); f.flush(); os.fsync(f.fileno())
+            for attempt in range(5):
+                try: os.replace(tmp,path); return self.digest(raw)
+                except OSError as exc:
+                    if exc.errno not in {errno.EACCES,errno.EBUSY,errno.EPERM} or attempt == 4: raise
+                    time.sleep(.01*(2**attempt))
+        finally: tmp.unlink(missing_ok=True)
     def create(self,task_id,state):
         with self.lock(task_id):
             p=self._task(task_id)
@@ -64,6 +70,8 @@ class WorkspaceStore:
         if not p.exists(): raise NotFoundError("任务不存在")
         return json.loads(p.read_text(encoding="utf-8"))
     def commit(self,task_id,state,event):
+        from .execution import checkpoint
+        checkpoint()
         with self.lock(task_id):
             p=self._task(task_id); tx=p/"pending-commit.json"
             self.atomic_json(tx,{"state":state,"event":event})
@@ -84,6 +92,8 @@ class WorkspaceStore:
                 try: self._finish(p,data["state"],data["event"]); tx.unlink()
                 finally: self.fault=saved
     def put_version(self,task_id,kind,content:bytes,metadata):
+        from .execution import checkpoint
+        checkpoint()
         with self.lock(task_id):
             if not kind or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in kind): raise ValidationError("版本 kind 格式无效")
             digest=self.digest(content); p=self._task(task_id)/"artifacts"/digest
