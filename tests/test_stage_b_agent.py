@@ -323,6 +323,73 @@ class StageBAgentTests(unittest.TestCase):
         self.assertEqual(tool_error["error_code"], "unauthorized_tool")
         self.assertEqual([tool["name"] for tool in client.inputs[1]["tools"]], ["read_skill_file"])
 
+    def test_mixed_tool_batch_recovery_uses_one_remaining_path_contract(self):
+        first_batch = (
+            ModelToolCall("read_skill_file", '{"path":"SKILL.md"}', "initial-read"),
+            ModelToolCall("get_asset_info", '{"path":"assets/template.html"}', "hidden-tool"),
+        )
+        recovery_batch = (
+            ModelToolCall("read_skill_file", '{"path":"SKILL.md"}', "duplicate-read"),
+            ModelToolCall("read_skill_file", '{"path":"references/checklist.md"}', "remaining-read"),
+        )
+        client = ScriptedClient([
+            ModelTurn(None, "mixed", first_batch),
+            ModelTurn(None, "recovery", recovery_batch),
+            ModelTurn('{"markdown":"recovered"}', "final"),
+        ])
+
+        result = AgentRuntime(client, SkillRuntime.builtin()).run("outline", {})
+
+        recovery_tools = client.inputs[1]["tools"]
+        self.assertEqual([tool["name"] for tool in recovery_tools], ["read_skill_file"])
+        self.assertEqual(
+            recovery_tools[0]["parameters"]["properties"]["path"]["enum"],
+            ["references/checklist.md"],
+        )
+        recovery_prompts = [
+            item["content"] for item in client.inputs[1]["input"]
+            if item.get("role") == "user" and "受限恢复轮" in item.get("content", "")
+        ]
+        recovery_prompt = recovery_prompts[0]
+        self.assertNotIn("SKILL.md", recovery_prompt)
+        self.assertIn("references/checklist.md", recovery_prompt)
+        second_round = [item for item in result.audit if item.get("step") == 2 and item.get("event") in {"tool", "tool_error"}]
+        self.assertEqual(
+            [(item["event"], item.get("error_code"), item.get("path")) for item in second_round],
+            [("tool_error", "path_not_in_lock", None), ("tool", None, "references/checklist.md")],
+        )
+        self.assertEqual(client.inputs[2]["tools"], [])
+        self.assertEqual(client.inputs[2]["tool_choice"], "none")
+        self.assertIn("已无剩余合法读取路径", recovery_prompts[-1])
+
+    def test_mixed_batch_keeps_recovery_restricted_until_stable_failure(self):
+        first_batch = (
+            ModelToolCall("read_skill_file", '{"path":"SKILL.md"}', "initial-read"),
+            ModelToolCall("get_asset_info", '{"path":"assets/template.html"}', "hidden-tool"),
+        )
+        duplicate = (ModelToolCall("read_skill_file", '{"path":"SKILL.md"}', "duplicate"),)
+        client = ScriptedClient([
+            ModelTurn(None, "mixed", first_batch),
+            ModelTurn(None, "recovery-1", duplicate),
+            ModelTurn(None, "recovery-2", duplicate),
+        ])
+
+        with self.assertRaises(GatewayError) as caught:
+            AgentRuntime(client, SkillRuntime.builtin()).run("outline", {})
+
+        self.assertEqual(caught.exception.code, "stage_tool_contract_error")
+        self.assertEqual(caught.exception.audit[-1]["reason"], "tool_error_limit")
+        for request in client.inputs[1:]:
+            self.assertEqual(
+                request["tools"][0]["parameters"]["properties"]["path"]["enum"],
+                ["references/checklist.md"],
+            )
+        recovery_errors = [
+            item for item in caught.exception.audit
+            if item.get("step") in {2, 3} and item.get("event") == "tool_error"
+        ]
+        self.assertEqual([item["error_code"] for item in recovery_errors], ["path_not_in_lock", "path_not_in_lock"])
+
     def test_image_content_is_removed_from_every_nested_model_input(self):
         client = ScriptedClient([ModelTurn('{"html":"<html></html>"}', "r")])
         result = AgentRuntime(client, SkillRuntime.builtin()).run("deck", {

@@ -152,7 +152,8 @@ class AgentRuntime:
         override = CLARIFICATION_OVERRIDE if stage == "clarification" else PRODUCT_OVERRIDE
         started, audit, tool_count, tool_error_rounds, schema_corrections = self.clock(), [], 0, 0, 0
         successful_read_count, successful_read_paths = 0, set()
-        tool_error_corrections, recovery_pending = 0, False
+        tool_error_corrections, recovery_active = 0, False
+        remaining_paths: frozenset[str] | None = None
         input_json=json.dumps(payload,ensure_ascii=False,sort_keys=True,separators=(",",":"))
         stage_file_contract = json.dumps(sorted(stage_files) if stage_files is not None else ["*"])
         tool_contract = self._stage_tool_contract(stage, stage_files)
@@ -202,11 +203,15 @@ class AgentRuntime:
             try:
                 tool_choice = None
                 request_tools = stage_tools
-                if recovery_pending:
-                    request_tools = self._recovery_tools(stage, stage_files, successful_read_paths, successful_read_count)
+                request_allowed_files = stage_files
+                if recovery_active:
+                    request_tools = self._recovery_tools(stage, stage_files, remaining_paths)
+                    if stage in PLANNING_STAGES:
+                        # The same immutable path set drives the recovery request
+                        # schema and the dispatch-time authorization below.
+                        request_allowed_files = remaining_paths or frozenset()
                     if not request_tools:
                         tool_choice = "none"
-                    recovery_pending = False
                 if capability_probe and stage != "clarification":
                     tool_choice = {"type": "function", "name": "list_skill_files"} if tool_count == 0 else "none"
                 request_schema = None if capability_probe and stage != "clarification" and tool_count == 0 else response_schema
@@ -282,7 +287,7 @@ class AgentRuntime:
                         result = {"ok": False, "error": {"code": "quota_exceeded", "message": f"当前阶段最多读取 {MAX_PLANNING_FILE_READS} 个 Skill 文件；请直接提交最终 JSON"}}
                     else:
                         try:
-                            result = error or self.skill.dispatch(call.name, args, allowed_files=stage_files)
+                            result = error or self.skill.dispatch(call.name, args, allowed_files=request_allowed_files)
                         except (ValidationError, OSError, ValueError) as exc:
                             result = {"ok": False, "error": {"code": self._tool_error_code(call.name, str(exc)), "message": str(exc)}}
                     failed = result.get("ok") is False
@@ -298,12 +303,16 @@ class AgentRuntime:
                     audit.append({"step": step, "event": "tool_error" if failed else "tool", "tool": call.name, "error_code": result.get("error", {}).get("code") if failed else None, "call_id_sha256": hashlib.sha256((call.call_id or "").encode()).hexdigest(), "requested_path_sha256": hashlib.sha256(requested_path.encode()).hexdigest() if isinstance(requested_path, str) and requested_path else None, "path": result.get("path"), "file_sha256": result.get("sha256"), "result_sha256": hashlib.sha256(json.dumps(result, sort_keys=True, ensure_ascii=False).encode()).hexdigest()})
                     conversation.append({"type": "function_call", "name": call.name, "arguments": call.arguments, "call_id": call.call_id})
                     conversation.append({"type": "function_call_output", "call_id": call.call_id, "output": json.dumps(result, ensure_ascii=False)})
-                if failed_calls and tool_error_corrections == 0:
+                if failed_calls and not recovery_active:
                     tool_error_corrections = 1
-                    recovery_pending = True
-                    instruction = self._tool_recovery_instruction(stage, stage_files, successful_read_count)
-                    conversation.append({"role": "user", "content": instruction})
-                    audit.append({"step": step, "event": "tool_recovery_instruction", "attempt": tool_error_corrections})
+                    recovery_active = True
+                if recovery_active:
+                    remaining_paths = self._remaining_paths(
+                        stage,
+                        stage_files,
+                        successful_read_paths,
+                        successful_read_count,
+                    )
                 # Budget failed *model rounds*, not individual calls.  Every
                 # call in one response is processed and fed back as one batch.
                 tool_error_rounds = tool_error_rounds + 1 if successful_calls == 0 else 0
@@ -311,6 +320,10 @@ class AgentRuntime:
                     audit.append({"step": step, "event": "tool_error_round", "attempt": tool_error_rounds, "calls": len(turn.tool_calls)})
                     if tool_error_rounds >= self.max_tool_error_rounds:
                         fail("阶段工具契约连续不满足，生成已停止", "tool_error_limit")
+                if recovery_active:
+                    instruction = self._tool_recovery_instruction(stage, remaining_paths)
+                    conversation.append({"role": "user", "content": instruction})
+                    audit.append({"step": step, "event": "tool_recovery_instruction", "attempt": tool_error_corrections})
                 continue
             if capability_probe and stage != "clarification" and tool_count == 0:
                 fail("模型忽略了强制工具调用要求", "capability_probe_failed")
@@ -378,24 +391,35 @@ class AgentRuntime:
     def _recovery_tools(
         stage: str,
         stage_files: frozenset[str] | None,
-        successful_read_paths: set[str],
-        successful_read_count: int,
+        remaining_paths: frozenset[str] | None,
     ) -> list[dict]:
         if stage not in PLANNING_STAGES:
             return _tools_for_stage(stage, stage_files)
-        if successful_read_count >= MAX_PLANNING_FILE_READS:
-            return []
-        remaining = set(stage_files or ()) - successful_read_paths
-        return [_read_skill_file_tool(remaining)] if remaining else []
+        return [_read_skill_file_tool(remaining_paths)] if remaining_paths else []
 
     @staticmethod
-    def _tool_recovery_instruction(stage: str, stage_files: frozenset[str] | None, successful_read_count: int) -> str:
-        if stage in PLANNING_STAGES and successful_read_count < MAX_PLANNING_FILE_READS:
-            allowed = "、".join(sorted(stage_files or ())) or "（无）"
+    def _remaining_paths(
+        stage: str,
+        stage_files: frozenset[str] | None,
+        successful_read_paths: set[str],
+        successful_read_count: int,
+    ) -> frozenset[str] | None:
+        if stage not in PLANNING_STAGES:
+            return None
+        if successful_read_count >= MAX_PLANNING_FILE_READS:
+            return frozenset()
+        return frozenset((stage_files or frozenset()) - successful_read_paths)
+
+    @staticmethod
+    def _tool_recovery_instruction(stage: str, remaining_paths: frozenset[str] | None) -> str:
+        if stage in PLANNING_STAGES and remaining_paths:
+            allowed = "、".join(sorted(remaining_paths))
             return (
-                "上轮工具调用未通过当前阶段契约。下一轮如仍需读取，只能调用 read_skill_file，"
+                "当前处于受限恢复轮。如仍需读取，只能调用 read_skill_file，"
                 f"且 path 必须从以下合法路径选择：{allowed}；否则请不要调用工具，直接提交符合 Schema 的最终 JSON。"
             )
+        if stage in PLANNING_STAGES:
+            return "当前受限恢复轮已无剩余合法读取路径。下一轮不得调用工具，请直接提交符合 Schema 的最终 JSON。"
         return "上轮工具调用未通过当前阶段契约。下一轮不要重复无效调用；请仅使用当前可用工具的合法参数，或直接提交符合 Schema 的最终 JSON。"
 
     @staticmethod
