@@ -1,10 +1,10 @@
-import { api, ApiError } from "./api.js?v=2026.08.16.100923465190";
-import { JobTracker } from "./job-tracker.js?v=2026.08.16.100923465190";
-import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.16.100923465190";
-import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.16.100923465190";
-import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.16.100923465190";
-import { inlineError, setBusy } from "./components/index.js?v=2026.08.16.100923465190";
-import { renderStage } from "./stages/index.js?v=2026.08.16.100923465190";
+import { api, ApiError } from "./api.js?v=2026.08.16.113005185829";
+import { JobTracker } from "./job-tracker.js?v=2026.08.16.113005185829";
+import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.16.113005185829";
+import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.16.113005185829";
+import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.16.113005185829";
+import { inlineError, setBusy } from "./components/index.js?v=2026.08.16.113005185829";
+import { renderStage } from "./stages/index.js?v=2026.08.16.113005185829";
 
 const app = document.getElementById("app");
 const APP_BUILD = document.querySelector('meta[name="app-build"]')?.content || "unknown";
@@ -35,6 +35,13 @@ const OPERATION_STAGES = {
   "deck.generate": ["sample", "deck"],
   "deck.modify": ["deck", "review"],
   "inspection.run": ["deck", "review"],
+};
+
+const JOB_ERROR_PRESENTATIONS = {
+  stage_tool_contract_error: {
+    label: "阶段工具契约错误",
+    guidance: "模型连续请求了本阶段不允许的工具或文件。系统已停止无效调用；请重试，若再次发生请提供诊断 ID。",
+  },
 };
 
 applyTheme(preferredTheme());
@@ -424,6 +431,7 @@ function latestJobFailure(shell, selected) {
     .sort((left, right) => `${left.created_at}:${left.job_id}`.localeCompare(`${right.created_at}:${right.job_id}`));
   const latest = relevant.at(-1);
   if (!latest || !["failed", "interrupted"].includes(latest.status)) return null;
+  const presentation = JOB_ERROR_PRESENTATIONS[latest.error?.code];
   const retry = button("前往本阶段操作区重试", { kind: "secondary", onClick: () => {
     const control = document.querySelector('#stage-content [data-requires-runtime="true"]');
     control?.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -434,6 +442,8 @@ function latestJobFailure(shell, selected) {
       element("div", {}, [element("strong", { text: `${operationLabel(latest.operation)}失败` }), element("p", { text: latest.error?.message || "后台任务未完成" })]),
       badge("可重试", "danger"),
     ]),
+    presentation ? element("p", { className: "field__hint", text: `失败类型：${presentation.label}` }) : null,
+    presentation ? element("p", { text: presentation.guidance }) : null,
     latest.error?.code ? element("p", { className: "field__hint", text: `错误代码：${latest.error.code}` }) : null,
     latest.error?.diagnostic_id ? element("p", { className: "field__hint", text: `诊断 ID：${latest.error.diagnostic_id}` }) : null,
     retry,

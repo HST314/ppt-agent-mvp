@@ -102,6 +102,12 @@ class StageBAgentTests(unittest.TestCase):
         self.assertEqual(result.value["markdown"], "已纠正")
         self.assertEqual(result.audit[2]["event"], "tool_error")
         self.assertIn("path_not_in_lock", str(client.inputs[1]["input"]))
+        self.assertIn("只能调用 read_skill_file", str(client.inputs[1]["input"]))
+        self.assertEqual([tool["name"] for tool in client.inputs[1]["tools"]], ["read_skill_file"])
+        self.assertEqual(
+            client.inputs[1]["tools"][0]["parameters"]["properties"]["path"]["enum"],
+            ["SKILL.md", "references/checklist.md"],
+        )
 
     def test_tool_audit_records_requested_path_hash_and_normalized_path(self):
         calls = [ModelToolCall("read_skill_file", '{"path":"guizang-ppt/SKILL.md"}', "c1")]
@@ -137,6 +143,7 @@ class StageBAgentTests(unittest.TestCase):
         with self.assertRaises(GatewayError) as caught:
             AgentRuntime(exhausted,SkillRuntime.builtin()).run("narrative",{})
         self.assertEqual(caught.exception.audit[-1]["reason"],"tool_error_limit")
+        self.assertEqual(caught.exception.code,"stage_tool_contract_error")
         self.assertEqual(len(exhausted.inputs),2)
         self.assertEqual(sum(item.get("event")=="tool_error" for item in caught.exception.audit),6)
 
@@ -153,7 +160,8 @@ class StageBAgentTests(unittest.TestCase):
         self.assertEqual(client.inputs[0]["tools"],[])
         self.assertIsNone(client.inputs[0]["response_schema"])
         self.assertEqual(client.inputs[1]["tools"],[])
-        self.assertEqual(client.inputs[2]["tools"],TOOLS)
+        self.assertEqual([tool["name"] for tool in client.inputs[2]["tools"]],["list_skill_files","read_skill_file"])
+        self.assertEqual(client.inputs[2]["tools"][1]["parameters"]["properties"]["path"]["enum"],["SKILL.md","references/checklist.md"])
         self.assertEqual(client.inputs[2]["tool_choice"],{"type":"function","name":"list_skill_files"})
         self.assertIsNone(client.inputs[2]["response_schema"])
         self.assertEqual(client.inputs[3]["tool_choice"],"none")
@@ -254,11 +262,66 @@ class StageBAgentTests(unittest.TestCase):
         result = AgentRuntime(client, SkillRuntime.builtin()).run("outline", {"topic": "secret-topic"})
         self.assertEqual(result.value, {"markdown": "done"}); self.assertEqual([x["event"] for x in result.audit], ["run", "model", "tool", "model", "terminal"])
         self.assertNotIn("secret-topic", json.dumps(result.audit)); self.assertNotIn("content", json.dumps(result.audit))
-        self.assertIn("function_call_output", str(client.inputs[1]["input"])); self.assertEqual(client.inputs[0]["tools"], TOOLS)
+        self.assertIn("function_call_output", str(client.inputs[1]["input"])); self.assertEqual([tool["name"] for tool in client.inputs[0]["tools"]], ["list_skill_files", "read_skill_file"])
         system = client.inputs[0]["input"][0]["content"]
         for denied in ("联网", "图片", "Shell", "文件写入", "自更新"):
             self.assertIn(denied, system)
         self.assertIn(STAGE_PROMPTS["outline"], system)
+
+    def test_planning_stage_tools_paths_and_prompt_are_the_same_contract(self):
+        finals = {
+            "narrative": '{"markdown":"narrative-ok"}',
+            "outline": '{"markdown":"outline-ok"}',
+            "inspection": '{"passed":true,"issues":[]}',
+        }
+        for stage, final in finals.items():
+            with self.subTest(stage=stage):
+                client = ScriptedClient([
+                    ModelTurn(None, "tool", (ModelToolCall("read_skill_file", '{"path":"SKILL.md"}', "call"),)),
+                    ModelTurn(final, "final"),
+                ])
+                AgentRuntime(client, SkillRuntime.builtin()).run(stage, {})
+                tools = client.inputs[0]["tools"]
+                self.assertEqual([tool["name"] for tool in tools], ["list_skill_files", "read_skill_file"])
+                self.assertNotIn("get_asset_info", [tool["name"] for tool in tools])
+                self.assertEqual(
+                    tools[1]["parameters"]["properties"]["path"]["enum"],
+                    ["SKILL.md", "references/checklist.md"],
+                )
+                system = client.inputs[0]["input"][0]["content"]
+                self.assertIn("SKILL.md", system)
+                self.assertIn("references/checklist.md", system)
+                self.assertIn("最多成功读取 2 个文件", system)
+
+    def test_planning_stage_enforces_two_successful_file_reads(self):
+        calls = (
+            ModelToolCall("read_skill_file", '{"path":"SKILL.md"}', "one"),
+            ModelToolCall("read_skill_file", '{"path":"references/checklist.md"}', "two"),
+            ModelToolCall("read_skill_file", '{"path":"SKILL.md"}', "three"),
+        )
+        client = ScriptedClient([ModelTurn(None, "tools", calls), ModelTurn('{"markdown":"done"}', "final")])
+
+        result = AgentRuntime(client, SkillRuntime.builtin()).run("outline", {})
+
+        self.assertEqual(result.value, {"markdown": "done"})
+        self.assertEqual(sum(item.get("event") == "tool" for item in result.audit), 2)
+        quota = [item for item in result.audit if item.get("event") == "tool_error"]
+        self.assertEqual([item["error_code"] for item in quota], ["quota_exceeded"])
+        self.assertEqual(client.inputs[1]["tools"], [])
+        self.assertEqual(client.inputs[1]["tool_choice"], "none")
+
+    def test_planning_stage_rejects_a_hidden_asset_tool(self):
+        client = ScriptedClient([
+            ModelTurn(None, "asset", (ModelToolCall("get_asset_info", '{"path":"assets/template.html"}', "asset-call"),)),
+            ModelTurn('{"markdown":"recovered"}', "final"),
+        ])
+
+        result = AgentRuntime(client, SkillRuntime.builtin()).run("narrative", {})
+
+        self.assertEqual(result.value, {"markdown": "recovered"})
+        tool_error = next(item for item in result.audit if item.get("event") == "tool_error")
+        self.assertEqual(tool_error["error_code"], "unauthorized_tool")
+        self.assertEqual([tool["name"] for tool in client.inputs[1]["tools"]], ["read_skill_file"])
 
     def test_image_content_is_removed_from_every_nested_model_input(self):
         client = ScriptedClient([ModelTurn('{"html":"<html></html>"}', "r")])

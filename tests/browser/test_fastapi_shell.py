@@ -181,7 +181,7 @@ class FastAPIShellBrowserGate(unittest.TestCase):
         class FailingGenerator:
             model = "failing-browser-generator"
             def generate(self, *_args, **_kwargs):
-                raise GatewayError("Agent 达到最大步数，未提交阶段产物", code="gateway_error")
+                raise GatewayError("阶段工具契约连续不满足，生成已停止", code="stage_tool_contract_error")
 
         self.service.create("persistent-failure")
         self.service.import_input("persistent-failure", {"goal": "发布", "audience": "客户", "topic": "新品"})
@@ -198,8 +198,10 @@ class FastAPIShellBrowserGate(unittest.TestCase):
         page.goto(self.base + "/tasks/persistent-failure?stage=outline")
         page.get_by_role("heading", name="逐页大纲", exact=True).wait_for()
         failure = page.get_by_role("alert", name="最近一次后台任务失败")
-        self.assertTrue(failure.get_by_text("Agent 达到最大步数，未提交阶段产物", exact=True).is_visible())
-        self.assertTrue(failure.get_by_text("错误代码：gateway_error", exact=True).is_visible())
+        self.assertTrue(failure.get_by_text("阶段工具契约连续不满足，生成已停止", exact=True).is_visible())
+        self.assertTrue(failure.get_by_text("失败类型：阶段工具契约错误", exact=True).is_visible())
+        self.assertTrue(failure.get_by_text("错误代码：stage_tool_contract_error", exact=True).is_visible())
+        self.assertTrue(failure.get_by_text("模型连续请求了本阶段不允许的工具或文件。系统已停止无效调用；请重试，若再次发生请提供诊断 ID。", exact=True).is_visible())
         self.assertTrue(failure.get_by_role("button", name="前往本阶段操作区重试").is_visible())
 
         page.reload()

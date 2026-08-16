@@ -1,4 +1,4 @@
-import { api } from "./api.js?v=2026.08.16.100923465190";
+import { api } from "./api.js?v=2026.08.16.113005185829";
 
 const TERMINAL = new Set(["succeeded", "failed", "cancelled", "interrupted"]);
 const EVENT_TYPES = ["queued", "started", "progress", "checkpoint", "succeeded", "failed", "cancelled", "interrupted", "heartbeat"];
