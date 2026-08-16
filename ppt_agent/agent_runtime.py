@@ -43,6 +43,10 @@ def _object_schema(properties: dict, required: list[str]) -> dict:
     return {"type": "object", "properties": properties, "required": required, "additionalProperties": False}
 
 
+# These schemas are the complete local contract.  They intentionally include
+# defensive constraints that are not accepted by every provider's strict JSON
+# Schema subset; AgentRuntime always revalidates the completed response against
+# this contract even when the provider performed its own validation.
 STAGE_OUTPUT_SCHEMAS = {
     "clarification": {"name": "clarification", "strict": True, "schema": _object_schema({"questions": {"type": "array", "items": _object_schema({
         "question_id": {"type": "string"}, "field_path": {"type": "string"}, "prompt": {"type": "string"},
@@ -67,6 +71,28 @@ STAGE_OUTPUT_SCHEMAS = {
         "message": {"type": "string"}, "slide_id": {"type": "string"}, "element_id": {"type": "string"},
         "evidence": {"type": "string"}, "suggestion": {"type": "string"},
     }, ["issue_id", "severity", "level", "code", "message", "slide_id", "element_id", "evidence", "suggestion"])}}, ["passed", "issues"])},
+}
+
+
+_PROVIDER_UNSUPPORTED_SCHEMA_KEYWORDS = frozenset({"minLength", "minItems", "uniqueItems"})
+
+
+def _provider_schema(value: Any) -> Any:
+    """Return the strict provider subset without weakening local validation."""
+    if isinstance(value, dict):
+        return {
+            key: _provider_schema(item)
+            for key, item in value.items()
+            if key not in _PROVIDER_UNSUPPORTED_SCHEMA_KEYWORDS
+        }
+    if isinstance(value, list):
+        return [_provider_schema(item) for item in value]
+    return value
+
+
+STAGE_PROVIDER_SCHEMAS = {
+    stage: _provider_schema(schema)
+    for stage, schema in STAGE_OUTPUT_SCHEMAS.items()
 }
 PRODUCT_OVERRIDE = """产品规则高于 Skill：你只处理当前阶段，不得推进工作流或请求状态机操作。
 仅允许纯文本输入；禁止联网、图片输入、图片生成、Shell、文件写入、自更新和安装依赖。
@@ -157,9 +183,11 @@ class AgentRuntime:
     def run(self, stage: str, payload: dict, *, response_schema: dict | None = None, capability_probe: bool = False) -> AgentResult:
         if stage not in STAGES:
             raise ValidationError("Agent 阶段不在允许列表")
-        if response_schema is not None and response_schema != STAGE_OUTPUT_SCHEMAS[stage]:
+        allowed_schemas = (STAGE_OUTPUT_SCHEMAS[stage], STAGE_PROVIDER_SCHEMAS[stage])
+        if response_schema is not None and response_schema not in allowed_schemas:
             raise ValidationError("阶段输出 Schema 不允许覆盖")
-        response_schema = STAGE_OUTPUT_SCHEMAS[stage]
+        local_schema = STAGE_OUTPUT_SCHEMAS[stage]
+        provider_schema = STAGE_PROVIDER_SCHEMAS[stage]
         if not isinstance(payload, dict):
             raise ValidationError("Agent 输入无效")
         payload = self._text_only(payload)
@@ -212,7 +240,7 @@ class AgentRuntime:
                 if stage == "clarification"
                 else "\n这是启动能力探测：必须先调用一次 list_skill_files，收到工具结果后再提交符合 Schema 的 JSON。"
             )
-        conversation: list[Any] = [{"role": "system", "content": f"当前阶段：{stage}\n阶段目标：{STAGE_PROMPTS[stage]}\n{override}\n{tool_contract}{probe_instruction}\n{_output_contract(response_schema)}"}, {"role": "user", "content": input_json}]
+        conversation: list[Any] = [{"role": "system", "content": f"当前阶段：{stage}\n阶段目标：{STAGE_PROMPTS[stage]}\n{override}\n{tool_contract}{probe_instruction}\n{_output_contract(local_schema)}"}, {"role": "user", "content": input_json}]
         for step in range(1, self.max_steps + 1):
             if self.clock() - started >= self.timeout_seconds:
                 fail("Agent 运行超时，未提交阶段产物", "deadline_exceeded")
@@ -230,7 +258,7 @@ class AgentRuntime:
                         tool_choice = "none"
                 if capability_probe and stage != "clarification":
                     tool_choice = {"type": "function", "name": "list_skill_files"} if tool_count == 0 else "none"
-                request_schema = None if capability_probe and stage != "clarification" and tool_count == 0 else response_schema
+                request_schema = None if capability_probe and stage != "clarification" and tool_count == 0 else provider_schema
                 turn = self.client.create(input=conversation, tools=request_tools, response_schema=request_schema, tool_choice=tool_choice)
             except (IndexError, StopIteration) as exc:
                 fail("Agent 未在工具纠错后提交阶段产物", "incomplete_after_tool_error", exc)
@@ -355,7 +383,7 @@ class AgentRuntime:
             if not isinstance(value, dict):
                 fail("Agent 最终输出必须为 JSON object", "invalid_output")
             try:
-                self._validate_schema(value, response_schema.get("schema", response_schema), "output")
+                self._validate_schema(value, local_schema.get("schema", local_schema), "output")
             except GatewayError as exc:
                 if schema_corrections < self.max_schema_corrections:
                     schema_corrections += 1

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import httpx
 from openai import APIConnectionError, APIStatusError, APITimeoutError
 
-from ppt_agent.agent_runtime import AgentRuntime, STAGE_OUTPUT_SCHEMAS, STAGE_PROMPTS, TOOLS
+from ppt_agent.agent_runtime import AgentRuntime, STAGE_OUTPUT_SCHEMAS, STAGE_PROVIDER_SCHEMAS, STAGE_PROMPTS, TOOLS
 from ppt_agent.errors import GatewayError, GatewayUnknownResult, ValidationError
 from ppt_agent.gateways import AgentGateway
 from ppt_agent.model_clients import ModelToolCall, ModelTurn, OpenAIResponsesClient
@@ -152,7 +152,7 @@ class StageBAgentTests(unittest.TestCase):
     def test_startup_probe_checks_schema_then_complete_tool_round(self):
         client=ScriptedClient([
             ModelTurn("OK","basic"),
-            ModelTurn('{"questions":[]}',"clarification"),
+            ModelTurn(OUTLINE_JSON,"outline-schema"),
             ModelTurn(None,"tools",(ModelToolCall("list_skill_files","{}","probe-call"),)),
             ModelTurn('{"markdown":"probe-ok"}',"final"),
         ])
@@ -162,6 +162,7 @@ class StageBAgentTests(unittest.TestCase):
         self.assertEqual(client.inputs[0]["tools"],[])
         self.assertIsNone(client.inputs[0]["response_schema"])
         self.assertEqual(client.inputs[1]["tools"],[])
+        self.assertEqual(client.inputs[1]["response_schema"],STAGE_PROVIDER_SCHEMAS["outline"])
         self.assertEqual([tool["name"] for tool in client.inputs[2]["tools"]],["list_skill_files","read_skill_file"])
         self.assertEqual(client.inputs[2]["tools"][1]["parameters"]["properties"]["path"]["enum"],["SKILL.md","references/checklist.md"])
         self.assertEqual(client.inputs[2]["tool_choice"],{"type":"function","name":"list_skill_files"})
@@ -189,7 +190,7 @@ class StageBAgentTests(unittest.TestCase):
         serialized=json.dumps(gateway.last_probe_audit)
         self.assertNotIn('{"wrong":1}',serialized)
 
-        missing=AgentGateway(ScriptedClient([ModelTurn("OK","basic"),ModelTurn('{"questions":[]}',"strict"),ModelTurn('{"markdown":"skipped"}',"no-tool")]),skill=SkillRuntime.builtin())
+        missing=AgentGateway(ScriptedClient([ModelTurn("OK","basic"),ModelTurn(OUTLINE_JSON,"strict"),ModelTurn('{"markdown":"skipped"}',"no-tool")]),skill=SkillRuntime.builtin())
         with self.assertRaises(GatewayError) as caught:
             missing.probe_capabilities(probe_id="runtime-probe-tools")
         self.assertEqual(caught.exception.code,"probe_tool_call_missing")
@@ -200,7 +201,7 @@ class StageBAgentTests(unittest.TestCase):
 
         final_invalid=AgentGateway(ScriptedClient([
             ModelTurn("OK","basic"),
-            ModelTurn('{"questions":[]}',"strict"),
+            ModelTurn(OUTLINE_JSON,"strict"),
             ModelTurn(None,"tool",(ModelToolCall("list_skill_files","{}","call"),)),
             ModelTurn("not-json","bad-final"),
             ModelTurn("still-not-json","bad-final-again"),
@@ -216,7 +217,7 @@ class StageBAgentTests(unittest.TestCase):
 
         rejected=AgentGateway(ScriptedClient([
             ModelTurn("OK","basic"),
-            ModelTurn('{"questions":[]}',"strict"),
+            ModelTurn(OUTLINE_JSON,"strict"),
             ModelTurn(None,"tool",(ModelToolCall("list_skill_files","{}","call"),)),
             GatewayError("provider rejected tool output",code="model_request_invalid"),
         ]),skill=SkillRuntime.builtin())
@@ -235,7 +236,7 @@ class StageBAgentTests(unittest.TestCase):
 
         bad_calls=(ModelToolCall("shell","{}","bad"),)
         first_call=(ModelToolCall("list_skill_files","{}","first"),)
-        broken=AgentGateway(ScriptedClient([ModelTurn("OK","basic"),ModelTurn('{"questions":[]}',"strict"),ModelTurn(None,"first",first_call),ModelTurn(None,"bad-1",bad_calls),ModelTurn(None,"bad-2",bad_calls)]),skill=SkillRuntime.builtin())
+        broken=AgentGateway(ScriptedClient([ModelTurn("OK","basic"),ModelTurn(OUTLINE_JSON,"strict"),ModelTurn(None,"first",first_call),ModelTurn(None,"bad-1",bad_calls),ModelTurn(None,"bad-2",bad_calls)]),skill=SkillRuntime.builtin())
         with self.assertRaises(GatewayError) as caught:
             broken.probe_capabilities(probe_id="runtime-probe-broken-tools")
         self.assertEqual(caught.exception.code,"probe_tool_round_failed")
@@ -409,6 +410,28 @@ class StageBAgentTests(unittest.TestCase):
         for stage, schema in STAGE_OUTPUT_SCHEMAS.items():
             with self.subTest(stage=stage):
                 self.assertTrue(schema["strict"]); self.assertFalse(schema["schema"]["additionalProperties"])
+
+    def test_provider_outline_schema_omits_local_only_constraints(self):
+        local = json.dumps(STAGE_OUTPUT_SCHEMAS["outline"], sort_keys=True)
+        provider = json.dumps(STAGE_PROVIDER_SCHEMAS["outline"], sort_keys=True)
+        for keyword in ("minLength", "minItems", "uniqueItems"):
+            self.assertIn(keyword, local)
+            self.assertNotIn(keyword, provider)
+
+        client = ScriptedClient([
+            ModelTurn('{"slides":[]}', "empty"),
+            ModelTurn(OUTLINE_JSON, "fixed"),
+        ])
+        result = AgentRuntime(client, SkillRuntime.builtin()).run("outline", {})
+        self.assertEqual(result.value, OUTLINE_VALUE)
+        self.assertEqual(client.inputs[0]["response_schema"], STAGE_PROVIDER_SCHEMAS["outline"])
+        self.assertEqual(sum(item.get("event") == "schema_correction" for item in result.audit), 1)
+
+        compatible = ScriptedClient([ModelTurn(OUTLINE_JSON, "compatible")])
+        AgentRuntime(compatible, SkillRuntime.builtin()).run(
+            "outline", {}, response_schema=STAGE_OUTPUT_SCHEMAS["outline"]
+        )
+        self.assertEqual(compatible.inputs[0]["response_schema"], STAGE_PROVIDER_SCHEMAS["outline"])
 
     def test_invalid_stage_tool_output_and_limits_fail_closed(self):
         with self.assertRaises(ValidationError): AgentRuntime(ScriptedClient([]), SkillRuntime.builtin()).run("publish", {})
@@ -599,7 +622,11 @@ class StageBAgentTests(unittest.TestCase):
     def test_client_auto_mode_falls_back_once_on_400_and_caches(self):
         config = SimpleNamespace(model="m", api_key="k", base_url="https://example.com", timeout_seconds=1, structured_output="auto")
         request = httpx.Request("POST", "https://provider.example/v1/responses")
-        failure = APIStatusError("unsupported parameter", response=httpx.Response(400, request=request), body=None)
+        failure = APIStatusError(
+            "unsupported parameter: text.format",
+            response=httpx.Response(400, request=request),
+            body={"error":{"message":"Unsupported parameter: text.format","param":"text.format"}},
+        )
         sdk = SimpleNamespace(); sdk.responses = sdk; sdk.seen = []
         def create(**kwargs):
             sdk.seen.append(kwargs)
@@ -626,6 +653,33 @@ class StageBAgentTests(unittest.TestCase):
         with self.assertRaises(GatewayError) as caught:
             strict.create(input=[], response_schema=schema)
         self.assertEqual(caught.exception.code, "model_request_invalid")
+
+    def test_client_schema_400_never_falls_back_or_poisons_capability_cache(self):
+        config = SimpleNamespace(model="m", api_key="k", base_url="https://example.com", timeout_seconds=1, structured_output="auto")
+        request = httpx.Request("POST", "https://provider.example/v1/responses")
+        invalid_schema = APIStatusError(
+            "invalid schema",
+            response=httpx.Response(400, request=request),
+            body={"error":{"message":"Invalid schema for response_format 'outline': 'uniqueItems' is not permitted in schema.","code":"invalid_json_schema","param":"text.format.schema"}},
+        )
+        sdk = SimpleNamespace(); sdk.responses = sdk; sdk.seen = []
+        def create(**kwargs):
+            sdk.seen.append(kwargs)
+            if len(sdk.seen) == 1:
+                raise invalid_schema
+            return SimpleNamespace(output_text="ok", id="r", output=[])
+        sdk.create = create
+        client = OpenAIResponsesClient(config, sdk_client=sdk)
+        schema = STAGE_PROVIDER_SCHEMAS["outline"]
+
+        with self.assertRaises(GatewayError) as caught:
+            client.create(input=[], response_schema=schema)
+        self.assertEqual(caught.exception.code, "model_schema_invalid")
+        self.assertEqual(len(sdk.seen), 1)
+
+        client.create(input=[], response_schema=schema)
+        self.assertEqual(len(sdk.seen), 2)
+        self.assertIn("text", sdk.seen[1])
 
     def test_runtime_parses_fenced_and_prose_wrapped_json(self):
         for text in ('```json\n{"markdown":"fenced"}\n```', '说明文字 {"markdown":"prose"} 结束'):

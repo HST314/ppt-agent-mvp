@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 from .errors import GatewayError, GatewayUnknownResult, ValidationError
-from .agent_runtime import AgentRuntime
+from .agent_runtime import AgentRuntime, STAGE_OUTPUT_SCHEMAS, STAGE_PROVIDER_SCHEMAS, _extract_json_object
 from .audit import current_agent_audit_context
 from .skill_runtime import SkillRuntime
 
@@ -208,15 +208,34 @@ class AgentGateway:
         check="strict_json_schema"
         record(check,"started")
         try:
-            clarification = AgentRuntime(
+            # Probe the production outline schema itself.  It is the most
+            # demanding strict schema in the planning path and previously was
+            # only exercised by the first real outline request after readiness
+            # had already gone green.
+            schema_runtime = AgentRuntime(
                 self.client,
                 self.skill_factory(),
                 max_steps=self.max_steps,
                 timeout_seconds=self.run_timeout_seconds,
-            ).run("clarification", {"capability_probe": "return_empty_questions"}, capability_probe=True)
-            if clarification.value != {"questions": []}:
-                raise GatewayError("模型未按探测契约返回空问题集",code="probe_invalid_output")
-            record(check,"succeeded",response_id_sha256=hashlib.sha256((clarification.response_id or "").encode()).hexdigest())
+            )
+            outline = self.client.create(
+                input=[
+                    {"role":"system","content":"运行时严格结构化输出探测。只返回符合指定 Schema 的 JSON，不得调用工具。"},
+                    {"role":"user","content":'返回一页大纲：{"slides":[{"title":"探测","purpose":"验证结构化输出","content_markdown":"- 探测内容","resource_uris":[]}]}。'},
+                ],
+                tools=[],
+                response_schema=STAGE_PROVIDER_SCHEMAS["outline"],
+            )
+            if outline.tool_calls:
+                raise GatewayError("模型在 Schema 探测中返回了未授权工具调用",code="probe_invalid_output")
+            try:
+                outline_value = _extract_json_object(outline.text or "")
+                schema_runtime._validate_schema(outline_value, STAGE_OUTPUT_SCHEMAS["outline"]["schema"], "output")
+            except (json.JSONDecodeError, GatewayError) as exc:
+                if isinstance(exc, GatewayError) and exc.code == "probe_invalid_output":
+                    raise
+                raise GatewayError("模型未按 outline 探测契约返回有效结构",code="probe_invalid_output") from exc
+            record(check,"succeeded",response_id_sha256=hashlib.sha256((outline.response_id or "").encode()).hexdigest())
         except Exception as exc:
             failed(check,exc)
 

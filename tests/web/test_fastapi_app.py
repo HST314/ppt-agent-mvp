@@ -114,7 +114,7 @@ class FastAPIAppTests(unittest.TestCase):
                     raise RuntimeError("raw provider message with secret-key")
                 responses = {
                     1: SimpleNamespace(output_text="OK", id="provider-basic-id", output=[]),
-                    2: SimpleNamespace(output_text='{"questions":[]}', id="provider-schema-id", output=[]),
+                    2: SimpleNamespace(output_text='{"slides":[{"title":"探测","purpose":"验证","content_markdown":"- 内容","resource_uris":[]}]}', id="provider-schema-id", output=[]),
                     3: SimpleNamespace(
                         output_text="",
                         id="provider-tool-id",
@@ -183,7 +183,7 @@ class FastAPIAppTests(unittest.TestCase):
                 self.calls += 1
                 common = {
                     1: SimpleNamespace(output_text="OK", id="provider-basic-id", output=[]),
-                    2: SimpleNamespace(output_text='{"questions":[]}', id="provider-schema-id", output=[]),
+                    2: SimpleNamespace(output_text='{"slides":[{"title":"探测","purpose":"验证","content_markdown":"- 内容","resource_uris":[]}]}', id="provider-schema-id", output=[]),
                 }
                 if self.calls in common:
                     return common[self.calls]

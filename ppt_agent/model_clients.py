@@ -36,10 +36,10 @@ class OpenAIResponsesClient:
     - ``json_schema``: always send ``text.format`` (strict provider enforcement).
     - ``prompt``: never send it; the runtime prompt contract plus local
       validation carry the whole burden.
-    - ``auto`` (default): send it, but an HTTP 400 marks the parameter as
-      unsupported and every later request in this process omits it.  A 400
-      means the request was rejected before processing, so the single retry
-      without the parameter cannot duplicate model side effects.
+    - ``auto`` (default): send it and fall back only when the provider
+      explicitly says that the structured-output parameter itself is not
+      supported.  Invalid schemas and unrelated 400 responses fail closed and
+      never poison the process-wide capability cache.
 
     A completed response with neither text nor tool calls is a known,
     side-effect-free outcome (the provider finished processing and returned
@@ -73,7 +73,8 @@ class OpenAIResponsesClient:
                     continue
                 raise self._transport_error(exc, "timeout", attempts=timeout_attempts) from exc
             except APIStatusError as exc:
-                if use_format and self.structured_output == "auto" and int(getattr(exc, "status_code", 0) or 0) == 400:
+                format_rejection = self._format_rejection(exc) if use_format else None
+                if self.structured_output == "auto" and format_rejection == "unsupported_parameter":
                     self._text_format_unsupported = True
                     use_format = False
                     continue
@@ -132,8 +133,60 @@ class OpenAIResponsesClient:
         return seconds if 0 <= seconds <= 86400 else None
 
     @classmethod
+    def _format_rejection(cls, exc: Exception) -> str | None:
+        """Classify a provider 400 without exposing the provider response.
+
+        Only an explicit rejection of ``text.format``/structured outputs may
+        enable prompt-only fallback.  A malformed JSON Schema is a deployment
+        error, not evidence that the endpoint lacks the capability.
+        """
+        if int(getattr(exc, "status_code", 0) or 0) != 400:
+            return None
+
+        fragments = [str(exc)]
+
+        def collect(value: Any, depth: int = 0) -> None:
+            if depth > 4:
+                return
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    fragments.append(str(key))
+                    collect(item, depth + 1)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    collect(item, depth + 1)
+            elif isinstance(value, (str, int)):
+                fragments.append(str(value))
+
+        collect(getattr(exc, "body", None))
+        text = " ".join(fragments).lower().replace("_", " ")
+        schema_markers = (
+            "invalid schema",
+            "schema is invalid",
+            "invalid json schema",
+            "schema for response format",
+            "json schema for response format",
+            "not permitted in schema",
+        )
+        if any(marker in text for marker in schema_markers):
+            return "invalid_schema"
+
+        format_markers = ("text.format", "text format", "response format", "structured output", "json schema")
+        unsupported_markers = (
+            "unsupported parameter",
+            "unknown parameter",
+            "unrecognized request argument",
+            "not supported",
+            "does not support",
+        )
+        if any(marker in text for marker in format_markers) and any(marker in text for marker in unsupported_markers):
+            return "unsupported_parameter"
+        return None
+
+    @classmethod
     def _status_error(cls, exc: Exception) -> GatewayError:
         status = int(getattr(exc, "status_code", 0) or 0)
+        format_rejection = cls._format_rejection(exc)
         mapping = {
             400: ("model_request_invalid", "模型请求与当前端点不兼容，请联系管理员检查模型与结构化输出配置", False, "request_invalid"),
             401: ("model_authentication_failed", "模型服务认证失败，请联系管理员检查凭据", False, "authentication"),
@@ -141,7 +194,14 @@ class OpenAIResponsesClient:
             404: ("model_not_found", "配置的模型或端点不存在，请联系管理员检查配置", False, "not_found"),
             429: ("model_rate_limited", "模型服务请求过于频繁，请等待后重新探测", True, "rate_limit"),
         }
-        if status in mapping:
+        if status == 400 and format_rejection == "invalid_schema":
+            code, message, retryable, category = (
+                "model_schema_invalid",
+                "结构化输出 Schema 不受当前模型支持，请联系管理员检查提供商 Schema 配置",
+                False,
+                "schema_invalid",
+            )
+        elif status in mapping:
             code, message, retryable, category = mapping[status]
         elif 500 <= status <= 599:
             code, message, retryable, category = (
