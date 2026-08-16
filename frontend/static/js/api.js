@@ -91,21 +91,33 @@ export const api = {
 };
 
 async function runtimeStatus(recheck = false) {
+  let live;
+  let liveData;
+  try {
+    ({ response: live, data: liveData } = await runtimeFetch("/livez"));
+  } catch (_error) {
+    return { backendReachable: false, runtimeReady: false, live: null, ready: null };
+  }
+  if (!live.ok) return { backendReachable: false, runtimeReady: false, live: liveData, ready: null };
+  try {
+    const { response: ready, data: readyData } = await runtimeFetch(recheck ? "/v1/runtime/recheck" : "/v1/runtime/status", {
+      method: recheck ? "POST" : "GET",
+    });
+    return { backendReachable: true, runtimeReady: readyData.runtime_ready === true, live: liveData, ready: readyData };
+  } catch (_error) {
+    // Liveness already succeeded. A slow readiness/model probe must never be
+    // mislabeled as a dead backend; leave model readiness unknown instead.
+    return { backendReachable: true, runtimeReady: null, live: liveData, ready: null };
+  }
+}
+
+async function runtimeFetch(path, options = {}) {
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort("timeout"), 8000);
   try {
-    const live = await fetch("/livez", { signal: controller.signal, cache: "no-store" });
-    const liveData = await live.json().catch(() => ({}));
-    if (!live.ok) return { backendReachable: false, runtimeReady: false, live: liveData, ready: null };
-    const ready = await fetch(recheck ? "/v1/runtime/recheck" : "/v1/runtime/status", {
-      method: recheck ? "POST" : "GET",
-      signal: controller.signal,
-      cache: "no-store",
-    });
-    const readyData = await ready.json().catch(() => ({}));
-    return { backendReachable: true, runtimeReady: readyData.runtime_ready === true, live: liveData, ready: readyData };
-  } catch (_error) {
-    return { backendReachable: false, runtimeReady: false, live: null, ready: null };
+    const response = await fetch(path, { ...options, signal: controller.signal, cache: "no-store" });
+    const data = await response.json().catch(() => ({}));
+    return { response, data };
   } finally {
     window.clearTimeout(timeout);
   }

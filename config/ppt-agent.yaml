@@ -8,10 +8,10 @@ models:
     api_key_env: MODEL_API_KEY
     base_url_env: MODEL_BASE_URL
     # 单次 HTTP 请求超时（秒，1-600）
-    request_timeout_seconds: 60
-    # 整轮 Agent 运行预算（秒，10-3600）；叙事等带工具多轮往返的阶段需要较大预算
-    run_timeout_seconds: 300
-    max_steps: 12
+    request_timeout_seconds: 180
+    # 整轮 Agent 运行预算需覆盖一次超时重试及多轮工具往返
+    run_timeout_seconds: 600
+    max_steps: 100
     # 结构化输出模式：auto=默认，端点不支持 text.format 时自动降级；json_schema=强制发送；prompt=从不发送
     structured_output: auto
   inspection:
@@ -19,9 +19,9 @@ models:
     model: deepseek-v4-flash-ga-260731
     api_key_env: MODEL_API_KEY
     base_url_env: MODEL_BASE_URL
-    request_timeout_seconds: 60
-    run_timeout_seconds: 300
-    max_steps: 6
+    request_timeout_seconds: 180
+    run_timeout_seconds: 600
+    max_steps: 100
     fallback_to_generation: true
 
 # 澄清阶段运行参数（仅 agent 模式的模型澄清使用）

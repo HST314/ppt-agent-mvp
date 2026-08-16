@@ -422,7 +422,33 @@ class StageBAgentTests(unittest.TestCase):
                     OpenAIResponsesClient(config, sdk_client=sdk).create(input=[])
                 self.assertEqual(caught.exception.code, code)
                 self.assertEqual(caught.exception.safe_audit_details()["category"], category)
+                if code != "gateway_error":
+                    self.assertEqual(caught.exception.safe_audit_details()["attempts"], 2 if code == "model_timeout" else 1)
                 self.assertNotIn("raw sdk secret", json.dumps(caught.exception.public()))
+
+    def test_client_retries_a_timeout_once_then_returns_the_result(self):
+        config = SimpleNamespace(model="m", api_key="secret-key", base_url="https://example.com", timeout_seconds=1)
+        request = httpx.Request("POST", "https://provider.example/v1/responses")
+        sdk = SimpleNamespace(); sdk.responses = sdk; sdk.calls = 0
+        def create(**_kwargs):
+            sdk.calls += 1
+            if sdk.calls == 1:
+                raise APITimeoutError(request=request)
+            return SimpleNamespace(output_text="recovered", id="r", output=[])
+        sdk.create = create
+
+        turn = OpenAIResponsesClient(config, sdk_client=sdk).create(input=[])
+
+        self.assertEqual(turn.text, "recovered")
+        self.assertEqual(sdk.calls, 2)
+
+    def test_outline_skill_view_hides_rendering_only_references(self):
+        skill = SkillRuntime.builtin()
+        allowed = skill.files_for_stage("outline")
+        self.assertEqual(skill.list_skill_files(allowed_files=allowed)["files"], ["SKILL.md", "references/checklist.md"])
+        with self.assertRaises(ValidationError):
+            skill.dispatch("read_skill_file", {"path": "references/themes.md"}, allowed_files=allowed)
+        self.assertIsNone(skill.files_for_stage("deck"))
 
     def test_client_structured_output_modes_control_text_format(self):
         schema = {"name": "narrative", "strict": True, "schema": {"type": "object"}}

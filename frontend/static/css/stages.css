@@ -17,6 +17,7 @@
 .stat dt { color: var(--color-muted-foreground); font-size: 0.78rem; }
 .stat dd { margin: var(--space-1) 0 0; font-weight: 750; overflow-wrap: anywhere; }
 .job-panel { margin-top: var(--space-4); padding: var(--space-4); border: 1px solid color-mix(in srgb, var(--color-primary) 30%, var(--color-border)); border-radius: var(--radius-sm); background: color-mix(in srgb, var(--color-primary) 6%, var(--color-surface)); }
+.job-panel--failed { border-color: color-mix(in srgb, var(--color-destructive) 45%, var(--color-border)); background: color-mix(in srgb, var(--color-destructive) 7%, var(--color-surface)); }
 .job-panel__header { display: flex; justify-content: space-between; gap: var(--space-3); }
 @media (max-width: 767px) {
   .stage-status-grid { grid-template-columns: 1fr; }

@@ -30,7 +30,7 @@ class ResponsesModelClient(Protocol):
 
 
 class OpenAIResponsesClient:
-    """Narrow Responses API adapter. Unknown outcomes are never retried here.
+    """Narrow Responses API adapter with one bounded timeout retry.
 
     `structured_output` controls how stage schemas reach the provider:
     - ``json_schema``: always send ``text.format`` (strict provider enforcement).
@@ -56,6 +56,7 @@ class OpenAIResponsesClient:
     def create(self, *, input: Any, tools: list[dict] | None = None, response_schema: dict | None = None, tool_choice: Any = None) -> ModelTurn:
         use_format = bool(response_schema) and self.structured_output != "prompt" and not self._text_format_unsupported
         empty_attempts = 0
+        timeout_attempts = 0
         while True:
             request: dict[str, Any] = {"model": self.config.model, "input": input}
             if tools:
@@ -67,7 +68,10 @@ class OpenAIResponsesClient:
             try:
                 response = self._client.responses.create(**request)
             except (APITimeoutError, TimeoutError, socket.timeout) as exc:
-                raise self._transport_error(exc, "timeout") from exc
+                timeout_attempts += 1
+                if timeout_attempts <= 1:
+                    continue
+                raise self._transport_error(exc, "timeout", attempts=timeout_attempts) from exc
             except APIStatusError as exc:
                 if use_format and self.structured_output == "auto" and int(getattr(exc, "status_code", 0) or 0) == 400:
                     self._text_format_unsupported = True
@@ -169,7 +173,7 @@ class OpenAIResponsesClient:
         )
 
     @staticmethod
-    def _transport_error(exc: Exception, category: str) -> GatewayUnknownResult:
+    def _transport_error(exc: Exception, category: str, *, attempts: int = 1) -> GatewayUnknownResult:
         timeout = category == "timeout"
         return GatewayUnknownResult(
             "模型请求超时，结果可能未知；请先核对供应商记录" if timeout else "模型连接中断，结果可能未知；请先核对供应商记录",
@@ -178,6 +182,7 @@ class OpenAIResponsesClient:
             audit_details={
                 "category": category,
                 "sdk_exception_type": type(exc).__name__,
+                "attempts": attempts,
                 "retryable": False,
             },
         )

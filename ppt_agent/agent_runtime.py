@@ -20,8 +20,8 @@ STAGE_PROMPTS = {
         "helper_text、0 个或多个带 value/label/description 的 options、allow_other 与 blocking。"
         "本阶段不提供也不需要任何 Skill 工具，禁止请求工具。"
     ),
-    "narrative": "根据任务卡生成叙事结构 Markdown；不要生成逐页 HTML。按需最多读取 1 到 2 个最相关的 Skill 文件，不要逐个读取全部文件。",
-    "outline": "根据已确认叙事生成逐页大纲 Markdown；保持页面标识稳定。",
+    "narrative": "根据任务卡生成叙事结构 Markdown；不要生成逐页 HTML。按需最多读取 1 到 2 个当前阶段已列出的 Skill 文件，不要重复读取。",
+    "outline": "根据已确认叙事生成逐页大纲 Markdown；保持页面标识稳定。按需最多读取 1 到 2 个当前阶段已列出的 Skill 文件，禁止尝试读取布局、主题、图片或 HTML 模板文件；读取后立即提交大纲 JSON，不要重复读取。",
     "sample": "仅为外层状态机指定的样品页生成完整 HTML，不得扩展到全稿。",
     "deck": "为外层状态机给定的全部页面生成完整 HTML，并遵守已确认样品的视觉基线。",
     "inspection": "独立检查大纲与 HTML，仅报告有证据的问题，不得直接修改产物。",
@@ -125,10 +125,12 @@ class AgentRuntime:
             raise ValidationError("Agent 输入无效")
         payload = self._text_only(payload)
         stage_tools = [] if stage == "clarification" else TOOLS
+        stage_files = self.skill.files_for_stage(stage)
         override = CLARIFICATION_OVERRIDE if stage == "clarification" else PRODUCT_OVERRIDE
         started, audit, tool_count, tool_error_rounds, schema_corrections = self.clock(), [], 0, 0, 0
         input_json=json.dumps(payload,ensure_ascii=False,sort_keys=True,separators=(",",":"))
-        audit.append({"event": "run", "stage": stage, "skill": self.skill.skill_name, "skill_version": self.skill.skill_version, "lock_sha256": hashlib.sha256(json.dumps(self.skill.manifest, sort_keys=True).encode()).hexdigest(), "input_sha256": hashlib.sha256(input_json.encode()).hexdigest(), "config_sha256": hashlib.sha256((STAGE_PROMPTS[stage]+override).encode()).hexdigest()})
+        stage_file_contract = json.dumps(sorted(stage_files) if stage_files is not None else ["*"])
+        audit.append({"event": "run", "stage": stage, "skill": self.skill.skill_name, "skill_version": self.skill.skill_version, "lock_sha256": hashlib.sha256(json.dumps(self.skill.manifest, sort_keys=True).encode()).hexdigest(), "input_sha256": hashlib.sha256(input_json.encode()).hexdigest(), "config_sha256": hashlib.sha256((STAGE_PROMPTS[stage]+override+stage_file_contract).encode()).hexdigest()})
         def probe_phase(reason: str) -> str:
             if stage == "clarification":
                 return "strict_json_schema"
@@ -241,7 +243,7 @@ class AgentRuntime:
                     except (json.JSONDecodeError, ValidationError) as exc:
                         args, error = {}, {"ok": False, "error": {"code": "invalid_arguments", "message": str(exc)}}
                     try:
-                        result = error or self.skill.dispatch(call.name, args)
+                        result = error or self.skill.dispatch(call.name, args, allowed_files=stage_files)
                     except (ValidationError, OSError, ValueError) as exc:
                         result = {"ok": False, "error": {"code": self._tool_error_code(call.name, str(exc)), "message": str(exc)}}
                     failed = result.get("ok") is False

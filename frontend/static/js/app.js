@@ -1,10 +1,10 @@
-import { api, ApiError } from "./api.js?v=2026.08.16.064435603168";
-import { JobTracker } from "./job-tracker.js?v=2026.08.16.064435603168";
-import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.16.064435603168";
-import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.16.064435603168";
-import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.16.064435603168";
-import { inlineError, setBusy } from "./components/index.js?v=2026.08.16.064435603168";
-import { renderStage } from "./stages/index.js?v=2026.08.16.064435603168";
+import { api, ApiError } from "./api.js?v=2026.08.16.100923465190";
+import { JobTracker } from "./job-tracker.js?v=2026.08.16.100923465190";
+import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.16.100923465190";
+import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.16.100923465190";
+import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.16.100923465190";
+import { inlineError, setBusy } from "./components/index.js?v=2026.08.16.100923465190";
+import { renderStage } from "./stages/index.js?v=2026.08.16.100923465190";
 
 const app = document.getElementById("app");
 const APP_BUILD = document.querySelector('meta[name="app-build"]')?.content || "unknown";
@@ -24,6 +24,17 @@ const STATUS = {
   cancelled: ["已取消", "danger"],
   failed: ["失败", "danger"],
   completed: ["已完成", "success"],
+};
+
+const OPERATION_STAGES = {
+  "clarification.generate": ["clarification"],
+  "narrative.generate": ["clarification", "narrative"],
+  "outline.generate": ["narrative", "outline"],
+  "samples.generate": ["outline", "sample"],
+  "samples.modify": ["outline", "sample"],
+  "deck.generate": ["sample", "deck"],
+  "deck.modify": ["deck", "review"],
+  "inspection.run": ["deck", "review"],
 };
 
 applyTheme(preferredTheme());
@@ -366,6 +377,7 @@ function workspaceMain(shell, selected) {
         badge(statusLabel, tone),
       ]),
       element("div", { id: "active-job-region", "aria-live": "polite" }, shell.active_jobs.map(jobPanel)),
+      latestJobFailure(shell, selected),
       element("div", { id: "stage-content" }, locked ? lockedState(selected, current) : [
         element("div", { className: "skeleton skeleton--title" }),
         element("div", { className: "card", role: "status" }, [element("span", { className: "sr-only", text: `正在加载${selected.label}` }), element("div", { className: "skeleton skeleton--line" }), element("div", { className: "skeleton skeleton--line" })]),
@@ -406,6 +418,28 @@ function jobPanel(job) {
   ]);
 }
 
+function latestJobFailure(shell, selected) {
+  const relevant = (shell.latest_jobs || [])
+    .filter((job) => OPERATION_STAGES[job.operation]?.includes(selected.id))
+    .sort((left, right) => `${left.created_at}:${left.job_id}`.localeCompare(`${right.created_at}:${right.job_id}`));
+  const latest = relevant.at(-1);
+  if (!latest || !["failed", "interrupted"].includes(latest.status)) return null;
+  const retry = button("前往本阶段操作区重试", { kind: "secondary", onClick: () => {
+    const control = document.querySelector('#stage-content [data-requires-runtime="true"]');
+    control?.scrollIntoView({ behavior: "smooth", block: "center" });
+    control?.focus({ preventScroll: true });
+  } });
+  return element("section", { className: "job-panel job-panel--failed", role: "alert", "aria-label": "最近一次后台任务失败" }, [
+    element("div", { className: "job-panel__header" }, [
+      element("div", {}, [element("strong", { text: `${operationLabel(latest.operation)}失败` }), element("p", { text: latest.error?.message || "后台任务未完成" })]),
+      badge("可重试", "danger"),
+    ]),
+    latest.error?.code ? element("p", { className: "field__hint", text: `错误代码：${latest.error.code}` }) : null,
+    latest.error?.diagnostic_id ? element("p", { className: "field__hint", text: `诊断 ID：${latest.error.diagnostic_id}` }) : null,
+    retry,
+  ]);
+}
+
 function connectJob(job, route, storageKey = null) {
   const recoveredStorageKey = storageKey || storageKeyForJob(job.job_id);
   tracker.track(job, {
@@ -413,7 +447,10 @@ function connectJob(job, route, storageKey = null) {
     onEvent: (event) => updateJobEvent(event),
     onComplete: (finished) => {
       if (recoveredStorageKey) clearIdempotencyKey(recoveredStorageKey, finished.job_id);
-      showToast(finished.status === "succeeded" ? "后台任务已完成" : "后台任务已结束，请查看详情");
+      const label = operationLabel(finished.operation);
+      if (finished.status === "succeeded") showToast(`${label}已完成`);
+      else if (finished.status === "failed") showToast(`${label}失败：${finished.error?.message || "请查看阶段内详情"}`);
+      else showToast(`${label}已${finished.status === "cancelled" ? "取消" : "中断"}，请查看阶段内详情`);
       renderRoute(route);
     },
   });

@@ -199,6 +199,24 @@ class JobServiceTests(unittest.TestCase):
             self.assertEqual([item["type"] for item in jobs.events(created["job_id"])], ["queued", "cancelled"])
             jobs.close()
 
+    def test_latest_job_per_operation_supports_persistent_failure_feedback(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = TaskService(WorkspaceStore(root))
+            service.create("latest")
+            service.command("latest", "to-clarification", "advance")
+            service.command("latest", "to-narrative", "advance")
+            jobs = JobService(service, executor=DeferredExecutor())
+            first, _ = jobs.create("latest", "narrative.generate", {}, "first")
+            jobs.cancel(first["job_id"])
+            second, _ = jobs.create("latest", "narrative.generate", {"prompt": "retry"}, "second")
+
+            latest = jobs.latest_by_operation("latest")
+
+            self.assertEqual(len(latest), 1)
+            self.assertEqual(latest[0]["job_id"], second["job_id"])
+            self.assertEqual(latest[0]["status"], "queued")
+            jobs.close()
+
     def test_task_job_mutual_exclusion(self):
         with tempfile.TemporaryDirectory() as root:
             service = BlockingService(WorkspaceStore(root))

@@ -71,6 +71,7 @@ def get_shell(task_id: str, service: TaskService = Depends(task_service), jobs: 
         "summary": summary,
         "stages": stages,
         "active_jobs": jobs.list(task_id, "active"),
+        "latest_jobs": jobs.latest_by_operation(task_id),
     }
 
 

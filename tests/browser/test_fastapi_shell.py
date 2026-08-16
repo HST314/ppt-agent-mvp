@@ -70,7 +70,8 @@ class FastAPIShellBrowserGate(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.service = TaskService(WorkspaceStore(self.tmp.name))
         port = free_port()
-        config = uvicorn.Config(create_app(self.service), host="127.0.0.1", port=port, log_level="critical")
+        self.app = create_app(self.service)
+        config = uvicorn.Config(self.app, host="127.0.0.1", port=port, log_level="critical")
         self.server = uvicorn.Server(config)
         self.thread = threading.Thread(target=self.server.run, daemon=True)
         self.thread.start()
@@ -159,6 +160,50 @@ class FastAPIShellBrowserGate(unittest.TestCase):
         page.get_by_role("button", name="打开确认对话框").click()
         self.assertTrue(page.get_by_role("dialog").is_visible())
         page.get_by_role("dialog").get_by_role("button", name="取消").click()
+        self.assertEqual(errors, [])
+        page.close()
+
+    def test_readiness_transport_failure_does_not_mislabel_live_backend(self):
+        self.service.create("partial-health")
+        page, errors = self.new_page()
+        page.route("**/v1/runtime/status", lambda route: route.abort())
+
+        page.goto(self.base + "/tasks/partial-health")
+        page.get_by_role("heading", name="任务/资料").wait_for()
+        page.get_by_text("后端可达", exact=True).first.wait_for()
+
+        self.assertEqual(page.get_by_text("后端不可达", exact=True).count(), 0)
+        self.assertTrue(page.get_by_text("模型检测中", exact=True).first.is_visible())
+        self.assertTrue(errors and all("ERR_FAILED" in error for error in errors))
+        page.close()
+
+    def test_failed_outline_job_details_survive_refresh_with_retry_entry(self):
+        class FailingGenerator:
+            model = "failing-browser-generator"
+            def generate(self, *_args, **_kwargs):
+                raise GatewayError("Agent 达到最大步数，未提交阶段产物", code="gateway_error")
+
+        self.service.create("persistent-failure")
+        self.service.import_input("persistent-failure", {"goal": "发布", "audience": "客户", "topic": "新品"})
+        self.service.generate_narrative("persistent-failure")
+        self.service.confirm_narrative("persistent-failure")
+        self.service.generator = FailingGenerator()
+        job, _ = self.app.state.job_service.create("persistent-failure", "outline.generate", {}, "failed-outline")
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and self.app.state.job_service.get(job["job_id"])["status"] != "failed":
+            time.sleep(0.01)
+        self.assertEqual(self.app.state.job_service.get(job["job_id"])["status"], "failed")
+
+        page, errors = self.new_page()
+        page.goto(self.base + "/tasks/persistent-failure?stage=outline")
+        page.get_by_role("heading", name="逐页大纲", exact=True).wait_for()
+        failure = page.get_by_role("alert", name="最近一次后台任务失败")
+        self.assertTrue(failure.get_by_text("Agent 达到最大步数，未提交阶段产物", exact=True).is_visible())
+        self.assertTrue(failure.get_by_text("错误代码：gateway_error", exact=True).is_visible())
+        self.assertTrue(failure.get_by_role("button", name="前往本阶段操作区重试").is_visible())
+
+        page.reload()
+        self.assertTrue(page.get_by_role("alert", name="最近一次后台任务失败").is_visible())
         self.assertEqual(errors, [])
         page.close()
 

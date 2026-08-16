@@ -12,6 +12,11 @@ class SkillRuntime:
     """Read-only, quota-bound view of a locked standard Skill directory."""
 
     TEXT_SUFFIXES = {".md", ".html", ".js", ".css", ".json", ".txt"}
+    STAGE_FILES = {
+        "narrative": frozenset({"SKILL.md", "references/checklist.md"}),
+        "outline": frozenset({"SKILL.md", "references/checklist.md"}),
+        "inspection": frozenset({"SKILL.md", "references/checklist.md"}),
+    }
 
     def __init__(self, root: str | Path, *, max_file_bytes: int = 256 * 1024, max_total_bytes: int = 512 * 1024):
         self.root = Path(root).resolve()
@@ -70,8 +75,21 @@ class SkillRuntime:
     def _allowed(self, name: str) -> bool:
         return name == "SKILL.md" or name.startswith("references/") or name.startswith("assets/")
 
-    def list_skill_files(self) -> dict:
-        files = sorted(name for name in self.manifest if self._allowed(name))
+    def files_for_stage(self, stage: str) -> frozenset[str] | None:
+        """Return a least-privilege file view for planning/checking stages.
+
+        HTML-producing stages retain the complete locked Skill because they need
+        templates, layouts and themes. Planning stages only need the workflow and
+        quality checklist; hiding rendering references keeps weak models from
+        spending an entire step budget reading irrelevant files.
+        """
+        return self.STAGE_FILES.get(stage)
+
+    def list_skill_files(self, *, allowed_files: frozenset[str] | None = None) -> dict:
+        files = sorted(
+            name for name in self.manifest
+            if self._allowed(name) and (allowed_files is None or name in allowed_files)
+        )
         return {"skill": self.skill_name, "version": self.skill_version, "files": files}
 
     def _normalize_tool_path(self, name: str) -> str:
@@ -91,21 +109,21 @@ class SkillRuntime:
             normalized = normalized[len(skill_prefix):]
         return normalized
 
-    def _whitelist_error(self, asset: bool) -> ValidationError:
+    def _whitelist_error(self, asset: bool, allowed_files: frozenset[str] | None = None) -> ValidationError:
         # 报错回传模型时附带合法路径列表，模型下一轮即可自我修正。
-        files = self.list_skill_files()["files"]
+        files = self.list_skill_files(allowed_files=allowed_files)["files"]
         if asset:
             allowed = "、".join(name for name in files if name.startswith("assets/")) or "（无）"
             return ValidationError(f"Asset 不在只读白名单；合法路径：{allowed}")
         return ValidationError("Skill 文件不在锁定只读白名单；合法路径：" + "、".join(files))
 
-    def _locked_bytes(self, name: str, *, asset: bool = False) -> tuple[Path, bytes]:
+    def _locked_bytes(self, name: str, *, asset: bool = False, allowed_files: frozenset[str] | None = None) -> tuple[Path, bytes]:
         name = self._normalize_tool_path(name)
         path = self._resolve(name)
-        if name not in self.manifest or not self._allowed(name) or not path.is_file():
-            raise self._whitelist_error(asset)
+        if name not in self.manifest or not self._allowed(name) or not path.is_file() or (allowed_files is not None and name not in allowed_files):
+            raise self._whitelist_error(asset, allowed_files)
         if asset and not name.startswith("assets/"):
-            raise self._whitelist_error(asset=True)
+            raise self._whitelist_error(asset=True, allowed_files=allowed_files)
         try:
             content = path.read_bytes()
         except (OSError, ValueError) as exc:
@@ -114,9 +132,9 @@ class SkillRuntime:
             raise ValidationError(f"Skill 固定文件校验失败：{name}")
         return path, content
 
-    def read_skill_file(self, name: str) -> dict:
+    def read_skill_file(self, name: str, *, allowed_files: frozenset[str] | None = None) -> dict:
         name = self._normalize_tool_path(name)
-        path, raw = self._locked_bytes(name)
+        path, raw = self._locked_bytes(name, allowed_files=allowed_files)
         if path.suffix.lower() not in self.TEXT_SUFFIXES:
             raise ValidationError("Skill 文件不在只读白名单（仅可读取文本文件；二进制 Asset 请用 get_asset_info）")
         size = len(raw)
@@ -131,9 +149,9 @@ class SkillRuntime:
         self.total_bytes += size
         return {"path": name, "content": content, "bytes": size, "sha256": hashlib.sha256(content.encode()).hexdigest()}
 
-    def get_asset_info(self, name: str) -> dict:
+    def get_asset_info(self, name: str, *, allowed_files: frozenset[str] | None = None) -> dict:
         name = self._normalize_tool_path(name)
-        path, raw = self._locked_bytes(name, asset=True)
+        path, raw = self._locked_bytes(name, asset=True, allowed_files=allowed_files)
         size = len(raw)
         if size > self.max_file_bytes:
             raise ValidationError("Skill 单文件超过读取上限")
@@ -143,11 +161,11 @@ class SkillRuntime:
         self.total_bytes += size
         return {"path": name, "bytes": size, "media_type": mimetypes.guess_type(name)[0] or "application/octet-stream", "sha256": digest}
 
-    def dispatch(self, name: str, arguments: dict) -> dict:
+    def dispatch(self, name: str, arguments: dict, *, allowed_files: frozenset[str] | None = None) -> dict:
         if name == "list_skill_files":
-            return self.list_skill_files()
+            return self.list_skill_files(allowed_files=allowed_files)
         if name == "read_skill_file":
-            return self.read_skill_file(arguments.get("path"))
+            return self.read_skill_file(arguments.get("path"), allowed_files=allowed_files)
         if name == "get_asset_info":
-            return self.get_asset_info(arguments.get("path"))
+            return self.get_asset_info(arguments.get("path"), allowed_files=allowed_files)
         raise ValidationError("Agent 请求了未授权工具")

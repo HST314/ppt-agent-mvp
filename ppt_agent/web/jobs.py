@@ -386,6 +386,12 @@ class JobService:
             records = [item for item in records if item["status"] == status]
         return [self.public(item) for item in records]
 
+    def latest_by_operation(self, task_id: str) -> list[dict[str, Any]]:
+        latest: dict[str, dict[str, Any]] = {}
+        for record in reversed(self._records(task_id)):
+            latest.setdefault(record["operation"], record)
+        return [self.public(record) for record in sorted(latest.values(), key=lambda item: (item["created_at"], item["job_id"]))]
+
     def cancel(self, job_id: str) -> dict[str, Any]:
         snapshot = self.get(job_id)
         with self._guard:

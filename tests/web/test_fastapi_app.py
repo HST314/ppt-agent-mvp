@@ -63,6 +63,7 @@ class FastAPIAppTests(unittest.TestCase):
         self.assertEqual(shell["stages"][0]["status"], "current")
         self.assertEqual(shell["stages"][1]["status"], "locked")
         self.assertIn("前置条件", shell["stages"][1]["lock_reason"])
+        self.assertEqual(shell["latest_jobs"], [])
 
         self.assertIn("PPT Agent 工作台", self.client.get("/tasks/shell/outline").text)
         legacy = self.client.get("/legacy/tasks/shell")

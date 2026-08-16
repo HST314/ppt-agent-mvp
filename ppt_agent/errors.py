@@ -88,6 +88,7 @@ class GatewayError(DomainError):
                 "http_status",
                 "sdk_exception_type",
                 "provider_request_id_sha256",
+                "attempts",
                 "retryable",
             }
             and value is not None

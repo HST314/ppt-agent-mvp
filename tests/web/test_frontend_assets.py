@@ -78,8 +78,10 @@ class FrontendAssetTests(unittest.TestCase):
         app = (FRONTEND / "static/js/app.js").read_text()
         api = (FRONTEND / "static/js/api.js").read_text()
         input_stage = (FRONTEND / "static/js/stages/input.js").read_text()
-        self.assertIn('fetch("/livez"', api)
-        self.assertIn('fetch(recheck ? "/v1/runtime/recheck" : "/v1/runtime/status"', api)
+        self.assertIn('runtimeFetch("/livez"', api)
+        self.assertIn('runtimeFetch(recheck ? "/v1/runtime/recheck" : "/v1/runtime/status"', api)
+        self.assertIn("runtimeFetch", api)
+        self.assertIn("backendReachable: true, runtimeReady: null", api)
         for label in ("浏览器在线", "后端可达", "模型可用", "模型不可用"):
             self.assertIn(label, app)
         self.assertIn('role: "status"', app)
@@ -118,6 +120,8 @@ class FrontendAssetTests(unittest.TestCase):
         self.assertIn("ppt-agent:job-intent:", store)
         self.assertIn("bindJobIntent(job, intent.storageKey)", app)
         self.assertIn("reconcileStoredIntents", app)
+        self.assertIn("latestJobFailure", app)
+        self.assertIn("前往本阶段操作区重试", app)
 
 
 if __name__ == "__main__":
