@@ -74,7 +74,7 @@ class TaskService:
                         audit_details={"category":"sdk_error","sdk_exception_type":type(exc).__name__,"retryable":False},
                     )
                 public=exc.public()["error"]
-                error={key:public[key] for key in ("code","diagnostic_id","retryable","retry_after_seconds","agent_audit_id","probe_phase","terminal_reason","tool_calls","underlying_code") if key in public}
+                error={key:public[key] for key in ("code","message","diagnostic_id","retryable","retry_after_seconds","agent_audit_id","probe_phase","terminal_reason","tool_calls","underlying_code") if key in public}
                 error.update({"probe_id":probe_id,"failed_check":failed_check})
                 if not any(event.get("status")=="failed" for event in probe_events):
                     probe_events.append({"event":"probe_check","gateway_index":gateway_index,"model":str(getattr(gateway,"model","unknown")),"check":failed_check,"status":"failed","error_code":error["code"],"diagnostic_id":error["diagnostic_id"],**exc.safe_audit_details()})

@@ -1,10 +1,10 @@
-import { api, ApiError } from "./api.js?v=2026.08.15.155434751550";
-import { JobTracker } from "./job-tracker.js?v=2026.08.15.155434751550";
-import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.15.155434751550";
-import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.15.155434751550";
-import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.15.155434751550";
-import { inlineError, setBusy } from "./components/index.js?v=2026.08.15.155434751550";
-import { renderStage } from "./stages/index.js?v=2026.08.15.155434751550";
+import { api, ApiError } from "./api.js?v=2026.08.16.053640953906";
+import { JobTracker } from "./job-tracker.js?v=2026.08.16.053640953906";
+import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.16.053640953906";
+import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.16.053640953906";
+import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.16.053640953906";
+import { inlineError, setBusy } from "./components/index.js?v=2026.08.16.053640953906";
+import { renderStage } from "./stages/index.js?v=2026.08.16.053640953906";
 
 const app = document.getElementById("app");
 const APP_BUILD = document.querySelector('meta[name="app-build"]')?.content || "unknown";
@@ -687,6 +687,7 @@ function renderRuntimeProbeDetails(container) {
     Number.isInteger(error.tool_calls) ? element("div", {}, [element("dt", { text: "工具调用数" }), element("dd", { text: String(error.tool_calls) })]) : null,
     error.code ? element("div", {}, [element("dt", { text: "运行时错误" }), element("dd", { text: error.code })]) : null,
     error.underlying_code ? element("div", {}, [element("dt", { text: "底层错误" }), element("dd", { text: error.underlying_code })]) : null,
+    error.message ? element("div", {}, [element("dt", { text: "错误详情" }), element("dd", { text: error.message })]) : null,
   ]));
 }
 

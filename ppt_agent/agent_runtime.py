@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -55,6 +56,37 @@ PRODUCT_OVERRIDE = """产品规则高于 Skill：你只处理当前阶段，不�
 CLARIFICATION_OVERRIDE = """产品规则高于 Skill：你只处理澄清阶段，不得推进工作流或请求状态机操作。
 仅允许纯文本输入；禁止联网、图片输入、图片生成、Shell、文件读写、自更新和安装依赖。
 当前请求没有可用工具；直接依据输入作答。最终仅返回符合指定 JSON Schema 的 JSON。"""
+
+
+def _output_contract(response_schema: dict) -> str:
+    """Spell the stage schema out in the prompt.
+
+    Providers that ignore ``text.format`` (or run with ``structured_output:
+    prompt``) get no enforcement from the endpoint; naming the exact shape in
+    the prompt is what keeps their final output parseable.
+    """
+    schema = response_schema.get("schema", response_schema)
+    return (
+        "输出契约：最终答案必须且只能是符合以下 JSON Schema 的 JSON object；"
+        "不得包含任何额外字段、解释文字或 markdown 代码围栏。\n"
+        + json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+    )
+
+
+def _extract_json_object(text: str) -> Any:
+    """Parse model output as JSON, tolerating code fences and surrounding prose."""
+    stripped = text.strip()
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+    fence = re.match(r"^```[A-Za-z]*\s*(?P<body>.*?)\s*```$", stripped, re.DOTALL)
+    if fence:
+        return json.loads(fence.group("body"))
+    start, end = stripped.find("{"), stripped.rfind("}")
+    if 0 <= start < end:
+        return json.loads(stripped[start : end + 1])
+    return json.loads(stripped)
 
 TOOLS = [
     {"type": "function", "name": "list_skill_files", "description": "列出可读取的标准 Skill 文件", "parameters": {"type": "object", "properties": {}, "additionalProperties": False}},
@@ -134,7 +166,7 @@ class AgentRuntime:
                 if stage == "clarification"
                 else "\n这是启动能力探测：必须先调用一次 list_skill_files，收到工具结果后再提交符合 Schema 的 JSON。"
             )
-        conversation: list[Any] = [{"role": "system", "content": f"当前阶段：{stage}\n阶段目标：{STAGE_PROMPTS[stage]}\n{override}{probe_instruction}"}, {"role": "user", "content": input_json}]
+        conversation: list[Any] = [{"role": "system", "content": f"当前阶段：{stage}\n阶段目标：{STAGE_PROMPTS[stage]}\n{override}{probe_instruction}\n{_output_contract(response_schema)}"}, {"role": "user", "content": input_json}]
         for step in range(1, self.max_steps + 1):
             if self.clock() - started >= self.timeout_seconds:
                 fail("Agent 运行超时，未提交阶段产物", "deadline_exceeded")
@@ -229,7 +261,7 @@ class AgentRuntime:
             if capability_probe and stage != "clarification" and tool_count == 0:
                 fail("模型忽略了强制工具调用要求", "capability_probe_failed")
             try:
-                value = json.loads(turn.text or "")
+                value = _extract_json_object(turn.text or "")
             except json.JSONDecodeError as exc:
                 if schema_corrections < self.max_schema_corrections:
                     schema_corrections += 1

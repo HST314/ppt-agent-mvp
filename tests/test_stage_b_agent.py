@@ -396,5 +396,65 @@ class StageBAgentTests(unittest.TestCase):
                 self.assertEqual(caught.exception.safe_audit_details()["category"], category)
                 self.assertNotIn("raw sdk secret", json.dumps(caught.exception.public()))
 
+    def test_client_structured_output_modes_control_text_format(self):
+        schema = {"name": "narrative", "strict": True, "schema": {"type": "object"}}
+        for mode in ("auto", "json_schema", "prompt"):
+            with self.subTest(mode=mode):
+                config = SimpleNamespace(model="m", api_key="k", base_url="https://example.com", timeout_seconds=1, structured_output=mode)
+                sdk = SimpleNamespace(); sdk.responses = sdk; sdk.seen = []
+                sdk.create = lambda **kwargs: (sdk.seen.append(kwargs) or SimpleNamespace(output_text="ok", id="r", output=[]))
+                client = OpenAIResponsesClient(config, sdk_client=sdk)
+                client.create(input=[], response_schema=schema)
+                if mode == "prompt":
+                    self.assertNotIn("text", sdk.seen[0])
+                else:
+                    self.assertEqual(sdk.seen[0]["text"], {"format": {"type": "json_schema", **schema}})
+
+    def test_client_auto_mode_falls_back_once_on_400_and_caches(self):
+        config = SimpleNamespace(model="m", api_key="k", base_url="https://example.com", timeout_seconds=1, structured_output="auto")
+        request = httpx.Request("POST", "https://provider.example/v1/responses")
+        failure = APIStatusError("unsupported parameter", response=httpx.Response(400, request=request), body=None)
+        sdk = SimpleNamespace(); sdk.responses = sdk; sdk.seen = []
+        def create(**kwargs):
+            sdk.seen.append(kwargs)
+            if len(sdk.seen) == 1:
+                raise failure
+            return SimpleNamespace(output_text="ok", id="r", output=[])
+        sdk.create = create
+        schema = {"name": "narrative", "strict": True, "schema": {"type": "object"}}
+        client = OpenAIResponsesClient(config, sdk_client=sdk)
+
+        turn = client.create(input=[], response_schema=schema)
+        self.assertEqual(turn.text, "ok")
+        self.assertEqual(len(sdk.seen), 2)
+        self.assertIn("text", sdk.seen[0])
+        self.assertNotIn("text", sdk.seen[1])
+
+        client.create(input=[], response_schema=schema)
+        self.assertEqual(len(sdk.seen), 3)
+        self.assertNotIn("text", sdk.seen[2])
+
+        failing = SimpleNamespace(); failing.responses = failing
+        failing.create = lambda **_kwargs: (_ for _ in ()).throw(failure)
+        strict = OpenAIResponsesClient(SimpleNamespace(model="m", api_key="k", base_url="https://example.com", timeout_seconds=1, structured_output="json_schema"), sdk_client=failing)
+        with self.assertRaises(GatewayError) as caught:
+            strict.create(input=[], response_schema=schema)
+        self.assertEqual(caught.exception.code, "model_request_invalid")
+
+    def test_runtime_parses_fenced_and_prose_wrapped_json(self):
+        for text in ('```json\n{"markdown":"fenced"}\n```', '说明文字 {"markdown":"prose"} 结束'):
+            with self.subTest(text=text[:12]):
+                client = ScriptedClient([ModelTurn(text, "r")])
+                result = AgentRuntime(client, SkillRuntime.builtin()).run("narrative", {})
+                self.assertEqual(result.value, {"markdown": "fenced" if "fenced" in text else "prose"})
+
+    def test_system_prompt_spells_out_the_output_contract(self):
+        client = ScriptedClient([ModelTurn('{"markdown":"ok"}', "r")])
+        AgentRuntime(client, SkillRuntime.builtin()).run("narrative", {})
+        system = client.inputs[0]["input"][0]["content"]
+        self.assertIn("输出契约", system)
+        self.assertIn('"markdown"', system)
+        self.assertIn("additionalProperties", system)
+
 
 if __name__ == "__main__": unittest.main()

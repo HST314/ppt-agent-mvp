@@ -30,38 +30,57 @@ class ResponsesModelClient(Protocol):
 
 
 class OpenAIResponsesClient:
-    """Narrow Responses API adapter. Unknown outcomes are never retried here."""
+    """Narrow Responses API adapter. Unknown outcomes are never retried here.
+
+    `structured_output` controls how stage schemas reach the provider:
+    - ``json_schema``: always send ``text.format`` (strict provider enforcement).
+    - ``prompt``: never send it; the runtime prompt contract plus local
+      validation carry the whole burden.
+    - ``auto`` (default): send it, but an HTTP 400 marks the parameter as
+      unsupported and every later request in this process omits it.  A 400
+      means the request was rejected before processing, so the single retry
+      without the parameter cannot duplicate model side effects.
+    """
 
     def __init__(self, config: ModelConfig, *, sdk_client=None):
         self.config = config
+        self.structured_output = getattr(config, "structured_output", "auto") or "auto"
+        self._text_format_unsupported = False
         self._client = sdk_client or OpenAI(api_key=config.api_key, base_url=config.base_url, timeout=config.timeout_seconds, max_retries=0)
 
     def create(self, *, input: Any, tools: list[dict] | None = None, response_schema: dict | None = None, tool_choice: Any = None) -> ModelTurn:
-        request: dict[str, Any] = {"model": self.config.model, "input": input}
-        if tools:
-            request["tools"] = tools
-        if tool_choice is not None:
-            request["tool_choice"] = tool_choice
-        if response_schema:
-            request["text"] = {"format": {"type": "json_schema", **response_schema}}
-        try:
-            response = self._client.responses.create(**request)
-        except (APITimeoutError, TimeoutError, socket.timeout) as exc:
-            raise self._transport_error(exc, "timeout") from exc
-        except APIStatusError as exc:
-            raise self._status_error(exc) from exc
-        except (APIConnectionError, ConnectionError, OSError) as exc:
-            raise self._transport_error(exc, "connection") from exc
-        except Exception as exc:
-            raise GatewayError(
-                "模型 SDK 返回了无法分类的失败，请联系管理员核对运行日志",
-                retryable=False,
-                audit_details={
-                    "category": "sdk_error",
-                    "sdk_exception_type": type(exc).__name__,
-                    "retryable": False,
-                },
-            ) from exc
+        use_format = bool(response_schema) and self.structured_output != "prompt" and not self._text_format_unsupported
+        while True:
+            request: dict[str, Any] = {"model": self.config.model, "input": input}
+            if tools:
+                request["tools"] = tools
+            if tool_choice is not None:
+                request["tool_choice"] = tool_choice
+            if use_format:
+                request["text"] = {"format": {"type": "json_schema", **response_schema}}
+            try:
+                response = self._client.responses.create(**request)
+                break
+            except (APITimeoutError, TimeoutError, socket.timeout) as exc:
+                raise self._transport_error(exc, "timeout") from exc
+            except APIStatusError as exc:
+                if use_format and self.structured_output == "auto" and int(getattr(exc, "status_code", 0) or 0) == 400:
+                    self._text_format_unsupported = True
+                    use_format = False
+                    continue
+                raise self._status_error(exc) from exc
+            except (APIConnectionError, ConnectionError, OSError) as exc:
+                raise self._transport_error(exc, "connection") from exc
+            except Exception as exc:
+                raise GatewayError(
+                    "模型 SDK 返回了无法分类的失败，请联系管理员核对运行日志",
+                    retryable=False,
+                    audit_details={
+                        "category": "sdk_error",
+                        "sdk_exception_type": type(exc).__name__,
+                        "retryable": False,
+                    },
+                ) from exc
         text = getattr(response, "output_text", None)
         calls = []
         for item in getattr(response, "output", ()) or ():

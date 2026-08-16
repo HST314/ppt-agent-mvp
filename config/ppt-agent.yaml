@@ -9,6 +9,8 @@ models:
     base_url_env: MODEL_BASE_URL
     timeout_seconds: 60
     max_steps: 12
+    # 结构化输出模式：auto=默认，端点不支持 text.format 时自动降级；json_schema=强制发送；prompt=从不发送
+    structured_output: auto
   inspection:
     provider: openai_responses
     model: deepseek-v4-flash-ga-260731

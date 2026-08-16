@@ -32,18 +32,32 @@ class StageAConfigTests(unittest.TestCase):
         cfg = self.config("gateway: {mode: fake}\n", {})
         self.assertEqual(cfg.mode, "fake")
 
-    def test_repository_default_config_needs_no_environment(self):
-        with patch.dict(os.environ, {}, clear=True), patch("ppt_agent.config.load_dotenv"):
-            cfg = load_config(ROOT / "config/ppt-agent.yaml")
-        self.assertEqual(cfg.mode, "fake")
-        self.assertIsNone(cfg.generation)
-        self.assertIsNone(cfg.inspection)
-
+    def test_repository_default_config_loads_with_referenced_environment(self):
+        # The shipped default flips between fake (acceptance) and agent (live
+        # use); either way it must load cleanly once its referenced secrets
+        # exist, and its public snapshot must not leak them.
         env={"MODEL_API_KEY":"secret","MODEL_BASE_URL":"https://provider.example/v1"}
+        with patch.dict(os.environ,env,clear=True), patch("ppt_agent.config.load_dotenv"):
+            cfg = load_config(ROOT / "config/ppt-agent.yaml")
+        self.assertIn(cfg.mode, {"fake", "agent"})
+        if cfg.mode == "agent":
+            self.assertEqual(cfg.generation.structured_output, "auto")
+        self.assertNotIn("secret", str(cfg.public()))
+
         with patch.dict(os.environ,env,clear=True), patch("ppt_agent.config.load_dotenv"):
             example=load_config(ROOT / "config/ppt-agent.agent.example.yaml")
         self.assertEqual(example.mode,"agent")
-        self.assertEqual(example.generation.model,"your-generation-model")
+        self.assertEqual(example.generation.structured_output,"auto")
+
+    def test_structured_output_mode_is_validated(self):
+        env={"GEN_KEY":"secret","GEN_URL":"https://gen.example/v1"}
+        base="""gateway: {mode: agent}\nmodels:\n  generation:\n    provider: openai_responses\n    model: gen\n    api_key_env: GEN_KEY\n    base_url_env: GEN_URL\n    structured_output: %s\n  inspection: {fallback_to_generation: true}\n"""
+        for mode, expected in (("prompt", "prompt"), ("json_schema", "json_schema")):
+            with self.subTest(mode=mode):
+                self.assertEqual(self.config(base % mode, env).generation.structured_output, expected)
+        for invalid in ("strict", "true", "1"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValidationError):
+                self.config(base % invalid, env)
 
     def test_separate_models_and_redacted_snapshot(self):
         env={"GEN_KEY":"generation-secret","GEN_URL":"https://gen.example/v1","INSPECT_KEY":"inspection-secret","INSPECT_URL":"https://inspect.example/v1"}

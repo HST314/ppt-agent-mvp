@@ -21,6 +21,7 @@ class ModelConfig:
     max_steps: int
     api_key: str
     base_url: str
+    structured_output: str = "auto"
 
     def public(self) -> dict:
         value = asdict(self)
@@ -58,7 +59,8 @@ class RuntimeConfig:
 
 
 _ROOT_KEYS = {"gateway", "models", "skills", "capabilities"}
-_MODEL_KEYS = {"provider", "model", "api_key_env", "base_url_env", "timeout_seconds", "max_steps", "fallback_to_generation"}
+_MODEL_KEYS = {"provider", "model", "api_key_env", "base_url_env", "timeout_seconds", "max_steps", "fallback_to_generation", "structured_output"}
+_STRUCTURED_OUTPUT_MODES = {"auto", "json_schema", "prompt"}
 
 
 def _mapping(value, name: str) -> dict:
@@ -103,7 +105,10 @@ def _model(value: dict, name: str, *, required: bool) -> ModelConfig | None:
         raise ValidationError(f"models.{name}.max_steps 必须为 integer")
     if not 1 <= timeout <= 600 or not 1 <= max_steps <= 100:
         raise ValidationError(f"models.{name} 的超时或步数超出范围")
-    return ModelConfig(provider, model, api_key_env, base_url_env, timeout, max_steps, api_key, base_url.rstrip("/"))
+    structured_output = value.get("structured_output", "auto")
+    if structured_output not in _STRUCTURED_OUTPUT_MODES:
+        raise ValidationError(f"models.{name}.structured_output 只能是 auto、json_schema 或 prompt")
+    return ModelConfig(provider, model, api_key_env, base_url_env, timeout, max_steps, api_key, base_url.rstrip("/"), structured_output)
 
 
 def load_config(path: str | Path | None = None, *, env_file: str | Path | None = None) -> RuntimeConfig:
