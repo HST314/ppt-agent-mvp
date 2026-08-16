@@ -340,7 +340,7 @@ class JobService:
         except Exception as error:
             if isinstance(error, GatewayError):
                 self.service.record_runtime_failure(error)
-            if record.get("operation") == "clarification.generate" and not isinstance(error, ExecutionCancelled):
+            if record.get("operation") == "clarification.generate":
                 try:
                     # Recovery is deliberately outside the expired execution
                     # scope, otherwise its own task commit would be rejected.

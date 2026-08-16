@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import socket
+import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -51,9 +53,24 @@ class OpenAIResponsesClient:
         self.config = config
         self.structured_output = getattr(config, "structured_output", "auto") or "auto"
         self._text_format_unsupported = False
-        self._client = sdk_client or OpenAI(api_key=config.api_key, base_url=config.base_url, timeout=config.request_timeout_seconds, max_retries=0)
+        self._client = sdk_client
 
-    def create(self, *, input: Any, tools: list[dict] | None = None, response_schema: dict | None = None, tool_choice: Any = None) -> ModelTurn:
+    def _request_timeout(self) -> float:
+        return getattr(self.config, "request_timeout_seconds", getattr(self.config, "timeout_seconds", 60))
+
+    def _request_client(self):
+        return self._client or OpenAI(
+            api_key=self.config.api_key,
+            base_url=self.config.base_url,
+            timeout=self._request_timeout(),
+            max_retries=0,
+        )
+
+    supports_execution_cancellation = True
+
+    def create(self, *, input: Any, tools: list[dict] | None = None, response_schema: dict | None = None, tool_choice: Any = None, timeout_seconds: float | None = None) -> ModelTurn:
+        from .execution import cancellation_state, checkpoint
+
         use_format = bool(response_schema) and self.structured_output != "prompt" and not self._text_format_unsupported
         empty_attempts = 0
         timeout_attempts = 0
@@ -65,14 +82,31 @@ class OpenAIResponsesClient:
                 request["tool_choice"] = tool_choice
             if use_format:
                 request["text"] = {"format": {"type": "json_schema", **response_schema}}
+            request["timeout"] = max(.001, timeout_seconds if timeout_seconds is not None else self._request_timeout())
+            request_client = self._request_client()
+            cancelled, deadline = cancellation_state()
+            monitor_stop = threading.Event()
+
+            def abort_on_cancel():
+                while not monitor_stop.wait(.01):
+                    if (cancelled is not None and cancelled()) or (deadline is not None and time.monotonic() >= deadline):
+                        close = getattr(request_client, "close", None)
+                        if close is not None:
+                            close()
+                        return
+
+            monitor = threading.Thread(target=abort_on_cancel, name="ppt-model-cancellation", daemon=False)
+            monitor.start()
             try:
-                response = self._client.responses.create(**request)
+                response = request_client.responses.create(**request)
             except (APITimeoutError, TimeoutError, socket.timeout) as exc:
+                checkpoint()
                 timeout_attempts += 1
                 if timeout_attempts <= 1:
                     continue
                 raise self._transport_error(exc, "timeout", attempts=timeout_attempts) from exc
             except APIStatusError as exc:
+                checkpoint()
                 format_rejection = self._format_rejection(exc) if use_format else None
                 if self.structured_output == "auto" and format_rejection == "unsupported_parameter":
                     self._text_format_unsupported = True
@@ -80,8 +114,10 @@ class OpenAIResponsesClient:
                     continue
                 raise self._status_error(exc) from exc
             except (APIConnectionError, ConnectionError, OSError) as exc:
+                checkpoint()
                 raise self._transport_error(exc, "connection") from exc
             except Exception as exc:
+                checkpoint()
                 raise GatewayError(
                     "模型 SDK 返回了无法分类的失败，请联系管理员核对运行日志",
                     retryable=False,
@@ -91,6 +127,12 @@ class OpenAIResponsesClient:
                         "retryable": False,
                     },
                 ) from exc
+            finally:
+                monitor_stop.set()
+                monitor.join()
+                if self._client is None:
+                    request_client.close()
+            checkpoint()
             text = getattr(response, "output_text", None)
             calls = []
             for item in getattr(response, "output", ()) or ():

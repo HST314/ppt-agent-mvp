@@ -34,6 +34,10 @@ def remaining_seconds(default=None):
     deadline = _deadline.get()
     return default if deadline is None else max(0.0, deadline - time.monotonic())
 
+def cancellation_state():
+    """Return the current cancellation predicate and absolute deadline."""
+    return _cancelled.get(), _deadline.get()
+
 def interruptible(call, *, poll_seconds=.02):
     """Return promptly on cancellation/deadline while a blocking SDK call drains.
 

@@ -273,7 +273,8 @@ class AgentRuntime:
                 # Clients that support a request timeout receive the absolute
                 # stage remainder. Legacy/test clients keep their old signature.
                 try:
-                    turn = interruptible(lambda: self.client.create(**kwargs, timeout_seconds=remaining))
+                    call = lambda: self.client.create(**kwargs, timeout_seconds=remaining)
+                    turn = call() if getattr(self.client, "supports_execution_cancellation", False) else interruptible(call)
                 except TypeError as exc:
                     if "timeout_seconds" not in str(exc): raise
                     turn = interruptible(lambda: self.client.create(**kwargs))

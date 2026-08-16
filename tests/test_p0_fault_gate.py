@@ -10,7 +10,8 @@ from unittest.mock import Mock, patch
 
 from ppt_agent.agent_runtime import AgentRuntime
 from ppt_agent.execution import ExecutionCancelled, ExecutionDeadlineExceeded, execution_scope, interruptible
-from ppt_agent.model_clients import ModelToolCall, ModelTurn
+from ppt_agent.gateways import AgentGateway
+from ppt_agent.model_clients import ModelToolCall, ModelTurn, OpenAIResponsesClient
 from ppt_agent.service import TaskService
 from ppt_agent.skill_runtime import SkillRuntime
 from ppt_agent.store import WorkspaceStore
@@ -23,7 +24,59 @@ class Client:
     def create(self, **_kwargs): return self.turns.pop(0)
 
 
+class BlockingSDK:
+    def __init__(self):
+        self.responses = self
+        self.started, self.closed = threading.Event(), threading.Event()
+        self.seen = None
+    def create(self, **kwargs):
+        self.seen = kwargs; self.started.set(); self.closed.wait(2)
+        raise OSError("request transport closed")
+    def close(self): self.closed.set()
+
+
+def adapter(sdk):
+    config = type("Config", (), {"model":"m", "api_key":"k", "base_url":"https://example.com", "timeout_seconds":5})()
+    return OpenAIResponsesClient(config, sdk_client=sdk)
+
+
 class P0FaultInjectionGate(unittest.TestCase):
+    def test_real_adapter_passes_budget_and_cancel_leaves_no_execution_unit(self):
+        sdk, cancelled = BlockingSDK(), threading.Event()
+        def cancel():
+            self.assertTrue(sdk.started.wait(1)); cancelled.set()
+        timer = threading.Timer(.03, cancel); timer.start()
+        with self.assertRaises(ExecutionCancelled):
+            with execution_scope(cancelled.is_set, time.monotonic() + 1):
+                AgentRuntime(adapter(sdk), SkillRuntime.builtin()).run("narrative", {})
+        timer.join()
+        self.assertGreater(sdk.seen["timeout"], 0)
+        self.assertLessEqual(sdk.seen["timeout"], 1)
+        self.assertFalse(any(t.name in {"ppt-interruptible-call", "ppt-model-cancellation"} for t in threading.enumerate()))
+
+    def test_real_adapter_clarification_cancel_recovers_retry_state(self):
+        with tempfile.TemporaryDirectory() as root:
+            sdk = BlockingSDK()
+            service = TaskService(WorkspaceStore(root), clarifier=AgentGateway(adapter(sdk)))
+            # This gate exercises cancellation after dispatch. Capability-probe
+            # readiness is covered separately and would consume the blocking SDK.
+            service.require_runtime_ready = Mock(return_value=None)
+            service.create("clarify-cancel")
+            service.import_input("clarify-cancel", {"goal":"g", "audience":"a", "topic":"t"}, "json")
+            jobs = JobService(service)
+            created, _ = jobs.create("clarify-cancel", "clarification.generate", {}, "cancel-key")
+            self.assertTrue(sdk.started.wait(1))
+            jobs.cancel(created["job_id"])
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and jobs.get(created["job_id"])["status"] not in {"cancelled", "failed"}:
+                time.sleep(.01)
+            self.assertEqual(jobs.get(created["job_id"])["status"], "cancelled")
+            state = service.get("clarify-cancel")
+            self.assertEqual(state["waiting_reason"], "clarification_failed")
+            self.assertEqual(state["required_action"], "retry_clarification")
+            self.assertFalse(any(t.name in {"ppt-interruptible-call", "ppt-model-cancellation"} for t in threading.enumerate()))
+            jobs.close()
+
     def test_blocking_call_is_cancelled_within_sla(self):
         cancelled, release = threading.Event(), threading.Event()
         started = time.monotonic()
