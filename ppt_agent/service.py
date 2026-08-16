@@ -12,7 +12,7 @@ from .schema import DeliveryManifest, InspectionReport, IssueDisposition
 from .p2 import canonical, digest, now, parse_task_card, questions_for, scan_resources, validate_answer
 from .schema import ClarificationSet, ResourceManifest, TaskCard, TaskInputSnapshot
 from .schema import NarrativeDocument, SlideOutline, SampleSelection, DeckArtifact
-from .p3 import changed_slide_ids, narrative_markdown, outline_markdown, parse_outline, requested_slide_count
+from .p3 import changed_slide_ids, narrative_markdown, normalize_outline_markdown, outline_markdown, parse_outline, requested_slide_count, structured_outline_markdown
 from .p4 import controlled_assets, infer_scope, recommend, render, validate_html
 from .offline import offline_assets, offline_player
 
@@ -462,7 +462,7 @@ class TaskService:
         current=self._current_version(task_id,"outline")
         if slide_ids:
             if not current or not prompt: raise ValidationError("指定页修改需要现有大纲和修改 Prompt")
-            old=json.loads(self.version(task_id,current))["markdown"]; order,blocks=parse_outline(old,resources,None)
+            old=normalize_outline_markdown(json.loads(self.version(task_id,current))["markdown"],resources,None); order,blocks=parse_outline(old,resources,None)
             unknown=set(slide_ids)-set(order)
             if unknown: raise ValidationError("指定页面不存在")
             for sid in slide_ids: blocks[sid] += f"\n- 修改要求：{prompt.strip()}"
@@ -472,12 +472,33 @@ class TaskService:
                 text=outline_markdown(view["task_card"],resources,count)
                 if prompt: text += f"\n<!-- 修改要求：{prompt.strip()} -->\n"
             else:
-                generated=self.generator.generate("outline",{"task_id":task_id,"task_card":view["task_card"],"narrative":json.loads(self.version(task_id,narrative))["markdown"],"resources":resources,"slide_count":count,"prompt":prompt},skill=skill["content"])
-                text=generated["text"]
+                payload={"task_id":task_id,"task_card":view["task_card"],"narrative":json.loads(self.version(task_id,narrative))["markdown"],"resources":resources,"slide_count":count,"prompt":prompt}
+                for attempt in range(1,3):
+                    generated=self.generator.generate("outline",payload,skill=skill["content"])
+                    try:
+                        if not isinstance(generated,dict):
+                            raise ValidationError("大纲生成响应必须为对象")
+                        if "slides" in generated:
+                            text=structured_outline_markdown(generated["slides"],resources,count)
+                        elif isinstance(generated.get("text"),str):
+                            # Compatibility boundary for legacy HTTP gateways.
+                            text=normalize_outline_markdown(generated["text"],resources,count)
+                        else:
+                            raise ValidationError("大纲生成响应必须包含 slides 或兼容 text")
+                        break
+                    except ValidationError as exc:
+                        self.store.put_version(task_id,"outline-diagnostic",canonical({"attempt":attempt,"candidate":generated}),{
+                            "v":len(self.versions(task_id,"outline-diagnostic"))+1,
+                            "stage":"outline","attempt":attempt,"error_code":exc.code,"error_message":exc.message,
+                            "model":generated.get("model","unknown") if isinstance(generated,dict) else "unknown","public_error_exposes_candidate":False,
+                        })
+                        if attempt == 2: raise
+                        payload={**payload,"semantic_correction":{"attempt":1,"error":exc.message,"previous_candidate":generated}}
         return self.edit_outline(task_id,text,"生成逐页大纲",actor="system",skill=skill)
     def edit_outline(self,task_id,markdown,summary="直接编辑",actor="user",skill=None):
         self._require_actionable(task_id)
         view=self._p3_input(task_id); expected=requested_slide_count(view["task_card"])
+        markdown=normalize_outline_markdown(markdown,view["manifest"].get("resources",[]),expected)
         slide_ids,blocks=parse_outline(markdown,view["manifest"].get("resources",[]),expected)
         prior=self._current_version(task_id,"outline"); before={}
         if prior: _,before=parse_outline(json.loads(self.version(task_id,prior))["markdown"],view["manifest"].get("resources",[]),None)

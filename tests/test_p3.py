@@ -56,6 +56,16 @@ class P3Tests(unittest.TestCase):
         with self.assertRaises(ValidationError): self.service.edit_outline("task-1",changed.replace("resources位","resources位" ).replace("待补资源位","![x](resources://foreign.png)",1))
         with self.assertRaises(ValidationError): self.service.edit_outline("task-1",changed.split("## [slide-3]")[0])
 
+    def test_human_markdown_headings_are_normalized_to_stable_page_ids(self):
+        self.service.generate_narrative("task-1"); self.service.confirm_narrative("task-1")
+        markdown=("# 逐页大纲\n\n## 开场\n- 建立目标\n\n"
+                  "### 第 2 页｜核心方案\n- 展开方案\n\n## 3. 行动建议\n- 明确行动\n")
+        outline=self.service.edit_outline("task-1",markdown)["outline"]
+        self.assertEqual(outline["slide_ids"],["slide-1","slide-2","slide-3"])
+        self.assertIn("## [slide-1] 开场",outline["markdown"])
+        self.assertIn("## [slide-2] 核心方案",outline["markdown"])
+        self.assertIn("## [slide-3] 行动建议",outline["markdown"])
+
     def test_non_destructive_rollback(self):
         first=self.service.generate_narrative("task-1")["narrative"]
         self.service.edit_narrative("task-1",first["markdown"]+"\n新版")

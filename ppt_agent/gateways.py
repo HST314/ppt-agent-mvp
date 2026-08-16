@@ -242,7 +242,10 @@ class AgentGateway:
     def generate(self, action, payload, *, skill=""):
         if action not in {"narrative", "outline"}:
             raise ValidationError("Agent 生成阶段无效")
-        return {"text": self._run(action, payload)["markdown"], "model": self.model}
+        value = self._run(action, payload)
+        if action == "outline":
+            return {"slides": value["slides"], "model": self.model}
+        return {"text": value["markdown"], "model": self.model}
 
     def clarify(self, payload):
         return {**self._run("clarification", payload), "model": self.model}

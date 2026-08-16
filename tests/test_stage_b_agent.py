@@ -17,6 +17,8 @@ from ppt_agent.skill_runtime import SkillRuntime
 
 
 SCHEMA = {"name": "answer", "schema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"], "additionalProperties": False}}
+OUTLINE_VALUE = {"slides": [{"title": "完成", "purpose": "验证契约", "content_markdown": "- 内容", "resource_uris": []}]}
+OUTLINE_JSON = json.dumps(OUTLINE_VALUE, ensure_ascii=False)
 
 
 class ScriptedClient:
@@ -258,9 +260,9 @@ class StageBAgentTests(unittest.TestCase):
             ModelTurn(None, "r1", (ModelToolCall("read_skill_file", json.dumps({"path": "SKILL.md"}), "c1"),)),
             ModelTurn('{"text":"done"}', "r2"),
         ])
-        client.turns[-1] = ModelTurn('{"markdown":"done"}', "r2")
+        client.turns[-1] = ModelTurn(OUTLINE_JSON, "r2")
         result = AgentRuntime(client, SkillRuntime.builtin()).run("outline", {"topic": "secret-topic"})
-        self.assertEqual(result.value, {"markdown": "done"}); self.assertEqual([x["event"] for x in result.audit], ["run", "model", "tool", "model", "terminal"])
+        self.assertEqual(result.value, OUTLINE_VALUE); self.assertEqual([x["event"] for x in result.audit], ["run", "model", "tool", "model", "terminal"])
         self.assertNotIn("secret-topic", json.dumps(result.audit)); self.assertNotIn("content", json.dumps(result.audit))
         self.assertIn("function_call_output", str(client.inputs[1]["input"])); self.assertEqual([tool["name"] for tool in client.inputs[0]["tools"]], ["list_skill_files", "read_skill_file"])
         system = client.inputs[0]["input"][0]["content"]
@@ -271,7 +273,7 @@ class StageBAgentTests(unittest.TestCase):
     def test_planning_stage_tools_paths_and_prompt_are_the_same_contract(self):
         finals = {
             "narrative": '{"markdown":"narrative-ok"}',
-            "outline": '{"markdown":"outline-ok"}',
+            "outline": OUTLINE_JSON,
             "inspection": '{"passed":true,"issues":[]}',
         }
         for stage, final in finals.items():
@@ -299,11 +301,11 @@ class StageBAgentTests(unittest.TestCase):
             ModelToolCall("read_skill_file", '{"path":"references/checklist.md"}', "two"),
             ModelToolCall("read_skill_file", '{"path":"SKILL.md"}', "three"),
         )
-        client = ScriptedClient([ModelTurn(None, "tools", calls), ModelTurn('{"markdown":"done"}', "final")])
+        client = ScriptedClient([ModelTurn(None, "tools", calls), ModelTurn(OUTLINE_JSON, "final")])
 
         result = AgentRuntime(client, SkillRuntime.builtin()).run("outline", {})
 
-        self.assertEqual(result.value, {"markdown": "done"})
+        self.assertEqual(result.value, OUTLINE_VALUE)
         self.assertEqual(sum(item.get("event") == "tool" for item in result.audit), 2)
         quota = [item for item in result.audit if item.get("event") == "tool_error"]
         self.assertEqual([item["error_code"] for item in quota], ["quota_exceeded"])
@@ -335,7 +337,7 @@ class StageBAgentTests(unittest.TestCase):
         client = ScriptedClient([
             ModelTurn(None, "mixed", first_batch),
             ModelTurn(None, "recovery", recovery_batch),
-            ModelTurn('{"markdown":"recovered"}', "final"),
+            ModelTurn(OUTLINE_JSON, "final"),
         ])
 
         result = AgentRuntime(client, SkillRuntime.builtin()).run("outline", {})
@@ -450,7 +452,7 @@ class StageBAgentTests(unittest.TestCase):
         with self.assertRaises(GatewayError) as caught: runtime.run("inspection", {})
         self.assertEqual(caught.exception.audit[-1]["reason"], "invalid_output")
         self.assertNotIn("secret-response", json.dumps(caught.exception.audit))
-        huge = AgentRuntime(ScriptedClient([ModelTurn('{"markdown":"' + 'x' * 100 + '"}', "r")]), SkillRuntime.builtin(), max_output_bytes=32)
+        huge = AgentRuntime(ScriptedClient([ModelTurn(json.dumps({"slides":[{"title":"t","purpose":"p","content_markdown":"x"*100,"resource_uris":[]}]}), "r")]), SkillRuntime.builtin(), max_output_bytes=32)
         with self.assertRaises(GatewayError) as caught: huge.run("outline", {})
         self.assertEqual(caught.exception.audit[-1]["reason"], "output_limit")
         calls = tuple(ModelToolCall("list_skill_files", "{}", f"secret-{i}") for i in range(2))
@@ -459,7 +461,7 @@ class StageBAgentTests(unittest.TestCase):
         self.assertEqual(caught.exception.audit[-1]["reason"], "tool_call_limit")
 
         ticks = iter([0, 0, 2])
-        timed = AgentRuntime(ScriptedClient([ModelTurn('{"markdown":"late"}', "r")]), SkillRuntime.builtin(), timeout_seconds=1, clock=lambda: next(ticks))
+        timed = AgentRuntime(ScriptedClient([ModelTurn(OUTLINE_JSON, "r")]), SkillRuntime.builtin(), timeout_seconds=1, clock=lambda: next(ticks))
         with self.assertRaises(GatewayError) as caught: timed.run("outline", {})
         self.assertEqual(caught.exception.audit[-1]["reason"], "deadline_exceeded")
 

@@ -23,7 +23,16 @@ STAGE_PROMPTS = {
         "本阶段不提供也不需要任何 Skill 工具，禁止请求工具。"
     ),
     "narrative": "根据任务卡生成叙事结构 Markdown；不要生成逐页 HTML。按需最多读取 1 到 2 个当前阶段已列出的 Skill 文件，不要重复读取。",
-    "outline": "根据已确认叙事生成逐页大纲 Markdown；保持页面标识稳定。按需最多读取 1 到 2 个当前阶段已列出的 Skill 文件，禁止尝试读取布局、主题、图片或 HTML 模板文件；读取后立即提交大纲 JSON，不要重复读取。",
+    "outline": (
+        "根据已确认叙事生成结构化逐页大纲；不要自行编写页面 ID，也不要返回 markdown 字段。"
+        "每页必须只包含 title、purpose、content_markdown、resource_uris；resource_uris 只能选自输入的冻结资源清单，"
+        "没有合适资源时返回空数组。content_markdown 只写页内正文或列表，不得包含一级、二级标题。"
+        "例如：{\"slides\":[{\"title\":\"开场与目标\",\"purpose\":\"建立共同目标\","
+        "\"content_markdown\":\"- 背景\\n- 目标\",\"resource_uris\":[]}]}}。"
+        "若输入包含 semantic_correction，须依据其中的具体错误修正并重新提交完整 slides。"
+        "按需最多读取 1 到 2 个当前阶段已列出的 Skill 文件，禁止尝试读取布局、主题、图片或 HTML 模板文件；"
+        "读取后立即提交大纲 JSON，不要重复读取。"
+    ),
     "sample": "仅为外层状态机指定的样品页生成完整 HTML，不得扩展到全稿。",
     "deck": "为外层状态机给定的全部页面生成完整 HTML，并遵守已确认样品的视觉基线。",
     "inspection": "独立检查大纲与 HTML，仅报告有证据的问题，不得直接修改产物。",
@@ -42,7 +51,14 @@ STAGE_OUTPUT_SCHEMAS = {
         }, ["value", "label", "description"])}, "allow_other": {"type": "boolean"}, "blocking": {"type": "boolean"}
     }, ["question_id", "field_path", "prompt", "helper_text", "options", "allow_other", "blocking"])}}, ["questions"])},
     "narrative": {"name": "narrative", "strict": True, "schema": _object_schema({"markdown": {"type": "string"}}, ["markdown"])},
-    "outline": {"name": "outline", "strict": True, "schema": _object_schema({"markdown": {"type": "string"}}, ["markdown"])},
+    "outline": {"name": "outline", "strict": True, "schema": _object_schema({"slides": {
+        "type": "array", "minItems": 1, "items": _object_schema({
+            "title": {"type": "string", "minLength": 1},
+            "purpose": {"type": "string", "minLength": 1},
+            "content_markdown": {"type": "string", "minLength": 1},
+            "resource_uris": {"type": "array", "uniqueItems": True, "items": {"type": "string"}},
+        }, ["title", "purpose", "content_markdown", "resource_uris"]),
+    }}, ["slides"])},
     "sample": {"name": "sample_html", "strict": True, "schema": _object_schema({"html": {"type": "string"}}, ["html"])},
     "deck": {"name": "deck_html", "strict": True, "schema": _object_schema({"html": {"type": "string"}}, ["html"])},
     "inspection": {"name": "inspection", "strict": True, "schema": _object_schema({"passed": {"type": "boolean"}, "issues": {"type": "array", "items": _object_schema({
@@ -456,6 +472,8 @@ class AgentRuntime:
             raise GatewayError(f"Agent 输出不符合 Schema：{path} 类型无效")
         if "enum" in schema and value not in schema["enum"]:
             raise GatewayError(f"Agent 输出不符合 Schema：{path} 枚举无效")
+        if expected == "string" and len(value) < schema.get("minLength", 0):
+            raise GatewayError(f"Agent 输出不符合 Schema：{path} 长度不足")
         if expected == "object":
             properties, required = schema.get("properties", {}), schema.get("required", [])
             missing = [name for name in required if name not in value]
@@ -467,5 +485,9 @@ class AgentRuntime:
                 if name in properties:
                     self._validate_schema(item, properties[name], f"{path}.{name}")
         elif expected == "array":
+            if len(value) < schema.get("minItems", 0):
+                raise GatewayError(f"Agent 输出不符合 Schema：{path} 元素不足")
+            if schema.get("uniqueItems") and len({json.dumps(item, sort_keys=True, ensure_ascii=False) for item in value}) != len(value):
+                raise GatewayError(f"Agent 输出不符合 Schema：{path} 元素重复")
             for index, item in enumerate(value):
                 self._validate_schema(item, schema.get("items", {}), f"{path}[{index}]")

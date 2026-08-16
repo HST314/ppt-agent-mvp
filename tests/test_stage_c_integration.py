@@ -2,7 +2,7 @@ import json
 import tempfile
 import unittest
 
-from ppt_agent.errors import GatewayError, GatewayUnknownResult
+from ppt_agent.errors import GatewayError, GatewayUnknownResult, ValidationError
 from ppt_agent.audit import bind_agent_audit_context
 from ppt_agent.gateways import AgentGateway, LockedSkillMetadataLoader
 from ppt_agent.model_clients import ModelTurn
@@ -26,7 +26,52 @@ def service(root, client):
     return TaskService(WorkspaceStore(root), generator=gateway, builder=gateway, inspector=gateway, skills=LockedSkillMetadataLoader(skill))
 
 
+def outline_response(count):
+    return json.dumps({"slides":[{
+        "title":f"第 {index + 1} 页","purpose":f"推进节点 {index + 1}",
+        "content_markdown":f"- 内容 {index + 1}","resource_uris":[],
+    } for index in range(count)]},ensure_ascii=False)
+
+
 class StageCIntegrationTests(unittest.TestCase):
+    def test_structured_outline_is_validated_and_rendered_as_canonical_markdown(self):
+        with tempfile.TemporaryDirectory() as root:
+            client=ScriptedClient('{"markdown":"# 叙事结构"}',outline_response(3))
+            svc=service(root,client); svc.create("task","manual")
+            svc.import_input("task",{"goal":"演示","audience":"客户","topic":"方案","页数":3})
+            svc.generate_narrative("task"); svc.confirm_narrative("task")
+            outline=svc.generate_outline("task")["outline"]
+            self.assertEqual(outline["slide_ids"],["slide-1","slide-2","slide-3"])
+            self.assertIn("## [slide-1] 第 1 页",outline["markdown"])
+            self.assertIn("- 页面目的：推进节点 1",outline["markdown"])
+            self.assertNotIn('"slides"',outline["markdown"])
+
+    def test_semantic_outline_failure_gets_one_correction_and_private_diagnostic(self):
+        with tempfile.TemporaryDirectory() as root:
+            client=ScriptedClient('{"markdown":"# 叙事结构"}',outline_response(1),outline_response(3))
+            svc=service(root,client); svc.create("task","manual")
+            svc.import_input("task",{"goal":"演示","audience":"客户","topic":"方案","页数":3})
+            svc.generate_narrative("task"); svc.confirm_narrative("task")
+            outline=svc.generate_outline("task")["outline"]
+            self.assertEqual(len(outline["slide_ids"]),3)
+            correction=json.loads(client.inputs[2]["input"][1]["content"])["semantic_correction"]
+            self.assertIn("必须严格包含 3 页",correction["error"])
+            diagnostics=svc.versions("task","outline-diagnostic")
+            self.assertEqual(len(diagnostics),1)
+            candidate=json.loads(svc.version("task",diagnostics[0]["hash"]))
+            self.assertEqual(len(candidate["candidate"]["slides"]),1)
+            self.assertFalse(diagnostics[0]["metadata"]["public_error_exposes_candidate"])
+
+    def test_semantic_outline_correction_is_bounded_to_one_retry(self):
+        with tempfile.TemporaryDirectory() as root:
+            client=ScriptedClient('{"markdown":"# 叙事结构"}',outline_response(1),outline_response(1))
+            svc=service(root,client); svc.create("task","manual")
+            svc.import_input("task",{"goal":"演示","audience":"客户","topic":"方案","页数":3})
+            svc.generate_narrative("task"); svc.confirm_narrative("task")
+            with self.assertRaises(ValidationError): svc.generate_outline("task")
+            self.assertEqual(len(client.inputs),3)
+            self.assertEqual(len(svc.versions("task","outline-diagnostic")),2)
+            self.assertFalse(svc.versions("task","outline"))
     def test_reported_natural_language_input_uses_tool_free_agent_contract(self):
         with tempfile.TemporaryDirectory() as root:
             client=ScriptedClient('{"questions":[]}')
