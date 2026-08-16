@@ -19,6 +19,17 @@ from .offline import offline_assets, offline_player
 def utcnow(): return datetime.now(timezone.utc).isoformat()
 def fingerprint(value): return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(",",":")).encode()).hexdigest()
 
+# 只有传输/认证/5xx 类失败才把全局运行时置为不可用；空响应、工具错误、
+# 内容校验等模型行为类失败只记录在所属任务，避免单任务的单次模型抖动
+# 劫持全局徽章并波及其他任务。
+RUNTIME_DEGRADING_CODES = frozenset({
+    "model_timeout",
+    "model_connection_error",
+    "model_authentication_failed",
+    "model_permission_denied",
+    "model_upstream_unavailable",
+})
+
 def _clarification_directive(config: ClarificationConfig, round_number: int) -> str:
     budget = f"本轮为第 {round_number}/{config.max_rounds} 轮澄清，最多提出 {config.max_questions_per_round} 个问题。"
     if config.style == "minimal":
@@ -127,8 +138,11 @@ class TaskService:
             runtime_error_code=error.get("code"),
             retryable=error.get("retryable") is True,
             retry_after_seconds=error.get("retry_after_seconds"),
-            agent_audit_id=error.get("agent_audit_id"),
-            diagnostic_id=error.get("diagnostic_id"),
+            # 全局运行时错误可能源自其他任务的执行：抛给当前任务时换发全新的
+            # 诊断 ID，且不再引用其他任务的 Agent 审计；探测产生的审计不绑定
+            # 任何任务，可以保留引用。
+            agent_audit_id=error.get("agent_audit_id") if error.get("probe_id") else None,
+            diagnostic_id=uuid.uuid4().hex,
             probe_id=error.get("probe_id") or (capabilities.get("probe_id") if failed_check else None),
             failed_check=failed_check,
             probe_phase=error.get("probe_phase"),
@@ -139,6 +153,7 @@ class TaskService:
     def runtime_probes(self,limit=20): return self.store.runtime_probes(limit)
     def record_runtime_failure(self,error):
         if not isinstance(error,GatewayError): return
+        if error.code not in RUNTIME_DEGRADING_CODES: return
         public=error.public()["error"]
         safe={key:public[key] for key in ("code","diagnostic_id","retryable","retry_after_seconds","agent_audit_id") if key in public}
         with self._runtime_guard:
@@ -260,11 +275,12 @@ class TaskService:
         try:
             value=self.clarifier.clarify(payload)
             asked=[q.get("field_path") for entry in history for q in entry.get("questions",[]) if isinstance(q,dict)]
-            questions=self._validate_model_questions(value.get("questions"),view["task_card"],max_questions=config.max_questions_per_round,asked_field_paths=asked)
+            questions,filtered=self._validate_model_questions(value.get("questions"),view["task_card"],max_questions=config.max_questions_per_round,asked_field_paths=asked)
         except Exception as exc:
             error=exc.public()["error"] if hasattr(exc,"public") else {"code":"clarification_generation_failed","message":"澄清问题生成失败","diagnostic_id":hashlib.sha256(f"{task_id}:{type(exc).__name__}".encode()).hexdigest()[:24]}
             self._record_clarification(task_id,view,[],"failed",None,error,"clarification_failed"); raise
-        result=self._record_clarification(task_id,view,questions,"ready",value.get("model"),None,"clarification_generate")
+        extra={"filtered_duplicate_questions":filtered} if filtered else None
+        result=self._record_clarification(task_id,view,questions,"ready",value.get("model"),None,"clarification_generate",extra=extra)
         if result["confirmed"] and history:
             # 模型在后续轮次返回 0 题 = 提前确认；此前轮次的答案已合并进任务卡，同步冻结。
             self._freeze_task_card(task_id,view["task_card"],result["clarification_hash"])
@@ -277,27 +293,40 @@ class TaskService:
         public=error.public()["error"] if hasattr(error,"public") else {"code":"runtime_unavailable","message":"模型运行时尚未就绪","diagnostic_id":hashlib.sha256(f"{task_id}:runtime".encode()).hexdigest()[:24]}
         return self._record_clarification(task_id,view,[],"failed",None,public,"clarification_failed")
     def _validate_model_questions(self,questions,card,*,max_questions=5,asked_field_paths=()):
+        """校验模型问题，返回 (有效问题列表, 被过滤的重复字段数)。
+
+        跨轮撞库（询问任务卡已知字段或历轮已问字段）采用过滤而非拒绝：
+        剔除撞库问题，剩余问题照常展示；全部被剔除时返回空列表，由上层
+        视为"模型没有更多问题"提前确认，流程不被打断。
+        """
         if not isinstance(questions,list) or len(questions)>max_questions: raise ValidationError(f"澄清模型 questions 必须为 0 到 {max_questions} 项")
-        required={"question_id","field_path","prompt","helper_text","options","allow_other","blocking"}; seen_ids=set(); seen_paths=set(); known={k for k in ("goal","audience","topic") if k not in card.get("missing",[])}; asked={path for path in asked_field_paths if isinstance(path,str)}; result=[]
+        required={"question_id","field_path","prompt","helper_text","options","allow_other","blocking"}; seen_ids=set(); seen_paths=set(); known={k for k in ("goal","audience","topic") if k not in card.get("missing",[])}; asked={path for path in asked_field_paths if isinstance(path,str)}; result=[]; filtered=0
         for q in questions:
             if not isinstance(q,dict) or set(q)!=required: raise ValidationError("澄清问题 Schema 无效")
             if q["question_id"] in seen_ids or q["field_path"] in seen_paths: raise ValidationError("澄清问题存在重复 ID 或字段")
-            if q["field_path"] in known or q["field_path"] in asked: raise ValidationError("澄清模型重复询问已知事实")
+            if q["field_path"] in known or q["field_path"] in asked:
+                filtered+=1; continue
             if not all(isinstance(q[k],str) and q[k].strip() for k in ("question_id","field_path","prompt","helper_text")) or not isinstance(q["allow_other"],bool) or not isinstance(q["blocking"],bool): raise ValidationError("澄清问题字段无效")
             if not isinstance(q["options"],list) or any(not isinstance(o,dict) or set(o)!={"value","label","description"} or not all(isinstance(o[k],str) for k in o) or not o["value"].strip() or not o["label"].strip() for o in q["options"]): raise ValidationError("澄清选项 Schema 无效")
             if len({o["value"] for o in q["options"]})!=len(q["options"]): raise ValidationError("澄清选项重复")
             seen_ids.add(q["question_id"]); seen_paths.add(q["field_path"]); result.append({**q,"field":q["field_path"]})
-        return result
-    def _record_clarification(self,task_id,view,questions,status,model,error,action,source="model"):
+        return result, filtered
+    def _record_clarification(self,task_id,view,questions,status,model,error,action,source="model",extra=None):
         config=self._clarification_config
         meta={"questions":questions,"details":questions,"answers":{},"invalidated":[],"status":status,"question_source":source if status=="ready" else None,"question_model":model,"diagnostic_id":view["clarification"]["diagnostic_id"],"question_schema_version":"1.0","input_hash":view["clarification"]["input_hash"],"normalized_task_card":view["task_card"],"round":config.max_rounds if source=="fallback" else view["clarification"].get("round",1),"rounds_history":list(view["clarification"].get("rounds_history",[])),"max_rounds":config.max_rounds,"max_questions_per_round":config.max_questions_per_round,"style":config.style}
         if error: meta["error"]=error
+        if extra: meta.update(extra)
         artifact=ClarificationSet.parse({"clarification_id":f"clarification-{digest(canonical(meta))[:16]}","task_id":task_id,"questions":tuple(q["prompt"] for q in questions),"assumptions":tuple(),"confirmed":status=="ready" and not questions,"schema_version":"1.0"}); ch=self.store.put_version(task_id,"clarification",canonical(artifact.to_dict()),meta)
         state=TaskState.parse(self.get(task_id)); failed=status=="failed"; new=TaskState(**{**state.__dict__,"status":state.status.WAITING_FOR_USER if failed or questions else state.status.READY,"waiting_reason":"clarification_failed" if failed else "missing_required_input" if questions else None,"required_action":"retry_clarification" if failed else "answer_clarifications" if questions else None,"revision":state.revision+1})
         event={"event_id":hashlib.sha256(f"{task_id}:{action}:{ch}".encode()).hexdigest()[:24],"command_id":f"{action}-{ch[:16]}","action":action,"actor":"system" if action!="clarification_fallback" else "user","request_hash":meta["input_hash"],"at":utcnow(),"from":state.to_dict(),"to":new.to_dict(),"result":{"clarification_hash":ch,"snapshot_hash":view["snapshot_hash"],"input_hash":meta["input_hash"]}}
         self.store.commit(task_id,new.to_dict(),event); return {"clarification_hash":ch,**meta,"confirmed":artifact.confirmed}
     def _freeze_task_card(self,task_id,merged,clarification_hash):
-        self.store.put_version(task_id,"task-card",canonical(TaskCard.parse({"task_id":task_id,"goal":merged.get("goal","待澄清"),"audience":merged.get("audience","待澄清"),"topic":merged.get("topic","待澄清"),"source_format":merged.get("source_format","json"),"schema_version":"1.0"}).to_dict()),{"normalized":merged,"clarification_hash":clarification_hash})
+        raw=canonical(TaskCard.parse({"task_id":task_id,"goal":merged.get("goal","待澄清"),"audience":merged.get("audience","待澄清"),"topic":merged.get("topic","待澄清"),"source_format":merged.get("source_format","json"),"schema_version":"1.0"}).to_dict())
+        # 规范卡内容未变化时（回答只涉及 goal/audience/topic 以外的字段）跳过重写：
+        # 合入结果已由澄清元数据携带，重写只会与既有版本产生元数据冲突。
+        cards=self.versions(task_id,"task-card")
+        if cards and self.version(task_id,cards[-1]["hash"])==raw: return
+        self.store.put_version(task_id,"task-card",raw,{"normalized":merged,"clarification_hash":clarification_hash})
     def answer_clarification(self,task_id,question_id,answer):
         return self.answer_clarifications(task_id,{question_id:answer})
     def answer_clarifications(self,task_id,submitted,require_complete=False):

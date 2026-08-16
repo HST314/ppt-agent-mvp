@@ -74,12 +74,38 @@ class SkillRuntime:
         files = sorted(name for name in self.manifest if self._allowed(name))
         return {"skill": self.skill_name, "version": self.skill_version, "files": files}
 
+    def _normalize_tool_path(self, name: str) -> str:
+        """容忍模型常见的路径前缀写法（``./``、``/``、``<skill名>/``）。
+
+        归一化只剥离无害前缀；随后的越界检查、白名单与哈希校验保持严格，
+        安全语义不降级。
+        """
+        if not isinstance(name, str):
+            return name
+        normalized = name.strip()
+        while normalized.startswith("./"):
+            normalized = normalized[2:]
+        normalized = normalized.lstrip("/")
+        skill_prefix = f"{self.skill_name}/"
+        if normalized.startswith(skill_prefix):
+            normalized = normalized[len(skill_prefix):]
+        return normalized
+
+    def _whitelist_error(self, asset: bool) -> ValidationError:
+        # 报错回传模型时附带合法路径列表，模型下一轮即可自我修正。
+        files = self.list_skill_files()["files"]
+        if asset:
+            allowed = "、".join(name for name in files if name.startswith("assets/")) or "（无）"
+            return ValidationError(f"Asset 不在只读白名单；合法路径：{allowed}")
+        return ValidationError("Skill 文件不在锁定只读白名单；合法路径：" + "、".join(files))
+
     def _locked_bytes(self, name: str, *, asset: bool = False) -> tuple[Path, bytes]:
+        name = self._normalize_tool_path(name)
         path = self._resolve(name)
         if name not in self.manifest or not self._allowed(name) or not path.is_file():
-            raise ValidationError("Skill 文件不在锁定只读白名单")
+            raise self._whitelist_error(asset)
         if asset and not name.startswith("assets/"):
-            raise ValidationError("Asset 不在只读白名单")
+            raise self._whitelist_error(asset=True)
         try:
             content = path.read_bytes()
         except (OSError, ValueError) as exc:
@@ -89,9 +115,10 @@ class SkillRuntime:
         return path, content
 
     def read_skill_file(self, name: str) -> dict:
+        name = self._normalize_tool_path(name)
         path, raw = self._locked_bytes(name)
         if path.suffix.lower() not in self.TEXT_SUFFIXES:
-            raise ValidationError("Skill 文件不在只读白名单")
+            raise ValidationError("Skill 文件不在只读白名单（仅可读取文本文件；二进制 Asset 请用 get_asset_info）")
         size = len(raw)
         if size > self.max_file_bytes:
             raise ValidationError("Skill 单文件超过读取上限")
@@ -105,6 +132,7 @@ class SkillRuntime:
         return {"path": name, "content": content, "bytes": size, "sha256": hashlib.sha256(content.encode()).hexdigest()}
 
     def get_asset_info(self, name: str) -> dict:
+        name = self._normalize_tool_path(name)
         path, raw = self._locked_bytes(name, asset=True)
         size = len(raw)
         if size > self.max_file_bytes:

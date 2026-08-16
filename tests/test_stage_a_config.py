@@ -145,4 +145,42 @@ class StageAConfigTests(unittest.TestCase):
         self.assertNotIn("secret",str(caught.exception.public()))
 
 
+class EmptyResponseRetryTests(unittest.TestCase):
+    class SequenceSDK:
+        def __init__(self, results): self.results=list(results); self.responses=self; self.calls=0
+        def create(self, **_kwargs):
+            self.calls+=1
+            return self.results.pop(0)
+
+    def config(self):
+        env={"GEN_KEY":"secret","GEN_URL":"https://gen.example/v1","INSPECT_KEY":"i","INSPECT_URL":"https://inspect.example/v1"}
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, env, clear=True):
+            path = Path(tmp) / "config.yaml"; path.write_text(AGENT)
+            return load_config(path).generation
+
+    def test_empty_response_is_retried_within_the_same_call(self):
+        cfg=self.config()
+        empty=SimpleNamespace(output_text="", id="r-empty", output=[])
+        ok=SimpleNamespace(output_text="ok", id="r-ok", output=[])
+        sdk=self.SequenceSDK([empty, ok])
+        turn=OpenAIResponsesClient(cfg,sdk_client=sdk).create(input="x")
+        self.assertEqual(turn.text,"ok"); self.assertEqual(sdk.calls,2)
+
+    def test_persistent_empty_response_fails_after_bounded_retries(self):
+        cfg=self.config()
+        empty=SimpleNamespace(output_text="", id="r-empty", output=[])
+        sdk=self.SequenceSDK([empty, empty, empty, empty])
+        with self.assertRaises(GatewayError) as caught:
+            OpenAIResponsesClient(cfg,sdk_client=sdk).create(input="x")
+        self.assertEqual(sdk.calls,3)  # 1 次原始请求 + 最多 2 次重试
+        self.assertEqual(caught.exception.audit_details["category"],"empty_response")
+
+    def test_tool_call_only_response_is_not_retried(self):
+        cfg=self.config()
+        call_only=SimpleNamespace(output_text="", id="r-call", output=[SimpleNamespace(type="function_call", name="read_skill_file", arguments='{"path":"SKILL.md"}', call_id="c")])
+        sdk=self.SequenceSDK([call_only])
+        turn=OpenAIResponsesClient(cfg,sdk_client=sdk).create(input="x")
+        self.assertEqual(len(turn.tool_calls),1); self.assertEqual(sdk.calls,1)
+
+
 if __name__ == "__main__": unittest.main()

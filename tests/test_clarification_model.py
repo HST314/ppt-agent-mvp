@@ -44,8 +44,16 @@ class ClarificationModelTests(unittest.TestCase):
         service=self.service(Clarifier(error=RuntimeError("timeout"))); service.import_input("task",{"topic":"新品"})
         with self.assertRaises(RuntimeError): service.generate_clarification("task")
         view=service.input_view("task"); self.assertEqual(view["clarification"]["status"],"failed"); self.assertIsNone(view["clarification"]["question_source"]); self.assertEqual(view["clarification"]["details"],[])
-    def test_rejects_known_field_and_duplicate_field(self):
+    def test_known_field_question_is_filtered_and_confirms_early(self):
+        # 模型询问任务卡已知字段：过滤而非整轮拒绝；全部被剔除视为没有更多问题，提前确认。
         service=self.service(Clarifier([question("topic")])); service.import_input("task",{"topic":"新品"})
+        result=service.generate_clarification("task")
+        self.assertTrue(result["confirmed"]); self.assertEqual(result["details"],[])
+        self.assertEqual(result["filtered_duplicate_questions"],1)
+        self.assertEqual(service.input_view("task")["clarification"]["status"],"ready")
+    def test_duplicate_field_within_one_round_is_rejected(self):
+        # 同一轮内的重复字段仍是 Schema 级错误，整轮拒绝。
+        service=self.service(Clarifier([question("pace","q-1"),question("pace","q-2")])); service.import_input("task","新品发布")
         with self.assertRaises(ValidationError): service.generate_clarification("task")
         self.assertEqual(service.input_view("task")["clarification"]["status"],"failed")
     def test_fallback_requires_separate_service_action(self):
@@ -138,14 +146,33 @@ class ClarificationModelTests(unittest.TestCase):
         with self.assertRaises(ValidationError): service.generate_clarification("task")
         self.assertEqual(service.input_view("task")["clarification"]["status"],"failed")
 
-    def test_cross_round_field_repeat_is_rejected(self):
+    def test_cross_round_repeat_is_filtered_but_fresh_questions_survive(self):
+        # 撞库问题被剔除，其余新问题照常展示，流程继续等待用户作答。
+        gateway=SequentialClarifier([[question("pace","q-pace")],[question("pace","q-pace-2"),question("budget","q-budget")]])
+        service=self.multi_round_service(gateway)
+        service.import_input("task","新品发布")
+        service.generate_clarification("task")
+        service.answer_clarifications("task",{"q-pace":{"option":"Other","other":"10 页"}})
+        result=service.generate_clarification("task")
+        self.assertFalse(result["confirmed"])
+        self.assertEqual([q["field_path"] for q in result["details"]],["budget"])
+        self.assertEqual(result["filtered_duplicate_questions"],1)
+        self.assertEqual(service.input_view("task")["state"]["status"],"waiting_for_user")
+
+    def test_cross_round_field_repeat_is_filtered_and_confirms_early(self):
+        # 跨轮撞库：剔除撞库问题；全部被剔除时提前确认，已答字段并入任务卡，流程不中断。
         gateway=SequentialClarifier([[question("pace","q-pace")],[question("pace","q-pace-2")]])
         service=self.multi_round_service(gateway)
         service.import_input("task","新品发布")
         service.generate_clarification("task")
         service.answer_clarifications("task",{"q-pace":{"option":"Other","other":"10 页"}})
-        with self.assertRaises(ValidationError): service.generate_clarification("task")
-        self.assertEqual(service.input_view("task")["clarification"]["status"],"failed")
+        result=service.generate_clarification("task")
+        self.assertTrue(result["confirmed"]); self.assertEqual(result["details"],[])
+        self.assertEqual(result["filtered_duplicate_questions"],1)
+        view=service.input_view("task")
+        self.assertEqual(view["clarification"]["status"],"ready")
+        self.assertEqual(view["task_card"]["pace"],"10 页")
+        self.assertEqual(view["state"]["status"],"ready")
 
 
 if __name__ == "__main__": unittest.main()

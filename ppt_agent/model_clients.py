@@ -40,6 +40,11 @@ class OpenAIResponsesClient:
       unsupported and every later request in this process omits it.  A 400
       means the request was rejected before processing, so the single retry
       without the parameter cannot duplicate model side effects.
+
+    A completed response with neither text nor tool calls is a known,
+    side-effect-free outcome (the provider finished processing and returned
+    nothing); it is retried at most twice within the same call before being
+    surfaced as an error.
     """
 
     def __init__(self, config: ModelConfig, *, sdk_client=None):
@@ -50,6 +55,7 @@ class OpenAIResponsesClient:
 
     def create(self, *, input: Any, tools: list[dict] | None = None, response_schema: dict | None = None, tool_choice: Any = None) -> ModelTurn:
         use_format = bool(response_schema) and self.structured_output != "prompt" and not self._text_format_unsupported
+        empty_attempts = 0
         while True:
             request: dict[str, Any] = {"model": self.config.model, "input": input}
             if tools:
@@ -60,7 +66,6 @@ class OpenAIResponsesClient:
                 request["text"] = {"format": {"type": "json_schema", **response_schema}}
             try:
                 response = self._client.responses.create(**request)
-                break
             except (APITimeoutError, TimeoutError, socket.timeout) as exc:
                 raise self._transport_error(exc, "timeout") from exc
             except APIStatusError as exc:
@@ -81,18 +86,26 @@ class OpenAIResponsesClient:
                         "retryable": False,
                     },
                 ) from exc
-        text = getattr(response, "output_text", None)
-        calls = []
-        for item in getattr(response, "output", ()) or ():
-            if getattr(item, "type", None) == "function_call":
-                name, arguments, call_id = getattr(item, "name", None), getattr(item, "arguments", None), getattr(item, "call_id", None)
-                if not all(isinstance(value, str) and value for value in (name, arguments, call_id)):
-                    raise GatewayError("模型工具调用契约无效")
-                calls.append(ModelToolCall(name, arguments, call_id))
-        if (not isinstance(text, str) or not text.strip()) and not calls:
-            raise GatewayError("模型响应缺少文本结果")
-        response_id = getattr(response, "id", None)
-        return ModelTurn(text=text if isinstance(text, str) else None, response_id=response_id if isinstance(response_id, str) else None, tool_calls=tuple(calls))
+            text = getattr(response, "output_text", None)
+            calls = []
+            for item in getattr(response, "output", ()) or ():
+                if getattr(item, "type", None) == "function_call":
+                    name, arguments, call_id = getattr(item, "name", None), getattr(item, "arguments", None), getattr(item, "call_id", None)
+                    if not all(isinstance(value, str) and value for value in (name, arguments, call_id)):
+                        raise GatewayError("模型工具调用契约无效")
+                    calls.append(ModelToolCall(name, arguments, call_id))
+            if (not isinstance(text, str) or not text.strip()) and not calls:
+                # 端点偶发返回空响应（请求已被完整处理、服务端无副作用），在同一
+                # 调用内有界重试；仍为空才判失败。
+                empty_attempts += 1
+                if empty_attempts <= 2:
+                    continue
+                raise GatewayError(
+                    "模型响应缺少文本结果",
+                    audit_details={"category": "empty_response", "retryable": False},
+                )
+            response_id = getattr(response, "id", None)
+            return ModelTurn(text=text if isinstance(text, str) else None, response_id=response_id if isinstance(response_id, str) else None, tool_calls=tuple(calls))
 
     @staticmethod
     def _request_id_hash(exc: Exception) -> str | None:

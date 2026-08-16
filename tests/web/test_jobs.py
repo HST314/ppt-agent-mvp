@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from ppt_agent.errors import ConflictError, GatewayError
+from ppt_agent.errors import ConflictError, GatewayError, RuntimeUnavailableError
 from ppt_agent.service import TaskService
 from ppt_agent.store import WorkspaceStore
 from ppt_agent.web.jobs import JobService
@@ -106,9 +106,62 @@ class JobServiceTests(unittest.TestCase):
             clarification = service.input_view("clarification-gated")["clarification"]
             self.assertEqual(clarification["status"], "failed")
             self.assertEqual(clarification["error"]["code"], "runtime_unavailable")
-            self.assertEqual(clarification["error"]["diagnostic_id"], failure.diagnostic_id)
+            # 落入本任务记录的运行时错误换发本任务自己的诊断 ID，且不引用
+            # 其他任务的 Agent 审计，避免跨任务错误污染。
+            self.assertNotEqual(clarification["error"]["diagnostic_id"], failure.diagnostic_id)
+            self.assertNotIn("agent_audit_id", clarification["error"])
             self.assertEqual(jobs.get(created["job_id"])["status"], "failed")
             jobs.close()
+
+    def test_only_transport_auth_and_upstream_failures_degrade_global_runtime(self):
+        behavior_codes = ("gateway_error", "probe_tool_final_invalid_output")
+        degrading_codes = (
+            "model_timeout",
+            "model_connection_error",
+            "model_authentication_failed",
+            "model_permission_denied",
+            "model_upstream_unavailable",
+        )
+        for code in behavior_codes:
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as root:
+                service = TaskService(WorkspaceStore(root))
+                service.record_runtime_failure(GatewayError("模型行为失败", code=code))
+                self.assertTrue(service.runtime_health()["ready"])
+        for code in degrading_codes:
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as root:
+                service = TaskService(WorkspaceStore(root))
+                service.record_runtime_failure(GatewayError("服务降级", code=code))
+                self.assertFalse(service.runtime_health()["ready"])
+
+    def test_runtime_gate_reissues_diagnostic_and_drops_foreign_audit(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = TaskService(WorkspaceStore(root))
+            failure = GatewayError("上游不可用", code="model_upstream_unavailable")
+            failure.agent_audit_id = "agent-audit-from-another-task"
+            service.record_runtime_failure(failure)
+            with self.assertRaises(RuntimeUnavailableError) as caught:
+                service.require_runtime_ready()
+            error = caught.exception.public()["error"]
+            self.assertEqual(error["runtime_error_code"], "model_upstream_unavailable")
+            self.assertNotEqual(error["diagnostic_id"], failure.diagnostic_id)
+            self.assertNotIn("agent_audit_id", error)
+
+    def test_probe_originated_runtime_error_keeps_probe_audit_reference(self):
+        class FailingProbeGateway:
+            model = "probe-model"
+            def set_audit_sink(self, _sink): pass
+            def probe_capabilities(self, probe_id=None):
+                error = GatewayError("认证失败", code="model_authentication_failed")
+                error.agent_audit_id = "agent-audit-probe"
+                raise error
+        with tempfile.TemporaryDirectory() as root:
+            service = TaskService(WorkspaceStore(root), generator=FailingProbeGateway())
+            service.initialize_runtime()
+            with self.assertRaises(RuntimeUnavailableError) as caught:
+                service.require_runtime_ready()
+            error = caught.exception.public()["error"]
+            self.assertEqual(error["agent_audit_id"], "agent-audit-probe")
+            self.assertTrue(error["probe_id"])
 
     def test_persisted_chinese_job_data_is_always_read_as_utf8(self):
         with tempfile.TemporaryDirectory() as root:

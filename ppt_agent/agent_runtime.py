@@ -247,7 +247,8 @@ class AgentRuntime:
                     failed = result.get("ok") is False
                     if not failed:
                         successful_calls += 1
-                    audit.append({"step": step, "event": "tool_error" if failed else "tool", "tool": call.name, "error_code": result.get("error", {}).get("code") if failed else None, "call_id_sha256": hashlib.sha256((call.call_id or "").encode()).hexdigest(), "path": result.get("path"), "file_sha256": result.get("sha256"), "result_sha256": hashlib.sha256(json.dumps(result, sort_keys=True, ensure_ascii=False).encode()).hexdigest()})
+                    requested_path = args.get("path") if isinstance(args, dict) else None
+                    audit.append({"step": step, "event": "tool_error" if failed else "tool", "tool": call.name, "error_code": result.get("error", {}).get("code") if failed else None, "call_id_sha256": hashlib.sha256((call.call_id or "").encode()).hexdigest(), "requested_path_sha256": hashlib.sha256(requested_path.encode()).hexdigest() if isinstance(requested_path, str) and requested_path else None, "path": result.get("path"), "file_sha256": result.get("sha256"), "result_sha256": hashlib.sha256(json.dumps(result, sort_keys=True, ensure_ascii=False).encode()).hexdigest()})
                     conversation.append({"type": "function_call", "name": call.name, "arguments": call.arguments, "call_id": call.call_id})
                     conversation.append({"type": "function_call_output", "call_id": call.call_id, "output": json.dumps(result, ensure_ascii=False)})
                 # Budget failed *model rounds*, not individual calls.  Every

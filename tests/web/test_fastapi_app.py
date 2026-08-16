@@ -316,14 +316,17 @@ class FastAPIAppTests(unittest.TestCase):
                 )
                 self.assertEqual(retry.status_code,503)
                 self.assertEqual(retry.json()["error"]["code"],"runtime_unavailable")
-                self.assertEqual(retry.json()["error"]["diagnostic_id"],error["diagnostic_id"])
+                # 每次运行时门禁拒绝都会换发新的诊断 ID；与全局运行时状态的
+                # 关联通过 probe_id 保持。
+                self.assertNotEqual(retry.json()["error"]["diagnostic_id"],error["diagnostic_id"])
+                self.assertEqual(retry.json()["error"]["probe_id"],error["probe_id"])
                 self.assertEqual(client.get("/v1/tasks/unready/jobs").json()["jobs"],[])
                 fallback=client.post("/v1/tasks/unready/clarifications/fallback",json={"confirm":True})
                 self.assertEqual(fallback.status_code,200)
                 self.assertEqual(fallback.json()["question_source"],"fallback")
             self.assertEqual(clarifier.calls,0)
 
-    def test_classified_job_failure_degrades_readiness_and_keeps_public_error(self):
+    def test_classified_job_failure_keeps_readiness_and_public_error(self):
         class RateLimitedGateway:
             model="rate-limited-model"
             def set_audit_sink(self,_sink): pass
@@ -358,9 +361,9 @@ class FastAPIAppTests(unittest.TestCase):
                 self.assertEqual(job["error"]["code"],"model_rate_limited")
                 self.assertTrue(job["error"]["retryable"])
                 self.assertEqual(job["error"]["retry_after_seconds"],11)
+                # 429 限流属于模型行为类失败：记录在本任务，不翻转全局运行时就绪
                 ready=client.get("/readyz")
-                self.assertEqual(ready.status_code,503)
-                self.assertEqual(ready.json()["model_capabilities"]["error"]["code"],"model_rate_limited")
+                self.assertEqual(ready.status_code,200)
 
     def test_task_and_job_scoped_audit_exports_are_filtered(self):
         self.service.create("audit-export")

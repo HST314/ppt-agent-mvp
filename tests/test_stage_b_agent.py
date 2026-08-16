@@ -63,6 +63,26 @@ class StageBSkillTests(unittest.TestCase):
             skill.read_skill_file("SKILL.md")
             with self.assertRaises(ValidationError): skill.read_skill_file("references/a.md")
 
+    def test_tool_path_prefixes_are_normalized_but_whitelist_stays_strict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); make_skill(root, {"SKILL.md": b"ok", "references/a.md": b"a"})
+            skill = SkillRuntime(root)
+            for variant in ("./SKILL.md", "/SKILL.md", "guizang-ppt/SKILL.md", "./guizang-ppt/references/a.md"):
+                with self.subTest(variant=variant):
+                    self.assertTrue(skill.read_skill_file(variant)["content"])
+            for hostile in ("../SKILL_LOCK.json", "guizang-ppt/../SKILL_LOCK.json", "private.txt", "SKILL_LOCK.json"):
+                with self.subTest(hostile=hostile), self.assertRaises(ValidationError):
+                    skill.read_skill_file(hostile)
+
+    def test_whitelist_error_lists_valid_paths_for_self_correction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); make_skill(root, {"SKILL.md": b"ok", "references/a.md": b"a"})
+            skill = SkillRuntime(root)
+            with self.assertRaises(ValidationError) as caught:
+                skill.read_skill_file("references/missing.md")
+            message = caught.exception.message
+            self.assertIn("SKILL.md", message); self.assertIn("references/a.md", message)
+
     def test_symlink_and_tampered_lock_are_rejected(self):
         if not hasattr(os, "symlink"): self.skipTest("symlink unsupported")
         with tempfile.TemporaryDirectory() as tmp:
@@ -82,6 +102,14 @@ class StageBAgentTests(unittest.TestCase):
         self.assertEqual(result.value["markdown"], "已纠正")
         self.assertEqual(result.audit[2]["event"], "tool_error")
         self.assertIn("path_not_in_lock", str(client.inputs[1]["input"]))
+
+    def test_tool_audit_records_requested_path_hash_and_normalized_path(self):
+        calls = [ModelToolCall("read_skill_file", '{"path":"guizang-ppt/SKILL.md"}', "c1")]
+        client = ScriptedClient([ModelTurn(None, "r1", calls), ModelTurn('{"markdown":"ok"}', "r2")])
+        result = AgentRuntime(client, SkillRuntime.builtin()).run("narrative", {})
+        tool_event = next(e for e in result.audit if e.get("event") == "tool")
+        self.assertEqual(tool_event["requested_path_sha256"], hashlib.sha256("guizang-ppt/SKILL.md".encode()).hexdigest())
+        self.assertEqual(tool_event["path"], "SKILL.md")
 
     def test_clarification_has_no_tools_and_rejects_unsolicited_tool_calls(self):
         client=ScriptedClient([ModelTurn('{"questions":[]}',"r")])
