@@ -1,10 +1,10 @@
-import { api, ApiError } from "./api.js?v=2026.08.16.053640953906";
-import { JobTracker } from "./job-tracker.js?v=2026.08.16.053640953906";
-import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.16.053640953906";
-import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.16.053640953906";
-import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.16.053640953906";
-import { inlineError, setBusy } from "./components/index.js?v=2026.08.16.053640953906";
-import { renderStage } from "./stages/index.js?v=2026.08.16.053640953906";
+import { api, ApiError } from "./api.js?v=2026.08.16.064435603168";
+import { JobTracker } from "./job-tracker.js?v=2026.08.16.064435603168";
+import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.16.064435603168";
+import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.16.064435603168";
+import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.16.064435603168";
+import { inlineError, setBusy } from "./components/index.js?v=2026.08.16.064435603168";
+import { renderStage } from "./stages/index.js?v=2026.08.16.064435603168";
 
 const app = document.getElementById("app");
 const APP_BUILD = document.querySelector('meta[name="app-build"]')?.content || "unknown";

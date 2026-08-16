@@ -95,9 +95,9 @@ class AgentGateway:
     It deliberately exposes no workflow operation to the model.  The service
     remains the only owner of stages, versions, approvals and commits.
     """
-    def __init__(self, client, *, skill=None, max_steps=12, timeout_seconds=60, model="agent"):
+    def __init__(self, client, *, skill=None, max_steps=12, run_timeout_seconds=300, model="agent"):
         self.client, self.model = client, model
-        self.max_steps, self.timeout_seconds = max_steps, timeout_seconds
+        self.max_steps, self.run_timeout_seconds = max_steps, run_timeout_seconds
         self.skill_factory = SkillRuntime.builtin if skill is None else lambda: SkillRuntime(skill.root, max_file_bytes=skill.max_file_bytes, max_total_bytes=skill.max_total_bytes)
         self.runtime = None
         self.audit_sink = None
@@ -108,7 +108,7 @@ class AgentGateway:
     def _run(self, stage, payload):
         # Read quotas and audit are scoped to one stage invocation.  Reusing a
         # mutable SkillRuntime would let earlier stages consume later budgets.
-        self.runtime = AgentRuntime(self.client, self.skill_factory(), max_steps=self.max_steps, timeout_seconds=self.timeout_seconds)
+        self.runtime = AgentRuntime(self.client, self.skill_factory(), max_steps=self.max_steps, timeout_seconds=self.run_timeout_seconds)
         failure = None
         try:
             result = self.runtime.run(stage, payload)
@@ -212,7 +212,7 @@ class AgentGateway:
                 self.client,
                 self.skill_factory(),
                 max_steps=self.max_steps,
-                timeout_seconds=self.timeout_seconds,
+                timeout_seconds=self.run_timeout_seconds,
             ).run("clarification", {"capability_probe": "return_empty_questions"}, capability_probe=True)
             if clarification.value != {"questions": []}:
                 raise GatewayError("模型未按探测契约返回空问题集",code="probe_invalid_output")
@@ -227,7 +227,7 @@ class AgentGateway:
                 self.client,
                 self.skill_factory(),
                 max_steps=self.max_steps,
-                timeout_seconds=self.timeout_seconds,
+                timeout_seconds=self.run_timeout_seconds,
             ).run("narrative", {"capability_probe": "list_skill_files_then_return_markdown"}, capability_probe=True)
             if not any(event.get("event") == "tool" for event in tools.audit):
                 raise GatewayError("模型未完成强制工具调用",code="probe_tool_call_missing")
@@ -271,8 +271,8 @@ def agent_gateways_from_config(config):
     if config.mode == "fake": return {}
     from .model_clients import model_clients_from_config
     clients = model_clients_from_config(config); skill = SkillRuntime.builtin()
-    generation = AgentGateway(clients["generation"], skill=skill, max_steps=config.generation.max_steps, timeout_seconds=config.generation.timeout_seconds, model=config.generation.model)
-    inspection = AgentGateway(clients["inspection"], skill=skill, max_steps=config.inspection.max_steps, timeout_seconds=config.inspection.timeout_seconds, model=config.inspection.model)
+    generation = AgentGateway(clients["generation"], skill=skill, max_steps=config.generation.max_steps, run_timeout_seconds=config.generation.run_timeout_seconds, model=config.generation.model)
+    inspection = AgentGateway(clients["inspection"], skill=skill, max_steps=config.inspection.max_steps, run_timeout_seconds=config.inspection.run_timeout_seconds, model=config.inspection.model)
     return {"generator": generation, "clarifier": generation, "builder": generation, "inspector": inspection, "skills": LockedSkillMetadataLoader(skill)}
 
 def gateways_from_env():

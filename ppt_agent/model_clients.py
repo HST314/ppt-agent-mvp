@@ -46,7 +46,7 @@ class OpenAIResponsesClient:
         self.config = config
         self.structured_output = getattr(config, "structured_output", "auto") or "auto"
         self._text_format_unsupported = False
-        self._client = sdk_client or OpenAI(api_key=config.api_key, base_url=config.base_url, timeout=config.timeout_seconds, max_retries=0)
+        self._client = sdk_client or OpenAI(api_key=config.api_key, base_url=config.base_url, timeout=config.request_timeout_seconds, max_retries=0)
 
     def create(self, *, input: Any, tools: list[dict] | None = None, response_schema: dict | None = None, tool_choice: Any = None) -> ModelTurn:
         use_format = bool(response_schema) and self.structured_output != "prompt" and not self._text_format_unsupported

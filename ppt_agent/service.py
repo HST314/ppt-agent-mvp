@@ -4,6 +4,7 @@ import hashlib, inspect, json, logging, re, threading, time, uuid
 from pathlib import Path
 from datetime import datetime, timezone
 
+from .config import ClarificationConfig
 from .errors import ConflictError, GatewayError, RuntimeUnavailableError, ValidationError
 from .fsm import TaskState, transition
 from .gateways import FakeGenerationGateway, FakeHtmlBuilder, FakeInspectionGateway, FakeSkillLoader
@@ -18,9 +19,21 @@ from .offline import offline_assets, offline_player
 def utcnow(): return datetime.now(timezone.utc).isoformat()
 def fingerprint(value): return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(",",":")).encode()).hexdigest()
 
+def _clarification_directive(config: ClarificationConfig, round_number: int) -> str:
+    budget = f"本轮为第 {round_number}/{config.max_rounds} 轮澄清，最多提出 {config.max_questions_per_round} 个问题。"
+    if config.style == "minimal":
+        return budget + "仅提出真正阻碍交付的关键问题，blocking 置 true；若没有值得追问的问题，返回空 questions 数组提前结束澄清。"
+    return (
+        budget
+        + "积极全面地追问：除缺失的目标/受众/主题外，还可围绕使用场景、内容范围、风格偏好、页数、语言、素材约束等提出高价值问题；"
+        "阻断交付的问题 blocking 置 true，偏好类问题 blocking 置 false；"
+        "除非确无更多有价值的问题，本轮应尽量提出接近上限数量的问题；确无更多问题时返回空 questions 数组提前结束澄清。"
+    )
+
 class TaskService:
-    def __init__(self,store,generator=None,inspector=None,skills=None,builder=None,clarifier=None):
+    def __init__(self,store,generator=None,inspector=None,skills=None,builder=None,clarifier=None,clarification_config=None):
         self.store=store; self.generator=generator or FakeGenerationGateway(); self.inspector=inspector or FakeInspectionGateway(); self.skills=skills or FakeSkillLoader(); self.builder=builder or FakeHtmlBuilder(); self.clarifier=clarifier
+        self._clarification_config=clarification_config or ClarificationConfig()
         self._runtime_capabilities={"checked":False,"ready":True,"status":"not_required","models":[]}
         self._runtime_guard=threading.RLock()
         self._runtime_probe_guard=threading.Lock()
@@ -199,7 +212,7 @@ class TaskService:
             questions=[] if self.clarifier is not None else questions_for(card)
             diagnostic_id=f"clarification-{digest(canonical({'task_id':task_id,'card':card,'raw_source_hash':raw_source_hash}))[:16]}"
             clarification=ClarificationSet.parse({"clarification_id":f"clarification-{digest(canonical({'questions':questions,'diagnostic_id':diagnostic_id,'raw_source_hash':raw_source_hash}))[:16]}","task_id":task_id,"questions":tuple(q["prompt"] for q in questions),"assumptions":tuple(card["assumptions"]),"confirmed":not questions,"schema_version":"1.0"})
-            clarification_meta={"questions":questions,"details":questions,"answers":{},"invalidated":[],"status":"generating" if self.clarifier is not None else "ready","question_source":None if self.clarifier is not None else "fallback","question_model":None,"diagnostic_id":diagnostic_id,"question_schema_version":"1.0","input_hash":raw_source_hash}
+            clarification_meta={"questions":questions,"details":questions,"answers":{},"invalidated":[],"status":"generating" if self.clarifier is not None else "ready","question_source":None if self.clarifier is not None else "fallback","question_model":None,"diagnostic_id":diagnostic_id,"question_schema_version":"1.0","input_hash":raw_source_hash,"round":1,"rounds_history":[],"max_rounds":self._clarification_config.max_rounds,"max_questions_per_round":self._clarification_config.max_questions_per_round,"style":self._clarification_config.style}
             clarification_hash=self.store.put_version(task_id,"clarification",canonical(clarification.to_dict()),clarification_meta)
             snapshot=TaskInputSnapshot.parse({"snapshot_id":f"snapshot-{digest((raw_source_hash+card_hash+manifest_hash).encode())[:16]}","task_id":task_id,"task_card_hash":card_hash,"resource_manifest_hash":manifest_hash,"created_at":now(),"schema_version":"1.0"})
             snapshot_hash=self.store.put_version(task_id,"input-snapshot",canonical(snapshot.to_dict()),{"clarification_hash":clarification_hash,"raw_source_hash":raw_source_hash,"rebuild_of":existing[-1]["hash"] if existing else None})
@@ -241,13 +254,21 @@ class TaskService:
     def generate_clarification(self,task_id):
         if self.clarifier is None: raise ConflictError("当前为 fake 模式，不能调用澄清模型")
         view=self.input_view(task_id); snapshot_record=next(v for v in self.versions(task_id,"input-snapshot") if v["hash"]==view["snapshot_hash"]); raw_hash=snapshot_record["metadata"]["raw_source_hash"]
-        payload={"task_id":task_id,"original_input":self.version(task_id,raw_hash).decode("utf-8"),"original_input_sha256":raw_hash,"normalized_task_card":view["task_card"],"candidate_missing_fields":view["task_card"].get("missing",[]),"resource_summary":view["manifest"]}
+        prior=view["clarification"]; config=self._clarification_config
+        round_number=prior.get("round",1); history=list(prior.get("rounds_history",[]))
+        payload={"task_id":task_id,"original_input":self.version(task_id,raw_hash).decode("utf-8"),"original_input_sha256":raw_hash,"normalized_task_card":view["task_card"],"candidate_missing_fields":view["task_card"].get("missing",[]),"resource_summary":view["manifest"],"clarification_context":{"round":round_number,"max_rounds":config.max_rounds,"max_questions_per_round":config.max_questions_per_round,"style":config.style,"directive":_clarification_directive(config,round_number),"previous_qa":history}}
         try:
-            value=self.clarifier.clarify(payload); questions=self._validate_model_questions(value.get("questions"),view["task_card"])
+            value=self.clarifier.clarify(payload)
+            asked=[q.get("field_path") for entry in history for q in entry.get("questions",[]) if isinstance(q,dict)]
+            questions=self._validate_model_questions(value.get("questions"),view["task_card"],max_questions=config.max_questions_per_round,asked_field_paths=asked)
         except Exception as exc:
             error=exc.public()["error"] if hasattr(exc,"public") else {"code":"clarification_generation_failed","message":"澄清问题生成失败","diagnostic_id":hashlib.sha256(f"{task_id}:{type(exc).__name__}".encode()).hexdigest()[:24]}
             self._record_clarification(task_id,view,[],"failed",None,error,"clarification_failed"); raise
-        return self._record_clarification(task_id,view,questions,"ready",value.get("model"),None,"clarification_generate")
+        result=self._record_clarification(task_id,view,questions,"ready",value.get("model"),None,"clarification_generate")
+        if result["confirmed"] and history:
+            # 模型在后续轮次返回 0 题 = 提前确认；此前轮次的答案已合并进任务卡，同步冻结。
+            self._freeze_task_card(task_id,view["task_card"],result["clarification_hash"])
+        return result
     def use_fallback_clarification(self,task_id):
         view=self.input_view(task_id)
         return self._record_clarification(task_id,view,questions_for(view["task_card"]),"ready",None,None,"clarification_fallback",source="fallback")
@@ -255,25 +276,28 @@ class TaskService:
         view=self.input_view(task_id)
         public=error.public()["error"] if hasattr(error,"public") else {"code":"runtime_unavailable","message":"模型运行时尚未就绪","diagnostic_id":hashlib.sha256(f"{task_id}:runtime".encode()).hexdigest()[:24]}
         return self._record_clarification(task_id,view,[],"failed",None,public,"clarification_failed")
-    def _validate_model_questions(self,questions,card):
-        if not isinstance(questions,list) or len(questions)>5: raise ValidationError("澄清模型 questions 必须为 0 到 5 项")
-        required={"question_id","field_path","prompt","helper_text","options","allow_other","blocking"}; seen_ids=set(); seen_paths=set(); known={k for k in ("goal","audience","topic") if k not in card.get("missing",[])}; result=[]
+    def _validate_model_questions(self,questions,card,*,max_questions=5,asked_field_paths=()):
+        if not isinstance(questions,list) or len(questions)>max_questions: raise ValidationError(f"澄清模型 questions 必须为 0 到 {max_questions} 项")
+        required={"question_id","field_path","prompt","helper_text","options","allow_other","blocking"}; seen_ids=set(); seen_paths=set(); known={k for k in ("goal","audience","topic") if k not in card.get("missing",[])}; asked={path for path in asked_field_paths if isinstance(path,str)}; result=[]
         for q in questions:
             if not isinstance(q,dict) or set(q)!=required: raise ValidationError("澄清问题 Schema 无效")
             if q["question_id"] in seen_ids or q["field_path"] in seen_paths: raise ValidationError("澄清问题存在重复 ID 或字段")
-            if q["field_path"] in known: raise ValidationError("澄清模型重复询问已知事实")
+            if q["field_path"] in known or q["field_path"] in asked: raise ValidationError("澄清模型重复询问已知事实")
             if not all(isinstance(q[k],str) and q[k].strip() for k in ("question_id","field_path","prompt","helper_text")) or not isinstance(q["allow_other"],bool) or not isinstance(q["blocking"],bool): raise ValidationError("澄清问题字段无效")
             if not isinstance(q["options"],list) or any(not isinstance(o,dict) or set(o)!={"value","label","description"} or not all(isinstance(o[k],str) for k in o) or not o["value"].strip() or not o["label"].strip() for o in q["options"]): raise ValidationError("澄清选项 Schema 无效")
             if len({o["value"] for o in q["options"]})!=len(q["options"]): raise ValidationError("澄清选项重复")
             seen_ids.add(q["question_id"]); seen_paths.add(q["field_path"]); result.append({**q,"field":q["field_path"]})
         return result
     def _record_clarification(self,task_id,view,questions,status,model,error,action,source="model"):
-        meta={"questions":questions,"details":questions,"answers":{},"invalidated":[],"status":status,"question_source":source if status=="ready" else None,"question_model":model,"diagnostic_id":view["clarification"]["diagnostic_id"],"question_schema_version":"1.0","input_hash":view["clarification"]["input_hash"],"normalized_task_card":view["task_card"]}
+        config=self._clarification_config
+        meta={"questions":questions,"details":questions,"answers":{},"invalidated":[],"status":status,"question_source":source if status=="ready" else None,"question_model":model,"diagnostic_id":view["clarification"]["diagnostic_id"],"question_schema_version":"1.0","input_hash":view["clarification"]["input_hash"],"normalized_task_card":view["task_card"],"round":config.max_rounds if source=="fallback" else view["clarification"].get("round",1),"rounds_history":list(view["clarification"].get("rounds_history",[])),"max_rounds":config.max_rounds,"max_questions_per_round":config.max_questions_per_round,"style":config.style}
         if error: meta["error"]=error
         artifact=ClarificationSet.parse({"clarification_id":f"clarification-{digest(canonical(meta))[:16]}","task_id":task_id,"questions":tuple(q["prompt"] for q in questions),"assumptions":tuple(),"confirmed":status=="ready" and not questions,"schema_version":"1.0"}); ch=self.store.put_version(task_id,"clarification",canonical(artifact.to_dict()),meta)
         state=TaskState.parse(self.get(task_id)); failed=status=="failed"; new=TaskState(**{**state.__dict__,"status":state.status.WAITING_FOR_USER if failed or questions else state.status.READY,"waiting_reason":"clarification_failed" if failed else "missing_required_input" if questions else None,"required_action":"retry_clarification" if failed else "answer_clarifications" if questions else None,"revision":state.revision+1})
         event={"event_id":hashlib.sha256(f"{task_id}:{action}:{ch}".encode()).hexdigest()[:24],"command_id":f"{action}-{ch[:16]}","action":action,"actor":"system" if action!="clarification_fallback" else "user","request_hash":meta["input_hash"],"at":utcnow(),"from":state.to_dict(),"to":new.to_dict(),"result":{"clarification_hash":ch,"snapshot_hash":view["snapshot_hash"],"input_hash":meta["input_hash"]}}
         self.store.commit(task_id,new.to_dict(),event); return {"clarification_hash":ch,**meta,"confirmed":artifact.confirmed}
+    def _freeze_task_card(self,task_id,merged,clarification_hash):
+        self.store.put_version(task_id,"task-card",canonical(TaskCard.parse({"task_id":task_id,"goal":merged.get("goal","待澄清"),"audience":merged.get("audience","待澄清"),"topic":merged.get("topic","待澄清"),"source_format":merged.get("source_format","json"),"schema_version":"1.0"}).to_dict()),{"normalized":merged,"clarification_hash":clarification_hash})
     def answer_clarification(self,task_id,question_id,answer):
         return self.answer_clarifications(task_id,{question_id:answer})
     def answer_clarifications(self,task_id,submitted,require_complete=False):
@@ -295,13 +319,26 @@ class TaskService:
         merged=dict(view["task_card"]); merged.update({q["field"]:answers[q["question_id"]] for q in details if q["question_id"] in answers})
         merged["missing"]=[key for key in merged.get("missing",[]) if not merged.get(key)]
         payload={"questions":details,"details":details,"answers":answers,"status":"ready","normalized_task_card":merged,"invalidated":(["narrative","outline","sample","deck","inspection","delivery"] if changed else clarification.get("invalidated",[])),**{k:clarification.get(k) for k in ("question_source","question_model","diagnostic_id","question_schema_version","input_hash")}}
+        if not pending:
+            config=self._clarification_config; current_round=clarification.get("round",1)
+            if self.clarifier is not None and clarification.get("question_source")=="model" and current_round < config.max_rounds:
+                # 阻断题已答完且轮次预算未用尽：归档本轮问答，自动生成下一轮。
+                history=list(clarification.get("rounds_history",[]))
+                history.append({"round":current_round,"questions":details,"answers":{q["question_id"]:answers[q["question_id"]] for q in details if q["question_id"] in answers}})
+                next_meta={"questions":[],"details":[],"answers":{},"invalidated":payload["invalidated"],"status":"generating","question_source":None,"question_model":None,"diagnostic_id":clarification["diagnostic_id"],"question_schema_version":"1.0","input_hash":clarification["input_hash"],"normalized_task_card":merged,"round":current_round+1,"rounds_history":history,"max_rounds":config.max_rounds,"max_questions_per_round":config.max_questions_per_round,"style":config.style}
+                artifact=ClarificationSet.parse({"clarification_id":f"clarification-{digest(canonical(next_meta))[:16]}","task_id":task_id,"questions":tuple(),"assumptions":tuple(),"confirmed":False,"schema_version":"1.0"})
+                ch=self.store.put_version(task_id,"clarification",canonical(artifact.to_dict()),next_meta)
+                state=TaskState.parse(self.get(task_id)); new=TaskState(**{**state.__dict__,"status":state.status.WAITING_FOR_USER,"waiting_reason":"clarification_generating","required_action":"wait_for_clarification","revision":state.revision+1})
+                event={"event_id":hashlib.sha256(f"{task_id}:answer:{ch}".encode()).hexdigest()[:24],"command_id":f"answer-{ch[:16]}","action":"answer_clarification","actor":"user","request_hash":fingerprint(submitted),"at":utcnow(),"from":state.to_dict(),"to":new.to_dict(),"result":{"clarification_hash":ch,"invalidated":payload["invalidated"],"next_round":current_round+1}}
+                self.store.commit(task_id,new.to_dict(),event)
+                return {"state":self.get(task_id),"clarification_hash":ch,**next_meta,"confirmed":False}
         model=ClarificationSet.parse({"clarification_id":f"clarification-{digest(canonical(payload))[:16]}","task_id":task_id,"questions":tuple(q["prompt"] for q in details),"assumptions":tuple(),"confirmed":not pending,"schema_version":"1.0"})
         ch=self.store.put_version(task_id,"clarification",canonical(model.to_dict()),payload)
         state=TaskState.parse(self.get(task_id)); new=TaskState(**{**state.__dict__,"status":state.status.WAITING_FOR_USER if pending else state.status.READY,"waiting_reason":"missing_required_input" if pending else None,"required_action":"answer_clarifications" if pending else None,"revision":state.revision+1})
         event={"event_id":hashlib.sha256(f"{task_id}:answer:{ch}".encode()).hexdigest()[:24],"command_id":f"answer-{ch[:16]}","action":"answer_clarification","actor":"user","request_hash":fingerprint(submitted),"at":utcnow(),"from":state.to_dict(),"to":new.to_dict(),"result":{"clarification_hash":ch,"invalidated":payload["invalidated"]}}
         self.store.commit(task_id,new.to_dict(),event)
         if not pending:
-            self.store.put_version(task_id,"task-card",canonical(TaskCard.parse({"task_id":task_id,"goal":merged.get("goal","待澄清"),"audience":merged.get("audience","待澄清"),"topic":merged.get("topic","待澄清"),"source_format":merged.get("source_format","json"),"schema_version":"1.0"}).to_dict()),{"normalized":merged,"clarification_hash":ch})
+            self._freeze_task_card(task_id,merged,ch)
         if new.mode=="auto" and not pending: self._drive_auto_to_sample(task_id)
         return {"state":self.get(task_id),"clarification_hash":ch,**payload,"confirmed":not pending}
 

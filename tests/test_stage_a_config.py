@@ -49,6 +49,38 @@ class StageAConfigTests(unittest.TestCase):
         self.assertEqual(example.mode,"agent")
         self.assertEqual(example.generation.structured_output,"auto")
 
+    def test_timeout_split_defaults_and_legacy_alias(self):
+        env={"GEN_KEY":"secret","GEN_URL":"https://gen.example/v1"}
+        base="""gateway: {mode: agent}\nmodels:\n  generation:\n    provider: openai_responses\n    model: gen\n    api_key_env: GEN_KEY\n    base_url_env: GEN_URL\n%s  inspection: {fallback_to_generation: true}\n"""
+        cfg=self.config(base % "",env)
+        self.assertEqual(cfg.generation.request_timeout_seconds,60)
+        self.assertEqual(cfg.generation.run_timeout_seconds,300)
+        cfg=self.config(base % "    timeout_seconds: 45\n",env)
+        self.assertEqual(cfg.generation.request_timeout_seconds,45)
+        self.assertEqual(cfg.generation.run_timeout_seconds,300)
+        cfg=self.config(base % "    request_timeout_seconds: 30\n    run_timeout_seconds: 900\n",env)
+        self.assertEqual(cfg.generation.request_timeout_seconds,30)
+        self.assertEqual(cfg.generation.run_timeout_seconds,900)
+        with self.assertRaises(ValidationError):
+            self.config(base % "    timeout_seconds: 30\n    request_timeout_seconds: 30\n",env)
+        for invalid in ("    run_timeout_seconds: 5\n","    run_timeout_seconds: 1.5.2\n","    request_timeout_seconds: true\n"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValidationError):
+                self.config(base % invalid,env)
+
+    def test_clarification_block_is_validated_and_carried(self):
+        env={"GEN_KEY":"secret","GEN_URL":"https://gen.example/v1"}
+        base="""gateway: {mode: agent}\nmodels:\n  generation:\n    provider: openai_responses\n    model: gen\n    api_key_env: GEN_KEY\n    base_url_env: GEN_URL\n  inspection: {fallback_to_generation: true}\n"""
+        cfg=self.config(base,env)
+        self.assertEqual((cfg.clarification.max_questions_per_round,cfg.clarification.max_rounds,cfg.clarification.style),(3,3,"comprehensive"))
+        cfg=self.config(base+"clarification: {max_questions_per_round: 5, max_rounds: 2, style: minimal}\n",env)
+        self.assertEqual((cfg.clarification.max_questions_per_round,cfg.clarification.max_rounds,cfg.clarification.style),(5,2,"minimal"))
+        self.assertIn("clarification",cfg.public())
+        for invalid in ("clarification: {style: strict}\n","clarification: {max_rounds: 9}\n","clarification: {max_questions_per_round: 1.5}\n","clarification: {unknown: 1}\n","clarification: {max_questions_per_round: 0}\n"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValidationError):
+                self.config(base+invalid,env)
+        fake=self.config("gateway: {mode: fake}\nclarification: {style: minimal, max_rounds: 1}\n",{})
+        self.assertEqual((fake.clarification.style,fake.clarification.max_rounds),("minimal",1))
+
     def test_structured_output_mode_is_validated(self):
         env={"GEN_KEY":"secret","GEN_URL":"https://gen.example/v1"}
         base="""gateway: {mode: agent}\nmodels:\n  generation:\n    provider: openai_responses\n    model: gen\n    api_key_env: GEN_KEY\n    base_url_env: GEN_URL\n    structured_output: %s\n  inspection: {fallback_to_generation: true}\n"""

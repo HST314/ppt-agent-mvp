@@ -105,17 +105,32 @@ async def fallback_clarification(task_id: str, request: Request, service: TaskSe
     return service.use_fallback_clarification(task_id)
 
 
+def _enqueue_next_clarification_round(task_id: str, result: dict, service: TaskService, jobs: JobService) -> dict:
+    """答案合并后若触发了下一轮澄清，像首轮一样交给持久化 Job 生成。"""
+    if result.get("status") != "generating":
+        return result
+    try:
+        job, _ = jobs.create(task_id, "clarification.generate", {}, f"clarification-round-{result['clarification_hash'][:16]}")
+        result["job_id"] = job["job_id"]
+    except RuntimeUnavailableError as error:
+        failed = service.fail_clarification_for_runtime(task_id, error)
+        result.update({"status": failed["status"], "error": failed.get("error"), "state": service.get(task_id)})
+    return result
+
+
 @router.post("/tasks/{task_id}/clarifications/{question_id}/answer")
-async def answer_clarification(task_id: str, question_id: str, request: Request, service: TaskService = Depends(task_service)):
+async def answer_clarification(task_id: str, question_id: str, request: Request, service: TaskService = Depends(task_service), jobs: JobService = Depends(job_service)):
     body = await json_body(request)
     exact(body, {"option", "other"}, {"option"})
-    return service.answer_clarification(task_id, question_id, body)
+    result = service.answer_clarification(task_id, question_id, body)
+    return _enqueue_next_clarification_round(task_id, result, service, jobs)
 
 @router.post("/tasks/{task_id}/clarifications/answers")
-async def answer_clarifications(task_id: str, request: Request, service: TaskService = Depends(task_service)):
+async def answer_clarifications(task_id: str, request: Request, service: TaskService = Depends(task_service), jobs: JobService = Depends(job_service)):
     body = await json_body(request)
     exact(body, {"answers"}, {"answers"})
-    return service.answer_clarifications(task_id, body["answers"], require_complete=True)
+    result = service.answer_clarifications(task_id, body["answers"], require_complete=True)
+    return _enqueue_next_clarification_round(task_id, result, service, jobs)
 
 
 @router.get("/tasks/{task_id}/planning")

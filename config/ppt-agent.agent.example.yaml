@@ -7,7 +7,10 @@ models:
     model: your-generation-model
     api_key_env: MODEL_API_KEY
     base_url_env: MODEL_BASE_URL
-    timeout_seconds: 60
+    # 单次 HTTP 请求超时（秒，1-600）
+    request_timeout_seconds: 60
+    # 整轮 Agent 运行预算（秒，10-3600）；叙事等带工具多轮往返的阶段需要较大预算
+    run_timeout_seconds: 300
     max_steps: 12
     # 结构化输出模式：auto=默认，端点不支持 text.format 时自动降级；json_schema=强制发送；prompt=从不发送
     structured_output: auto
@@ -16,9 +19,19 @@ models:
     model: your-inspection-model
     api_key_env: MODEL_API_KEY
     base_url_env: MODEL_BASE_URL
-    timeout_seconds: 60
+    request_timeout_seconds: 60
+    run_timeout_seconds: 300
     max_steps: 6
     fallback_to_generation: true
+
+# 澄清阶段运行参数（仅 agent 模式的模型澄清使用）
+clarification:
+  # 每轮最多问题数（1-10）
+  max_questions_per_round: 3
+  # 最多轮次（1-5）；模型某轮返回 0 题会提前确认结束
+  max_rounds: 3
+  # 提问风格：minimal=只问阻断交付的关键问题；comprehensive=积极全面追问（偏好类问题可跳过）
+  style: comprehensive
 
 skills:
   active: guizang-ppt-skill

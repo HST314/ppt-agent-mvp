@@ -15,5 +15,6 @@ from config.env_loader import load_dotenv  # 引入 .env 加载器
 load_dotenv(".env")  # 在程序启动时自动读取当前目录下的 .env 文件
 p=argparse.ArgumentParser(); p.add_argument("--host",default="127.0.0.1"); p.add_argument("--port",type=int,default=8000); p.add_argument("--data",default=".ppt-agent-data")
 a=p.parse_args()
-service=TaskService(WorkspaceStore(a.data),**agent_gateways_from_config(load_config()))
+config=load_config()
+service=TaskService(WorkspaceStore(a.data),clarification_config=config.clarification,**agent_gateways_from_config(config))
 uvicorn.run(create_app(service),host=a.host,port=a.port)

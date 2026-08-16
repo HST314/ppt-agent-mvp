@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
+from ppt_agent.config import ClarificationConfig
 from ppt_agent.errors import GatewayError
 from ppt_agent.gateways import AgentGateway
 from ppt_agent.model_clients import OpenAIResponsesClient
@@ -236,6 +237,53 @@ class FastAPIAppTests(unittest.TestCase):
                 self.assertNotIn("I will not call a tool", serialized)
                 self.assertNotIn("not-json", serialized)
                 self.assertNotIn("secret-key", serialized)
+
+    def test_answer_completion_enqueues_next_configured_clarification_round(self):
+        class MultiRoundClarifier:
+            model="multi-round-model"
+            def __init__(self): self.calls=[]
+            def set_audit_sink(self,_sink): pass
+            def probe_capabilities(self): return {"strict_json_schema":True}
+            def clarify(self,payload):
+                self.calls.append(payload)
+                if payload["clarification_context"]["round"]==1:
+                    return {"questions":[{"question_id":"q-audience","field_path":"audience","prompt":"受众是谁？","helper_text":"用于确定叙事重点","options":[],"allow_other":True,"blocking":True}],"model":self.model}
+                return {"questions":[],"model":self.model}
+        def wait_job(client,job_id):
+            deadline=time.monotonic()+5
+            while time.monotonic()<deadline:
+                job=client.get(f"/v1/jobs/{job_id}").json()
+                if job["status"] in {"succeeded","failed","cancelled","interrupted"}: return job
+                time.sleep(0.01)
+            raise AssertionError(f"job {job_id} did not finish: {job}")
+        with tempfile.TemporaryDirectory() as root:
+            clarifier=MultiRoundClarifier()
+            service=TaskService(WorkspaceStore(root),clarifier=clarifier,clarification_config=ClarificationConfig(max_questions_per_round=3,max_rounds=3,style="comprehensive"))
+            with TestClient(create_app(service)) as client:
+                client.post("/v1/tasks",json={"task_id":"rounds","mode":"manual"})
+                imported=client.post("/v1/tasks/rounds/input",json={"source":"新品发布"})
+                self.assertEqual(imported.status_code,200)
+                first_job=wait_job(client,imported.json()["clarification"]["job_id"])
+                self.assertEqual(first_job["status"],"succeeded")
+                view=client.get("/v1/tasks/rounds/input").json()
+                self.assertEqual(view["clarification"]["round"],1)
+                question=view["clarification"]["details"][0]
+                answered=client.post("/v1/tasks/rounds/clarifications/answers",json={"answers":{question["question_id"]:{"option":"Other","other":"管理层"}}})
+                self.assertEqual(answered.status_code,200)
+                body=answered.json()
+                self.assertEqual(body["status"],"generating")
+                self.assertEqual(body["round"],2)
+                self.assertFalse(body["confirmed"])
+                second_job=wait_job(client,body["job_id"])
+                self.assertEqual(second_job["status"],"succeeded")
+                view=client.get("/v1/tasks/rounds/input").json()
+                self.assertTrue(view["clarification"]["confirmed"])
+                self.assertEqual(view["clarification"]["round"],2)
+                self.assertEqual(view["task_card"]["audience"],"管理层")
+                self.assertEqual(view["state"]["status"],"ready")
+                self.assertEqual(len(clarifier.calls),2)
+                previous=clarifier.calls[1]["clarification_context"]["previous_qa"]
+                self.assertEqual(previous[0]["answers"],{question["question_id"]:"管理层"})
 
     def test_unready_clarifier_does_not_enqueue_and_preserves_fallback(self):
         class UnreadyClarifier:

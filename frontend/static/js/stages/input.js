@@ -1,6 +1,6 @@
-import { api } from "../api.js?v=2026.08.16.053640953906";
-import { badge, button, confirmationDialog, element, field, metadataList, shortHash } from "../components/index.js?v=2026.08.16.053640953906";
-import { actionMessage, invalidationNotice, runAction, section, stageGrid } from "./shared.js?v=2026.08.16.053640953906";
+import { api } from "../api.js?v=2026.08.16.064435603168";
+import { badge, button, confirmationDialog, element, field, metadataList, shortHash } from "../components/index.js?v=2026.08.16.064435603168";
+import { actionMessage, invalidationNotice, runAction, section, stageGrid } from "./shared.js?v=2026.08.16.064435603168";
 
 const FIELD_LABELS = { goal: "演示目标", audience: "主要受众", topic: "核心主题" };
 const WARNING_LABELS = {
@@ -123,7 +123,7 @@ function clarificationStage(view, context) {
       actions: [button("返回任务/资料", { href: `/tasks/${encodeURIComponent(context.taskId)}?stage=created`, kind: "primary" })],
     }));
   } else if (status === "generating") {
-    primary.push(clarificationGenerating(activeJob));
+    primary.push(clarificationGenerating(activeJob, clarification));
   } else if (status === "failed") {
     primary.push(clarificationFailed(clarification, context));
   } else if (status !== "ready") {
@@ -188,6 +188,7 @@ function clarificationStage(view, context) {
     section("澄清状态", [
       clarificationStatusBadge(status, clarification),
       metadataList([
+        clarificationRound(clarification) ? ["当前轮次", clarificationRound(clarification)] : null,
         status === "ready" ? ["已回答", `${Object.keys(answers).length} / ${questions.length}`] : null,
         activeJob ? ["生成任务", activeJob.job_id] : null,
         ["当前快照", shortHash(view.snapshot_hash)],
@@ -198,11 +199,13 @@ function clarificationStage(view, context) {
   ], "stage-grid--clarification");
 }
 
-function clarificationGenerating(job) {
+function clarificationGenerating(job, clarification) {
+  const round = clarification && Number.isInteger(clarification.round) && Number.isInteger(clarification.max_rounds)
+    ? `第 ${clarification.round}/${clarification.max_rounds} 轮` : "本轮";
   return section("模型正在阅读任务卡", element("div", { className: "clarification-generating", role: "status", "aria-live": "polite", "aria-atomic": "true" }, [
     element("div", { className: "clarification-generating__header" }, [
       badge("AI 生成中", "primary"),
-      element("p", { text: "正在结合原始任务卡、规范化字段和资源摘要整理本轮问题。" }),
+      element("p", { text: `正在结合原始任务卡、规范化字段、资源摘要和已答记录整理${round}问题。` }),
     ]),
     element("div", { className: "clarification-generating__skeleton", "aria-hidden": "true" }, [
       element("span", { className: "skeleton skeleton--title" }),
@@ -415,10 +418,18 @@ function setQuestionError(card, message) {
   else card.removeAttribute("aria-invalid");
 }
 
+function clarificationRound(clarification) {
+  if (clarification.question_source !== "model") return null;
+  if (!Number.isInteger(clarification.round) || !Number.isInteger(clarification.max_rounds)) return null;
+  return `第 ${clarification.round}/${clarification.max_rounds} 轮`;
+}
+
 function clarificationSource(clarification) {
   const modelGenerated = clarification.question_source === "model";
+  const round = clarificationRound(clarification);
   return element("div", { className: "clarification-source" }, [
     badge(modelGenerated ? "AI 生成问题" : "系统补充问题", modelGenerated ? "primary" : "warning"),
+    round ? badge(round, "primary") : null,
     element("p", { className: "muted", text: modelGenerated
       ? `问题已根据当前任务生成${clarification.question_model ? ` · ${clarification.question_model}` : ""}。`
       : "这些问题来自确定性缺口检查，用于补齐任务卡中的必要信息。" }),

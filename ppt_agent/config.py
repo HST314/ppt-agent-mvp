@@ -17,7 +17,8 @@ class ModelConfig:
     model: str
     api_key_env: str
     base_url_env: str
-    timeout_seconds: float
+    request_timeout_seconds: float
+    run_timeout_seconds: float
     max_steps: int
     api_key: str
     base_url: str
@@ -41,11 +42,22 @@ class ModelConfig:
 
 
 @dataclass(frozen=True)
+class ClarificationConfig:
+    max_questions_per_round: int = 3
+    max_rounds: int = 3
+    style: str = "comprehensive"
+
+    def public(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     mode: str
     generation: ModelConfig | None = None
     inspection: ModelConfig | None = None
     inspection_fallback: bool = False
+    clarification: ClarificationConfig = ClarificationConfig()
 
     def public(self) -> dict:
         return {
@@ -55,12 +67,15 @@ class RuntimeConfig:
                 "inspection": self.inspection.public() if self.inspection else None,
                 "inspection_fallback": self.inspection_fallback,
             },
+            "clarification": self.clarification.public(),
         }
 
 
-_ROOT_KEYS = {"gateway", "models", "skills", "capabilities"}
-_MODEL_KEYS = {"provider", "model", "api_key_env", "base_url_env", "timeout_seconds", "max_steps", "fallback_to_generation", "structured_output"}
+_ROOT_KEYS = {"gateway", "models", "skills", "capabilities", "clarification"}
+_MODEL_KEYS = {"provider", "model", "api_key_env", "base_url_env", "timeout_seconds", "request_timeout_seconds", "run_timeout_seconds", "max_steps", "fallback_to_generation", "structured_output"}
 _STRUCTURED_OUTPUT_MODES = {"auto", "json_schema", "prompt"}
+_CLARIFICATION_KEYS = {"max_questions_per_round", "max_rounds", "style"}
+_CLARIFICATION_STYLES = {"minimal", "comprehensive"}
 
 
 def _mapping(value, name: str) -> dict:
@@ -97,18 +112,45 @@ def _model(value: dict, name: str, *, required: bool) -> ModelConfig | None:
         raise ValidationError(f"models.{name} Base URL 不得缺少主机或包含凭证、查询参数、片段")
     if parsed.scheme != "https" and not (parsed.scheme == "http" and hostname in {"127.0.0.1", "localhost"}):
         raise ValidationError(f"models.{name} Base URL 必须使用 HTTPS（本机回环地址除外）")
-    timeout = value.get("timeout_seconds", 60)
+    legacy_timeout = value.get("timeout_seconds")
+    request_timeout = value.get("request_timeout_seconds")
+    if legacy_timeout is not None and request_timeout is not None:
+        raise ValidationError(f"models.{name} 不能同时配置 timeout_seconds 与 request_timeout_seconds")
+    if request_timeout is None:
+        # timeout_seconds 是 request_timeout_seconds 的兼容别名；整轮运行预算
+        # 由 run_timeout_seconds 独立控制。
+        request_timeout = legacy_timeout if legacy_timeout is not None else 60
+    run_timeout = value.get("run_timeout_seconds", 300)
     max_steps = value.get("max_steps", 12)
-    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
-        raise ValidationError(f"models.{name}.timeout_seconds 必须为 number")
+    for label, timeout in (("request_timeout_seconds", request_timeout), ("run_timeout_seconds", run_timeout)):
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+            raise ValidationError(f"models.{name}.{label} 必须为 number")
     if isinstance(max_steps, bool) or not isinstance(max_steps, int):
         raise ValidationError(f"models.{name}.max_steps 必须为 integer")
-    if not 1 <= timeout <= 600 or not 1 <= max_steps <= 100:
+    if not 1 <= request_timeout <= 600 or not 10 <= run_timeout <= 3600 or not 1 <= max_steps <= 100:
         raise ValidationError(f"models.{name} 的超时或步数超出范围")
     structured_output = value.get("structured_output", "auto")
     if structured_output not in _STRUCTURED_OUTPUT_MODES:
         raise ValidationError(f"models.{name}.structured_output 只能是 auto、json_schema 或 prompt")
-    return ModelConfig(provider, model, api_key_env, base_url_env, timeout, max_steps, api_key, base_url.rstrip("/"), structured_output)
+    return ModelConfig(provider, model, api_key_env, base_url_env, request_timeout, run_timeout, max_steps, api_key, base_url.rstrip("/"), structured_output)
+
+
+def _clarification(value) -> ClarificationConfig:
+    value = _mapping(value, "clarification")
+    unknown = set(value) - _CLARIFICATION_KEYS
+    if unknown:
+        raise ValidationError(f"clarification 包含未知字段：{', '.join(sorted(unknown))}")
+    max_questions = value.get("max_questions_per_round", 3)
+    max_rounds = value.get("max_rounds", 3)
+    for label, item in (("max_questions_per_round", max_questions), ("max_rounds", max_rounds)):
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise ValidationError(f"clarification.{label} 必须为 integer")
+    if not 1 <= max_questions <= 10 or not 1 <= max_rounds <= 5:
+        raise ValidationError("clarification 的题数或轮次超出范围")
+    style = value.get("style", "comprehensive")
+    if style not in _CLARIFICATION_STYLES:
+        raise ValidationError("clarification.style 只能是 minimal 或 comprehensive")
+    return ClarificationConfig(max_questions, max_rounds, style)
 
 
 def load_config(path: str | Path | None = None, *, env_file: str | Path | None = None) -> RuntimeConfig:
@@ -137,8 +179,9 @@ def load_config(path: str | Path | None = None, *, env_file: str | Path | None =
         raise ValidationError("capabilities 配置无效")
     if any(capabilities.values()):
         raise ValidationError("阶段 A 不允许启用网络或图片能力")
+    clarification = _clarification(raw.get("clarification", {}))
     if mode == "fake":
-        return RuntimeConfig(mode="fake")
+        return RuntimeConfig(mode="fake", clarification=clarification)
     models = _mapping(raw.get("models"), "models")
     if set(models) - {"generation", "inspection"}:
         raise ValidationError("models 包含未知字段")
@@ -155,4 +198,4 @@ def load_config(path: str | Path | None = None, *, env_file: str | Path | None =
         if not fallback:
             raise ValidationError("缺少检查模型且未启用生成模型回退")
         inspection = generation
-    return RuntimeConfig("agent", generation, inspection, fallback)
+    return RuntimeConfig("agent", generation, inspection, fallback, clarification)

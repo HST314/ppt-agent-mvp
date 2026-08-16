@@ -15,12 +15,12 @@ STAGES = {"clarification", "narrative", "outline", "sample", "deck", "inspection
 DATA_IMAGE = "data:image/"
 STAGE_PROMPTS = {
     "clarification": (
-        "直接依据原始任务卡、规范化结果和资源摘要，仅提出真正阻碍交付的 0 到 5 个上下文相关问题；"
-        "不得重复询问已知事实。每个问题必须包含稳定 question_id、目标 field_path、明确 prompt、"
+        "直接依据原始任务卡、规范化结果、资源摘要和澄清上下文（当前轮次、提问预算、已答记录与风格指令）提出澄清问题；"
+        "不得重复询问已知事实或已答记录中已覆盖的内容。每个问题必须包含稳定 question_id、目标 field_path、明确 prompt、"
         "helper_text、0 个或多个带 value/label/description 的 options、allow_other 与 blocking。"
         "本阶段不提供也不需要任何 Skill 工具，禁止请求工具。"
     ),
-    "narrative": "根据任务卡生成叙事结构 Markdown；不要生成逐页 HTML。",
+    "narrative": "根据任务卡生成叙事结构 Markdown；不要生成逐页 HTML。按需最多读取 1 到 2 个最相关的 Skill 文件，不要逐个读取全部文件。",
     "outline": "根据已确认叙事生成逐页大纲 Markdown；保持页面标识稳定。",
     "sample": "仅为外层状态机指定的样品页生成完整 HTML，不得扩展到全稿。",
     "deck": "为外层状态机给定的全部页面生成完整 HTML，并遵守已确认样品的视觉基线。",
