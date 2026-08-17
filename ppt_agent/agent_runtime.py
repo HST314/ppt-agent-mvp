@@ -33,8 +33,8 @@ STAGE_PROMPTS = {
         "按需最多读取 1 到 2 个当前阶段已列出的 Skill 文件，禁止尝试读取布局、主题、图片或 HTML 模板文件；"
         "读取后立即提交大纲 JSON，不要重复读取。"
     ),
-    "sample": "仅为外层状态机指定的样品页生成 section 片段，不得生成公共模板或扩展到全稿；每项 html 必须严格以 <section class=\"slide\" id=\"给定ID\" data-slide-id=\"给定ID\"> 开始并以 </section> 结束；本阶段无工具。",
-    "deck": "仅为外层状态机给定的未确认页面生成 section 片段；不得重做确认样品、不得生成公共模板；每项 html 必须严格以 <section class=\"slide\" id=\"给定ID\" data-slide-id=\"给定ID\"> 开始并以 </section> 结束；本阶段无工具。",
+    "sample": "仅为外层状态机指定的样品页生成 section 片段，不得生成公共模板或扩展到全稿；可按需调用只读 Skill 工具了解布局、主题和素材约束；每项 html 必须严格以 <section class=\"slide\" id=\"给定ID\" data-slide-id=\"给定ID\"> 开始并以 </section> 结束。",
+    "deck": "仅为外层状态机给定的未确认页面生成 section 片段；不得重做确认样品、不得生成公共模板；可按需调用只读 Skill 工具了解布局、主题和素材约束；每项 html 必须严格以 <section class=\"slide\" id=\"给定ID\" data-slide-id=\"给定ID\"> 开始并以 </section> 结束。",
     "inspection": "独立检查大纲与 HTML，仅报告有证据的问题，不得直接修改产物。",
 }
 
@@ -152,7 +152,7 @@ TOOLS = [_list_skill_files_tool(), _read_skill_file_tool(), _get_asset_info_tool
 
 
 def _tools_for_stage(stage: str, stage_files: frozenset[str] | None) -> list[dict]:
-    if stage in {"clarification", "sample", "deck"}:
+    if stage == "clarification":
         return []
     if stage in PLANNING_STAGES:
         allowed = stage_files or frozenset()
@@ -168,10 +168,13 @@ class AgentResult:
 
 
 class AgentRuntime:
-    def __init__(self, client, skill: SkillRuntime, *, max_steps: int = 12, timeout_seconds: float = 60, clock=time.monotonic, max_output_bytes: int = 1024 * 1024, max_tool_calls: int = 24, max_schema_corrections: int = 1, max_tool_error_rounds: int = 2):
+    def __init__(self, client, skill: SkillRuntime, *, max_steps: int = 12, timeout_seconds: float = 60, clock=time.monotonic, max_output_bytes: int = 1024 * 1024, max_tool_calls: int = 24, max_provider_calls: int = 8, max_schema_corrections: int = 1, max_tool_error_rounds: int = 2):
         self.client, self.skill = client, skill
         self.max_steps, self.timeout_seconds, self.clock = max_steps, timeout_seconds, clock
         self.max_output_bytes, self.max_tool_calls = max_output_bytes, max_tool_calls
+        if isinstance(max_provider_calls, bool) or not isinstance(max_provider_calls, int) or not 1 <= max_provider_calls <= 20:
+            raise ValidationError("模型真实请求上限必须是 1 到 20 的整数")
+        self.max_provider_calls = max_provider_calls
         if isinstance(max_schema_corrections, bool) or not isinstance(max_schema_corrections, int) or not 0 <= max_schema_corrections <= 2:
             raise ValidationError("Schema 纠错次数必须是 0 到 2 的整数")
         if isinstance(max_tool_error_rounds, bool) or not isinstance(max_tool_error_rounds, int) or not 1 <= max_tool_error_rounds <= 3:
@@ -197,7 +200,27 @@ class AgentRuntime:
         stage_tools = _tools_for_stage(stage, stage_files)
         override = CLARIFICATION_OVERRIDE if stage == "clarification" else PRODUCT_OVERRIDE
         started, audit, tool_count, tool_error_rounds, schema_corrections = self.clock(), [], 0, 0, 0
-        provider_call_budget = ProviderCallBudget(2) if stage in {"sample", "deck"} else None
+        active_step = 0
+
+        def metrics(*, provider_calls: int | None = None) -> dict[str, Any]:
+            return {
+                "stage": stage,
+                "agent_step": active_step,
+                "max_steps": self.max_steps,
+                "provider_calls": provider_call_budget.claimed if provider_calls is None else provider_calls,
+                "max_provider_calls": self.max_provider_calls,
+                "tool_calls": tool_count,
+                "max_tool_calls": self.max_tool_calls,
+            }
+
+        def provider_claimed(claimed: int, limit: int) -> None:
+            progress(
+                "provider_request",
+                f"模型请求 {claimed} / {limit}",
+                metrics(provider_calls=claimed),
+            )
+
+        provider_call_budget = ProviderCallBudget(self.max_provider_calls, provider_claimed)
         successful_read_count, successful_read_paths = 0, set()
         tool_error_corrections, recovery_active = 0, False
         remaining_paths: frozenset[str] | None = None
@@ -217,7 +240,15 @@ class AgentRuntime:
 
         def fail(message: str, reason: str, cause=None):
             phase = probe_phase(reason) if capability_probe else None
-            terminal = {"event": "terminal", "reason": reason, "tool_calls": tool_count}
+            terminal = {
+                "event": "terminal",
+                "reason": reason,
+                "tool_calls": tool_count,
+                "provider_calls": provider_call_budget.claimed,
+                "max_steps": self.max_steps,
+                "max_tool_calls": self.max_tool_calls,
+                "max_provider_calls": self.max_provider_calls,
+            }
             if phase:
                 terminal["probe_phase"] = phase
             audit.append(terminal)
@@ -244,8 +275,9 @@ class AgentRuntime:
                 else "\n这是启动能力探测：必须先调用一次 list_skill_files，收到工具结果后再提交符合 Schema 的 JSON。"
             )
         conversation: list[Any] = [{"role": "system", "content": f"当前阶段：{stage}\n阶段目标：{STAGE_PROMPTS[stage]}\n{override}\n{tool_contract}{probe_instruction}\n{_output_contract(local_schema)}"}, {"role": "user", "content": input_json}]
-        stage_max_steps = min(self.max_steps, 2) if stage in {"sample", "deck"} else self.max_steps
-        for step in range(1, stage_max_steps + 1):
+        convergence_step = max(2, (self.max_steps * 4 + 4) // 5)
+        for step in range(1, self.max_steps + 1):
+            active_step = step
             checkpoint()
             if self.clock() - started >= self.timeout_seconds:
                 fail("Agent 运行超时，未提交阶段产物", "deadline_exceeded")
@@ -265,18 +297,25 @@ class AgentRuntime:
                 if capability_probe and stage != "clarification":
                     tool_choice = {"type": "function", "name": "list_skill_files"} if tool_count == 0 else "none"
                 request_schema = None if capability_probe and stage != "clarification" and tool_count == 0 else provider_schema
-                progress("waiting_model", f"等待模型响应（第 {step} 轮）")
+                if step == convergence_step:
+                    conversation.append({
+                        "role": "user",
+                        "content": "当前阶段已使用约 80% 的 Agent 步数预算。请停止非必要探索，优先利用已有信息提交符合 Schema 的完整最终结果。",
+                    })
+                    audit.append({"step": step, "event": "budget_convergence", "threshold": 80})
+                progress("waiting_model", f"等待模型响应（第 {step} 轮）", metrics())
                 kwargs = {
                     "input": conversation,
                     "tools": request_tools,
                     "response_schema": request_schema,
                     "tool_choice": tool_choice,
                 }
-                remaining = remaining_seconds(self.timeout_seconds)
                 # Clients that support a request timeout receive the absolute
                 # stage remainder. Legacy/test clients keep their old signature.
                 try:
                     if getattr(self.client, "supports_execution_cancellation", False):
+                        run_remaining = max(0.0, self.timeout_seconds - (self.clock() - started))
+                        remaining = min(run_remaining, remaining_seconds(run_remaining))
                         turn = self.client.create(
                             **kwargs,
                             timeout_seconds=remaining,
@@ -330,6 +369,7 @@ class AgentRuntime:
                     exc.tool_calls = tool_count
                 raise
             checkpoint()
+            progress("provider_response", f"模型响应已返回（第 {step} 轮）", metrics())
             if self.clock() - started >= self.timeout_seconds:
                 fail("Agent 运行超时，未提交阶段产物", "deadline_exceeded")
             output = (turn.text or "").encode()
@@ -345,7 +385,11 @@ class AgentRuntime:
                 request_tool_names = {tool["name"] for tool in request_tools}
                 for call in turn.tool_calls:
                     checkpoint()
-                    progress("skill_loading", f"读取 Skill：{call.name}")
+                    progress("skill_loading", f"调用只读 Skill：{call.name}", {
+                        **metrics(),
+                        "tool_calls": tool_count + 1,
+                        "tool_name": call.name,
+                    })
                     tool_count += 1
                     if tool_count > self.max_tool_calls:
                         fail("Agent 工具调用超过上限", "tool_call_limit")
@@ -375,6 +419,11 @@ class AgentRuntime:
                                 successful_read_paths.add(result["path"])
                     requested_path = args.get("path") if isinstance(args, dict) else None
                     audit.append({"step": step, "event": "tool_error" if failed else "tool", "tool": call.name, "error_code": result.get("error", {}).get("code") if failed else None, "call_id_sha256": hashlib.sha256((call.call_id or "").encode()).hexdigest(), "requested_path_sha256": hashlib.sha256(requested_path.encode()).hexdigest() if isinstance(requested_path, str) and requested_path else None, "path": result.get("path"), "file_sha256": result.get("sha256"), "result_sha256": hashlib.sha256(json.dumps(result, sort_keys=True, ensure_ascii=False).encode()).hexdigest()})
+                    progress(
+                        "skill_completed",
+                        f"只读 Skill 调用{'失败' if failed else '完成'}：{call.name}",
+                        {**metrics(), "tool_name": call.name, "tool_failed": failed},
+                    )
                     conversation.append({"type": "function_call", "name": call.name, "arguments": call.arguments, "call_id": call.call_id})
                     conversation.append({"type": "function_call_output", "call_id": call.call_id, "output": json.dumps(result, ensure_ascii=False)})
                 if failed_calls and not recovery_active:
@@ -401,6 +450,7 @@ class AgentRuntime:
                 continue
             if capability_probe and stage != "clarification" and tool_count == 0:
                 fail("模型忽略了强制工具调用要求", "capability_probe_failed")
+            progress("validating_output", "校验模型输出与阶段 Schema", metrics())
             try:
                 value = _extract_json_object(turn.text or "")
             except json.JSONDecodeError as exc:
@@ -423,7 +473,8 @@ class AgentRuntime:
                 fail(exc.message, "invalid_output", exc)
             if capability_probe and stage != "clarification" and not any(item.get("event") == "tool" for item in audit):
                 fail("模型未完成工具能力探测", "capability_probe_failed")
-            audit.append({"event": "terminal", "reason": "success", "tool_calls": tool_count})
+            audit.append({"event": "terminal", "reason": "success", "tool_calls": tool_count, "provider_calls": provider_call_budget.claimed})
+            progress("agent_completed", "Agent 已提交有效阶段结果", metrics())
             self.last_audit = tuple(audit)
             return AgentResult(value, self.last_audit, turn.response_id)
         fail("Agent 达到最大步数，未提交阶段产物", "max_steps")
@@ -433,7 +484,15 @@ class AgentRuntime:
         if not capability_probe:
             if reason == "tool_error_limit":
                 return "stage_tool_contract_error"
-            return "gateway_error"
+            return {
+                "deadline_exceeded": "agent_run_deadline_exceeded",
+                "max_steps": "agent_step_limit",
+                "tool_call_limit": "agent_tool_call_limit",
+                "output_limit": "agent_output_limit",
+                "invalid_output": "agent_invalid_output",
+                "incomplete_after_tool_error": "agent_incomplete_after_tool_error",
+                "unauthorized_tool": "agent_unauthorized_tool",
+            }.get(reason, "gateway_error")
         if reason == "invalid_output":
             return "probe_tool_final_invalid_output" if tool_calls > 0 else "probe_invalid_output"
         if reason == "capability_probe_failed":

@@ -95,9 +95,10 @@ class AgentGateway:
     It deliberately exposes no workflow operation to the model.  The service
     remains the only owner of stages, versions, approvals and commits.
     """
-    def __init__(self, client, *, skill=None, max_steps=12, run_timeout_seconds=300, model="agent"):
+    def __init__(self, client, *, skill=None, max_steps=12, max_tool_calls=24, max_provider_calls=8, run_timeout_seconds=300, job_timeout_seconds=330, model="agent"):
         self.client, self.model = client, model
-        self.max_steps, self.run_timeout_seconds = max_steps, run_timeout_seconds
+        self.max_steps, self.max_tool_calls, self.max_provider_calls = max_steps, max_tool_calls, max_provider_calls
+        self.run_timeout_seconds, self.job_timeout_seconds = run_timeout_seconds, job_timeout_seconds
         self.skill_factory = SkillRuntime.builtin if skill is None else lambda: SkillRuntime(skill.root, max_file_bytes=skill.max_file_bytes, max_total_bytes=skill.max_total_bytes)
         self.runtime = None
         self.audit_sink = None
@@ -108,7 +109,14 @@ class AgentGateway:
     def _run(self, stage, payload):
         # Read quotas and audit are scoped to one stage invocation.  Reusing a
         # mutable SkillRuntime would let earlier stages consume later budgets.
-        self.runtime = AgentRuntime(self.client, self.skill_factory(), max_steps=self.max_steps, timeout_seconds=self.run_timeout_seconds)
+        self.runtime = AgentRuntime(
+            self.client,
+            self.skill_factory(),
+            max_steps=self.max_steps,
+            max_tool_calls=self.max_tool_calls,
+            max_provider_calls=self.max_provider_calls,
+            timeout_seconds=self.run_timeout_seconds,
+        )
         failure = None
         try:
             result = self.runtime.run(stage, payload)
@@ -216,6 +224,8 @@ class AgentGateway:
                 self.client,
                 self.skill_factory(),
                 max_steps=self.max_steps,
+                max_tool_calls=self.max_tool_calls,
+                max_provider_calls=self.max_provider_calls,
                 timeout_seconds=self.run_timeout_seconds,
             )
             outline = self.client.create(
@@ -246,6 +256,8 @@ class AgentGateway:
                 self.client,
                 self.skill_factory(),
                 max_steps=self.max_steps,
+                max_tool_calls=self.max_tool_calls,
+                max_provider_calls=self.max_provider_calls,
                 timeout_seconds=self.run_timeout_seconds,
             ).run("narrative", {"capability_probe": "list_skill_files_then_return_markdown"}, capability_probe=True)
             if not any(event.get("event") == "tool" for event in tools.audit):
@@ -308,8 +320,24 @@ def agent_gateways_from_config(config):
     if config.mode == "fake": return {}
     from .model_clients import model_clients_from_config
     clients = model_clients_from_config(config); skill = SkillRuntime.builtin()
-    generation = AgentGateway(clients["generation"], skill=skill, max_steps=config.generation.max_steps, run_timeout_seconds=config.generation.run_timeout_seconds, model=config.generation.model)
-    inspection = AgentGateway(clients["inspection"], skill=skill, max_steps=config.inspection.max_steps, run_timeout_seconds=config.inspection.run_timeout_seconds, model=config.inspection.model)
+    generation = AgentGateway(
+        clients["generation"], skill=skill,
+        max_steps=config.generation.max_steps,
+        max_tool_calls=config.generation.max_tool_calls,
+        max_provider_calls=config.generation.max_provider_calls,
+        run_timeout_seconds=config.generation.run_timeout_seconds,
+        job_timeout_seconds=config.generation.job_timeout_seconds,
+        model=config.generation.model,
+    )
+    inspection = AgentGateway(
+        clients["inspection"], skill=skill,
+        max_steps=config.inspection.max_steps,
+        max_tool_calls=config.inspection.max_tool_calls,
+        max_provider_calls=config.inspection.max_provider_calls,
+        run_timeout_seconds=config.inspection.run_timeout_seconds,
+        job_timeout_seconds=config.inspection.job_timeout_seconds,
+        model=config.inspection.model,
+    )
     return {"generator": generation, "clarifier": generation, "builder": generation, "inspector": inspection, "skills": LockedSkillMetadataLoader(skill)}
 
 def gateways_from_env():

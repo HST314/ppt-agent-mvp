@@ -130,10 +130,16 @@ class P0FaultInjectionGate(unittest.TestCase):
         calls = [ModelToolCall("list_skill_files", "{}", "c1")]
         client = Client([ModelTurn(None, "r1", calls), ModelTurn('{"markdown":"ok"}', "r2")])
         seen = []
-        with execution_scope(lambda: False, time.monotonic() + 1, lambda step, message: seen.append(step)):
+        with execution_scope(lambda: False, time.monotonic() + 1, lambda step, message, details: seen.append((step, details))):
             AgentRuntime(client, SkillRuntime.builtin()).run("narrative", {})
-        self.assertIn("waiting_model", seen)
-        self.assertIn("skill_loading", seen)
+        steps = [step for step, _details in seen]
+        self.assertIn("waiting_model", steps)
+        self.assertIn("provider_response", steps)
+        self.assertIn("skill_loading", steps)
+        self.assertIn("skill_completed", steps)
+        metrics = next(details for step, details in seen if step == "skill_completed")
+        self.assertEqual(metrics["tool_calls"], 1)
+        self.assertEqual(metrics["max_provider_calls"], 8)
 
     def test_clarification_infrastructure_failure_is_normalized(self):
         with tempfile.TemporaryDirectory() as root:

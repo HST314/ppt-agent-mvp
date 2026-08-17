@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from ppt_agent.agent_runtime import AgentRuntime
 from ppt_agent.gateways import AgentGateway
-from ppt_agent.model_clients import ModelTurn
+from ppt_agent.model_clients import ModelToolCall, ModelTurn
 from ppt_agent.model_clients import OpenAIResponsesClient
 from ppt_agent.p4 import render
 from ppt_agent.service import TaskService
@@ -32,14 +32,39 @@ class BatchBuilder:
 
 
 class P0GenerationRefactorTests(unittest.TestCase):
-    def test_sample_is_tool_free_and_server_assembles_public_shell(self):
+    def test_sample_exposes_only_read_only_skill_tools_and_server_assembles_public_shell(self):
         fragment='<section class="slide" id="slide-1" data-slide-id="slide-1"><h1>样品</h1></section>'
         client=RecordingClient([ModelTurn(json.dumps({"slides":[{"slide_id":"slide-1","html":fragment}]}),"r1")])
         gateway=AgentGateway(client,skill=SkillRuntime.builtin(),max_steps=100)
         html=gateway.build("## [slide-1] 样品",action="sample",slide_ids=["slide-1"])
         self.assertEqual(len(client.inputs),1)
-        self.assertEqual(client.inputs[0]["tools"],[])
+        self.assertEqual(
+            {tool["name"] for tool in client.inputs[0]["tools"]},
+            {"list_skill_files", "read_skill_file", "get_asset_info"},
+        )
         self.assertNotIn("<!doctype html>",client.inputs[0]["input"][1]["content"])
+        self.assertTrue(html.startswith("<!doctype html>"))
+        self.assertIn(fragment,html)
+
+    def test_sample_can_read_skill_and_finish_after_more_than_two_agent_steps(self):
+        fragment='<section class="slide" id="slide-1" data-slide-id="slide-1"><h1>样品</h1></section>'
+        client=RecordingClient([
+            ModelTurn(None,"r1",(ModelToolCall("list_skill_files","{}","c1"),)),
+            ModelTurn(None,"r2",(ModelToolCall("read_skill_file",'{"path":"SKILL.md"}',"c2"),)),
+            ModelTurn("{}","r3"),
+            ModelTurn(json.dumps({"slides":[{"slide_id":"slide-1","html":fragment}]}),"r4"),
+        ])
+        gateway=AgentGateway(
+            client,
+            skill=SkillRuntime.builtin(),
+            max_steps=30,
+            max_tool_calls=40,
+            max_provider_calls=8,
+        )
+
+        html=gateway.build("## [slide-1] 样品",action="sample",slide_ids=["slide-1"])
+
+        self.assertEqual(len(client.inputs),4)
         self.assertTrue(html.startswith("<!doctype html>"))
         self.assertIn(fragment,html)
 
@@ -58,12 +83,12 @@ class P0GenerationRefactorTests(unittest.TestCase):
             self.assertEqual(candidate["metadata"]["inspection_status"],"pending")
             self.assertFalse(svc.versions("task","inspection"))
 
-    def test_latency_stub_deadlines_are_90_and_180_seconds(self):
-        self.assertEqual(OPERATION_BUDGET_SECONDS["samples.generate"],90)
-        self.assertEqual(OPERATION_BUDGET_SECONDS["samples.modify"],90)
-        self.assertEqual(OPERATION_BUDGET_SECONDS["deck.generate"],180)
-        self.assertEqual(OPERATION_BUDGET_SECONDS["deck.modify"],180)
-        self.assertEqual(OPERATION_BUDGET_SECONDS["inspection.run"],90)
+    def test_html_generation_jobs_have_ten_minute_budget_plus_save_tail(self):
+        self.assertEqual(OPERATION_BUDGET_SECONDS["samples.generate"],630)
+        self.assertEqual(OPERATION_BUDGET_SECONDS["samples.modify"],630)
+        self.assertEqual(OPERATION_BUDGET_SECONDS["deck.generate"],630)
+        self.assertEqual(OPERATION_BUDGET_SECONDS["deck.modify"],630)
+        self.assertEqual(OPERATION_BUDGET_SECONDS["inspection.run"],630)
 
     def test_confirmed_nested_section_is_preserved_by_original_bytes_and_sha256(self):
         class NestedBuilder:
@@ -117,6 +142,19 @@ class P0GenerationRefactorTests(unittest.TestCase):
             client.create(input=[],provider_call_limit=2)
         self.assertEqual(sdk.calls,2)
 
+    def test_provider_request_timeout_is_never_widened_to_the_stage_deadline(self):
+        class SDK:
+            def __init__(self): self.responses=self; self.timeout=None
+            def create(self,**kwargs):
+                self.timeout=kwargs["timeout"]
+                return type("Response",(),{"output_text":"ok","output":[],"id":"r"})()
+        config=type("Config",(),{"model":"m","api_key":"k","base_url":"https://example.com","request_timeout_seconds":180,"structured_output":"prompt"})()
+        sdk=SDK(); client=OpenAIResponsesClient(config,sdk_client=sdk)
+
+        client.create(input=[],timeout_seconds=600)
+
+        self.assertEqual(sdk.timeout,180)
+
     def test_shared_client_keeps_concurrent_stage_budgets_private(self):
         class SDK:
             def __init__(self):
@@ -144,7 +182,7 @@ class P0GenerationRefactorTests(unittest.TestCase):
         config=type("Config",(),{"model":"m","api_key":"k","base_url":"https://example.com","timeout_seconds":3,"structured_output":"prompt"})()
         sdk=SDK(); client=OpenAIResponsesClient(config,sdk_client=sdk)
         def run(task):
-            return AgentRuntime(client,SkillRuntime.builtin()).run("sample",{"task":task})
+            return AgentRuntime(client,SkillRuntime.builtin(),max_provider_calls=2).run("sample",{"task":task})
         with ThreadPoolExecutor(max_workers=2) as pool:
             future_a=pool.submit(run,"task-a")
             self.assertTrue(sdk.a_empty.wait(2))

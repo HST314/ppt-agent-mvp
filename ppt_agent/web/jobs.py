@@ -7,10 +7,16 @@ import os
 import threading
 import uuid
 import time
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows keeps the in-process guard.
+    fcntl = None
 
 from ..audit import bind_agent_audit_context
 from ..errors import ConflictError, GatewayError, NotFoundError, RuntimeUnavailableError, ValidationError
@@ -39,7 +45,24 @@ OPERATION_STAGES = {
     "deck.modify": {"deck", "review"},
     "inspection.run": {"deck", "review"},
 }
-OPERATION_BUDGET_SECONDS = {"clarification.generate":180,"narrative.generate":240,"outline.generate":240,"samples.generate":90,"samples.modify":90,"deck.generate":180,"deck.modify":180,"inspection.run":90}
+OPERATION_BUDGET_SECONDS = {
+    "clarification.generate": 180,
+    "narrative.generate": 240,
+    "outline.generate": 240,
+    "samples.generate": 630,
+    "samples.modify": 630,
+    "deck.generate": 630,
+    "deck.modify": 630,
+    "inspection.run": 630,
+}
+GENERATION_OPERATIONS = {
+    "clarification.generate", "narrative.generate", "outline.generate",
+    "samples.generate", "samples.modify", "deck.generate", "deck.modify",
+}
+METRIC_KEYS = {
+    "stage", "agent_step", "max_steps", "provider_calls", "max_provider_calls",
+    "tool_calls", "max_tool_calls", "tool_name", "tool_failed",
+}
 
 
 class ActiveJobConflict(ConflictError):
@@ -77,6 +100,19 @@ class JobService:
     def __init__(self, service, *, executor: ThreadPoolExecutor | None = None, defer_queued_recovery: bool = False):
         self.service = service
         self.store = service.store
+        self.operation_budgets = dict(OPERATION_BUDGET_SECONDS)
+        generation_timeout = max(
+            (
+                getattr(gateway, "job_timeout_seconds", 0)
+                for gateway in (getattr(service, "clarifier", None), getattr(service, "generator", None), getattr(service, "builder", None))
+            ),
+            default=0,
+        )
+        inspection_timeout = getattr(getattr(service, "inspector", None), "job_timeout_seconds", 0)
+        if generation_timeout:
+            self.operation_budgets.update({operation: generation_timeout for operation in GENERATION_OPERATIONS})
+        if inspection_timeout:
+            self.operation_budgets["inspection.run"] = inspection_timeout
         self.executor = executor or ThreadPoolExecutor(max_workers=4, thread_name_prefix="ppt-job")
         self._guard = threading.RLock()
         self._submitted: set[str] = set()
@@ -102,11 +138,26 @@ class JobService:
     def _event_path(self, task_id: str, job_id: str) -> Path:
         return self._root(task_id) / f"{job_id}.events.jsonl"
 
+    @contextmanager
+    def _event_lock(self, task_id: str, job_id: str):
+        """Serialize sequence allocation across workers and server processes."""
+        path = self._root(task_id) / f"{job_id}.events.lock"
+        with open(path, "a+b") as stream:
+            if fcntl is not None:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
     def _read(self, task_id: str, job_id: str) -> dict[str, Any]:
         path = self._record_path(task_id, job_id)
         pending = self._root(task_id) / f"{job_id}.pending-event.json"
         if pending.exists():
-            self._finish_pending(pending)
+            with self._event_lock(task_id, job_id):
+                if pending.exists():
+                    self._finish_pending(pending)
         if not path.exists():
             raise NotFoundError("Job 不存在")
         return json.loads(path.read_text(encoding="utf-8"))
@@ -127,21 +178,26 @@ class JobService:
         return sorted(records, key=lambda item: (item["created_at"], item["job_id"]))
 
     def _append_event(self, record: dict[str, Any], event_type: str, **values: Any) -> dict[str, Any]:
-        record["last_seq"] += 1
-        event = {
-            "seq": record["last_seq"],
-            "job_id": record["job_id"],
-            "type": event_type,
-            "progress": record.get("progress"),
-            "step": record.get("current_step"),
-            "message": values.pop("message", None),
-            "at": _now(),
-            **values,
-        }
-        pending = self._root(record["task_id"]) / f"{record['job_id']}.pending-event.json"
-        self.store.atomic_json(pending, {"record": record, "event": event})
-        self._finish_pending(pending)
-        return event
+        with self._event_lock(record["task_id"], record["job_id"]):
+            path = self._record_path(record["task_id"], record["job_id"])
+            if path.exists():
+                persisted = json.loads(path.read_text(encoding="utf-8"))
+                record["last_seq"] = max(record.get("last_seq", 0), persisted.get("last_seq", 0))
+            record["last_seq"] += 1
+            event = {
+                "seq": record["last_seq"],
+                "job_id": record["job_id"],
+                "type": event_type,
+                "progress": record.get("progress"),
+                "step": record.get("current_step"),
+                "message": values.pop("message", None),
+                "at": _now(),
+                **values,
+            }
+            pending = self._root(record["task_id"]) / f"{record['job_id']}.pending-event.json"
+            self.store.atomic_json(pending, {"record": record, "event": event})
+            self._finish_pending(pending)
+            return event
 
     def _finish_pending(self, pending: Path) -> None:
         value = json.loads(pending.read_text(encoding="utf-8"))
@@ -261,8 +317,9 @@ class JobService:
                 "result": None,
                 "error": None,
                 "cancellation_requested": False,
-                "deadline_seconds": OPERATION_BUDGET_SECONDS[operation],
+                "deadline_seconds": self.operation_budgets[operation],
                 "deadline_at": None,
+                "metrics": None,
             }
             self._write(record)
             self._append_event(record, "queued", message="任务已进入执行队列")
@@ -288,16 +345,22 @@ class JobService:
                     self._append_event(record, "cancelled", message="任务已取消")
                     return
                 started = datetime.now(timezone.utc)
-                record.update(status="running", progress=None, current_step="domain_operation", started_at=started.isoformat(), deadline_at=(started + timedelta(seconds=record.get("deadline_seconds", OPERATION_BUDGET_SECONDS[record["operation"]]))).isoformat())
+                record.update(status="running", progress=None, current_step="domain_operation", started_at=started.isoformat(), deadline_at=(started + timedelta(seconds=record.get("deadline_seconds", self.operation_budgets[record["operation"]]))).isoformat())
                 self._append_event(record, "started", message="业务操作已开始")
-            deadline = time.monotonic() + record.get("deadline_seconds", OPERATION_BUDGET_SECONDS[record["operation"]])
-            def publish_progress(step, message):
+            deadline = time.monotonic() + record.get("deadline_seconds", self.operation_budgets[record["operation"]])
+            def publish_progress(step, message, details=None):
                 with self._guard:
                     current = self._read(task_id, job_id)
                     if current["status"] not in ACTIVE:
                         return
                     current["current_step"] = step
-                    self._append_event(current, "checkpoint", message=message or step)
+                    metrics = {
+                        key: value for key, value in (details or {}).items()
+                        if key in METRIC_KEYS and isinstance(value, (str, int, float, bool))
+                    }
+                    if metrics:
+                        current["metrics"] = metrics
+                    self._append_event(current, "checkpoint", message=message or step, metrics=current.get("metrics"))
             with execution_scope(lambda: self._read(task_id, job_id).get("cancellation_requested", False), deadline, publish_progress):
                 # Readiness can change after enqueue or while a queued job is being
                 # recovered. Never cross the model boundary without a fresh gate.
@@ -367,8 +430,6 @@ class JobService:
                             "background Job failed",
                             extra={"job_id": job_id, "task_id": task_id, "diagnostic_id": public.get("diagnostic_id")},
                         )
-                    if isinstance(error, ExecutionDeadlineExceeded):
-                        public = {"code":"stage_deadline_exceeded","message":"阶段执行超过硬截止时间"}
                     record.update(
                         status="failed",
                         current_step="failed",
@@ -406,7 +467,7 @@ class JobService:
         keys = (
             "job_id", "task_id", "operation", "status", "progress", "current_step", "last_seq",
             "created_at", "started_at", "finished_at", "result", "error", "cancellation_requested",
-            "deadline_seconds", "deadline_at",
+            "deadline_seconds", "deadline_at", "metrics",
         )
         return {key: record.get(key) for key in keys}
 

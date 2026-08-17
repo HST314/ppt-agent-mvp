@@ -1,4 +1,4 @@
-import { api } from "./api.js?v=2026.08.17.062039223427";
+import { api } from "./api.js?v=2026.08.17.082310785785";
 
 const TERMINAL = new Set(["succeeded", "failed", "cancelled", "interrupted"]);
 const EVENT_TYPES = ["queued", "started", "progress", "checkpoint", "succeeded", "failed", "cancelled", "interrupted", "heartbeat"];
@@ -24,12 +24,30 @@ export class JobTracker {
     this.stop(job.job_id);
     const track = {
       job, callbacks, source: null, timer: null, reconnectTimer: null, recoveryTimer: null,
-      seq: job.last_seq || 0, stopped: false, streamFailures: 0, recoveryAttempts: 0, polling: false,
+      seq: 0, seen: new Set(), stopped: false, streamFailures: 0, recoveryAttempts: 0, polling: false,
     };
     this.tracks.set(job.job_id, track);
     callbacks.onUpdate?.(job, "initial");
-    if (TERMINAL.has(job.status)) return this.finish(track, job);
+    this.hydrate(track);
+  }
+
+  async hydrate(track) {
+    try {
+      await this.syncHistory(track);
+      const job = await api.getJob(track.job.job_id);
+      track.job = job;
+      track.callbacks.onUpdate?.(job, "hydrated");
+    } catch (error) {
+      track.callbacks.onError?.(error);
+    }
+    if (track.stopped) return;
+    if (TERMINAL.has(track.job.status)) return this.finish(track, track.job);
     this.openStream(track);
+  }
+
+  async syncHistory(track) {
+    const response = await api.jobEventHistory(track.job.job_id, track.seq);
+    response.events.forEach((event) => this.applyEvent(track, event, false));
   }
 
   openStream(track, { recovery = false } = {}) {
@@ -78,14 +96,20 @@ export class JobTracker {
 
   handleEvent(track, message) {
     const event = JSON.parse(message.data);
-    if (event.seq <= track.seq) return;
+    this.applyEvent(track, event, true);
+  }
+
+  applyEvent(track, event, reconcile = true) {
+    const eventKey = `${event.job_id}:${event.seq}`;
+    if (track.seen.has(eventKey) || event.seq <= track.seq) return;
+    track.seen.add(eventKey);
     track.seq = event.seq;
     if (event.type === "heartbeat") {
       track.callbacks.onTransport?.("heartbeat", { at: event.at, seq: track.seq });
       return;
     }
     track.callbacks.onEvent?.(event);
-    if (TERMINAL.has(event.type) || event.type === "started" || event.type === "checkpoint") this.reconcile(track);
+    if (reconcile && (TERMINAL.has(event.type) || event.type === "started" || event.type === "checkpoint")) this.reconcile(track);
   }
 
   poll(track, immediate = false) {
@@ -95,9 +119,9 @@ export class JobTracker {
       track.timer = null;
       if (track.stopped || !track.polling) return;
       try {
+        await this.syncHistory(track);
         const job = await api.getJob(track.job.job_id);
         track.job = job;
-        track.seq = Math.max(track.seq, job.last_seq || 0);
         track.callbacks.onUpdate?.(job, "polling");
         if (TERMINAL.has(job.status)) return this.finish(track, job);
       } catch (error) {
@@ -122,6 +146,7 @@ export class JobTracker {
 
   async reconcile(track) {
     try {
+      await this.syncHistory(track);
       const job = await api.getJob(track.job.job_id);
       track.job = job;
       track.callbacks.onUpdate?.(job, "reconciled");

@@ -240,15 +240,37 @@ class JobRecoveryBrowserGate(unittest.TestCase):
 
     def test_job_panel_separates_transport_business_timing_and_cancel_feedback(self):
         page = self.new_page(width=375, height=820)
+        page.emulate_media(reduced_motion="reduce", color_scheme="dark")
+        page.add_init_script("localStorage.setItem('ppt-agent:theme', 'dark')")
         self.start_first_job(page)
         panel = page.locator(".job-panel")
         panel.wait_for()
 
-        panel.get_by_text("等待模型生成叙事结构", exact=True).first.wait_for()
+        business_step = panel.locator(".job-panel__business-step")
+        business_step.wait_for()
+        business_before = business_step.inner_text()
+        self.assertTrue(business_before)
+        self.assertNotIn("进度通道", business_before)
         self.assertTrue(panel.get_by_text("业务进度", exact=True).is_visible())
         panel.get_by_text("进度通道已连接", exact=True).wait_for()
         panel.locator(".job-panel__deadline").filter(has_text="硬截止").wait_for()
         self.assertIn("已用时", panel.inner_text())
+        for label in ("Agent 步数", "模型请求", "Skill 调用"):
+            self.assertIn(label, panel.inner_text())
+        panel.locator(".job-execution > summary").click()
+        panel.get_by_text("进入队列", exact=True).wait_for()
+        panel.get_by_text("开始执行", exact=True).wait_for()
+
+        # Refresh rehydrates the persisted timeline and deduplicates by
+        # (job_id, seq), including in dark/reduced-motion mode.
+        page.reload()
+        panel = page.locator(".job-panel")
+        panel.wait_for()
+        panel.locator(".job-execution > summary").click()
+        panel.get_by_text("进入队列", exact=True).wait_for()
+        sequence_labels = panel.locator(".job-timeline__item small").all_inner_texts()
+        self.assertEqual(len(sequence_labels), len(set(sequence_labels)))
+        self.assertEqual(page.locator("html").get_attribute("data-theme"), "dark")
 
         elapsed = panel.locator(".job-panel__elapsed")
         before = elapsed.inner_text()
@@ -258,12 +280,15 @@ class JobRecoveryBrowserGate(unittest.TestCase):
         job = self.app.state.job_service.list("recovery")[-1]
         self.app.state.job_service.heartbeat(job["job_id"])
         panel.locator(".job-panel__transport").filter(has_text="进度通道正常").wait_for()
-        self.assertEqual(panel.locator(".job-panel__business-step").inner_text(), "等待模型生成叙事结构")
+        self.assertEqual(panel.locator(".job-panel__business-step").inner_text(), business_before)
 
         panel.get_by_role("button", name="取消后台任务", exact=True).click()
         panel.get_by_text("正在取消：等待当前安全停止点", exact=True).first.wait_for()
         panel.get_by_text("取消请求已送达；正在等待当前安全停止点，期间不会提交新的业务结果。", exact=True).wait_for()
         self.assertTrue(panel.get_by_role("button", name="已请求取消", exact=True).is_disabled())
+        self.assertTrue(page.locator("body").evaluate("node => node.scrollWidth <= node.clientWidth"))
+
+        page.set_viewport_size({"width": 812, "height": 375})
         self.assertTrue(page.locator("body").evaluate("node => node.scrollWidth <= node.clientWidth"))
 
         self.service.release.set()

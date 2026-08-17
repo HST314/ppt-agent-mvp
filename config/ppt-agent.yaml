@@ -9,9 +9,13 @@ models:
     base_url_env: MODEL_BASE_URL
     # 单次 HTTP 请求超时（秒，1-600）
     request_timeout_seconds: 180
-    # 整轮 Agent 运行预算需覆盖一次超时重试及多轮工具往返
+    # 整轮 Agent 运行预算（10 分钟）覆盖多轮只读 Skill 往返
     run_timeout_seconds: 600
-    max_steps: 100
+    # 外层持久化 Job 必须严格大于 Agent 预算，预留 30 秒校验/保存收尾
+    job_timeout_seconds: 630
+    max_steps: 30
+    max_tool_calls: 40
+    max_provider_calls: 8
     # 结构化输出模式：auto=默认，端点不支持 text.format 时自动降级；json_schema=强制发送；prompt=从不发送
     structured_output: auto
   inspection:
@@ -21,7 +25,10 @@ models:
     base_url_env: MODEL_BASE_URL
     request_timeout_seconds: 180
     run_timeout_seconds: 600
-    max_steps: 100
+    job_timeout_seconds: 630
+    max_steps: 30
+    max_tool_calls: 40
+    max_provider_calls: 8
     fallback_to_generation: true
 
 # 澄清阶段运行参数（仅 agent 模式的模型澄清使用）

@@ -455,6 +455,11 @@ class FastAPIAppTests(unittest.TestCase):
         self.assertIn("event: succeeded", events.text)
         ids = [int(line.split(":", 1)[1]) for line in events.text.splitlines() if line.startswith("id:")]
         self.assertEqual(ids, sorted(set(ids)))
+        history = self.client.get(f"/v1/jobs/{job_id}/event-history?after=0&limit=500")
+        self.assertEqual(history.status_code, 200)
+        history_events = history.json()["events"]
+        self.assertEqual([item["seq"] for item in history_events], ids)
+        self.assertEqual(len({(item["job_id"], item["seq"]) for item in history_events}), len(history_events))
 
 
 if __name__ == "__main__":

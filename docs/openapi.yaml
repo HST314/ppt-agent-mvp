@@ -70,7 +70,24 @@ components:
         result: {type: [object, 'null']}
         error: {type: [object, 'null']}
         cancellation_requested: {type: boolean}
+        deadline_seconds: {type: number, minimum: 1}
+        deadline_at: {type: [string, 'null'], format: date-time}
+        metrics: {type: [object, 'null'], description: Current secret-free Agent step/provider/Skill budget counters}
     Jobs: {type: object, required: [jobs], properties: {jobs: {type: array, items: {$ref: '#/components/schemas/Job'}}}}
+    JobEvent:
+      type: object
+      required: [seq, job_id, type, progress, step, message, at]
+      properties:
+        seq: {type: integer, minimum: 1}
+        job_id: {type: string}
+        type: {enum: [queued, started, progress, checkpoint, succeeded, failed, cancelled, interrupted, heartbeat]}
+        progress: {type: [integer, 'null'], minimum: 0, maximum: 100}
+        step: {type: string}
+        message: {type: [string, 'null']}
+        at: {type: string, format: date-time}
+        metrics: {type: [object, 'null']}
+        error: {type: object}
+    JobEvents: {type: object, required: [events], properties: {events: {type: array, items: {$ref: '#/components/schemas/JobEvent'}}}}
   responses:
     Error: {description: Unified domain error, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}, example: {error: {code: validation_error, message: 请求字段无效, diagnostic_id: abc123}}}}}
 paths:
@@ -101,6 +118,13 @@ paths:
     get:
       parameters: [{$ref: '#/components/parameters/JobId'}]
       responses: {'200': {description: Secret-free Agent audits correlated to this Job, content: {application/json: {schema: {$ref: '#/components/schemas/AgentAudits'}, example: {audits: []}}}}, '404': {$ref: '#/components/responses/Error'}}
+  /v1/jobs/{job_id}/event-history:
+    get:
+      parameters:
+        - {$ref: '#/components/parameters/JobId'}
+        - {in: query, name: after, schema: {type: integer, minimum: 0, default: 0}}
+        - {in: query, name: limit, schema: {type: integer, minimum: 1, maximum: 500, default: 200}}
+      responses: {'200': {description: Persistent ordered Job event history for refresh and polling recovery, content: {application/json: {schema: {$ref: '#/components/schemas/JobEvents'}, example: {events: []}}}}, '404': {$ref: '#/components/responses/Error'}, '422': {$ref: '#/components/responses/Error'}}
   /v1/jobs/{job_id}/cancel:
     post:
       parameters: [{$ref: '#/components/parameters/JobId'}]

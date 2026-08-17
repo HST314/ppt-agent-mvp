@@ -481,7 +481,7 @@ class StageBAgentTests(unittest.TestCase):
         calls = tuple(ModelToolCall("list_skill_files", "{}", f"secret-{i}") for i in range(2))
         limited = AgentRuntime(ScriptedClient([ModelTurn(None, "r", calls)]), SkillRuntime.builtin(), max_tool_calls=1)
         with self.assertRaises(GatewayError) as caught: limited.run("sample", {})
-        self.assertEqual(caught.exception.audit[-1]["reason"], "unauthorized_tool")
+        self.assertEqual(caught.exception.audit[-1]["reason"], "tool_call_limit")
 
         ticks = iter([0, 0, 2])
         timed = AgentRuntime(ScriptedClient([ModelTurn(OUTLINE_JSON, "r")]), SkillRuntime.builtin(), timeout_seconds=1, clock=lambda: next(ticks))

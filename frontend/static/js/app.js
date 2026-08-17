@@ -1,15 +1,18 @@
-import { api, ApiError } from "./api.js?v=2026.08.17.062039223427";
-import { JobTracker } from "./job-tracker.js?v=2026.08.17.062039223427";
-import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.17.062039223427";
-import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.17.062039223427";
-import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.17.062039223427";
-import { inlineError, setBusy } from "./components/index.js?v=2026.08.17.062039223427";
-import { renderStage } from "./stages/index.js?v=2026.08.17.062039223427";
+import { api, ApiError } from "./api.js?v=2026.08.17.082310785785";
+import { JobTracker } from "./job-tracker.js?v=2026.08.17.082310785785";
+import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.17.082310785785";
+import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.17.082310785785";
+import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.17.082310785785";
+import { inlineError, setBusy } from "./components/index.js?v=2026.08.17.082310785785";
+import { renderStage } from "./stages/index.js?v=2026.08.17.082310785785";
 
 const app = document.getElementById("app");
 const APP_BUILD = document.querySelector('meta[name="app-build"]')?.content || "unknown";
 const tracker = new JobTracker();
 const jobTransports = new Map();
+const jobSnapshots = new Map();
+const jobEvents = new Map();
+const jobAudits = new Map();
 let renderGeneration = 0;
 let activeController = null;
 let hasUnsavedDraft = false;
@@ -308,6 +311,10 @@ async function renderWorkspace(route, generation) {
     ]);
     replaceApp(page);
     shell.active_jobs.forEach((job) => connectJob(job, route));
+    const recentJob = latestRelevantJob(shell, selected);
+    if (recentJob && ["succeeded", "failed", "cancelled", "interrupted"].includes(recentJob.status)) {
+      hydrateJobDetails(recentJob);
+    }
     await reconcileStoredIntents(shell.task.task_id, shell.active_jobs, route);
     if (generation !== renderGeneration) return;
     if (!lockedStage(selected)) {
@@ -408,9 +415,19 @@ function lockedState(selected, current) {
 
 function jobPanel(job) {
   const hasProgress = typeof job.progress === "number";
-  const transport = jobTransports.get(job.job_id) || "正在连接进度通道";
+  const terminal = ["succeeded", "failed", "cancelled", "interrupted"].includes(job.status);
+  const transport = terminal ? "持久化记录已保留" : (jobTransports.get(job.job_id) || "正在连接进度通道");
   const businessStep = jobBusinessStep(job);
-  return element("section", { className: "job-panel", id: `job-${job.job_id}`, "aria-label": "活动后台任务" }, [
+  const events = jobEvents.get(job.job_id) || [];
+  const audits = jobAudits.get(job.job_id) || [];
+  const metrics = job.metrics || [...events].reverse().find((event) => event.metrics)?.metrics || {};
+  const failed = job.status === "failed" || job.status === "interrupted";
+  const panel = element("section", {
+    className: `job-panel ${job.status === "failed" || job.status === "interrupted" ? "job-panel--failed" : ""}`,
+    id: `job-${job.job_id}`,
+    "aria-label": failed ? "最近一次后台任务失败" : terminal ? "最近一次后台任务执行详情" : "活动后台任务",
+    role: failed ? "alert" : null,
+  }, [
     element("div", { className: "job-panel__header" }, [
       element("div", {}, [
         element("strong", { text: operationLabel(job.operation) }),
@@ -442,6 +459,9 @@ function jobPanel(job) {
         element("dt", { text: "传输状态" }),
         element("dd", { className: "job-panel__transport", text: transport }),
       ]),
+      metricItem("Agent 步数", budgetLabel(metrics.agent_step, metrics.max_steps)),
+      metricItem("模型请求", budgetLabel(metrics.provider_calls, metrics.max_provider_calls)),
+      metricItem("Skill 调用", budgetLabel(metrics.tool_calls, metrics.max_tool_calls)),
     ]),
     job.status === "cancellation_requested" || job.cancellation_requested ? element("p", {
       className: "job-panel__cancel-feedback",
@@ -458,47 +478,152 @@ function jobPanel(job) {
       }
     } }) : null,
     job.error ? inlineError(job.error.message || "后台任务失败", job.error.diagnostic_id) : null,
+    job.error?.agent_audit_id ? element("p", { className: "field__hint", text: `Agent 审计 ID：${job.error.agent_audit_id}` }) : null,
+    executionDetails(job, events, audits),
   ]);
+  if (failed) {
+    const presentation = JOB_ERROR_PRESENTATIONS[job.error?.code];
+    panel.append(
+      presentation ? element("p", { className: "field__hint", text: `失败类型：${presentation.label}` }) : "",
+      presentation ? element("p", { text: presentation.guidance }) : "",
+      job.error?.code ? element("p", { className: "field__hint", text: `错误代码：${job.error.code}` }) : "",
+      button("前往本阶段操作区重试", { kind: "secondary", onClick: () => {
+        const control = document.querySelector('#stage-content [data-requires-runtime="true"]');
+        control?.scrollIntoView({ behavior: "smooth", block: "center" });
+        control?.focus({ preventScroll: true });
+      } }),
+    );
+  }
+  return panel;
+}
+
+function metricItem(label, value) {
+  return element("div", {}, [element("dt", { text: label }), element("dd", { text: value })]);
+}
+
+function budgetLabel(value, limit) {
+  return Number.isInteger(value) && Number.isInteger(limit) ? `${value} / ${limit}` : "等待 Agent 上报";
+}
+
+function executionDetails(job, events, audits) {
+  const failed = ["failed", "interrupted"].includes(job.status);
+  const details = element("details", { className: "job-execution", open: failed && events.length > 0 }, [
+    element("summary", { text: `执行详情 · ${events.filter((event) => event.type !== "heartbeat").length} 条事件` }),
+    events.length ? element("ol", { className: "job-timeline", "aria-label": "后台执行事件时间线" }, events
+      .filter((event) => event.type !== "heartbeat")
+      .map((event) => element("li", { className: `job-timeline__item job-timeline__item--${eventTone(event)}` }, [
+        element("span", { className: "job-timeline__marker", "aria-hidden": "true" }),
+        element("div", {}, [
+          element("strong", { text: eventLabel(event) }),
+          element("p", { text: event.message && ["failed", "interrupted"].includes(event.type)
+            ? `错误：${event.message}`
+            : event.message || jobBusinessStep({ ...job, current_step: event.step }) }),
+          element("small", { text: `${formatClock(event.at)} · 序号 ${event.seq}` }),
+        ]),
+      ]))) : element("p", { className: "muted", text: "正在恢复持久化事件记录…" }),
+    audits.length ? element("details", { className: "job-audit" }, [
+      element("summary", { text: `技术审计 · ${audits.length} 次 Agent 运行` }),
+      element("pre", { className: "code-block job-audit__json", text: JSON.stringify(audits, null, 2), tabIndex: 0 }),
+    ]) : null,
+  ]);
+  return details;
+}
+
+function eventLabel(event) {
+  const labels = {
+    queued: "进入队列", started: "开始执行", checkpoint: stepLabel(event.step),
+    succeeded: "执行完成", failed: "执行失败", cancelled: "已取消", interrupted: "执行中断",
+  };
+  return labels[event.type] || event.type;
+}
+
+function stepLabel(step) {
+  return {
+    provider_request: "模型请求已发送",
+    provider_response: "模型响应已返回",
+    waiting_model: "等待模型响应",
+    skill_loading: "Skill 调用开始",
+    skill_completed: "Skill 调用完成",
+    validating_output: "校验结构化输出",
+    validating_html: "校验 HTML",
+    saving_result: "保存业务结果",
+    generating_batch: "生成页面批次",
+    agent_completed: "Agent 阶段完成",
+    completed: "业务操作完成",
+  }[step] || "执行检查点";
+}
+
+function eventTone(event) {
+  if (["failed", "interrupted"].includes(event.type) || event.metrics?.tool_failed) return "danger";
+  if (event.type === "succeeded") return "success";
+  return "primary";
 }
 
 function latestJobFailure(shell, selected) {
-  const relevant = (shell.latest_jobs || [])
+  const latest = latestRelevantJob(shell, selected);
+  if (!latest || !["succeeded", "failed", "cancelled", "interrupted"].includes(latest.status)) return null;
+  return jobPanel(latest);
+}
+
+function latestRelevantJob(shell, selected) {
+  return (shell.latest_jobs || [])
     .filter((job) => OPERATION_STAGES[job.operation]?.includes(selected.id))
-    .sort((left, right) => `${left.created_at}:${left.job_id}`.localeCompare(`${right.created_at}:${right.job_id}`));
-  const latest = relevant.at(-1);
-  if (!latest || !["failed", "interrupted"].includes(latest.status)) return null;
-  const presentation = JOB_ERROR_PRESENTATIONS[latest.error?.code];
-  const retry = button("前往本阶段操作区重试", { kind: "secondary", onClick: () => {
-    const control = document.querySelector('#stage-content [data-requires-runtime="true"]');
-    control?.scrollIntoView({ behavior: "smooth", block: "center" });
-    control?.focus({ preventScroll: true });
-  } });
-  return element("section", { className: "job-panel job-panel--failed", role: "alert", "aria-label": "最近一次后台任务失败" }, [
-    element("div", { className: "job-panel__header" }, [
-      element("div", {}, [element("strong", { text: `${operationLabel(latest.operation)}失败` }), element("p", { text: latest.error?.message || "后台任务未完成" })]),
-      badge("可重试", "danger"),
-    ]),
-    presentation ? element("p", { className: "field__hint", text: `失败类型：${presentation.label}` }) : null,
-    presentation ? element("p", { text: presentation.guidance }) : null,
-    latest.error?.code ? element("p", { className: "field__hint", text: `错误代码：${latest.error.code}` }) : null,
-    latest.error?.diagnostic_id ? element("p", { className: "field__hint", text: `诊断 ID：${latest.error.diagnostic_id}` }) : null,
-    retry,
-  ]);
+    .sort((left, right) => `${left.created_at}:${left.job_id}`.localeCompare(`${right.created_at}:${right.job_id}`))
+    .at(-1);
+}
+
+async function hydrateJobDetails(job) {
+  jobSnapshots.set(job.job_id, job);
+  try {
+    const [history, auditResponse] = await Promise.all([
+      api.jobEventHistory(job.job_id),
+      api.jobAgentAudits(job.job_id),
+    ]);
+    jobEvents.set(job.job_id, dedupeEvents(history.events));
+    jobAudits.set(job.job_id, auditResponse.audits || []);
+    updateJobPanel(job);
+  } catch (_error) {
+    // The summary remains usable when optional execution details cannot load.
+  }
+}
+
+function dedupeEvents(events) {
+  const seen = new Set();
+  return (events || []).filter((event) => {
+    const key = `${event.job_id}:${event.seq}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).sort((left, right) => left.seq - right.seq);
+}
+
+function rememberJobEvent(event) {
+  const current = jobEvents.get(event.job_id) || [];
+  jobEvents.set(event.job_id, dedupeEvents([...current, event]));
 }
 
 function connectJob(job, route, storageKey = null) {
   const recoveredStorageKey = storageKey || storageKeyForJob(job.job_id);
+  jobSnapshots.set(job.job_id, job);
   tracker.track(job, {
-    onUpdate: (next) => updateJobPanel(next),
-    onEvent: (event) => updateJobEvent(event),
+    onUpdate: (next) => {
+      jobSnapshots.set(next.job_id, next);
+      updateJobPanel(next);
+    },
+    onEvent: (event) => {
+      rememberJobEvent(event);
+      updateJobEvent(event);
+    },
     onTransport: (state, details) => updateJobTransport(job.job_id, state, details),
-    onComplete: (finished) => {
+    onComplete: async (finished) => {
+      jobSnapshots.set(finished.job_id, finished);
       jobTransports.delete(finished.job_id);
       if (recoveredStorageKey) clearIdempotencyKey(recoveredStorageKey, finished.job_id);
       const label = operationLabel(finished.operation);
       if (finished.status === "succeeded") showToast(`${label}已完成`);
       else if (finished.status === "failed") showToast(`${label}失败：${finished.error?.message || "请查看阶段内详情"}`);
       else showToast(`${label}已${finished.status === "cancelled" ? "取消" : "中断"}，请查看阶段内详情`);
+      await hydrateJobDetails(finished);
       renderRoute(route);
     },
   });
@@ -610,22 +735,28 @@ function enforceTaskActionState(content, task) {
 
 function updateJobPanel(job) {
   const old = document.getElementById(`job-${job.job_id}`);
-  if (old) old.replaceWith(jobPanel(job));
+  if (!old) return;
+  const executionWasOpen = old.querySelector(":scope > .job-execution")?.open;
+  const auditWasOpen = old.querySelector(".job-audit")?.open;
+  const next = jobPanel(job);
+  if (executionWasOpen) next.querySelector(":scope > .job-execution")?.setAttribute("open", "");
+  if (auditWasOpen) next.querySelector(".job-audit")?.setAttribute("open", "");
+  old.replaceWith(next);
 }
 
 function updateJobEvent(event) {
-  const panel = document.getElementById(`job-${event.job_id}`);
-  if (!panel) return;
   if (event.type === "heartbeat") return;
-  const text = panel.querySelector(".job-panel__business-step");
-  if (text && event.message && event.type === "checkpoint") text.textContent = event.message;
-  const bar = panel.querySelector(".progress__bar");
-  if (bar && typeof event.progress === "number") {
-    bar.classList.remove("progress__bar--indeterminate");
-    bar.style.setProperty("--progress", `${event.progress}%`);
-    bar.setAttribute("aria-valuenow", String(event.progress));
-    panel.querySelector(".progress__value").textContent = `${event.progress}%`;
-  }
+  const current = jobSnapshots.get(event.job_id);
+  if (!current) return;
+  const next = {
+    ...current,
+    current_step: event.step || current.current_step,
+    progress: typeof event.progress === "number" ? event.progress : current.progress,
+    metrics: event.metrics || current.metrics,
+    last_seq: Math.max(current.last_seq || 0, event.seq),
+  };
+  jobSnapshots.set(event.job_id, next);
+  updateJobPanel(next);
 }
 
 function updateJobTransport(jobId, state, details = {}) {
@@ -708,9 +839,15 @@ function jobBusinessStep(job) {
   };
   const steps = {
     waiting_model: "等待模型响应",
+    provider_request: "模型请求已发送，等待响应",
+    provider_response: "模型响应已返回，正在处理",
     skill_loading: "正在读取 Skill 与任务资料",
+    skill_completed: "只读 Skill 调用已完成",
+    validating_output: "正在校验模型输出与阶段 Schema",
     validating_html: "正在校验 HTML 与页面结构",
     saving_result: "正在保存版本与业务状态",
+    generating_batch: "正在生成页面批次",
+    agent_completed: "Agent 已提交有效阶段结果",
   };
   if (steps[job.current_step]) return steps[job.current_step];
   return operations[job.operation] || "业务操作执行中";

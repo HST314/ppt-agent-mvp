@@ -85,6 +85,8 @@ export const api = {
   version: (taskId, hash, controller) => request(`${taskPath(taskId)}/versions/${encodeURIComponent(hash)}`, { controller }),
   compareVersions: (taskId, payload) => post(`${taskPath(taskId)}/versions/compare`, payload),
   getJob: (jobId) => request(`/v1/jobs/${encodeURIComponent(jobId)}`),
+  jobEventHistory: (jobId, after = 0) => request(`/v1/jobs/${encodeURIComponent(jobId)}/event-history?after=${encodeURIComponent(after)}&limit=500`),
+  jobAgentAudits: (jobId) => request(`/v1/jobs/${encodeURIComponent(jobId)}/agent-audits`),
   activeJobs: (taskId) => request(`/v1/tasks/${encodeURIComponent(taskId)}/jobs?status=active`),
   createJob: (taskId, payload) => request(`/v1/tasks/${encodeURIComponent(taskId)}/jobs`, { method: "POST", body: payload }),
   cancelJob: (jobId) => request(`/v1/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST", body: {} }),

@@ -22,13 +22,14 @@ python3 scripts/start.py --data .ppt-agent-data --host 127.0.0.1 --port 8000
 ### Job 与 SSE 恢复
 
 - 浏览器刷新后会查询 `/v1/tasks/{task_id}/jobs?status=active`，并从持久化的 `job_id ↔ intent storage key` 映射恢复清理责任；终态会同时清理 intent 与映射，下一次同参操作会生成新幂等键。
+- 工作台通过 `/v1/jobs/{job_id}/event-history` 恢复最多 500 条持久化事件，并按 `(job_id, seq)` 去重；实时 SSE 与轮询都从最后已接收序号续传。执行详情显示 Agent 步数、provider 请求、只读 Skill 调用、阶段剩余时间与脱敏 Agent 审计。
 - SSE 断开后先执行有界指数退避重连；连续失败才降级轮询。轮询期间继续进行有限 SSE 恢复探测，成功后以 `after=last_seq` 续传并停止轮询；恢复连接再次断开时立即重启轮询，再消耗剩余探测次数，达到探测上限后保持轮询到终态。
 - 每个任务同时只允许一个写业务状态的活动 Job。相同 `idempotency_key` 与相同请求返回原 Job；同 key 不同请求返回 409。
 - 排队 Job 在服务重启后可重新调度；运行中或已请求取消但结果未知的 Job 会标记为 `interrupted`，必须由用户发起新的明确尝试。
 - 活动 Job 不清理。MVP 终态 Job 至少保留 7 天；当前版本由运维在备份后按 `finished_at` 清理任务目录内的终态 `jobs/*.json` 及同名事件文件，不得清理活动状态。
 - SSE 事件与 Job 错误只包含步骤、诊断 ID、`agent_audit_id` 和业务版本引用，不能写入完整 Prompt、客户资料、密钥或模型推理。按任务导出脱敏审计使用 `GET /v1/tasks/{task_id}/agent-audits`，可用 `job_id` 查询参数收窄；按 Job 导出使用 `GET /v1/jobs/{job_id}/agent-audits`。工具错误码区分 `invalid_arguments`、`path_not_in_lock`、`quota_exceeded`、`unauthorized_tool` 与其余校验错误。
 
-仓库默认 `config/ppt-agent.yaml` 使用无需秘密值的 `fake` 模式。真实 API 应复制 `config/ppt-agent.agent.example.yaml` 为本地配置，再设置 `gateway.mode: agent`。生成与检查分别配置 `provider: openai_responses`、模型、超时、最大步数，以及保存环境变量名称的 `api_key_env`/`base_url_env`；秘密值只放 `.env`，不要写进 YAML 或日志。检查模型未配置时只有显式 `fallback_to_generation: true` 才允许回退。Skill 根目录为 `ppt_agent/builtin_skills/guizang-ppt/`，以 `SKILL_LOCK.json` 校验并渐进读取。
+仓库默认 `config/ppt-agent.yaml` 为 Agent 模式示例。真实 API 应复制 `config/ppt-agent.agent.example.yaml` 为本地配置，并配置 `provider: openai_responses`、模型与保存环境变量名称的 `api_key_env`/`base_url_env`；秘密值只放 `.env`，不要写进 YAML 或日志。`request_timeout_seconds` 必须小于 `run_timeout_seconds`，`job_timeout_seconds` 又必须严格大于 Agent 运行预算。默认生成预算为单请求 180 秒、Agent 600 秒、Job 630 秒、30 步、40 次只读 Skill 调用和 8 次 provider 请求；达到约 80% 步数时会要求模型收敛。检查模型未配置时只有显式 `fallback_to_generation: true` 才允许回退。Skill 根目录为 `ppt_agent/builtin_skills/guizang-ppt/`，以 `SKILL_LOCK.json` 校验并渐进读取；样品/全稿可按需读取锁定 Skill，但仍不具备联网、Shell、写文件或状态机能力。
 
 ## 使用流程
 

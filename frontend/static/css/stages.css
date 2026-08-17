@@ -27,6 +27,18 @@
 .job-panel__meta dd { margin: var(--space-1) 0 0; font-size: 0.875rem; font-weight: 700; overflow-wrap: anywhere; }
 .job-panel__transport { color: var(--color-success); }
 .job-panel__cancel-feedback { margin: var(--space-3) 0; padding: var(--space-3); color: var(--color-foreground); background: color-mix(in srgb, var(--color-warning) 10%, var(--color-surface)); border-inline-start: 3px solid var(--color-warning); border-radius: var(--radius-sm); }
+.job-execution { margin-top: var(--space-3); border-top: 1px solid var(--color-border); }
+.job-execution > summary, .job-audit > summary { min-height: 2.75rem; display: flex; align-items: center; color: var(--color-secondary); cursor: pointer; font-weight: 750; }
+.job-timeline { display: grid; gap: 0; margin: 0 0 var(--space-3); padding: 0; list-style: none; }
+.job-timeline__item { position: relative; display: grid; grid-template-columns: 1rem minmax(0, 1fr); gap: var(--space-3); min-width: 0; padding-bottom: var(--space-3); }
+.job-timeline__item:not(:last-child)::before { position: absolute; width: 2px; inset: 1rem auto 0 0.44rem; background: var(--color-border-strong); content: ""; }
+.job-timeline__marker { position: relative; z-index: 1; width: 0.9rem; height: 0.9rem; margin-top: 0.25rem; border: 3px solid var(--color-surface); border-radius: 50%; background: var(--color-primary); box-shadow: 0 0 0 1px var(--color-primary); }
+.job-timeline__item--success .job-timeline__marker { background: var(--color-success); box-shadow: 0 0 0 1px var(--color-success); }
+.job-timeline__item--danger .job-timeline__marker { background: var(--color-destructive); box-shadow: 0 0 0 1px var(--color-destructive); }
+.job-timeline__item p { margin: var(--space-1) 0; color: var(--color-muted-foreground); }
+.job-timeline__item small { color: var(--color-muted-foreground); }
+.job-audit { margin-top: var(--space-2); border-top: 1px solid var(--color-border); }
+.job-audit__json { max-height: 22rem; font-size: 0.75rem; }
 @media (max-width: 767px) {
   .stage-status-grid { grid-template-columns: 1fr; }
   .job-panel__header { align-items: stretch; flex-direction: column; }

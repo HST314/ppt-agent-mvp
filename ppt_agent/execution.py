@@ -11,7 +11,8 @@ class ExecutionCancelled(ConflictError):
     def __init__(self): super().__init__("后台任务已取消")
 
 class ExecutionDeadlineExceeded(GatewayError):
-    def __init__(self): super().__init__("阶段执行超过硬截止时间")
+    def __init__(self):
+        super().__init__("阶段执行超过硬截止时间", code="stage_deadline_exceeded")
 
 @contextmanager
 def execution_scope(cancelled, deadline, progress=None):
@@ -24,11 +25,11 @@ def checkpoint():
     if cancelled is not None and cancelled(): raise ExecutionCancelled()
     if deadline is not None and time.monotonic() >= deadline: raise ExecutionDeadlineExceeded()
 
-def progress(step, message=None):
+def progress(step, message=None, details=None):
     """Publish a real business checkpoint without coupling domain code to Jobs."""
     checkpoint()
     callback = _progress.get()
-    if callback is not None: callback(step, message)
+    if callback is not None: callback(step, message, details or {})
 
 def remaining_seconds(default=None):
     deadline = _deadline.get()

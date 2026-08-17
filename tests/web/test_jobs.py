@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ppt_agent.errors import ConflictError, GatewayError, RuntimeUnavailableError
+from ppt_agent.execution import ExecutionDeadlineExceeded
 from ppt_agent.service import TaskService
 from ppt_agent.store import WorkspaceStore
 from ppt_agent.web.jobs import JobService
@@ -37,7 +38,31 @@ class BlockingService(TaskService):
         return {"accepted": True}
 
 
+class DeadlineService(TaskService):
+    def generate_narrative(self, task_id, prompt=None, scope="all"):
+        self.failure = ExecutionDeadlineExceeded()
+        raise self.failure
+
+
 class JobServiceTests(unittest.TestCase):
+    def test_stage_deadline_keeps_diagnostic_id_and_specific_error_code(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = DeadlineService(WorkspaceStore(root))
+            service.create("deadline")
+            service.command("deadline", "to-clarification", "advance")
+            service.command("deadline", "to-narrative", "advance")
+            executor = DeferredExecutor()
+            jobs = JobService(service, executor=executor)
+            created, _ = jobs.create("deadline", "narrative.generate", {}, "deadline-key")
+
+            function, args = executor.calls.pop(0)
+            function(*args)
+
+            error = jobs.get(created["job_id"])["error"]
+            self.assertEqual(error["code"], "stage_deadline_exceeded")
+            self.assertEqual(error["diagnostic_id"], service.failure.diagnostic_id)
+            jobs.close()
+
     def test_agent_runtime_starts_closed_before_capability_probe(self):
         class ModelGateway:
             model = "model"
@@ -315,6 +340,32 @@ class JobServiceTests(unittest.TestCase):
             self.assertEqual([item["type"] for item in events], ["queued", "started", "interrupted"])
             self.assertEqual(recovered.get(job_id)["status"], "interrupted")
             recovered.close()
+
+    def test_two_coordinators_allocate_unique_monotonic_event_sequences(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = TaskService(WorkspaceStore(root))
+            service.create("multi-writer")
+            service.command("multi-writer", "to-clarification", "advance")
+            service.command("multi-writer", "to-narrative", "advance")
+            first = JobService(service, executor=DeferredExecutor())
+            created, _ = first.create("multi-writer", "narrative.generate", {}, "multi-writer-key")
+            second = JobService(service, executor=DeferredExecutor())
+            first_record = first._read("multi-writer", created["job_id"])
+            second_record = second._read("multi-writer", created["job_id"])
+            barrier = threading.Barrier(2)
+
+            def append(coordinator, record, message):
+                barrier.wait()
+                coordinator._append_event(record, "checkpoint", message=message)
+
+            left = threading.Thread(target=append, args=(first, first_record, "left"))
+            right = threading.Thread(target=append, args=(second, second_record, "right"))
+            left.start(); right.start(); left.join(2); right.join(2)
+
+            events = first.events(created["job_id"])
+            self.assertEqual([item["seq"] for item in events], [1, 2, 3])
+            self.assertEqual(len({(item["job_id"], item["seq"]) for item in events}), 3)
+            first.close(); second.close()
 
 
 if __name__ == "__main__":

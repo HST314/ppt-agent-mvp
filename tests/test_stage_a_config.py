@@ -55,15 +55,27 @@ class StageAConfigTests(unittest.TestCase):
         cfg=self.config(base % "",env)
         self.assertEqual(cfg.generation.request_timeout_seconds,60)
         self.assertEqual(cfg.generation.run_timeout_seconds,300)
+        self.assertEqual(cfg.generation.job_timeout_seconds,330)
+        self.assertEqual(cfg.generation.max_tool_calls,24)
+        self.assertEqual(cfg.generation.max_provider_calls,8)
         cfg=self.config(base % "    timeout_seconds: 45\n",env)
         self.assertEqual(cfg.generation.request_timeout_seconds,45)
         self.assertEqual(cfg.generation.run_timeout_seconds,300)
         cfg=self.config(base % "    request_timeout_seconds: 30\n    run_timeout_seconds: 900\n",env)
         self.assertEqual(cfg.generation.request_timeout_seconds,30)
         self.assertEqual(cfg.generation.run_timeout_seconds,900)
+        self.assertEqual(cfg.generation.job_timeout_seconds,930)
         with self.assertRaises(ValidationError):
             self.config(base % "    timeout_seconds: 30\n    request_timeout_seconds: 30\n",env)
         for invalid in ("    run_timeout_seconds: 5\n","    run_timeout_seconds: 1.5.2\n","    request_timeout_seconds: true\n"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValidationError):
+                self.config(base % invalid,env)
+        for invalid in (
+            "    request_timeout_seconds: 300\n    run_timeout_seconds: 300\n",
+            "    run_timeout_seconds: 300\n    job_timeout_seconds: 300\n",
+            "    max_tool_calls: 0\n",
+            "    max_provider_calls: true\n",
+        ):
             with self.subTest(invalid=invalid), self.assertRaises(ValidationError):
                 self.config(base % invalid,env)
 

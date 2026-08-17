@@ -40,6 +40,17 @@ def get_job_agent_audits(job_id: str, jobs: JobService = Depends(job_service)):
     return {"audits":jobs.service.agent_audits(snapshot["task_id"],job_id)}
 
 
+@router.get("/jobs/{job_id}/event-history")
+def get_job_event_history(
+    job_id: str,
+    after: int = Query(default=0, ge=0),
+    limit: int = Query(default=200, ge=1, le=500),
+    jobs: JobService = Depends(job_service),
+):
+    events = jobs.events(job_id, after)
+    return {"events": events[-limit:]}
+
+
 @router.post("/jobs/{job_id}/cancel")
 async def cancel_job(job_id: str, request: Request, jobs: JobService = Depends(job_service)):
     body = await json_body(request)

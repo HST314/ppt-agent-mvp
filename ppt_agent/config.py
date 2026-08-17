@@ -19,7 +19,10 @@ class ModelConfig:
     base_url_env: str
     request_timeout_seconds: float
     run_timeout_seconds: float
+    job_timeout_seconds: float
     max_steps: int
+    max_tool_calls: int
+    max_provider_calls: int
     api_key: str
     base_url: str
     structured_output: str = "auto"
@@ -72,7 +75,12 @@ class RuntimeConfig:
 
 
 _ROOT_KEYS = {"gateway", "models", "skills", "capabilities", "clarification"}
-_MODEL_KEYS = {"provider", "model", "api_key_env", "base_url_env", "timeout_seconds", "request_timeout_seconds", "run_timeout_seconds", "max_steps", "fallback_to_generation", "structured_output"}
+_MODEL_KEYS = {
+    "provider", "model", "api_key_env", "base_url_env", "timeout_seconds",
+    "request_timeout_seconds", "run_timeout_seconds", "job_timeout_seconds",
+    "max_steps", "max_tool_calls", "max_provider_calls",
+    "fallback_to_generation", "structured_output",
+}
 _STRUCTURED_OUTPUT_MODES = {"auto", "json_schema", "prompt"}
 _CLARIFICATION_KEYS = {"max_questions_per_round", "max_rounds", "style"}
 _CLARIFICATION_STYLES = {"minimal", "comprehensive"}
@@ -121,18 +129,43 @@ def _model(value: dict, name: str, *, required: bool) -> ModelConfig | None:
         # 由 run_timeout_seconds 独立控制。
         request_timeout = legacy_timeout if legacy_timeout is not None else 60
     run_timeout = value.get("run_timeout_seconds", 300)
+    job_timeout = value.get("job_timeout_seconds")
+    if job_timeout is None:
+        job_timeout = run_timeout + 30 if isinstance(run_timeout, (int, float)) and not isinstance(run_timeout, bool) else 330
     max_steps = value.get("max_steps", 12)
-    for label, timeout in (("request_timeout_seconds", request_timeout), ("run_timeout_seconds", run_timeout)):
+    max_tool_calls = value.get("max_tool_calls", 24)
+    max_provider_calls = value.get("max_provider_calls", 8)
+    for label, timeout in (
+        ("request_timeout_seconds", request_timeout),
+        ("run_timeout_seconds", run_timeout),
+        ("job_timeout_seconds", job_timeout),
+    ):
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
             raise ValidationError(f"models.{name}.{label} 必须为 number")
-    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
-        raise ValidationError(f"models.{name}.max_steps 必须为 integer")
-    if not 1 <= request_timeout <= 600 or not 10 <= run_timeout <= 3600 or not 1 <= max_steps <= 100:
+    for label, limit in (
+        ("max_steps", max_steps),
+        ("max_tool_calls", max_tool_calls),
+        ("max_provider_calls", max_provider_calls),
+    ):
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise ValidationError(f"models.{name}.{label} 必须为 integer")
+    if (
+        not 1 <= request_timeout < run_timeout <= 3600
+        or not run_timeout < job_timeout <= 3660
+        or not 1 <= max_steps <= 100
+        or not 1 <= max_tool_calls <= 200
+        or not 1 <= max_provider_calls <= 20
+    ):
         raise ValidationError(f"models.{name} 的超时或步数超出范围")
     structured_output = value.get("structured_output", "auto")
     if structured_output not in _STRUCTURED_OUTPUT_MODES:
         raise ValidationError(f"models.{name}.structured_output 只能是 auto、json_schema 或 prompt")
-    return ModelConfig(provider, model, api_key_env, base_url_env, request_timeout, run_timeout, max_steps, api_key, base_url.rstrip("/"), structured_output)
+    return ModelConfig(
+        provider, model, api_key_env, base_url_env,
+        request_timeout, run_timeout, job_timeout,
+        max_steps, max_tool_calls, max_provider_calls,
+        api_key, base_url.rstrip("/"), structured_output,
+    )
 
 
 def _clarification(value) -> ClarificationConfig:

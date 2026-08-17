@@ -16,10 +16,11 @@ from .errors import GatewayError, GatewayUnknownResult
 class ProviderCallBudget:
     """A stage-scoped, thread-safe provider request budget."""
 
-    def __init__(self, limit: int):
+    def __init__(self, limit: int, on_claim=None):
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError("provider call limit must be a positive integer")
         self.limit = limit
+        self.on_claim = on_claim
         self._claimed = 0
         self._lock = threading.Lock()
 
@@ -33,9 +34,13 @@ class ProviderCallBudget:
             if self._claimed >= self.limit:
                 raise GatewayError(
                     "模型阶段真实请求次数已达到上限",
+                    code="provider_call_limit",
                     audit_details={"category": "provider_call_limit", "retryable": False},
                 )
             self._claimed += 1
+            claimed = self._claimed
+        if self.on_claim is not None:
+            self.on_claim(claimed, self.limit)
 
 
 @dataclass(frozen=True)
@@ -110,7 +115,11 @@ class OpenAIResponsesClient:
                 request["tool_choice"] = tool_choice
             if use_format:
                 request["text"] = {"format": {"type": "json_schema", **response_schema}}
-            request["timeout"] = max(.001, timeout_seconds if timeout_seconds is not None else self._request_timeout())
+            configured_timeout = self._request_timeout()
+            request["timeout"] = max(
+                .001,
+                min(timeout_seconds, configured_timeout) if timeout_seconds is not None else configured_timeout,
+            )
             request_client = self._request_client()
             cancelled, deadline = cancellation_state()
             monitor_stop = threading.Event()
