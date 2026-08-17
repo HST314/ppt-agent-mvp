@@ -394,13 +394,13 @@ class StageBAgentTests(unittest.TestCase):
         self.assertEqual([item["error_code"] for item in recovery_errors], ["path_not_in_lock", "path_not_in_lock"])
 
     def test_image_content_is_removed_from_every_nested_model_input(self):
-        client = ScriptedClient([ModelTurn('{"html":"<html></html>"}', "r")])
+        client = ScriptedClient([ModelTurn('{"slides":[{"slide_id":"slide-1","html":"<section class=\\"slide\\" id=\\"slide-1\\" data-slide-id=\\"slide-1\\"><p>ok</p></section>"}]}', "r")])
         result = AgentRuntime(client, SkillRuntime.builtin()).run("deck", {
             "assets":{"resources://hero.png":"data:image/png;base64,SECRETBYTES"},
             "items":["ok", " DATA:IMAGE/JPEG;BASE64,MORESECRET"],
         })
         serialized=json.dumps(client.inputs,ensure_ascii=False)
-        self.assertEqual(result.value["html"],"<html></html>")
+        self.assertEqual(result.value["slides"][0]["slide_id"],"slide-1")
         self.assertNotIn("SECRETBYTES",serialized); self.assertNotIn("MORESECRET",serialized)
         self.assertEqual(serialized.count("[image-content-removed]"),2)
         self.assertEqual(len(result.audit[0]["input_sha256"]),64)
@@ -481,7 +481,7 @@ class StageBAgentTests(unittest.TestCase):
         calls = tuple(ModelToolCall("list_skill_files", "{}", f"secret-{i}") for i in range(2))
         limited = AgentRuntime(ScriptedClient([ModelTurn(None, "r", calls)]), SkillRuntime.builtin(), max_tool_calls=1)
         with self.assertRaises(GatewayError) as caught: limited.run("sample", {})
-        self.assertEqual(caught.exception.audit[-1]["reason"], "tool_call_limit")
+        self.assertEqual(caught.exception.audit[-1]["reason"], "unauthorized_tool")
 
         ticks = iter([0, 0, 2])
         timed = AgentRuntime(ScriptedClient([ModelTurn(OUTLINE_JSON, "r")]), SkillRuntime.builtin(), timeout_seconds=1, clock=lambda: next(ticks))

@@ -33,8 +33,8 @@ STAGE_PROMPTS = {
         "按需最多读取 1 到 2 个当前阶段已列出的 Skill 文件，禁止尝试读取布局、主题、图片或 HTML 模板文件；"
         "读取后立即提交大纲 JSON，不要重复读取。"
     ),
-    "sample": "仅为外层状态机指定的样品页生成完整 HTML，不得扩展到全稿。",
-    "deck": "为外层状态机给定的全部页面生成完整 HTML，并遵守已确认样品的视觉基线。",
+    "sample": "仅为外层状态机指定的样品页生成 section 片段，不得生成公共模板或扩展到全稿；每项 html 必须严格以 <section class=\"slide\" id=\"给定ID\" data-slide-id=\"给定ID\"> 开始并以 </section> 结束；本阶段无工具。",
+    "deck": "仅为外层状态机给定的未确认页面生成 section 片段；不得重做确认样品、不得生成公共模板；每项 html 必须严格以 <section class=\"slide\" id=\"给定ID\" data-slide-id=\"给定ID\"> 开始并以 </section> 结束；本阶段无工具。",
     "inspection": "独立检查大纲与 HTML，仅报告有证据的问题，不得直接修改产物。",
 }
 
@@ -63,8 +63,8 @@ STAGE_OUTPUT_SCHEMAS = {
             "resource_uris": {"type": "array", "uniqueItems": True, "items": {"type": "string"}},
         }, ["title", "purpose", "content_markdown", "resource_uris"]),
     }}, ["slides"])},
-    "sample": {"name": "sample_html", "strict": True, "schema": _object_schema({"html": {"type": "string"}}, ["html"])},
-    "deck": {"name": "deck_html", "strict": True, "schema": _object_schema({"html": {"type": "string"}}, ["html"])},
+    "sample": {"name": "sample_slides", "strict": True, "schema": _object_schema({"slides": {"type":"array","minItems":1,"items":_object_schema({"slide_id":{"type":"string"},"html":{"type":"string"}},["slide_id","html"])}}, ["slides"])},
+    "deck": {"name": "deck_slides", "strict": True, "schema": _object_schema({"slides": {"type":"array","minItems":1,"items":_object_schema({"slide_id":{"type":"string"},"html":{"type":"string"}},["slide_id","html"])}}, ["slides"])},
     "inspection": {"name": "inspection", "strict": True, "schema": _object_schema({"passed": {"type": "boolean"}, "issues": {"type": "array", "items": _object_schema({
         "issue_id": {"type": "string"}, "severity": {"type": "string", "enum": ["warning", "blocker"]},
         "level": {"type": "string", "enum": ["element", "slide", "deck"]}, "code": {"type": "string"},
@@ -152,7 +152,7 @@ TOOLS = [_list_skill_files_tool(), _read_skill_file_tool(), _get_asset_info_tool
 
 
 def _tools_for_stage(stage: str, stage_files: frozenset[str] | None) -> list[dict]:
-    if stage == "clarification":
+    if stage in {"clarification", "sample", "deck"}:
         return []
     if stage in PLANNING_STAGES:
         allowed = stage_files or frozenset()
@@ -242,7 +242,8 @@ class AgentRuntime:
                 else "\n这是启动能力探测：必须先调用一次 list_skill_files，收到工具结果后再提交符合 Schema 的 JSON。"
             )
         conversation: list[Any] = [{"role": "system", "content": f"当前阶段：{stage}\n阶段目标：{STAGE_PROMPTS[stage]}\n{override}\n{tool_contract}{probe_instruction}\n{_output_contract(local_schema)}"}, {"role": "user", "content": input_json}]
-        for step in range(1, self.max_steps + 1):
+        stage_max_steps = min(self.max_steps, 2) if stage in {"sample", "deck"} else self.max_steps
+        for step in range(1, stage_max_steps + 1):
             checkpoint()
             if self.clock() - started >= self.timeout_seconds:
                 fail("Agent 运行超时，未提交阶段产物", "deadline_exceeded")

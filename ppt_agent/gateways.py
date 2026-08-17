@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import hashlib, json, os, socket, urllib.error, urllib.request, uuid
+import hashlib, html, json, os, re, socket, urllib.error, urllib.request, uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -276,7 +276,22 @@ class AgentGateway:
         # Inspection repair still generates deck HTML; inspection itself uses
         # inspect() and can never return a modified artifact.
         stage = "deck" if action == "inspection" else action
-        return self._run(stage, {"outline": outline, **context})["html"]
+        expected=list(context.get("slide_ids") or [])
+        value=self._run(stage, {"outline": outline, **context})
+        slides=value.get("slides")
+        if not isinstance(slides,list) or [item.get("slide_id") for item in slides if isinstance(item,dict)] != expected:
+            raise ValidationError("模型页面片段与请求页面不一致")
+        fragments=[]
+        for item in slides:
+            fragment=item.get("html")
+            pattern=rf'^<section class="slide" id="{re.escape(item["slide_id"])}" data-slide-id="{re.escape(item["slide_id"])}">[\s\S]*</section>$'
+            if not isinstance(fragment,str) or not re.fullmatch(pattern,fragment.strip()):
+                raise ValidationError("模型页面片段契约无效")
+            fragments.append(fragment.strip())
+        rules=" · ".join(html.escape(str(x)) for x in context.get("rules",[]))
+        # Public shell is versioned server code. It is never sent to, copied by,
+        # or editable by the model.
+        return '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><style>html,body{margin:0;background:#111827;color:#f8fafc;font-family:system-ui}.slide{box-sizing:border-box;width:1280px;height:720px;padding:72px;margin:24px auto;background:linear-gradient(135deg,#172033,#253858);overflow:hidden}.slide h1{font-size:46px}.slide p{font-size:25px;line-height:1.5}small{display:block;color:#93c5fd}</style></head><body><aside hidden data-global-rules="'+rules+'"></aside>'+''.join(fragments)+'</body></html>'
 
     def inspect(self, original_outline, html):
         value = self._run("inspection", {"original_outline": original_outline, "html": html})

@@ -39,7 +39,7 @@ OPERATION_STAGES = {
     "deck.modify": {"deck", "review"},
     "inspection.run": {"deck", "review"},
 }
-OPERATION_BUDGET_SECONDS = {"clarification.generate":180,"narrative.generate":240,"outline.generate":240,"samples.generate":300,"samples.modify":300,"deck.generate":600,"deck.modify":600,"inspection.run":300}
+OPERATION_BUDGET_SECONDS = {"clarification.generate":180,"narrative.generate":240,"outline.generate":240,"samples.generate":90,"samples.modify":90,"deck.generate":180,"deck.modify":180,"inspection.run":90}
 
 
 class ActiveJobConflict(ConflictError):

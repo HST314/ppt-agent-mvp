@@ -129,12 +129,15 @@ class AuditRegressionTests(SampleJourney):
         self.app.service.generate_deck("journey")
         self.app.service.modify_deck("journey", "统一留白")
         self.assertEqual([x["action"] for x in probe.calls], ["sample", "sample", "deck", "deck"])
-        self.assertIn("confirmed_sample_html", probe.calls[2])
+        self.assertNotIn("confirmed_sample_html", probe.calls[2])
+        confirmed=set(self.app.service.sample_view("journey")["selection"]["slide_ids"])
+        self.assertFalse(confirmed.intersection(probe.calls[2]["slide_ids"]))
 
     def test_auto_fix_publishes_changed_current_html_and_rechecks_it(self):
         self.app.service.inspector.calls=[]
         self.app.service.generate_sample("journey"); self.app.service.confirm_sample("journey")
         self.app.service.generate_deck("journey")
+        self.app.service.run_inspection("journey",max_rounds=0)
         before=self.app.service.deck_view("journey")["deck"]
         report=self.app.service.inspection_view("journey")["report"]
         fixed=self.app.service._auto_fix("journey", report, 1)

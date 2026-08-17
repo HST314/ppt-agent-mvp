@@ -680,30 +680,33 @@ class TaskService:
         outline=self._current_version(task_id,"outline"); data=json.loads(self.version(task_id,outline)); ids=list(data["slide_ids"])
         sample=sample_view["sample"]; meta=sample["metadata"]
         assets=controlled_assets(self.input_view(task_id)["manifest"],self.store.resource_root(task_id))
-        source=render(data["markdown"],ids,meta.get("global_rules",[]),meta.get("local_exceptions",{}),assets) if isinstance(self.builder,FakeHtmlBuilder) else self.builder.build(data["markdown"],action="deck",slide_ids=ids,rules=meta.get("global_rules",[]),exceptions=meta.get("local_exceptions",{}),assets=assets,confirmed_sample_html=sample["html"],confirmed_sample_slide_ids=list(sample_view["selection"]["slide_ids"]))
-        html_text=validate_html(source,ids,assets.values())
-        sample_fragments=self._slide_fragments(sample["html"]); deck_fragments=self._slide_fragments(html_text)
-        # The builder receives the confirmed sample as an immutable input. Merge
-        # those fragments here as a hard boundary instead of asking a model to
-        # reproduce byte-identical HTML.
+        sample_fragments=self._slide_fragments(sample["html"])
+        if isinstance(self.builder,FakeHtmlBuilder):
+            html_text=render(data["markdown"],ids,meta.get("global_rules",[]),meta.get("local_exceptions",{}),assets)
+        else:
+            from .execution import checkpoint, progress
+            unconfirmed=[sid for sid in ids if sid not in sample_fragments]
+            generated={}
+            for index in range(0,len(unconfirmed),3):
+                checkpoint(); batch=unconfirmed[index:index+3]
+                progress("generating_batch",f"生成未确认页面 {index+1}-{index+len(batch)} / {len(unconfirmed)}")
+                partial=self.builder.build(data["markdown"],action="deck",slide_ids=batch,rules=meta.get("global_rules",[]),exceptions=meta.get("local_exceptions",{}),assets=assets)
+                generated.update(self._slide_fragments(validate_html(partial,batch,assets.values())))
+            ordered={**generated,**sample_fragments}
+            shell=render(data["markdown"],ids,meta.get("global_rules",[]),meta.get("local_exceptions",{}),assets)
+            html_text=re.sub(r'<section class="slide" id="([A-Za-z0-9_-]+)"[\s\S]*?</section>',lambda match:ordered[match.group(1)],shell)
+        html_text=validate_html(html_text,ids,assets.values()); deck_fragments=self._slide_fragments(html_text)
+        # Confirmed fragments are immutable and are merged by the server.
         if not isinstance(self.builder,FakeHtmlBuilder):
             for sid,fragment in sample_fragments.items():
                 html_text=re.sub(rf'<section class="slide" id="{re.escape(sid)}"[\s\S]*?</section>',lambda _m,f=fragment:f,html_text,count=1)
             html_text=validate_html(html_text,ids,assets.values()); deck_fragments=self._slide_fragments(html_text)
         preserved={sid:digest(deck_fragments[sid].encode())==digest(fragment.encode()) for sid,fragment in sample_fragments.items()}
         if not all(preserved.values()): raise ConflictError("确认样品发生未提示变化")
-        # The first inspection is part of publishing a generated deck.  Ask the
-        # independent gateway while the deck is still only an in-memory
-        # candidate, so an unknown result cannot leave a deck/version or stage
-        # transition behind.
-        inspection_outline=data["markdown"]
-        prepared_inspection=self.inspector.inspect(inspection_outline,html_text)
-        result=self._record_deck(task_id,html_text,outline,{"parent":self._current_version(task_id,"deck"),"summary":"生成完整 HTML 演示稿","scope":"global","affected":ids,"sample_hash":sample["hash"],"sample_pages_preserved":preserved,"outline_consistent":True,"global_rules":meta.get("global_rules",[]),"local_exceptions":meta.get("local_exceptions",{})},"deck_generate")
+        result=self._record_deck(task_id,html_text,outline,{"parent":self._current_version(task_id,"deck"),"summary":"生成未检查候选稿","scope":"global","affected":ids,"sample_hash":sample["hash"],"sample_pages_preserved":preserved,"outline_consistent":True,"inspection_status":"pending","global_rules":meta.get("global_rules",[]),"local_exceptions":meta.get("local_exceptions",{})},"deck_generate")
         if state.stage==state.stage.SAMPLE:
             self.command(task_id,f"to-deck-{sample['hash'][:12]}","advance","system")
             result=self.deck_view(task_id)
-        self.run_inspection(task_id,max_rounds=2,_prepared_raw=prepared_inspection)
-        result=self.deck_view(task_id)
         return result
     def modify_deck(self,task_id,prompt,change_type="visual",scope=None,slide_ids=None,element_id=None):
         self._require_actionable(task_id)

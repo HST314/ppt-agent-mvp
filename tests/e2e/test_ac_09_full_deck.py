@@ -18,7 +18,8 @@ class AC09FullDeckE2E(SampleJourney):
         sample=self.ok("/v1/tasks/journey/samples/generate",{})
         self.ok("/v1/tasks/journey/samples/confirm",{})
         deck=self.ok("/v1/tasks/journey/deck/generate",{})
-        self.assertEqual(deck["state"]["stage"],"review")
+        self.assertEqual(deck["state"]["stage"],"deck")
+        self.assertEqual(deck["deck"]["metadata"]["inspection_status"],"pending")
         self.assertEqual(list(deck["deck"]["metadata"]["page_hashes"]),["slide-1","slide-2","slide-3"])
         self.assertEqual(deck["deck"]["html"].count('data-slide-id="'),3)
         self.assertTrue(all(deck["deck"]["metadata"]["sample_pages_preserved"].values()))
@@ -43,18 +44,12 @@ class AC09FullDeckE2E(SampleJourney):
         self.assertEqual(self.get_json("/v1/tasks/journey/deck")["versions"],before_versions)
         self.assertEqual(self.get_json("/v1/tasks/journey/events")["events"],before_events)
 
-    def test_first_inspection_unknown_keeps_deck_and_state_unpublished(self):
+    def test_inspection_unknown_keeps_published_candidate_available(self):
         self.ok("/v1/tasks/journey/samples/generate",{})
         self.ok("/v1/tasks/journey/samples/confirm",{})
         self.app.service.inspector=UnknownInspector()
-        before_state=self.get_json("/v1/tasks/journey")
-        before_versions=self.get_json("/v1/tasks/journey/deck")["versions"]
-        before_events=self.get_json("/v1/tasks/journey/events")["events"]
-
-        status,_=self.call("POST","/v1/tasks/journey/deck/generate",{})
-
+        candidate=self.ok("/v1/tasks/journey/deck/generate",{})
+        status,_=self.call("POST","/v1/tasks/journey/inspection/run",{})
         self.assertTrue(status.startswith("503"))
-        self.assertEqual(self.get_json("/v1/tasks/journey"),before_state)
-        self.assertEqual(self.get_json("/v1/tasks/journey/deck")["versions"],before_versions)
-        self.assertEqual(self.get_json("/v1/tasks/journey/events")["events"],before_events)
+        self.assertEqual(self.get_json("/v1/tasks/journey/deck")["deck"]["hash"],candidate["deck"]["hash"])
         self.assertFalse(self.app.service.versions("journey","inspection"))
