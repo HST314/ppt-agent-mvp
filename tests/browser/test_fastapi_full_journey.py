@@ -79,7 +79,12 @@ class FastAPIFullJourneyGate(unittest.TestCase):
         page.get_by_role("button", name="生成完整演示稿").wait_for()
         page.get_by_role("button", name="生成完整演示稿").click()
 
+        page.get_by_role("link", name="前往独立检查", exact=True).wait_for()
+        self.assertEqual(page.locator('.stage-link[href$="stage=review"]').get_attribute("data-status"), "available")
+        page.get_by_role("link", name="前往独立检查", exact=True).click()
         page.get_by_role("heading", name="检查", exact=True).wait_for()
+        page.get_by_text("尚未检查", exact=True).wait_for()
+        page.get_by_role("button", name="执行独立检查", exact=True).click()
         page.get_by_role("button", name="保存处置").wait_for()
         page.get_by_label("处置动作").select_option("waive")
         page.get_by_label("处置依据").fill("已人工核对，接受当前版式")

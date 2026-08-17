@@ -1,6 +1,6 @@
-import { api } from "../api.js?v=2026.08.17.031746330253";
-import { badge, button, element, field, metadataList, previewFrame, previewUrl, shortHash, versionTimeline } from "../components/index.js?v=2026.08.17.031746330253";
-import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.17.031746330253";
+import { api } from "../api.js?v=2026.08.17.062039223427";
+import { badge, button, element, field, metadataList, previewFrame, previewUrl, shortHash, versionTimeline } from "../components/index.js?v=2026.08.17.062039223427";
+import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.17.062039223427";
 
 export async function render(context) {
   const view = await api.deck(context.taskId, context.controller);
@@ -31,10 +31,15 @@ function deckStage(view, context) {
 
   return stageGrid([
     section("全稿生成", [
-      element("p", { text: "生成会保留已确认样品页，并在发布完整候选后执行独立检查。" }),
+      element("p", { text: "生成会保留已确认样品页，并发布一份尚未检查的完整候选稿。" }),
       generate,
       generationMessage,
     ], { description: "该操作可能超过 10 秒，可以安全离开页面并稍后恢复。" }),
+    deck ? section("候选稿已发布", [
+      badge(deck.metadata?.inspection_status === "pending" ? "等待独立检查" : "候选稿可检查", "warning"),
+      element("p", { text: "候选生成与质量检查相互独立。请进入检查阶段，确认范围后再启动检查。" }),
+      button("前往独立检查", { href: `/tasks/${encodeURIComponent(context.taskId)}?stage=review`, kind: "primary" }),
+    ], { description: "进入检查页面不会自动调用模型；由你明确点击后才会执行。" }) : null,
     modify,
     section("演示稿预览", previewRegion, { description: deck ? `当前候选 v${deck.version} · ${Object.keys(deck.metadata?.page_hashes || {}).length} 页` : "固定比例沙箱预览" }),
     compare,

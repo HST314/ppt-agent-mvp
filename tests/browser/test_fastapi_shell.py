@@ -205,7 +205,9 @@ class FastAPIShellBrowserGate(unittest.TestCase):
         self.assertTrue(failure.get_by_role("button", name="前往本阶段操作区重试").is_visible())
 
         page.reload()
-        self.assertTrue(page.get_by_role("alert", name="最近一次后台任务失败").is_visible())
+        failure_after_reload = page.get_by_role("alert", name="最近一次后台任务失败")
+        failure_after_reload.wait_for()
+        self.assertTrue(failure_after_reload.is_visible())
         self.assertEqual(errors, [])
         page.close()
 

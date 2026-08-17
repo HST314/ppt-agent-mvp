@@ -49,13 +49,16 @@ def get_agent_audits(task_id: str, job_id: str | None = Query(default=None), ser
 def get_shell(task_id: str, service: TaskService = Depends(task_service), jobs: JobService = Depends(job_service)):
     state = service.get(task_id)
     summary = service.status_summary(task_id)
+    review_available = state["stage"] == "deck" and bool(summary["latest_artifacts"].get("deck"))
     delivery_available = False
     if state["stage"] == "review":
         delivery_available = service.inspection_view(task_id)["delivery_allowed"]
     current_index = next(index for index, item in enumerate(STAGES) if item[0] == state["stage"])
     stages = []
     for index, (key, label, prerequisite) in enumerate(STAGES):
-        if key == "delivery" and delivery_available:
+        if key == "review" and review_available:
+            item_status = "available"
+        elif key == "delivery" and delivery_available:
             item_status = "available"
         else:
             item_status = "completed" if index < current_index else "current" if index == current_index else "locked"
