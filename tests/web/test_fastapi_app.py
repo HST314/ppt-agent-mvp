@@ -394,6 +394,17 @@ class FastAPIAppTests(unittest.TestCase):
         listed = self.client.get("/v1/tasks").json()["tasks"]
         self.assertEqual([item["task_id"] for item in listed], ["compat"])
 
+    def test_quick_task_api_requires_explicit_final_slide_count(self):
+        missing=self.client.post("/v1/tasks",json={"task_id":"quick-missing","mode":"quick"})
+        self.assertEqual(missing.status_code,400)
+        created=self.client.post("/v1/tasks",json={"task_id":"quick","mode":"quick","target_slide_count":2})
+        self.assertEqual(created.status_code,201)
+        self.assertEqual(created.json()["target_slide_count"],2)
+        imported=self.client.post("/v1/tasks/quick/input",json={"source":{"goal":"发布","audience":"客户","topic":"方案"}})
+        self.assertEqual(imported.status_code,200)
+        shell=self.client.get("/v1/tasks/quick/shell").json()
+        self.assertEqual((shell["task"]["mode"],shell["task"]["stage"]),("quick","sample"))
+
     def test_empty_resources_and_unstructured_markdown_return_clarifications(self):
         self.client.post("/v1/tasks", json={"task_id": "missing-input", "mode": "manual"})
         imported = self.client.post(

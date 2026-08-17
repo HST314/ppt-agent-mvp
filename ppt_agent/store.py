@@ -171,12 +171,17 @@ class WorkspaceStore:
         if not (p/"events.jsonl").exists(): raise NotFoundError("任务不存在")
         return self._read_events(p)
     def append_agent_audit(self, record):
-        """Persist a secret-free Agent run record independently of process life."""
-        path=self.root/"agent-audit.jsonl"
+        """Persist a secret-free Agent run globally and in its task export tree."""
+        paths=[self.root/"agent-audit.jsonl"]
+        task_id=record.get("task_id")
+        if isinstance(task_id,str):
+            task=self._task(task_id)
+            if task.is_dir(): paths.append(task/"agent-audit.jsonl")
+        line=json.dumps(record,ensure_ascii=False,separators=(",",":"))+"\n"
         with self._guard:
-            with open(path,"a",encoding="utf-8") as f:
-                f.write(json.dumps(record,ensure_ascii=False,separators=(",",":"))+"\n")
-                f.flush(); os.fsync(f.fileno())
+            for path in paths:
+                with open(path,"a",encoding="utf-8") as f:
+                    f.write(line); f.flush(); os.fsync(f.fileno())
 
     def append_runtime_probe(self, record):
         """Persist a global, secret-free readiness probe independently of tasks."""
@@ -192,7 +197,8 @@ class WorkspaceStore:
         records=[] if not path.exists() else [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
         return records[-limit:][::-1]
     def agent_audits(self,task_id=None,job_id=None):
-        path=self.root/"agent-audit.jsonl"
+        task_path=self._task(task_id)/"agent-audit.jsonl" if task_id is not None else None
+        path=task_path if task_path is not None and task_path.exists() else self.root/"agent-audit.jsonl"
         records=[] if not path.exists() else [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
         if task_id is not None: records=[record for record in records if record.get("task_id")==task_id]
         if job_id is not None: records=[record for record in records if record.get("job_id")==job_id]

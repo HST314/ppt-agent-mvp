@@ -18,7 +18,7 @@ components:
     TaskState:
       type: object
       required: [task_id, stage, status, mode, sample_confirmed, blockers_resolved, delivery_confirmed, revision, waiting_reason, required_action]
-      properties: {task_id: {type: string}, stage: {enum: [created, clarification, narrative, outline, sample, deck, review, delivery]}, status: {enum: [ready, running, waiting_for_user, paused, cancelled, failed, completed]}, mode: {enum: [manual, auto]}, sample_confirmed: {type: boolean}, blockers_resolved: {type: boolean}, delivery_confirmed: {type: boolean}, revision: {type: integer}, waiting_reason: {type: [string, 'null']}, required_action: {type: [string, 'null']}}
+      properties: {task_id: {type: string}, stage: {enum: [created, clarification, narrative, outline, sample, deck, review, delivery]}, status: {enum: [ready, running, waiting_for_user, paused, cancelled, failed, completed]}, mode: {enum: [manual, auto, quick]}, sample_confirmed: {type: boolean}, blockers_resolved: {type: boolean}, delivery_confirmed: {type: boolean}, revision: {type: integer}, waiting_reason: {type: [string, 'null']}, required_action: {type: [string, 'null']}, target_slide_count: {type: [integer, 'null'], minimum: 1, maximum: 200}}
     Command:
       type: object
       additionalProperties: false
@@ -228,7 +228,7 @@ paths:
     get:
       responses: {'200': {description: Recently updated task states for the application shell, content: {application/json: {schema: {type: object, required: [tasks], properties: {tasks: {type: array, items: {$ref: '#/components/schemas/TaskState'}}}}, example: {tasks: [{task_id: demo, stage: created, status: ready, mode: manual, sample_confirmed: false, blockers_resolved: false, delivery_confirmed: false, revision: 0, waiting_reason: null, required_action: null}]}}}}, '500': {$ref: '#/components/responses/Error'}}
     post:
-      requestBody: {required: true, content: {application/json: {schema: {type: object, additionalProperties: false, required: [task_id], properties: {task_id: {type: string}, mode: {enum: [manual, auto]}}}, example: {task_id: demo, mode: auto}}}}
+      requestBody: {required: true, content: {application/json: {schema: {type: object, additionalProperties: false, required: [task_id], properties: {task_id: {type: string}, mode: {enum: [manual, auto, quick]}, target_slide_count: {type: integer, minimum: 1, maximum: 200}}}, example: {task_id: demo, mode: quick, target_slide_count: 8}}}}
       responses: {'201': {description: Created, content: {application/json: {schema: {$ref: '#/components/schemas/TaskState'}, example: &task {task_id: demo, stage: created, status: ready, mode: auto, sample_confirmed: false, blockers_resolved: false, delivery_confirmed: false, revision: 0, waiting_reason: null, required_action: null}}}}, '400': {$ref: '#/components/responses/Error'}, '409': {$ref: '#/components/responses/Error'}}
   /v1/tasks/{task_id}:
     get:

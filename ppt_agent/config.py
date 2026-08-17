@@ -12,6 +12,23 @@ from .errors import ValidationError
 
 
 @dataclass(frozen=True)
+class StageBudgetConfig:
+    max_steps: int
+    max_tool_calls: int
+    max_provider_calls: int
+    max_exploration_rounds: int
+    max_unique_files: int
+    max_skill_bytes: int
+    reserved_final_calls: int
+
+
+DEFAULT_STAGE_BUDGETS = {
+    "sample": StageBudgetConfig(8, 4, 6, 2, 4, 128 * 1024, 2),
+    "deck": StageBudgetConfig(12, 8, 10, 3, 4, 128 * 1024, 2),
+}
+
+
+@dataclass(frozen=True)
 class ModelConfig:
     provider: str
     model: str
@@ -26,6 +43,7 @@ class ModelConfig:
     api_key: str
     base_url: str
     structured_output: str = "auto"
+    stage_budgets: dict[str, StageBudgetConfig] | None = None
 
     def public(self) -> dict:
         value = asdict(self)
@@ -79,7 +97,11 @@ _MODEL_KEYS = {
     "provider", "model", "api_key_env", "base_url_env", "timeout_seconds",
     "request_timeout_seconds", "run_timeout_seconds", "job_timeout_seconds",
     "max_steps", "max_tool_calls", "max_provider_calls",
-    "fallback_to_generation", "structured_output",
+    "fallback_to_generation", "structured_output", "stage_budgets",
+}
+_STAGE_BUDGET_KEYS = {
+    "max_steps", "max_tool_calls", "max_provider_calls", "max_exploration_rounds",
+    "max_unique_files", "max_skill_bytes", "reserved_final_calls",
 }
 _STRUCTURED_OUTPUT_MODES = {"auto", "json_schema", "prompt"}
 _CLARIFICATION_KEYS = {"max_questions_per_round", "max_rounds", "style"}
@@ -160,11 +182,42 @@ def _model(value: dict, name: str, *, required: bool) -> ModelConfig | None:
     structured_output = value.get("structured_output", "auto")
     if structured_output not in _STRUCTURED_OUTPUT_MODES:
         raise ValidationError(f"models.{name}.structured_output 只能是 auto、json_schema 或 prompt")
+    raw_stage_budgets = value.get("stage_budgets", {})
+    raw_stage_budgets = _mapping(raw_stage_budgets, f"models.{name}.stage_budgets")
+    if set(raw_stage_budgets) - {"sample", "deck"}:
+        raise ValidationError(f"models.{name}.stage_budgets 只能配置 sample 或 deck")
+    stage_budgets: dict[str, StageBudgetConfig] = {}
+    for stage, defaults in DEFAULT_STAGE_BUDGETS.items():
+        raw_budget = _mapping(raw_stage_budgets.get(stage, {}), f"models.{name}.stage_budgets.{stage}")
+        unknown_budget = set(raw_budget) - _STAGE_BUDGET_KEYS
+        if unknown_budget:
+            raise ValidationError(
+                f"models.{name}.stage_budgets.{stage} 包含未知字段：{', '.join(sorted(unknown_budget))}"
+            )
+        budget = StageBudgetConfig(**{
+            field: raw_budget.get(field, getattr(defaults, field))
+            for field in _STAGE_BUDGET_KEYS
+        })
+        values = asdict(budget)
+        if any(isinstance(item, bool) or not isinstance(item, int) for item in values.values()):
+            raise ValidationError(f"models.{name}.stage_budgets.{stage} 所有字段必须为 integer")
+        if (
+            not 2 <= budget.max_steps <= 100
+            or not 1 <= budget.max_tool_calls <= 200
+            or not 2 <= budget.max_provider_calls <= 20
+            or not 0 <= budget.max_exploration_rounds <= 10
+            or not 1 <= budget.max_unique_files <= 20
+            or not 1024 <= budget.max_skill_bytes <= 512 * 1024
+            or not 1 <= budget.reserved_final_calls < budget.max_provider_calls
+            or budget.max_exploration_rounds > budget.max_provider_calls - budget.reserved_final_calls
+        ):
+            raise ValidationError(f"models.{name}.stage_budgets.{stage} 预算超出范围或无法预留最终输出请求")
+        stage_budgets[stage] = budget
     return ModelConfig(
         provider, model, api_key_env, base_url_env,
         request_timeout, run_timeout, job_timeout,
         max_steps, max_tool_calls, max_provider_calls,
-        api_key, base_url.rstrip("/"), structured_output,
+        api_key, base_url.rstrip("/"), structured_output, stage_budgets,
     )
 
 

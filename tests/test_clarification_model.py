@@ -51,6 +51,21 @@ class ClarificationModelTests(unittest.TestCase):
         self.assertTrue(result["confirmed"]); self.assertEqual(result["details"],[])
         self.assertEqual(result["filtered_duplicate_questions"],1)
         self.assertEqual(service.input_view("task")["clarification"]["status"],"ready")
+    def test_quick_mode_uses_one_minimal_round_and_ignores_preference_questions(self):
+        preference={**question("visual_style","q-style"),"blocking":False}
+        gateway=Clarifier([preference])
+        service=TaskService(WorkspaceStore(self.tmp.name),clarifier=gateway)
+        service.create("quick",mode="quick",target_slide_count=2)
+        service.import_input("quick",{"goal":"发布","audience":"客户","topic":"方案"})
+        self.assertEqual(service.get("quick")["stage"],"clarification")
+        result=service.generate_clarification("quick")
+        self.assertTrue(result["confirmed"])
+        self.assertEqual(result["details"],[])
+        context=gateway.calls[0]["clarification_context"]
+        self.assertEqual((context["style"],context["max_rounds"]),("minimal",1))
+        self.assertIn("仅提出真正阻碍交付",context["directive"])
+        self.assertEqual(service.get("quick")["stage"],"sample")
+        self.assertEqual(service.planning_view("quick")["outline"]["slide_ids"],["slide-1","slide-2"])
     def test_duplicate_field_within_one_round_is_rejected(self):
         # 同一轮内的重复字段仍是 Schema 级错误，整轮拒绝。
         service=self.service(Clarifier([question("pace","q-1"),question("pace","q-2")])); service.import_input("task","新品发布")

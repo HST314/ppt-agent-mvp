@@ -15,6 +15,8 @@ class SkillRuntime:
     STAGE_FILES = {
         "narrative": frozenset({"SKILL.md", "references/checklist.md"}),
         "outline": frozenset({"SKILL.md", "references/checklist.md"}),
+        "sample": frozenset({"references/design-pack-v1.md"}),
+        "deck": frozenset({"references/design-pack-v1.md"}),
         "inspection": frozenset({"SKILL.md", "references/checklist.md"}),
     }
 
@@ -108,6 +110,10 @@ class SkillRuntime:
         if normalized.startswith(skill_prefix):
             normalized = normalized[len(skill_prefix):]
         return normalized
+
+    def normalize_tool_path(self, name: str) -> str:
+        """Expose the canonical locked path for runtime de-duplication."""
+        return self._normalize_tool_path(name)
 
     def _whitelist_error(self, asset: bool, allowed_files: frozenset[str] | None = None) -> ValidationError:
         # 报错回传模型时附带合法路径列表，模型下一轮即可自我修正。

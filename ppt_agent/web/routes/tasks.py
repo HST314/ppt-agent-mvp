@@ -31,8 +31,8 @@ def list_tasks(jobs: JobService = Depends(job_service)):
 @router.post("/tasks", status_code=status.HTTP_201_CREATED)
 async def create_task(request: Request, service: TaskService = Depends(task_service)):
     body = await json_body(request)
-    exact(body, {"task_id", "mode"}, {"task_id"})
-    return service.create(body["task_id"], body.get("mode", "manual"))
+    exact(body, {"task_id", "mode", "target_slide_count"}, {"task_id"})
+    return service.create(body["task_id"], body.get("mode", "manual"), body.get("target_slide_count"))
 
 
 @router.get("/tasks/{task_id}")

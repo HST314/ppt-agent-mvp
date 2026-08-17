@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from pathlib import Path
 
 from ppt_agent.errors import GatewayError, GatewayUnknownResult, ValidationError
 from ppt_agent.audit import bind_agent_audit_context
@@ -128,6 +129,8 @@ class StageCIntegrationTests(unittest.TestCase):
             svc.generate_narrative("task")
             first=WorkspaceStore(root).agent_audits()
             self.assertEqual(first[-1]["events"][-1]["reason"],"success")
+            self.assertTrue((Path(root)/"task"/"agent-audit.jsonl").is_file())
+            self.assertEqual(WorkspaceStore(root).agent_audits(task_id="task"),first)
             failing=service(root,RaisingClient(GatewayUnknownResult("unknown")))
             with self.assertRaises(GatewayUnknownResult): failing.generate_narrative("task")
             persisted=WorkspaceStore(root).agent_audits()

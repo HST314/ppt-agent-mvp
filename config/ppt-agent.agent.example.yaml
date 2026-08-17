@@ -16,6 +16,24 @@ models:
     max_steps: 30
     max_tool_calls: 40
     max_provider_calls: 8
+    # HTML 阶段独立预算：探索提前停止，并为最终生成与 Schema 纠错保留请求。
+    stage_budgets:
+      sample:
+        max_steps: 8
+        max_tool_calls: 4
+        max_provider_calls: 6
+        max_exploration_rounds: 2
+        max_unique_files: 4
+        max_skill_bytes: 131072
+        reserved_final_calls: 2
+      deck:
+        max_steps: 12
+        max_tool_calls: 8
+        max_provider_calls: 10
+        max_exploration_rounds: 3
+        max_unique_files: 4
+        max_skill_bytes: 131072
+        reserved_final_calls: 2
     # 结构化输出模式：auto=默认，端点不支持 text.format 时自动降级；json_schema=强制发送；prompt=从不发送
     structured_output: auto
   inspection:

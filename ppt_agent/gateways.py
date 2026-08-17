@@ -95,10 +95,11 @@ class AgentGateway:
     It deliberately exposes no workflow operation to the model.  The service
     remains the only owner of stages, versions, approvals and commits.
     """
-    def __init__(self, client, *, skill=None, max_steps=12, max_tool_calls=24, max_provider_calls=8, run_timeout_seconds=300, job_timeout_seconds=330, model="agent"):
+    def __init__(self, client, *, skill=None, max_steps=12, max_tool_calls=24, max_provider_calls=8, run_timeout_seconds=300, job_timeout_seconds=330, model="agent", stage_budgets=None):
         self.client, self.model = client, model
         self.max_steps, self.max_tool_calls, self.max_provider_calls = max_steps, max_tool_calls, max_provider_calls
         self.run_timeout_seconds, self.job_timeout_seconds = run_timeout_seconds, job_timeout_seconds
+        self.stage_budgets = stage_budgets or {}
         self.skill_factory = SkillRuntime.builtin if skill is None else lambda: SkillRuntime(skill.root, max_file_bytes=skill.max_file_bytes, max_total_bytes=skill.max_total_bytes)
         self.runtime = None
         self.audit_sink = None
@@ -109,13 +110,20 @@ class AgentGateway:
     def _run(self, stage, payload):
         # Read quotas and audit are scoped to one stage invocation.  Reusing a
         # mutable SkillRuntime would let earlier stages consume later budgets.
+        stage_budget = self.stage_budgets.get(stage)
+        runtime_limits = {
+            "max_steps": getattr(stage_budget, "max_steps", self.max_steps),
+            "max_tool_calls": getattr(stage_budget, "max_tool_calls", self.max_tool_calls),
+            "max_provider_calls": getattr(stage_budget, "max_provider_calls", self.max_provider_calls),
+        }
+        for name in ("max_exploration_rounds", "max_unique_files", "max_skill_bytes", "reserved_final_calls"):
+            if stage_budget is not None:
+                runtime_limits[name] = getattr(stage_budget, name)
         self.runtime = AgentRuntime(
             self.client,
             self.skill_factory(),
-            max_steps=self.max_steps,
-            max_tool_calls=self.max_tool_calls,
-            max_provider_calls=self.max_provider_calls,
             timeout_seconds=self.run_timeout_seconds,
+            **runtime_limits,
         )
         failure = None
         try:
@@ -328,6 +336,7 @@ def agent_gateways_from_config(config):
         run_timeout_seconds=config.generation.run_timeout_seconds,
         job_timeout_seconds=config.generation.job_timeout_seconds,
         model=config.generation.model,
+        stage_budgets=config.generation.stage_budgets,
     )
     inspection = AgentGateway(
         clients["inspection"], skill=skill,

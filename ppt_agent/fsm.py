@@ -16,6 +16,7 @@ class TaskState:
     task_id: str; stage: Stage = Stage.CREATED; status: RunStatus = RunStatus.READY; mode: str = "manual"
     sample_confirmed: bool = False; blockers_resolved: bool = False; delivery_confirmed: bool = False; revision: int = 0
     waiting_reason: str | None = None; required_action: str | None = None
+    target_slide_count: int | None = None
 
     def to_dict(self):
         d=self.__dict__.copy(); d["stage"]=self.stage.value; d["status"]=self.status.value; return d

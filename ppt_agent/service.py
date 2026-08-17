@@ -166,9 +166,23 @@ class TaskService:
     def agent_audits(self,task_id,job_id=None):
         self.store.checkpoint(task_id)
         return self.store.agent_audits(task_id=task_id,job_id=job_id)
-    def create(self,task_id,mode="manual"):
-        if mode not in {"manual","auto"}: raise ValidationError("mode 只能是 manual 或 auto")
-        s=TaskState(task_id=task_id,mode=mode); self.store.create(task_id,s.to_dict()); return s.to_dict()
+    def create(self,task_id,mode="manual",target_slide_count=None):
+        if mode not in {"manual","auto","quick"}: raise ValidationError("mode 只能是 manual、auto 或 quick")
+        if mode == "quick":
+            if isinstance(target_slide_count,bool) or not isinstance(target_slide_count,int) or not 1 <= target_slide_count <= 200:
+                raise ValidationError("快速生成必须明确 1 到 200 页的最终页数")
+        elif target_slide_count is not None:
+            raise ValidationError("target_slide_count 仅用于快速生成模式")
+        s=TaskState(task_id=task_id,mode=mode,target_slide_count=target_slide_count)
+        self.store.create(task_id,s.to_dict()); return s.to_dict()
+    def _task_clarification_config(self,task_id):
+        if self.get(task_id).get("mode") == "quick":
+            return ClarificationConfig(
+                max_questions_per_round=self._clarification_config.max_questions_per_round,
+                max_rounds=1,
+                style="minimal",
+            )
+        return self._clarification_config
     def get(self,task_id): return self.store.checkpoint(task_id)
     def _require_actionable(self,task_id):
         status=self.get(task_id)["status"]
@@ -216,6 +230,11 @@ class TaskService:
             raw_source=canonical(source) if isinstance(source,dict) else str(source).encode("utf-8")
             raw_source_hash=self.store.put_version(task_id,"input-source",raw_source,{"content_type":"application/json" if isinstance(source,dict) else "text/plain"})
             card=parse_task_card(source,source_format)
+            if state.mode == "quick":
+                requested=requested_slide_count(card)
+                if requested is not None and requested != state.target_slide_count:
+                    raise ValidationError(f"任务卡页数与快速生成目标 {state.target_slide_count} 页不一致")
+                card={**card,"constraints":{**card.get("constraints",{}),"page_count":state.target_slide_count}}
             source_format=card["source_format"]
             card_json={"task_id":task_id,"goal":card.get("goal","待澄清"),"audience":card.get("audience","待澄清"),"topic":card.get("topic","待澄清"),"source_format":source_format,"schema_version":"1.0"}
             parsed_card=TaskCard.parse(card_json); card_hash=self.store.put_version(task_id,"task-card",canonical(parsed_card.to_dict()),{"normalized":card})
@@ -227,7 +246,8 @@ class TaskService:
             questions=[] if self.clarifier is not None else questions_for(card)
             diagnostic_id=f"clarification-{digest(canonical({'task_id':task_id,'card':card,'raw_source_hash':raw_source_hash}))[:16]}"
             clarification=ClarificationSet.parse({"clarification_id":f"clarification-{digest(canonical({'questions':questions,'diagnostic_id':diagnostic_id,'raw_source_hash':raw_source_hash}))[:16]}","task_id":task_id,"questions":tuple(q["prompt"] for q in questions),"assumptions":tuple(card["assumptions"]),"confirmed":not questions,"schema_version":"1.0"})
-            clarification_meta={"questions":questions,"details":questions,"answers":{},"invalidated":[],"status":"generating" if self.clarifier is not None else "ready","question_source":None if self.clarifier is not None else "fallback","question_model":None,"diagnostic_id":diagnostic_id,"question_schema_version":"1.0","input_hash":raw_source_hash,"round":1,"rounds_history":[],"max_rounds":self._clarification_config.max_rounds,"max_questions_per_round":self._clarification_config.max_questions_per_round,"style":self._clarification_config.style}
+            clarification_config=self._task_clarification_config(task_id)
+            clarification_meta={"questions":questions,"details":questions,"answers":{},"invalidated":[],"status":"generating" if self.clarifier is not None else "ready","question_source":None if self.clarifier is not None else "fallback","question_model":None,"diagnostic_id":diagnostic_id,"question_schema_version":"1.0","input_hash":raw_source_hash,"round":1,"rounds_history":[],"max_rounds":clarification_config.max_rounds,"max_questions_per_round":clarification_config.max_questions_per_round,"style":clarification_config.style}
             clarification_hash=self.store.put_version(task_id,"clarification",canonical(clarification.to_dict()),clarification_meta)
             snapshot=TaskInputSnapshot.parse({"snapshot_id":f"snapshot-{digest((raw_source_hash+card_hash+manifest_hash).encode())[:16]}","task_id":task_id,"task_card_hash":card_hash,"resource_manifest_hash":manifest_hash,"created_at":now(),"schema_version":"1.0"})
             snapshot_hash=self.store.put_version(task_id,"input-snapshot",canonical(snapshot.to_dict()),{"clarification_hash":clarification_hash,"raw_source_hash":raw_source_hash,"rebuild_of":existing[-1]["hash"] if existing else None})
@@ -236,7 +256,10 @@ class TaskService:
             event={"event_id":hashlib.sha256(f"{task_id}:input:{snapshot_hash}".encode()).hexdigest()[:24],"command_id":f"input-{snapshot_hash[:16]}","action":"rebuild_input" if existing else "import_input","actor":"user","request_hash":snapshot_hash,"at":utcnow(),"from":state.to_dict(),"to":new.to_dict(),"result":{"snapshot_hash":snapshot_hash}}
             self.store.commit(task_id,new.to_dict(),event)
             result={"state":new.to_dict(),"snapshot":snapshot.to_dict(),"snapshot_hash":snapshot_hash,"task_card":card,"manifest":{**manifest.to_dict(),"resources":resources,"warnings":warnings},"clarification":{**clarification.to_dict(),"details":questions,**clarification_meta},"clarification_hash":clarification_hash}
-            if new.mode=="auto" and not questions:
+            # Fake mode can advance immediately. In real mode the empty
+            # placeholder means the clarification model has not run yet; the
+            # route will enqueue that persisted Job first.
+            if new.mode in {"auto","quick"} and self.clarifier is None and not questions:
                 self._drive_auto_to_sample(task_id); result["state"]=self.get(task_id)
             return result
     def input_view(self,task_id):
@@ -269,13 +292,17 @@ class TaskService:
     def generate_clarification(self,task_id):
         if self.clarifier is None: raise ConflictError("当前为 fake 模式，不能调用澄清模型")
         view=self.input_view(task_id); snapshot_record=next(v for v in self.versions(task_id,"input-snapshot") if v["hash"]==view["snapshot_hash"]); raw_hash=snapshot_record["metadata"]["raw_source_hash"]
-        prior=view["clarification"]; config=self._clarification_config
+        prior=view["clarification"]; config=self._task_clarification_config(task_id)
         round_number=prior.get("round",1); history=list(prior.get("rounds_history",[]))
         payload={"task_id":task_id,"original_input":self.version(task_id,raw_hash).decode("utf-8"),"original_input_sha256":raw_hash,"normalized_task_card":view["task_card"],"candidate_missing_fields":view["task_card"].get("missing",[]),"resource_summary":view["manifest"],"clarification_context":{"round":round_number,"max_rounds":config.max_rounds,"max_questions_per_round":config.max_questions_per_round,"style":config.style,"directive":_clarification_directive(config,round_number),"previous_qa":history}}
         try:
             value=self.clarifier.clarify(payload)
             asked=[q.get("field_path") for entry in history for q in entry.get("questions",[]) if isinstance(q,dict)]
             questions,filtered=self._validate_model_questions(value.get("questions"),view["task_card"],max_questions=config.max_questions_per_round,asked_field_paths=asked)
+            if self.get(task_id).get("mode") == "quick":
+                non_blocking=sum(1 for question in questions if not question["blocking"])
+                questions=[question for question in questions if question["blocking"]]
+                filtered += non_blocking
         except Exception as exc:
             error=exc.public()["error"] if hasattr(exc,"public") else {"code":"clarification_generation_failed","message":"澄清问题生成失败","diagnostic_id":hashlib.sha256(f"{task_id}:{type(exc).__name__}".encode()).hexdigest()[:24]}
             self._record_clarification(task_id,view,[],"failed",None,error,"clarification_failed"); raise
@@ -284,6 +311,8 @@ class TaskService:
         if result["confirmed"] and history:
             # 模型在后续轮次返回 0 题 = 提前确认；此前轮次的答案已合并进任务卡，同步冻结。
             self._freeze_task_card(task_id,view["task_card"],result["clarification_hash"])
+        if result["confirmed"] and self.get(task_id).get("mode") in {"auto","quick"}:
+            self._drive_auto_to_sample(task_id)
         return result
 
     def recover_clarification_failure(self,task_id,error):
@@ -323,7 +352,7 @@ class TaskService:
             seen_ids.add(q["question_id"]); seen_paths.add(q["field_path"]); result.append({**q,"field":q["field_path"]})
         return result, filtered
     def _record_clarification(self,task_id,view,questions,status,model,error,action,source="model",extra=None):
-        config=self._clarification_config
+        config=self._task_clarification_config(task_id)
         meta={"questions":questions,"details":questions,"answers":{},"invalidated":[],"status":status,"question_source":source if status=="ready" else None,"question_model":model,"diagnostic_id":view["clarification"]["diagnostic_id"],"question_schema_version":"1.0","input_hash":view["clarification"]["input_hash"],"normalized_task_card":view["task_card"],"round":config.max_rounds if source=="fallback" else view["clarification"].get("round",1),"rounds_history":list(view["clarification"].get("rounds_history",[])),"max_rounds":config.max_rounds,"max_questions_per_round":config.max_questions_per_round,"style":config.style}
         if error: meta["error"]=error
         if extra: meta.update(extra)
@@ -360,7 +389,7 @@ class TaskService:
         merged["missing"]=[key for key in merged.get("missing",[]) if not merged.get(key)]
         payload={"questions":details,"details":details,"answers":answers,"status":"ready","normalized_task_card":merged,"invalidated":(["narrative","outline","sample","deck","inspection","delivery"] if changed else clarification.get("invalidated",[])),**{k:clarification.get(k) for k in ("question_source","question_model","diagnostic_id","question_schema_version","input_hash")}}
         if not pending:
-            config=self._clarification_config; current_round=clarification.get("round",1)
+            config=self._task_clarification_config(task_id); current_round=clarification.get("round",1)
             if self.clarifier is not None and clarification.get("question_source")=="model" and current_round < config.max_rounds:
                 # 阻断题已答完且轮次预算未用尽：归档本轮问答，自动生成下一轮。
                 history=list(clarification.get("rounds_history",[]))
@@ -379,12 +408,12 @@ class TaskService:
         self.store.commit(task_id,new.to_dict(),event)
         if not pending:
             self._freeze_task_card(task_id,merged,ch)
-        if new.mode=="auto" and not pending: self._drive_auto_to_sample(task_id)
+        if new.mode in {"auto","quick"} and not pending: self._drive_auto_to_sample(task_id)
         return {"state":self.get(task_id),"clarification_hash":ch,**payload,"confirmed":not pending}
 
     def _drive_auto_to_sample(self,task_id):
         state=TaskState.parse(self.get(task_id))
-        if state.mode!="auto": return
+        if state.mode not in {"auto","quick"}: return
         if not self._current_version(task_id,"narrative"): self.generate_narrative(task_id)
         if not self._current_version(task_id,"outline"): self.generate_outline(task_id)
         if not self._current_version(task_id,"sample"): self.generate_sample(task_id)
@@ -521,7 +550,7 @@ class TaskService:
         self._invalidate_outline_confirmation(task_id,h)
         self._invalidate_sample_gate(task_id,h)
         state=TaskState.parse(self.get(task_id))
-        if state.stage==state.stage.NARRATIVE and state.mode=="auto":
+        if state.stage==state.stage.NARRATIVE and state.mode in {"auto","quick"}:
             self.command(task_id,f"auto-outline-stage-{h[:12]}","advance")
             self.confirm_outline(task_id)
         return self.planning_view(task_id)
@@ -870,12 +899,12 @@ class TaskService:
             if state.stage==state.stage.DECK: self.command(task_id,f"to-review-{self._current_version(task_id,'deck')[:12]}","advance","system"); state=TaskState.parse(self.get(task_id))
             if state.stage!=state.stage.REVIEW: raise ConflictError("当前阶段不能执行检查")
             report=self._inspect_once(task_id,scope,affected,0,_prepared_raw); rounds=0
-            if state.mode=="auto":
+            if state.mode in {"auto","quick"}:
                 while not report["passed"] and rounds<max_rounds:
                     rounds+=1; self._auto_fix(task_id,report,rounds); report=self._inspect_once(task_id,"incremental",affected,rounds)
             waiting=not report["passed"]
             current=TaskState.parse(self.get(task_id))
-            new=current.__class__(**{**current.__dict__,"status":current.status.WAITING_FOR_USER if waiting or state.mode=="manual" else current.status.READY,"waiting_reason":"inspection_round_limit" if waiting and state.mode=="auto" else "manual_review" if state.mode=="manual" else None,"required_action":"review_issues" if waiting or state.mode=="manual" else None,"revision":current.revision+1})
+            new=current.__class__(**{**current.__dict__,"status":current.status.WAITING_FOR_USER if waiting or state.mode=="manual" else current.status.READY,"waiting_reason":"inspection_round_limit" if waiting and state.mode in {"auto","quick"} else "manual_review" if state.mode=="manual" else None,"required_action":"review_issues" if waiting or state.mode=="manual" else None,"revision":current.revision+1})
             event={"event_id":digest(f"{task_id}:{report['hash']}:inspection".encode())[:24],"command_id":f"inspection-{report['hash'][:16]}","action":"inspection_complete","actor":"system","request_hash":report["hash"],"at":utcnow(),"from":current.to_dict(),"to":new.to_dict(),"result":{"report_hash":report["hash"],"rounds":rounds,"passed":report["passed"],"mode":state.mode}}
             self.store.commit(task_id,new.to_dict(),event)
         logging.info(json.dumps({"event":"action_metric","action":"inspection_run","task_id":task_id,"duration_ms":round((time.monotonic()-metric_started)*1000,2),"failed":False,"repair_rounds":rounds,"passed":report["passed"]}))

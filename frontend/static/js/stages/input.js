@@ -1,6 +1,6 @@
-import { api } from "../api.js?v=2026.08.17.095744983694";
-import { badge, button, confirmationDialog, element, field, metadataList, shortHash } from "../components/index.js?v=2026.08.17.095744983694";
-import { actionMessage, invalidationNotice, runAction, section, stageGrid } from "./shared.js?v=2026.08.17.095744983694";
+import { api } from "../api.js?v=2026.08.17.112846263255";
+import { badge, button, confirmationDialog, element, field, metadataList, shortHash } from "../components/index.js?v=2026.08.17.112846263255";
+import { actionMessage, invalidationNotice, runAction, section, stageGrid } from "./shared.js?v=2026.08.17.112846263255";
 
 const FIELD_LABELS = { goal: "演示目标", audience: "主要受众", topic: "核心主题" };
 const WARNING_LABELS = {
@@ -94,6 +94,10 @@ function inputStage(view, context) {
     await submitImport().catch(() => {});
     updateGate();
   } }, [
+    view.state.mode === "quick" ? element("div", { className: "notice", role: "status" }, [
+      element("strong", { text: `快速生成 · 严格 ${view.state.target_slide_count} 页` }),
+      element("p", { text: "系统只询问阻断交付的问题；澄清完成后会自动生成并保存叙事结构、逐页大纲与样品，仍可在各阶段回看。" }),
+    ]) : null,
     field("任务卡格式", format, { hint: "Markdown 更适合直接填写；JSON 适合结构化导入。" }),
     field("任务卡内容", source, { hint: hasSnapshot ? "已按当前冻结快照回填原始资料；修改后需显式重建。" : "任务资料首次导入即冻结；只有逐页大纲前可显式重建。" }),
     element("label", { className: "check-row", htmlFor: "rebuild-input" }, [rebuild, element("span", { text: "显式重建快照并重新扫描授权资源" })]),
@@ -326,8 +330,9 @@ function nextNarrative(context) {
   const message = actionMessage();
   const start = button("生成叙事结构", { kind: "primary", mutates: true, requiresRuntime: true });
   start.addEventListener("click", () => context.startJob("narrative.generate", { prompt: null, scope: "all" }, { buttonNode: start, region: message }));
-  return section("资料已可用于下一阶段", [
-    element("p", { text: "阻断澄清已完成。生成叙事结构后，任务会进入需要人工确认的叙事阶段。" }),
+  const quick = context.shell.task.mode === "quick";
+  return section(quick ? "快速流程已完成阻断澄清" : "资料已可用于下一阶段", [
+    element("p", { text: quick ? "快速流程会自动保存叙事结构、逐页大纲并推进到样品确认。若当前尚未推进，可从此处恢复生成。" : "阻断澄清已完成。生成叙事结构后，任务会进入需要人工确认的叙事阶段。" }),
     start,
     message,
   ]);

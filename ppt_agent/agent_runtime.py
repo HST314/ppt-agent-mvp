@@ -13,6 +13,7 @@ from .skill_runtime import SkillRuntime
 
 STAGES = {"clarification", "narrative", "outline", "sample", "deck", "inspection"}
 PLANNING_STAGES = frozenset({"narrative", "outline", "inspection"})
+RENDERING_STAGES = frozenset({"sample", "deck"})
 MAX_PLANNING_FILE_READS = 2
 DATA_IMAGE = "data:image/"
 STAGE_PROMPTS = {
@@ -33,8 +34,8 @@ STAGE_PROMPTS = {
         "按需最多读取 1 到 2 个当前阶段已列出的 Skill 文件，禁止尝试读取布局、主题、图片或 HTML 模板文件；"
         "读取后立即提交大纲 JSON，不要重复读取。"
     ),
-    "sample": "仅为外层状态机指定的样品页生成 section 片段，不得生成公共模板或扩展到全稿；可按需调用只读 Skill 工具了解布局、主题和素材约束；每项 html 必须严格以 <section class=\"slide\" id=\"给定ID\" data-slide-id=\"给定ID\"> 开始并以 </section> 结束。",
-    "deck": "仅为外层状态机给定的未确认页面生成 section 片段；不得重做确认样品、不得生成公共模板；可按需调用只读 Skill 工具了解布局、主题和素材约束；每项 html 必须严格以 <section class=\"slide\" id=\"给定ID\" data-slide-id=\"给定ID\"> 开始并以 </section> 结束。",
+    "sample": "仅为外层状态机指定的样品页生成 section 片段，不得生成公共模板或扩展到全稿；优先直接使用输入和轻量 design pack 清单，最多进行两轮必要探索；每项 html 必须严格以 <section class=\"slide\" id=\"给定ID\" data-slide-id=\"给定ID\"> 开始并以 </section> 结束。",
+    "deck": "仅为外层状态机给定的未确认页面生成 section 片段；不得重做确认样品、不得生成公共模板；优先直接使用输入和轻量 design pack 清单，避免重复探索；每项 html 必须严格以 <section class=\"slide\" id=\"给定ID\" data-slide-id=\"给定ID\"> 开始并以 </section> 结束。",
     "inspection": "独立检查大纲与 HTML，仅报告有证据的问题，不得直接修改产物。",
 }
 
@@ -157,6 +158,9 @@ def _tools_for_stage(stage: str, stage_files: frozenset[str] | None) -> list[dic
     if stage in PLANNING_STAGES:
         allowed = stage_files or frozenset()
         return [_list_skill_files_tool(), *([_read_skill_file_tool(allowed)] if allowed else [])]
+    if stage in RENDERING_STAGES:
+        allowed = stage_files or frozenset()
+        return [_read_skill_file_tool(allowed)] if allowed else []
     return TOOLS
 
 
@@ -168,7 +172,7 @@ class AgentResult:
 
 
 class AgentRuntime:
-    def __init__(self, client, skill: SkillRuntime, *, max_steps: int = 12, timeout_seconds: float = 60, clock=time.monotonic, max_output_bytes: int = 1024 * 1024, max_tool_calls: int = 24, max_provider_calls: int = 8, max_schema_corrections: int = 1, max_tool_error_rounds: int = 2):
+    def __init__(self, client, skill: SkillRuntime, *, max_steps: int = 12, timeout_seconds: float = 60, clock=time.monotonic, max_output_bytes: int = 1024 * 1024, max_tool_calls: int = 24, max_provider_calls: int = 8, max_schema_corrections: int = 1, max_tool_error_rounds: int = 2, max_exploration_rounds: int = 1, max_unique_files: int = 4, max_skill_bytes: int = 128 * 1024, reserved_final_calls: int = 1):
         self.client, self.skill = client, skill
         self.max_steps, self.timeout_seconds, self.clock = max_steps, timeout_seconds, clock
         self.max_output_bytes, self.max_tool_calls = max_output_bytes, max_tool_calls
@@ -181,6 +185,24 @@ class AgentRuntime:
             raise ValidationError("工具错误轮次必须是 1 到 3 的整数")
         self.max_schema_corrections = max_schema_corrections
         self.max_tool_error_rounds = max_tool_error_rounds
+        limits = {
+            "探索轮次": (max_exploration_rounds, 0, 10),
+            "唯一文件数": (max_unique_files, 1, 20),
+            "Skill 字节数": (max_skill_bytes, 1024, 512 * 1024),
+            "最终输出预留请求数": (reserved_final_calls, 1, max_provider_calls - 1),
+        }
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum
+            for value, minimum, maximum in limits.values()
+        ):
+            raise ValidationError("Agent 探索或最终输出预算无效")
+        if max_exploration_rounds > max_provider_calls - reserved_final_calls:
+            raise ValidationError("Agent 探索预算挤占了最终输出预留请求")
+        self.max_exploration_rounds = max_exploration_rounds
+        self.max_unique_files = max_unique_files
+        self.max_skill_bytes = max_skill_bytes
+        self.reserved_final_calls = reserved_final_calls
+        self.skill.max_total_bytes = min(self.skill.max_total_bytes, max_skill_bytes)
         self.last_audit: tuple[dict, ...] = ()
 
     def run(self, stage: str, payload: dict, *, response_schema: dict | None = None, capability_probe: bool = False) -> AgentResult:
@@ -222,13 +244,16 @@ class AgentRuntime:
 
         provider_call_budget = ProviderCallBudget(self.max_provider_calls, provider_claimed)
         successful_read_count, successful_read_paths = 0, set()
+        successful_read_digests: dict[str, str] = {}
+        exploration_rounds, repeated_read_count, skill_bytes = 0, 0, 0
+        force_final_output = False
         tool_error_corrections, recovery_active = 0, False
         remaining_paths: frozenset[str] | None = None
         input_json=json.dumps(payload,ensure_ascii=False,sort_keys=True,separators=(",",":"))
         stage_file_contract = json.dumps(sorted(stage_files) if stage_files is not None else ["*"])
         tool_contract = self._stage_tool_contract(stage, stage_files)
         tool_schema_contract = json.dumps(stage_tools, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        audit.append({"event": "run", "stage": stage, "skill": self.skill.skill_name, "skill_version": self.skill.skill_version, "lock_sha256": hashlib.sha256(json.dumps(self.skill.manifest, sort_keys=True).encode()).hexdigest(), "input_sha256": hashlib.sha256(input_json.encode()).hexdigest(), "config_sha256": hashlib.sha256((STAGE_PROMPTS[stage]+override+stage_file_contract+tool_contract+tool_schema_contract).encode()).hexdigest()})
+        audit.append({"event": "run", "stage": stage, "skill": self.skill.skill_name, "skill_version": self.skill.skill_version, "lock_sha256": hashlib.sha256(json.dumps(self.skill.manifest, sort_keys=True).encode()).hexdigest(), "input_sha256": hashlib.sha256(input_json.encode()).hexdigest(), "config_sha256": hashlib.sha256((STAGE_PROMPTS[stage]+override+stage_file_contract+tool_contract+tool_schema_contract).encode()).hexdigest(), "stage_files": sorted(stage_files or ()), "max_exploration_rounds": self.max_exploration_rounds, "max_unique_files": self.max_unique_files, "max_skill_bytes": self.max_skill_bytes, "reserved_final_calls": self.reserved_final_calls})
         def probe_phase(reason: str) -> str:
             if stage == "clarification":
                 return "strict_json_schema"
@@ -248,6 +273,10 @@ class AgentRuntime:
                 "max_steps": self.max_steps,
                 "max_tool_calls": self.max_tool_calls,
                 "max_provider_calls": self.max_provider_calls,
+                "exploration_rounds": exploration_rounds,
+                "cumulative_skill_bytes": skill_bytes,
+                "unique_skill_files": len(successful_read_paths),
+                "repeated_skill_reads": repeated_read_count,
             }
             if phase:
                 terminal["probe_phase"] = phase
@@ -275,7 +304,8 @@ class AgentRuntime:
                 else "\n这是启动能力探测：必须先调用一次 list_skill_files，收到工具结果后再提交符合 Schema 的 JSON。"
             )
         conversation: list[Any] = [{"role": "system", "content": f"当前阶段：{stage}\n阶段目标：{STAGE_PROMPTS[stage]}\n{override}\n{tool_contract}{probe_instruction}\n{_output_contract(local_schema)}"}, {"role": "user", "content": input_json}]
-        convergence_step = max(2, (self.max_steps * 4 + 4) // 5)
+        effective_round_budget = min(self.max_steps, self.max_provider_calls)
+        convergence_step = max(1, (effective_round_budget * 4 + 4) // 5)
         for step in range(1, self.max_steps + 1):
             active_step = step
             checkpoint()
@@ -284,9 +314,25 @@ class AgentRuntime:
             checkpoint()
             try:
                 tool_choice = None
-                request_tools = stage_tools
-                request_allowed_files = stage_files
-                if recovery_active:
+                dynamic_files = stage_files
+                if stage in RENDERING_STAGES and stage_files is not None:
+                    dynamic_files = frozenset(stage_files - successful_read_paths)
+                request_tools = _tools_for_stage(stage, dynamic_files)
+                request_allowed_files = dynamic_files
+                if (
+                    force_final_output
+                    or provider_call_budget.claimed >= self.max_provider_calls - self.reserved_final_calls
+                    or (stage in RENDERING_STAGES and (
+                        exploration_rounds >= self.max_exploration_rounds
+                        or successful_read_count >= self.max_unique_files
+                        or skill_bytes >= self.max_skill_bytes
+                    ))
+                ):
+                    request_tools = []
+                    request_allowed_files = frozenset()
+                    tool_choice = "none"
+                    force_final_output = True
+                if recovery_active and not force_final_output:
                     request_tools = self._recovery_tools(stage, stage_files, remaining_paths)
                     if stage in PLANNING_STAGES:
                         # The same immutable path set drives the recovery request
@@ -294,16 +340,20 @@ class AgentRuntime:
                         request_allowed_files = remaining_paths or frozenset()
                     if not request_tools:
                         tool_choice = "none"
+                if not request_tools:
+                    tool_choice = "none"
                 if capability_probe and stage != "clarification":
                     tool_choice = {"type": "function", "name": "list_skill_files"} if tool_count == 0 else "none"
                 request_schema = None if capability_probe and stage != "clarification" and tool_count == 0 else provider_schema
                 if step == convergence_step:
                     conversation.append({
                         "role": "user",
-                        "content": "当前阶段已使用约 80% 的 Agent 步数预算。请停止非必要探索，优先利用已有信息提交符合 Schema 的完整最终结果。",
+                        "content": "当前阶段已接近模型请求预算的 80%。请停止非必要探索，优先利用已有信息提交符合 Schema 的完整最终结果。",
                     })
                     audit.append({"step": step, "event": "budget_convergence", "threshold": 80})
                 progress("waiting_model", f"等待模型响应（第 {step} 轮）", metrics())
+                request_input_bytes = len(json.dumps(conversation, ensure_ascii=False, separators=(",", ":")).encode())
+                request_conversation_items = len(conversation)
                 kwargs = {
                     "input": conversation,
                     "tools": request_tools,
@@ -375,12 +425,13 @@ class AgentRuntime:
             output = (turn.text or "").encode()
             if len(output) > self.max_output_bytes:
                 fail("Agent 最终输出超过大小上限", "output_limit")
-            audit.append({"step": step, "event": "model", "response_id_sha256": hashlib.sha256((turn.response_id or "").encode()).hexdigest(), "output_sha256": hashlib.sha256(output).hexdigest()})
+            audit.append({"step": step, "event": "model", "response_id_sha256": hashlib.sha256((turn.response_id or "").encode()).hexdigest(), "output_sha256": hashlib.sha256(output).hexdigest(), "input_bytes": request_input_bytes, "conversation_items": request_conversation_items, "cumulative_skill_bytes": skill_bytes, "unique_skill_files": len(successful_read_paths), "repeated_skill_reads": repeated_read_count})
             if turn.tool_calls:
                 if not stage_tools:
                     fail("澄清阶段不允许工具调用", "unauthorized_tool")
                 if capability_probe and tool_count == 0 and (len(turn.tool_calls) != 1 or turn.tool_calls[0].name != "list_skill_files"):
                     fail("模型未按要求完成确定性工具调用", "capability_probe_failed")
+                exploration_rounds += 1
                 successful_calls, failed_calls = 0, 0
                 request_tool_names = {tool["name"] for tool in request_tools}
                 for call in turn.tool_calls:
@@ -401,8 +452,15 @@ class AgentRuntime:
                         args, error = {}, {"ok": False, "error": {"code": "invalid_arguments", "message": str(exc)}}
                     if error is None and call.name not in request_tool_names:
                         error = {"ok": False, "error": {"code": "unauthorized_tool", "message": "当前轮次未授权该工具；请使用已提供的工具或直接提交最终 JSON"}}
-                    if error is None and stage in PLANNING_STAGES and call.name == "read_skill_file" and successful_read_count >= MAX_PLANNING_FILE_READS:
-                        result = {"ok": False, "error": {"code": "quota_exceeded", "message": f"当前阶段最多读取 {MAX_PLANNING_FILE_READS} 个 Skill 文件；请直接提交最终 JSON"}}
+                    requested_path = args.get("path") if isinstance(args, dict) else None
+                    normalized_path = self.skill.normalize_tool_path(requested_path) if isinstance(requested_path, str) else None
+                    repeated = call.name == "read_skill_file" and normalized_path in successful_read_paths
+                    read_limit = MAX_PLANNING_FILE_READS if stage in PLANNING_STAGES else self.max_unique_files
+                    if error is None and repeated:
+                        repeated_read_count += 1
+                        result = {"ok": False, "error": {"code": "already_read", "message": "该文件已读取；未重复返回正文，请直接使用已有上下文"}, "path": normalized_path, "already_read": True, "bytes": 0, "sha256": successful_read_digests.get(normalized_path)}
+                    elif error is None and call.name == "read_skill_file" and successful_read_count >= read_limit:
+                        result = {"ok": False, "error": {"code": "quota_exceeded", "message": f"当前阶段最多读取 {read_limit} 个 Skill 文件；请直接提交最终 JSON"}}
                     else:
                         try:
                             result = error or self.skill.dispatch(call.name, args, allowed_files=request_allowed_files)
@@ -413,12 +471,15 @@ class AgentRuntime:
                         failed_calls += 1
                     else:
                         successful_calls += 1
-                        if stage in PLANNING_STAGES and call.name == "read_skill_file":
+                        if call.name == "read_skill_file" and not repeated:
                             successful_read_count += 1
                             if isinstance(result.get("path"), str):
                                 successful_read_paths.add(result["path"])
-                    requested_path = args.get("path") if isinstance(args, dict) else None
-                    audit.append({"step": step, "event": "tool_error" if failed else "tool", "tool": call.name, "error_code": result.get("error", {}).get("code") if failed else None, "call_id_sha256": hashlib.sha256((call.call_id or "").encode()).hexdigest(), "requested_path_sha256": hashlib.sha256(requested_path.encode()).hexdigest() if isinstance(requested_path, str) and requested_path else None, "path": result.get("path"), "file_sha256": result.get("sha256"), "result_sha256": hashlib.sha256(json.dumps(result, sort_keys=True, ensure_ascii=False).encode()).hexdigest()})
+                                if isinstance(result.get("sha256"), str):
+                                    successful_read_digests[result["path"]] = result["sha256"]
+                            if isinstance(result.get("bytes"), int):
+                                skill_bytes += result["bytes"]
+                    audit.append({"step": step, "event": "tool_error" if failed else "tool", "tool": call.name, "error_code": result.get("error", {}).get("code") if failed else None, "call_id_sha256": hashlib.sha256((call.call_id or "").encode()).hexdigest(), "requested_path_sha256": hashlib.sha256(requested_path.encode()).hexdigest() if isinstance(requested_path, str) and requested_path else None, "path": result.get("path"), "file_sha256": result.get("sha256"), "result_bytes": result.get("bytes", 0), "repeated": repeated, "cumulative_skill_bytes": skill_bytes, "unique_skill_files": len(successful_read_paths), "result_sha256": hashlib.sha256(json.dumps(result, sort_keys=True, ensure_ascii=False).encode()).hexdigest()})
                     progress(
                         "skill_completed",
                         f"只读 Skill 调用{'失败' if failed else '完成'}：{call.name}",
@@ -435,6 +496,7 @@ class AgentRuntime:
                         stage_files,
                         successful_read_paths,
                         successful_read_count,
+                        self.max_unique_files,
                     )
                 # Budget failed *model rounds*, not individual calls.  Every
                 # call in one response is processed and fed back as one batch.
@@ -458,6 +520,7 @@ class AgentRuntime:
                     schema_corrections += 1
                     audit.append({"step": step, "event": "schema_correction", "reason": "invalid_json", "attempt": schema_corrections})
                     conversation.extend([{"role": "assistant", "content": turn.text or ""}, {"role": "user", "content": "上次输出不是有效 JSON。请仅按已提供的 JSON Schema 重新输出完整 JSON；不要调用工具，不要添加解释。"}])
+                    force_final_output = True
                     continue
                 fail("Agent 最终输出不是有效 JSON", "invalid_output", exc)
             if not isinstance(value, dict):
@@ -469,11 +532,12 @@ class AgentRuntime:
                     schema_corrections += 1
                     audit.append({"step": step, "event": "schema_correction", "reason": "schema_validation", "attempt": schema_corrections})
                     conversation.extend([{"role": "assistant", "content": turn.text or ""}, {"role": "user", "content": f"上次输出未通过 Schema 校验：{exc.message}。请仅按已提供的 JSON Schema 重新输出完整 JSON；不要调用工具，不要添加解释。"}])
+                    force_final_output = True
                     continue
                 fail(exc.message, "invalid_output", exc)
             if capability_probe and stage != "clarification" and not any(item.get("event") == "tool" for item in audit):
                 fail("模型未完成工具能力探测", "capability_probe_failed")
-            audit.append({"event": "terminal", "reason": "success", "tool_calls": tool_count, "provider_calls": provider_call_budget.claimed})
+            audit.append({"event": "terminal", "reason": "success", "tool_calls": tool_count, "provider_calls": provider_call_budget.claimed, "exploration_rounds": exploration_rounds, "cumulative_skill_bytes": skill_bytes, "unique_skill_files": len(successful_read_paths), "repeated_skill_reads": repeated_read_count})
             progress("agent_completed", "Agent 已提交有效阶段结果", metrics())
             self.last_audit = tuple(audit)
             return AgentResult(value, self.last_audit, turn.response_id)
@@ -518,6 +582,13 @@ class AgentRuntime:
                 f"read_skill_file.path 只允许：{allowed}。最多成功读取 {MAX_PLANNING_FILE_READS} 个文件；"
                 "不需要读取时请直接提交最终 JSON。"
             )
+        if stage in RENDERING_STAGES:
+            allowed = "、".join(sorted(stage_files or ())) or "（无）"
+            return (
+                f"工具契约：轻量 design pack 的锁定文件清单为：{allowed}。"
+                "无需先调用 list_skill_files；read_skill_file.path 只能从该清单选择，已读路径不会再次返回正文。"
+                "达到探索、唯一文件或字节预算后工具会被移除，必须提交最终 JSON。"
+            )
         return "工具契约：仅可使用当前请求中提供的只读 Skill 工具；也可以不调用工具直接提交最终 JSON。"
 
     @staticmethod
@@ -526,6 +597,8 @@ class AgentRuntime:
         stage_files: frozenset[str] | None,
         remaining_paths: frozenset[str] | None,
     ) -> list[dict]:
+        if stage in RENDERING_STAGES:
+            return [_read_skill_file_tool(remaining_paths)] if remaining_paths else []
         if stage not in PLANNING_STAGES:
             return _tools_for_stage(stage, stage_files)
         return [_read_skill_file_tool(remaining_paths)] if remaining_paths else []
@@ -536,7 +609,12 @@ class AgentRuntime:
         stage_files: frozenset[str] | None,
         successful_read_paths: set[str],
         successful_read_count: int,
+        max_unique_files: int = 4,
     ) -> frozenset[str] | None:
+        if stage in RENDERING_STAGES:
+            if successful_read_count >= max_unique_files:
+                return frozenset()
+            return frozenset((stage_files or frozenset()) - successful_read_paths)
         if stage not in PLANNING_STAGES:
             return None
         if successful_read_count >= MAX_PLANNING_FILE_READS:

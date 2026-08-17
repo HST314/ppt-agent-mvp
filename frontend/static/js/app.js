@@ -1,10 +1,10 @@
-import { api, ApiError } from "./api.js?v=2026.08.17.095744983694";
-import { JobTracker } from "./job-tracker.js?v=2026.08.17.095744983694";
-import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.17.095744983694";
-import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.17.095744983694";
-import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.17.095744983694";
-import { inlineError, setBusy } from "./components/index.js?v=2026.08.17.095744983694";
-import { renderStage } from "./stages/index.js?v=2026.08.17.095744983694";
+import { api, ApiError } from "./api.js?v=2026.08.17.112846263255";
+import { JobTracker } from "./job-tracker.js?v=2026.08.17.112846263255";
+import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.17.112846263255";
+import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.17.112846263255";
+import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.17.112846263255";
+import { inlineError, setBusy } from "./components/index.js?v=2026.08.17.112846263255";
+import { renderStage } from "./stages/index.js?v=2026.08.17.112846263255";
 
 const app = document.getElementById("app");
 const APP_BUILD = document.querySelector('meta[name="app-build"]')?.content || "unknown";
@@ -47,6 +47,12 @@ const JOB_ERROR_PRESENTATIONS = {
     guidance: "模型连续请求了本阶段不允许的工具或文件。系统已停止无效调用；请重试，若再次发生请提供诊断 ID。",
   },
 };
+
+function taskModeLabel(mode, compact = false) {
+  if (mode === "quick") return compact ? "快速" : "快速生成";
+  if (mode === "auto") return compact ? "自动" : "自动模式";
+  return compact ? "人工" : "人工模式";
+}
 
 applyTheme(preferredTheme());
 installRouter(renderRoute);
@@ -115,7 +121,7 @@ function topbar(context = {}) {
     context.task ? element("div", { className: "topbar__context" }, [
       element("span", { className: "context-label", text: "当前任务" }),
       element("strong", { text: context.task.task_id }),
-      badge(context.task.mode === "auto" ? "自动模式" : "人工模式"),
+      badge(taskModeLabel(context.task.mode)),
     ]) : null,
     element("div", { className: "topbar__actions" }, [
       connection,
@@ -241,8 +247,23 @@ function taskForm() {
   const taskId = element("input", { className: "input", id: "task-id", name: "task_id", required: true, pattern: "[A-Za-z0-9_\\-]+", maxLength: 128, autocomplete: "off", "aria-describedby": "task-id-hint" });
   const mode = element("select", { className: "select", id: "task-mode", name: "mode" }, [
     element("option", { value: "manual", text: "人工模式（推荐）" }),
-    element("option", { value: "auto", text: "自动推进到人工门禁" }),
+    element("option", { value: "quick", text: "快速生成（明确页数，自动到样品）" }),
+    element("option", { value: "auto", text: "兼容自动模式" }),
   ]);
+  const targetSlideCount = element("input", { className: "input", id: "target-slide-count", name: "target_slide_count", type: "number", min: 1, max: 200, step: 1, inputMode: "numeric", autocomplete: "off", disabled: true, "aria-describedby": "target-slide-count-hint" });
+  const targetSlideCountField = element("div", { className: "field", hidden: true }, [
+    element("label", { className: "field__label", htmlFor: "target-slide-count", text: "最终页数" }),
+    targetSlideCount,
+    element("span", { className: "field__hint", id: "target-slide-count-hint", text: "快速生成会把此页数写入冻结任务卡，并严格约束逐页大纲。" }),
+  ]);
+  const updateModeFields = () => {
+    const quick = mode.value === "quick";
+    targetSlideCountField.hidden = !quick;
+    targetSlideCount.disabled = !quick;
+    targetSlideCount.required = quick;
+    if (quick && !targetSlideCount.value) targetSlideCount.value = "8";
+  };
+  mode.addEventListener("change", updateModeFields);
   const error = element("p", { className: "field__error", id: "create-error", role: "alert" });
   const submit = button("创建任务并进入工作台", { kind: "primary", type: "submit", block: true });
   const form = element("form", { onSubmit: async (event) => {
@@ -251,7 +272,9 @@ function taskForm() {
     submit.disabled = true;
     submit.textContent = "正在创建任务…";
     try {
-      const created = await api.createTask({ task_id: taskId.value.trim(), mode: mode.value });
+      const payload = { task_id: taskId.value.trim(), mode: mode.value };
+      if (mode.value === "quick") payload.target_slide_count = Number(targetSlideCount.value);
+      const created = await api.createTask(payload);
       showToast("任务已创建");
       navigate(`/tasks/${encodeURIComponent(created.task_id)}`);
     } catch (reason) {
@@ -269,9 +292,11 @@ function taskForm() {
       element("span", { className: "field__hint", id: "task-id-hint", text: "使用字母、数字、连字符或下划线，创建后不可更改。" }),
     ]),
     element("div", { className: "field" }, [element("label", { className: "field__label", htmlFor: "task-mode", text: "运行模式" }), mode]),
+    targetSlideCountField,
     error,
     submit,
   ]);
+  updateModeFields();
   return element("section", { className: "card card--raised", "aria-labelledby": "create-heading" }, [
     element("div", { className: "card__header" }, [element("h2", { id: "create-heading", text: "新建 PPT 任务" }), badge("第一步", "primary")]),
     form,
@@ -446,7 +471,8 @@ function jobPanel(job) {
         element("dd", {
           className: "job-panel__elapsed",
           "data-started-at": job.started_at || job.created_at,
-          text: formatDuration(elapsedSeconds(job.started_at || job.created_at)),
+          "data-finished-at": job.finished_at || "",
+          text: formatDuration(elapsedSeconds(job.started_at || job.created_at, job.finished_at)),
         }),
       ]),
       element("div", {}, [
@@ -464,7 +490,7 @@ function jobPanel(job) {
       ]),
       metricItem("Agent 步数", budgetLabel(metrics.agent_step, metrics.max_steps)),
       metricItem("模型请求", budgetLabel(metrics.provider_calls, metrics.max_provider_calls)),
-      metricItem("Skill 调用", budgetLabel(metrics.tool_calls, metrics.max_tool_calls)),
+      metricItem("只读工具调用", budgetLabel(metrics.tool_calls, metrics.max_tool_calls)),
     ]),
     job.status === "cancellation_requested" || job.cancellation_requested ? element("p", {
       className: "job-panel__cancel-feedback",
@@ -552,8 +578,8 @@ function stepLabel(step) {
     provider_request: "模型请求已发送",
     provider_response: "模型响应已返回",
     waiting_model: "等待模型响应",
-    skill_loading: "Skill 调用开始",
-    skill_completed: "Skill 调用完成",
+    skill_loading: "只读工具调用开始",
+    skill_completed: "只读工具调用完成",
     validating_output: "校验结构化输出",
     validating_html: "校验 HTML",
     saving_result: "保存业务结果",
@@ -786,16 +812,18 @@ function updateJobTransport(jobId, state, details = {}) {
 
 function refreshJobClocks() {
   document.querySelectorAll(".job-panel__elapsed").forEach((output) => {
-    output.textContent = formatDuration(elapsedSeconds(output.dataset.startedAt));
+    output.textContent = formatDuration(elapsedSeconds(output.dataset.startedAt, output.dataset.finishedAt));
   });
   document.querySelectorAll(".job-panel__deadline").forEach((output) => {
     output.textContent = deadlineLabel(output.dataset.deadlineAt, Number(output.dataset.deadlineSeconds) || null);
   });
 }
 
-function elapsedSeconds(value) {
+function elapsedSeconds(value, finishedValue = "") {
   const started = Date.parse(value || "");
-  return Number.isFinite(started) ? Math.max(0, Math.floor((Date.now() - started) / 1000)) : 0;
+  const finished = Date.parse(finishedValue || "");
+  const end = Number.isFinite(finished) ? finished : Date.now();
+  return Number.isFinite(started) ? Math.max(0, Math.floor((end - started) / 1000)) : 0;
 }
 
 function formatDuration(seconds) {
@@ -853,7 +881,7 @@ function jobBusinessStep(job) {
     provider_request: "模型请求已发送，等待响应",
     provider_response: "模型响应已返回，正在处理",
     skill_loading: "正在读取 Skill 与任务资料",
-    skill_completed: "只读 Skill 调用已完成",
+    skill_completed: "只读工具调用已完成",
     validating_output: "正在校验模型输出与阶段 Schema",
     validating_html: "正在校验 HTML 与页面结构",
     saving_result: "正在保存版本与业务状态",
@@ -910,7 +938,7 @@ function renderTaskList(tasks, emptyMessage, activeId = null) {
     const label = STATUS[task.status]?.[0] || task.status;
     const link = element("a", { className: "task-link", href: `/tasks/${encodeURIComponent(task.task_id)}`, "aria-current": task.task_id === activeId ? "page" : null, onClick: intercept }, [
       element("span", {}, [element("strong", { text: task.task_id }), element("small", { text: `${stageLabel(task.stage)} · ${label}` })]),
-      badge(task.mode === "auto" ? "自动" : "人工"),
+      badge(taskModeLabel(task.mode, true)),
     ]);
     return element("li", {}, link);
   }));

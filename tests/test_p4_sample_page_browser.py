@@ -60,10 +60,16 @@ class SamplePageBrowserTests(unittest.TestCase):
     def wait_for_versions(self, count, timeout=6):
         deadline = time.monotonic() + timeout
         view = self.svc.sample_view("task")
-        while time.monotonic() < deadline and len(view["versions"]) < count:
+        while time.monotonic() < deadline and (
+            len(view["versions"]) < count
+            or not view["sample"]
+            or view["sample"]["version"] < count
+        ):
             time.sleep(0.05)
             view = self.svc.sample_view("task")
         self.assertGreaterEqual(len(view["versions"]), count)
+        self.assertIsNotNone(view["sample"])
+        self.assertGreaterEqual(view["sample"]["version"], count)
         return view
 
     def test_generate_modify_preview_and_confirm_in_single_shell(self):

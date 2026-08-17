@@ -40,19 +40,22 @@ class P0GenerationRefactorTests(unittest.TestCase):
         self.assertEqual(len(client.inputs),1)
         self.assertEqual(
             {tool["name"] for tool in client.inputs[0]["tools"]},
-            {"list_skill_files", "read_skill_file", "get_asset_info"},
+            {"read_skill_file"},
         )
+        path_schema=client.inputs[0]["tools"][0]["parameters"]["properties"]["path"]
+        self.assertEqual(path_schema["enum"],["references/design-pack-v1.md"])
         self.assertNotIn("<!doctype html>",client.inputs[0]["input"][1]["content"])
         self.assertTrue(html.startswith("<!doctype html>"))
         self.assertIn(fragment,html)
 
-    def test_sample_can_read_skill_and_finish_after_more_than_two_agent_steps(self):
+    def test_sample_reads_lightweight_pack_once_and_deduplicates_same_round(self):
         fragment='<section class="slide" id="slide-1" data-slide-id="slide-1"><h1>样品</h1></section>'
         client=RecordingClient([
-            ModelTurn(None,"r1",(ModelToolCall("list_skill_files","{}","c1"),)),
-            ModelTurn(None,"r2",(ModelToolCall("read_skill_file",'{"path":"SKILL.md"}',"c2"),)),
-            ModelTurn("{}","r3"),
-            ModelTurn(json.dumps({"slides":[{"slide_id":"slide-1","html":fragment}]}),"r4"),
+            ModelTurn(None,"r1",(
+                ModelToolCall("read_skill_file",'{"path":"references/design-pack-v1.md"}',"c1"),
+                ModelToolCall("read_skill_file",'{"path":"references/design-pack-v1.md"}',"c2"),
+            )),
+            ModelTurn(json.dumps({"slides":[{"slide_id":"slide-1","html":fragment}]}),"r2"),
         ])
         gateway=AgentGateway(
             client,
@@ -64,7 +67,10 @@ class P0GenerationRefactorTests(unittest.TestCase):
 
         html=gateway.build("## [slide-1] 样品",action="sample",slide_ids=["slide-1"])
 
-        self.assertEqual(len(client.inputs),4)
+        self.assertEqual(len(client.inputs),2)
+        self.assertEqual(client.inputs[1]["tools"],[])
+        outputs=[item for item in client.inputs[1]["input"] if item.get("type")=="function_call_output"]
+        self.assertIn('"already_read": true',outputs[-1]["output"])
         self.assertTrue(html.startswith("<!doctype html>"))
         self.assertIn(fragment,html)
 

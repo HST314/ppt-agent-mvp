@@ -84,6 +84,23 @@ class P3Tests(unittest.TestCase):
         view=self.service.planning_view("auto")
         self.assertEqual(view["state"]["stage"],"sample"); self.assertEqual(view["state"]["status"],"ready"); self.assertIsNotNone(view["narrative"]); self.assertIsNotNone(view["outline"])
 
+    def test_quick_mode_requires_and_enforces_final_slide_count(self):
+        with self.assertRaisesRegex(ValidationError,"必须明确"):
+            self.service.create("quick-missing",mode="quick")
+        self.service.create("quick",mode="quick",target_slide_count=2)
+        self.service.import_input("quick",{"goal":"发布","audience":"客户","topic":"方案"})
+        view=self.service.planning_view("quick")
+        self.assertEqual(view["state"]["mode"],"quick")
+        self.assertEqual(view["state"]["target_slide_count"],2)
+        self.assertEqual(view["outline"]["slide_ids"],["slide-1","slide-2"])
+        self.assertEqual(view["state"]["stage"],"sample")
+        self.assertIsNotNone(view["narrative"])
+        self.assertIsNotNone(self.service.sample_view("quick")["sample"])
+
+        self.service.create("quick-conflict",mode="quick",target_slide_count=2)
+        with self.assertRaisesRegex(ValidationError,"不一致"):
+            self.service.import_input("quick-conflict",{"goal":"发布","audience":"客户","topic":"方案","页数":3})
+
     def request(self,path):
         status=[]
         body=b"".join(App(self.service)({"REQUEST_METHOD":"GET","PATH_INFO":path,"CONTENT_LENGTH":"0","wsgi.input":io.BytesIO()},lambda s,h:status.append(s)))

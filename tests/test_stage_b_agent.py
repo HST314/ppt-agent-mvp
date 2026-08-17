@@ -309,7 +309,7 @@ class StageBAgentTests(unittest.TestCase):
         self.assertEqual(result.value, OUTLINE_VALUE)
         self.assertEqual(sum(item.get("event") == "tool" for item in result.audit), 2)
         quota = [item for item in result.audit if item.get("event") == "tool_error"]
-        self.assertEqual([item["error_code"] for item in quota], ["quota_exceeded"])
+        self.assertEqual([item["error_code"] for item in quota], ["already_read"])
         self.assertEqual(client.inputs[1]["tools"], [])
         self.assertEqual(client.inputs[1]["tool_choice"], "none")
 
@@ -359,7 +359,7 @@ class StageBAgentTests(unittest.TestCase):
         second_round = [item for item in result.audit if item.get("step") == 2 and item.get("event") in {"tool", "tool_error"}]
         self.assertEqual(
             [(item["event"], item.get("error_code"), item.get("path")) for item in second_round],
-            [("tool_error", "path_not_in_lock", None), ("tool", None, "references/checklist.md")],
+            [("tool_error", "already_read", "SKILL.md"), ("tool", None, "references/checklist.md")],
         )
         self.assertEqual(client.inputs[2]["tools"], [])
         self.assertEqual(client.inputs[2]["tool_choice"], "none")
@@ -391,7 +391,7 @@ class StageBAgentTests(unittest.TestCase):
             item for item in caught.exception.audit
             if item.get("step") in {2, 3} and item.get("event") == "tool_error"
         ]
-        self.assertEqual([item["error_code"] for item in recovery_errors], ["path_not_in_lock", "path_not_in_lock"])
+        self.assertEqual([item["error_code"] for item in recovery_errors], ["already_read", "already_read"])
 
     def test_image_content_is_removed_from_every_nested_model_input(self):
         client = ScriptedClient([ModelTurn('{"slides":[{"slide_id":"slide-1","html":"<section class=\\"slide\\" id=\\"slide-1\\" data-slide-id=\\"slide-1\\"><p>ok</p></section>"}]}', "r")])
@@ -603,7 +603,7 @@ class StageBAgentTests(unittest.TestCase):
         self.assertEqual(skill.list_skill_files(allowed_files=allowed)["files"], ["SKILL.md", "references/checklist.md"])
         with self.assertRaises(ValidationError):
             skill.dispatch("read_skill_file", {"path": "references/themes.md"}, allowed_files=allowed)
-        self.assertIsNone(skill.files_for_stage("deck"))
+        self.assertEqual(skill.files_for_stage("deck"),frozenset({"references/design-pack-v1.md"}))
 
     def test_client_structured_output_modes_control_text_format(self):
         schema = {"name": "narrative", "strict": True, "schema": {"type": "object"}}

@@ -255,7 +255,7 @@ class JobRecoveryBrowserGate(unittest.TestCase):
         panel.get_by_text("进度通道已连接", exact=True).wait_for()
         panel.locator(".job-panel__deadline").filter(has_text="硬截止").wait_for()
         self.assertIn("已用时", panel.inner_text())
-        for label in ("Agent 步数", "模型请求", "Skill 调用"):
+        for label in ("Agent 步数", "模型请求", "只读工具调用"):
             self.assertIn(label, panel.inner_text())
         panel.locator(".job-execution > summary").click()
         panel.get_by_text("进入队列", exact=True).wait_for()
