@@ -1,8 +1,11 @@
 import json
 import hashlib
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
+from ppt_agent.agent_runtime import AgentRuntime
 from ppt_agent.gateways import AgentGateway
 from ppt_agent.model_clients import ModelTurn
 from ppt_agent.model_clients import OpenAIResponsesClient
@@ -113,6 +116,43 @@ class P0GenerationRefactorTests(unittest.TestCase):
         with self.assertRaisesRegex(Exception,"真实请求次数"):
             client.create(input=[],provider_call_limit=2)
         self.assertEqual(sdk.calls,2)
+
+    def test_shared_client_keeps_concurrent_stage_budgets_private(self):
+        class SDK:
+            def __init__(self):
+                self.responses=self; self.calls={"task-a":0,"task-b":0}
+                self.a_empty=threading.Event(); self.b_done=threading.Event()
+                self.lock=threading.Lock()
+            def create(self,**kwargs):
+                serialized=json.dumps(kwargs["input"])
+                task="task-a" if "task-a" in serialized else "task-b"
+                with self.lock:
+                    self.calls[task]+=1; attempt=self.calls[task]
+                if task == "task-a" and attempt == 1:
+                    self.a_empty.set()
+                    return type("Response",(),{"output_text":"","output":[],"id":"a-empty"})()
+                if task == "task-a":
+                    self.assert_interleaving()
+                    return type("Response",(),{"output_text":"{}","output":[],"id":"a-invalid"})()
+                self.b_done.set()
+                text='{"slides":[{"slide_id":"slide-1","html":"<section class=\\"slide\\" id=\\"slide-1\\" data-slide-id=\\"slide-1\\"><p>ok</p></section>"}]}'
+                return type("Response",(),{"output_text":text,"output":[],"id":"b-valid"})()
+            def assert_interleaving(self):
+                if not self.b_done.wait(2):
+                    raise AssertionError("task B did not interleave before task A schema correction")
+
+        config=type("Config",(),{"model":"m","api_key":"k","base_url":"https://example.com","timeout_seconds":3,"structured_output":"prompt"})()
+        sdk=SDK(); client=OpenAIResponsesClient(config,sdk_client=sdk)
+        def run(task):
+            return AgentRuntime(client,SkillRuntime.builtin()).run("sample",{"task":task})
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            future_a=pool.submit(run,"task-a")
+            self.assertTrue(sdk.a_empty.wait(2))
+            future_b=pool.submit(run,"task-b")
+            self.assertEqual(future_b.result(timeout=3).value["slides"][0]["slide_id"],"slide-1")
+            with self.assertRaisesRegex(Exception,"真实请求次数"):
+                future_a.result(timeout=3)
+        self.assertEqual(sdk.calls,{"task-a":2,"task-b":1})
 
 
 if __name__ == "__main__": unittest.main()

@@ -182,6 +182,7 @@ class AgentRuntime:
 
     def run(self, stage: str, payload: dict, *, response_schema: dict | None = None, capability_probe: bool = False) -> AgentResult:
         from .execution import checkpoint, interruptible, progress, remaining_seconds
+        from .model_clients import ProviderCallBudget
         if stage not in STAGES:
             raise ValidationError("Agent 阶段不在允许列表")
         allowed_schemas = (STAGE_OUTPUT_SCHEMAS[stage], STAGE_PROVIDER_SCHEMAS[stage])
@@ -196,7 +197,7 @@ class AgentRuntime:
         stage_tools = _tools_for_stage(stage, stage_files)
         override = CLARIFICATION_OVERRIDE if stage == "clarification" else PRODUCT_OVERRIDE
         started, audit, tool_count, tool_error_rounds, schema_corrections = self.clock(), [], 0, 0, 0
-        provider_calls = 0
+        provider_call_budget = ProviderCallBudget(2) if stage in {"sample", "deck"} else None
         successful_read_count, successful_read_paths = 0, set()
         tool_error_corrections, recovery_active = 0, False
         remaining_paths: frozenset[str] | None = None
@@ -276,16 +277,15 @@ class AgentRuntime:
                 # stage remainder. Legacy/test clients keep their old signature.
                 try:
                     if getattr(self.client, "supports_execution_cancellation", False):
-                        limit = 2 - provider_calls if stage in {"sample", "deck"} else None
-                        call = lambda: self.client.create(**kwargs, timeout_seconds=remaining, provider_call_limit=limit)
-                        try:
-                            turn = call()
-                        finally:
-                            provider_calls += int(getattr(self.client, "last_provider_call_count", 0) or 0)
+                        turn = self.client.create(
+                            **kwargs,
+                            timeout_seconds=remaining,
+                            provider_call_budget=provider_call_budget,
+                        )
                     else:
                         turn = interruptible(lambda: self.client.create(**kwargs))
                 except TypeError as exc:
-                    if "timeout_seconds" not in str(exc) and "provider_call_limit" not in str(exc): raise
+                    if "timeout_seconds" not in str(exc) and "provider_call_budget" not in str(exc): raise
                     turn = interruptible(lambda: self.client.create(**kwargs))
             except (IndexError, StopIteration) as exc:
                 fail("Agent 未在工具纠错后提交阶段产物", "incomplete_after_tool_error", exc)
