@@ -115,6 +115,8 @@ class FrontendAssetTests(unittest.TestCase):
         app = (FRONTEND / "static/js/app.js").read_text()
         self.assertIn("maxStreamFailures", tracker)
         self.assertIn("maxRecoveryAttempts", tracker)
+        self.assertIn("maxPollInterval", tracker)
+        self.assertIn("pollFailures", tracker)
         self.assertIn("scheduleRecovery", tracker)
         self.assertIn("events?after=${track.seq}", tracker)
         self.assertIn("ppt-agent:job-intent:", store)
@@ -130,6 +132,9 @@ class FrontendAssetTests(unittest.TestCase):
         for token in ("Agent 步数", "模型请求", "Skill 调用", "执行详情", "技术审计", "jobEventHistory", "jobAgentAudits"):
             self.assertIn(token, app + (FRONTEND / "static/js/api.js").read_text())
         self.assertIn("`${event.job_id}:${event.seq}`", app)
+        self.assertIn('"storage-error"', tracker + app)
+        self.assertIn('"aria-live": "polite"', app)
+        self.assertIn("event_history_warning", app)
 
 
 if __name__ == "__main__":

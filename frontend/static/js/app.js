@@ -1,10 +1,10 @@
-import { api, ApiError } from "./api.js?v=2026.08.17.082310785785";
-import { JobTracker } from "./job-tracker.js?v=2026.08.17.082310785785";
-import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.17.082310785785";
-import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.17.082310785785";
-import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.17.082310785785";
-import { inlineError, setBusy } from "./components/index.js?v=2026.08.17.082310785785";
-import { renderStage } from "./stages/index.js?v=2026.08.17.082310785785";
+import { api, ApiError } from "./api.js?v=2026.08.17.095744983694";
+import { JobTracker } from "./job-tracker.js?v=2026.08.17.095744983694";
+import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.17.095744983694";
+import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.17.095744983694";
+import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.17.095744983694";
+import { inlineError, setBusy } from "./components/index.js?v=2026.08.17.095744983694";
+import { renderStage } from "./stages/index.js?v=2026.08.17.095744983694";
 
 const app = document.getElementById("app");
 const APP_BUILD = document.querySelector('meta[name="app-build"]')?.content || "unknown";
@@ -416,7 +416,10 @@ function lockedState(selected, current) {
 function jobPanel(job) {
   const hasProgress = typeof job.progress === "number";
   const terminal = ["succeeded", "failed", "cancelled", "interrupted"].includes(job.status);
-  const transport = terminal ? "持久化记录已保留" : (jobTransports.get(job.job_id) || "正在连接进度通道");
+  const historyWarning = job.event_history_warning;
+  const transport = historyWarning
+    ? (historyWarning.recovered ? "事件记录已自动修复" : "事件记录异常 · 业务状态仍可查询")
+    : terminal ? "持久化记录已保留" : (jobTransports.get(job.job_id) || "正在连接进度通道");
   const businessStep = jobBusinessStep(job);
   const events = jobEvents.get(job.job_id) || [];
   const audits = jobAudits.get(job.job_id) || [];
@@ -457,7 +460,7 @@ function jobPanel(job) {
       ]),
       element("div", {}, [
         element("dt", { text: "传输状态" }),
-        element("dd", { className: "job-panel__transport", text: transport }),
+        element("dd", { className: "job-panel__transport", text: transport, role: "status", "aria-live": "polite" }),
       ]),
       metricItem("Agent 步数", budgetLabel(metrics.agent_step, metrics.max_steps)),
       metricItem("模型请求", budgetLabel(metrics.provider_calls, metrics.max_provider_calls)),
@@ -467,6 +470,13 @@ function jobPanel(job) {
       className: "job-panel__cancel-feedback",
       role: "status",
       text: "取消请求已送达；正在等待当前安全停止点，期间不会提交新的业务结果。",
+    }) : null,
+    historyWarning ? element("p", {
+      className: "job-panel__storage-warning",
+      role: historyWarning.recovered ? "status" : "alert",
+      text: historyWarning.recovered
+        ? `${historyWarning.message}；原始记录已备份。`
+        : `${historyWarning.message}；系统会自动重试，业务任务无需重新提交。`,
     }) : null,
     element("p", { className: "field__hint", text: "可以安全离开此页；再次打开任务时会自动恢复显示。" }),
     job.operation !== "clarification.generate" && !["succeeded", "failed", "cancelled", "interrupted"].includes(job.status) ? button(job.cancellation_requested ? "已请求取消" : "取消后台任务", { kind: "ghost", disabled: job.cancellation_requested, onClick: async () => {
@@ -766,6 +776,7 @@ function updateJobTransport(jobId, state, details = {}) {
     "sse-retry": "进度通道重连中",
     polling: "进度通道重连中 · 状态轮询可用",
     "sse-recovery": "正在恢复实时进度通道",
+    "storage-error": `事件存储暂不可用 · ${Math.max(1, Math.ceil((details.delay || 1000) / 1000))} 秒后重试`,
   };
   const label = labels[state] || "正在确认进度通道";
   jobTransports.set(jobId, label);

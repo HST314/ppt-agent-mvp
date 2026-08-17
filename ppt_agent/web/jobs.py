@@ -13,10 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows keeps the in-process guard.
-    fcntl = None
+import portalocker
 
 from ..audit import bind_agent_audit_context
 from ..errors import ConflictError, GatewayError, NotFoundError, RuntimeUnavailableError, ValidationError
@@ -63,6 +60,12 @@ METRIC_KEYS = {
     "stage", "agent_step", "max_steps", "provider_calls", "max_provider_calls",
     "tool_calls", "max_tool_calls", "tool_name", "tool_failed",
 }
+EVENT_LOCK_TIMEOUT_SECONDS = 10
+EVENT_PERSISTENCE_ERRORS = (
+    OSError,
+    json.JSONDecodeError,
+    portalocker.exceptions.LockException,
+)
 
 
 class ActiveJobConflict(ConflictError):
@@ -125,8 +128,10 @@ class JobService:
         self.executor.shutdown(wait=False, cancel_futures=False)
 
     def _root(self, task_id: str) -> Path:
-        self.store.checkpoint(task_id)
-        root = self.store._task(task_id) / "jobs"
+        task_root = self.store._task(task_id)
+        if not (task_root / "checkpoint.json").exists():
+            raise NotFoundError("任务不存在")
+        root = task_root / "jobs"
         root.mkdir(exist_ok=True)
         return root
 
@@ -140,27 +145,253 @@ class JobService:
 
     @contextmanager
     def _event_lock(self, task_id: str, job_id: str):
-        """Serialize sequence allocation across workers and server processes."""
+        """Serialize the whole event WAL transaction on POSIX and Windows."""
         path = self._root(task_id) / f"{job_id}.events.lock"
-        with open(path, "a+b") as stream:
-            if fcntl is not None:
-                fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        with portalocker.Lock(
+            str(path),
+            mode="a+b",
+            timeout=EVENT_LOCK_TIMEOUT_SECONDS,
+            check_interval=0.05,
+        ):
+            yield
+
+    @staticmethod
+    def _history_warning(
+        record: dict[str, Any],
+        *,
+        code: str,
+        message: str,
+        recovered: bool,
+        details: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        previous = record.get("event_history_warning") or {}
+        warning = {
+            "code": code,
+            "message": message,
+            "diagnostic_id": previous.get("diagnostic_id") or uuid.uuid4().hex,
+            "recovered": recovered,
+            "at": _now(),
+        }
+        if details:
+            warning["details"] = details
+        return warning
+
+    @staticmethod
+    def _backup_once(path: Path, reason: str) -> Path:
+        backup = path.with_name(f"{path.name}.{reason}.bak")
+        if backup.exists():
+            return backup
+        raw = path.read_bytes()
+        try:
+            with open(backup, "xb") as stream:
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except FileExistsError:
+            pass
+        return backup
+
+    @staticmethod
+    def _write_event_history(path: Path, events: list[dict[str, Any]]) -> None:
+        raw = "".join(
+            json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+            for event in events
+        ).encode("utf-8")
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+        try:
+            with open(temporary, "xb") as stream:
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _read_event_history_locked(
+        self,
+        task_id: str,
+        job_id: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Return a strictly increasing history and repair legacy corruption."""
+        path = self._event_path(task_id, job_id)
+        if not path.exists():
+            return [], []
+        events: list[dict[str, Any]] = []
+        repairs: list[dict[str, Any]] = []
+        seen_original: dict[int, dict[str, Any]] = {}
+        last_seq = 0
+        for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            if not line:
+                continue
             try:
-                yield
-            finally:
-                if fcntl is not None:
-                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                repairs.append({"reason": "invalid_json", "line": line_number})
+                continue
+            seq = event.get("seq") if isinstance(event, dict) else None
+            if (
+                not isinstance(event, dict)
+                or isinstance(seq, bool)
+                or not isinstance(seq, int)
+                or seq < 1
+                or event.get("job_id") != job_id
+            ):
+                repairs.append({"reason": "invalid_event", "line": line_number})
+                continue
+            if seq in seen_original and seen_original[seq] == event:
+                repairs.append({"reason": "duplicate_event", "line": line_number, "original_seq": seq})
+                continue
+            seen_original.setdefault(seq, event)
+            if seq <= last_seq:
+                original_seq = seq
+                event = dict(event)
+                event["seq"] = last_seq + 1
+                event["storage_repair"] = {
+                    "reason": "sequence_conflict",
+                    "original_seq": original_seq,
+                }
+                repairs.append(
+                    {
+                        "reason": "sequence_conflict",
+                        "line": line_number,
+                        "original_seq": original_seq,
+                        "assigned_seq": event["seq"],
+                    }
+                )
+            last_seq = event["seq"]
+            events.append(event)
+        if repairs:
+            self._backup_once(path, "recovery")
+            self._write_event_history(path, events)
+        return events, repairs
+
+    def _quarantine_pending_locked(
+        self,
+        task_id: str,
+        job_id: str,
+        pending: Path,
+        error: Exception,
+    ) -> dict[str, Any] | None:
+        self._backup_once(pending, "corrupt")
+        pending.unlink(missing_ok=True)
+        path = self._record_path(task_id, job_id)
+        if not path.exists():
+            return None
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record["event_history_warning"] = self._history_warning(
+            record,
+            code="job_event_history_degraded",
+            message="事件历史 WAL 已隔离；业务状态仍可查询",
+            recovered=False,
+            details={"exception_type": type(error).__name__},
+        )
+        self._write(record)
+        return record
+
+    def _finish_pending_locked(
+        self,
+        pending: Path,
+        expected_task_id: str | None = None,
+        expected_job_id: str | None = None,
+    ) -> dict[str, Any]:
+        value = json.loads(pending.read_text(encoding="utf-8"))
+        record, event = dict(value["record"]), dict(value["event"])
+        task_id, job_id = record["task_id"], record["job_id"]
+        if (
+            event.get("job_id") != job_id
+            or (expected_task_id is not None and task_id != expected_task_id)
+            or (expected_job_id is not None and job_id != expected_job_id)
+        ):
+            raise ValueError("pending Job 事件归属无效")
+
+        history, history_repairs = self._read_event_history_locked(task_id, job_id)
+        maximum_seq = max((item["seq"] for item in history), default=0)
+        existing = {item["seq"]: item for item in history}
+        original_seq = event.get("seq")
+        if isinstance(original_seq, bool) or not isinstance(original_seq, int) or original_seq < 1:
+            raise ValueError("pending Job 事件序号无效")
+
+        pending_repaired = False
+        if original_seq in existing and existing[original_seq] != event:
+            event["seq"] = maximum_seq + 1
+            event["storage_repair"] = {
+                "reason": "pending_sequence_conflict",
+                "original_seq": original_seq,
+            }
+            pending_repaired = True
+        elif original_seq <= maximum_seq and original_seq not in existing:
+            event["seq"] = maximum_seq + 1
+            event["storage_repair"] = {
+                "reason": "pending_out_of_order",
+                "original_seq": original_seq,
+            }
+            pending_repaired = True
+
+        if pending_repaired:
+            self._backup_once(pending, "recovery")
+        if event["seq"] not in existing:
+            path = self._event_path(task_id, job_id)
+            with open(path, "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+
+        record_path = self._record_path(task_id, job_id)
+        if record_path.exists():
+            persisted = json.loads(record_path.read_text(encoding="utf-8"))
+            if persisted.get("last_seq", 0) > record.get("last_seq", 0) or persisted.get("status") in TERMINAL:
+                record = persisted
+        record["last_seq"] = max(record.get("last_seq", 0), maximum_seq, event["seq"])
+        if history_repairs or pending_repaired:
+            record["event_history_warning"] = self._history_warning(
+                record,
+                code="job_event_history_repaired",
+                message="事件历史已自动修复；业务状态可继续使用",
+                recovered=True,
+                details={
+                    "history_repairs": len(history_repairs),
+                    "pending_resequenced": pending_repaired,
+                },
+            )
+        self._write(record)
+        pending.unlink(missing_ok=True)
+        return record
+
+    def _repair_event_history(self, task_id: str, job_id: str) -> list[dict[str, Any]]:
+        with self._event_lock(task_id, job_id):
+            path = self._record_path(task_id, job_id)
+            pending = self._root(task_id) / f"{job_id}.pending-event.json"
+            if pending.exists():
+                try:
+                    self._finish_pending_locked(pending, task_id, job_id)
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+                    self._quarantine_pending_locked(task_id, job_id, pending, error)
+            events, repairs = self._read_event_history_locked(task_id, job_id)
+            if repairs and path.exists():
+                record = json.loads(path.read_text(encoding="utf-8"))
+                record["last_seq"] = max(record.get("last_seq", 0), max((item["seq"] for item in events), default=0))
+                record["event_history_warning"] = self._history_warning(
+                    record,
+                    code="job_event_history_repaired",
+                    message="事件历史已自动修复；业务状态可继续使用",
+                    recovered=True,
+                    details={"history_repairs": len(repairs)},
+                )
+                self._write(record)
+            return events
 
     def _read(self, task_id: str, job_id: str) -> dict[str, Any]:
         path = self._record_path(task_id, job_id)
         pending = self._root(task_id) / f"{job_id}.pending-event.json"
-        if pending.exists():
-            with self._event_lock(task_id, job_id):
-                if pending.exists():
-                    self._finish_pending(pending)
-        if not path.exists():
-            raise NotFoundError("Job 不存在")
-        return json.loads(path.read_text(encoding="utf-8"))
+        with self._event_lock(task_id, job_id):
+            if pending.exists():
+                try:
+                    self._finish_pending_locked(pending, task_id, job_id)
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+                    self._quarantine_pending_locked(task_id, job_id, pending, error)
+            if not path.exists():
+                raise NotFoundError("Job 不存在")
+            return json.loads(path.read_text(encoding="utf-8"))
 
     def _write(self, record: dict[str, Any]) -> None:
         self.store.atomic_json(self._record_path(record["task_id"], record["job_id"]), record)
@@ -172,17 +403,39 @@ class JobService:
             if path.name.endswith(".pending-event.json"):
                 continue
             try:
-                records.append(json.loads(path.read_text(encoding="utf-8")))
+                records.append(self._read(task_id, path.stem))
             except (OSError, json.JSONDecodeError):
                 continue
         return sorted(records, key=lambda item: (item["created_at"], item["job_id"]))
 
     def _append_event(self, record: dict[str, Any], event_type: str, **values: Any) -> dict[str, Any]:
         with self._event_lock(record["task_id"], record["job_id"]):
+            pending = self._root(record["task_id"]) / f"{record['job_id']}.pending-event.json"
+            if pending.exists():
+                try:
+                    recovered = self._finish_pending_locked(pending, record["task_id"], record["job_id"])
+                    if recovered.get("event_history_warning"):
+                        record["event_history_warning"] = recovered["event_history_warning"]
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+                    recovered = self._quarantine_pending_locked(record["task_id"], record["job_id"], pending, error)
+                    if recovered and recovered.get("event_history_warning"):
+                        record["event_history_warning"] = recovered["event_history_warning"]
+            history, repairs = self._read_event_history_locked(record["task_id"], record["job_id"])
             path = self._record_path(record["task_id"], record["job_id"])
             if path.exists():
                 persisted = json.loads(path.read_text(encoding="utf-8"))
                 record["last_seq"] = max(record.get("last_seq", 0), persisted.get("last_seq", 0))
+                if persisted.get("event_history_warning") and not record.get("event_history_warning"):
+                    record["event_history_warning"] = persisted["event_history_warning"]
+            record["last_seq"] = max(record.get("last_seq", 0), max((item["seq"] for item in history), default=0))
+            if repairs:
+                record["event_history_warning"] = self._history_warning(
+                    record,
+                    code="job_event_history_repaired",
+                    message="事件历史已自动修复；业务状态可继续使用",
+                    recovered=True,
+                    details={"history_repairs": len(repairs)},
+                )
             record["last_seq"] += 1
             event = {
                 "seq": record["last_seq"],
@@ -194,28 +447,29 @@ class JobService:
                 "at": _now(),
                 **values,
             }
-            pending = self._root(record["task_id"]) / f"{record['job_id']}.pending-event.json"
             self.store.atomic_json(pending, {"record": record, "event": event})
-            self._finish_pending(pending)
+            self._finish_pending_locked(pending, record["task_id"], record["job_id"])
             return event
 
-    def _finish_pending(self, pending: Path) -> None:
-        value = json.loads(pending.read_text(encoding="utf-8"))
-        record, event = value["record"], value["event"]
-        path = self._event_path(record["task_id"], record["job_id"])
-        existing = {
-            item["seq"]: item
-            for item in (json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line)
-        } if path.exists() else {}
-        if event["seq"] in existing and existing[event["seq"]] != event:
-            raise OSError("Job 事件序号冲突")
-        if event["seq"] not in existing:
-            with open(path, "a", encoding="utf-8") as stream:
-                stream.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
-                stream.flush()
-                os.fsync(stream.fileno())
-        self._write(record)
-        pending.unlink(missing_ok=True)
+    def _publish_event(self, record: dict[str, Any], event_type: str, **values: Any) -> dict[str, Any] | None:
+        """Persist an event, but keep the business job alive if only history fails."""
+        try:
+            return self._append_event(record, event_type, **values)
+        except EVENT_PERSISTENCE_ERRORS as error:
+            log = logging.warning if record.get("event_history_warning") else logging.exception
+            log(
+                "Job event history degraded; persisting business state without the event",
+                extra={"job_id": record.get("job_id"), "task_id": record.get("task_id")},
+            )
+            record["event_history_warning"] = self._history_warning(
+                record,
+                code="job_event_history_degraded",
+                message="事件历史写入异常；业务执行未中断",
+                recovered=False,
+                details={"exception_type": type(error).__name__},
+            )
+            self._write(record)
+            return None
 
     def _recover(self) -> None:
         if not self.store.root.exists():
@@ -228,16 +482,23 @@ class JobService:
             if not jobs.is_dir():
                 continue
             for pending in jobs.glob("job_*.pending-event.json"):
+                job_id = pending.name.removesuffix(".pending-event.json")
                 try:
-                    self._finish_pending(pending)
-                except (OSError, KeyError, json.JSONDecodeError):
+                    with self._event_lock(task_path.name, job_id):
+                        try:
+                            self._finish_pending_locked(pending, task_path.name, job_id)
+                        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+                            self._quarantine_pending_locked(task_path.name, job_id, pending, error)
+                except EVENT_PERSISTENCE_ERRORS:
                     logging.exception("Job WAL recovery failed", extra={"pending": str(pending)})
             for path in jobs.glob("job_*.json"):
                 if path.name.endswith(".pending-event.json"):
                     continue
                 try:
-                    record = json.loads(path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
+                    record = self._read(task_path.name, path.stem)
+                    self._repair_event_history(task_path.name, path.stem)
+                    record = self._read(task_path.name, path.stem)
+                except EVENT_PERSISTENCE_ERRORS:
                     continue
                 if record.get("status") in {"running", "cancellation_requested"}:
                     record.update(status="interrupted", current_step="recovery_required", finished_at=_now())
@@ -246,7 +507,7 @@ class JobService:
                         "message": "服务重启时执行结果未知，未自动重试",
                     }
                     with self._guard:
-                        self._append_event(record, "interrupted", message=record["error"]["message"])
+                        self._publish_event(record, "interrupted", message=record["error"]["message"])
                 elif record.get("status") == "queued":
                     queued.append((record["task_id"], record["job_id"]))
         self._recovered_queued.extend(queued)
@@ -322,7 +583,7 @@ class JobService:
                 "metrics": None,
             }
             self._write(record)
-            self._append_event(record, "queued", message="任务已进入执行队列")
+            self._publish_event(record, "queued", message="任务已进入执行队列")
             self._submit(task_id, job_id)
             return self.public(record), True
 
@@ -335,6 +596,7 @@ class JobService:
         self.executor.submit(self._run, task_id, job_id, key)
 
     def _run(self, task_id: str, job_id: str, key: str) -> None:
+        record: dict[str, Any] = {"task_id": task_id, "job_id": job_id, "operation": None}
         try:
             with self._guard:
                 record = self._read(task_id, job_id)
@@ -342,11 +604,11 @@ class JobService:
                     return
                 if record["cancellation_requested"]:
                     record.update(status="cancelled", current_step="cancelled", finished_at=_now())
-                    self._append_event(record, "cancelled", message="任务已取消")
+                    self._publish_event(record, "cancelled", message="任务已取消")
                     return
                 started = datetime.now(timezone.utc)
                 record.update(status="running", progress=None, current_step="domain_operation", started_at=started.isoformat(), deadline_at=(started + timedelta(seconds=record.get("deadline_seconds", self.operation_budgets[record["operation"]]))).isoformat())
-                self._append_event(record, "started", message="业务操作已开始")
+                self._publish_event(record, "started", message="业务操作已开始")
             deadline = time.monotonic() + record.get("deadline_seconds", self.operation_budgets[record["operation"]])
             def publish_progress(step, message, details=None):
                 with self._guard:
@@ -360,7 +622,7 @@ class JobService:
                     }
                     if metrics:
                         current["metrics"] = metrics
-                    self._append_event(current, "checkpoint", message=message or step, metrics=current.get("metrics"))
+                    self._publish_event(current, "checkpoint", message=message or step, metrics=current.get("metrics"))
             with execution_scope(lambda: self._read(task_id, job_id).get("cancellation_requested", False), deadline, publish_progress):
                 # Readiness can change after enqueue or while a queued job is being
                 # recovered. Never cross the model boundary without a fresh gate.
@@ -399,7 +661,7 @@ class JobService:
                     result=reference,
                     error=None,
                 )
-                self._append_event(record, "succeeded", message="业务操作已完成")
+                self._publish_event(record, "succeeded", message="业务操作已完成")
         except Exception as error:
             if isinstance(error, GatewayError):
                 self.service.record_runtime_failure(error)
@@ -416,15 +678,15 @@ class JobService:
                     record = self._read(task_id, job_id)
                     if isinstance(error, ExecutionCancelled):
                         record.update(status="cancelled", progress=None, current_step="cancelled", finished_at=_now(), error=None)
-                        self._append_event(record, "cancelled", message="任务已取消，未提交业务结果")
+                        self._publish_event(record, "cancelled", message="任务已取消，未提交业务结果")
                         return
                     public = error.public()["error"] if hasattr(error, "public") else {
                         "code": "internal_error",
                         "message": "后台任务执行失败",
                         "diagnostic_id": uuid.uuid4().hex,
                     }
-                    if isinstance(error, OSError):
-                        public = {"code":"job_persistence_error","message":"Job 持久化失败，请重试","errno":error.errno}
+                    if isinstance(error, EVENT_PERSISTENCE_ERRORS):
+                        public = {"code":"job_persistence_error","message":"Job 持久化失败，请重试","errno":getattr(error, "errno", None)}
                     if not hasattr(error, "public"):
                         logging.exception(
                             "background Job failed",
@@ -436,7 +698,7 @@ class JobService:
                         finished_at=_now(),
                         error=public,
                     )
-                    self._append_event(record, "failed", message=public["message"], error=public)
+                    self._publish_event(record, "failed", message=public["message"], error=public)
                 except Exception:
                     logging.exception("failed to persist terminal Job state", extra={"job_id": job_id, "task_id": task_id})
         finally:
@@ -467,7 +729,7 @@ class JobService:
         keys = (
             "job_id", "task_id", "operation", "status", "progress", "current_step", "last_seq",
             "created_at", "started_at", "finished_at", "result", "error", "cancellation_requested",
-            "deadline_seconds", "deadline_at", "metrics",
+            "deadline_seconds", "deadline_at", "metrics", "event_history_warning",
         )
         return {key: record.get(key) for key in keys}
 
@@ -505,18 +767,15 @@ class JobService:
             record["cancellation_requested"] = True
             if record["status"] == "queued":
                 record.update(status="cancelled", current_step="cancelled", finished_at=_now())
-                self._append_event(record, "cancelled", message="排队任务已取消")
+                self._publish_event(record, "cancelled", message="排队任务已取消")
             else:
                 record.update(status="cancellation_requested", current_step="cancellation_requested")
-                self._append_event(record, "checkpoint", message="已请求取消；正在等待安全停止点")
+                self._publish_event(record, "checkpoint", message="已请求取消；正在等待安全停止点")
             return self.public(record)
 
     def events(self, job_id: str, after: int = 0) -> list[dict[str, Any]]:
         snapshot = self.get(job_id)
-        path = self._event_path(snapshot["task_id"], job_id)
-        if not path.exists():
-            return []
-        events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+        events = self._repair_event_history(snapshot["task_id"], job_id)
         return [event for event in events if event["seq"] > after]
 
     def heartbeat(self, job_id: str) -> dict[str, Any] | None:
@@ -525,7 +784,7 @@ class JobService:
             return None
         with self._guard:
             record = self._read(snapshot["task_id"], job_id)
-            return self._append_event(record, "heartbeat", message="连接正常")
+            return self._publish_event(record, "heartbeat", message="连接正常")
 
     def list_tasks(self) -> list[dict[str, Any]]:
         tasks = []

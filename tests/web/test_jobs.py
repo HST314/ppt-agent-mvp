@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ppt_agent.errors import ConflictError, GatewayError, RuntimeUnavailableError
-from ppt_agent.execution import ExecutionDeadlineExceeded
+from ppt_agent.execution import ExecutionDeadlineExceeded, progress
 from ppt_agent.service import TaskService
 from ppt_agent.store import WorkspaceStore
 from ppt_agent.web.jobs import JobService
@@ -42,6 +42,12 @@ class DeadlineService(TaskService):
     def generate_narrative(self, task_id, prompt=None, scope="all"):
         self.failure = ExecutionDeadlineExceeded()
         raise self.failure
+
+
+class ProgressService(TaskService):
+    def generate_narrative(self, task_id, prompt=None, scope="all"):
+        progress("waiting_model", "等待模型响应")
+        return {"accepted": True}
 
 
 class JobServiceTests(unittest.TestCase):
@@ -366,6 +372,102 @@ class JobServiceTests(unittest.TestCase):
             self.assertEqual([item["seq"] for item in events], [1, 2, 3])
             self.assertEqual(len({(item["job_id"], item["seq"]) for item in events}), 3)
             first.close(); second.close()
+
+    def test_legacy_duplicate_history_and_conflicting_pending_are_repaired_on_restart(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = TaskService(WorkspaceStore(root))
+            service.create("repair")
+            service.command("repair", "to-clarification", "advance")
+            service.command("repair", "to-narrative", "advance")
+            first = JobService(service, executor=DeferredExecutor())
+            created, _ = first.create("repair", "narrative.generate", {}, "repair-key")
+            job_id = created["job_id"]
+            jobs_dir = Path(root) / "repair" / "jobs"
+            record_path = jobs_dir / f"{job_id}.json"
+            event_path = jobs_dir / f"{job_id}.events.jsonl"
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            record.update(status="running", current_step="skill_loading", last_seq=2)
+            service.store.atomic_json(record_path, record)
+            started = {
+                "seq": 2, "job_id": job_id, "type": "started", "progress": None,
+                "step": "domain_operation", "message": "业务操作已开始", "at": "2026-08-17T09:00:00+00:00",
+            }
+            checkpoint = {
+                "seq": 3, "job_id": job_id, "type": "checkpoint", "progress": None,
+                "step": "skill_loading", "message": "读取第二个 Skill", "at": "2026-08-17T09:00:01+00:00",
+            }
+            with open(event_path, "a", encoding="utf-8") as stream:
+                for event in (started, started, checkpoint):
+                    stream.write(json.dumps(event, ensure_ascii=False) + "\n")
+            pending_record = dict(record, last_seq=3, current_step="skill_loading")
+            conflicting = {
+                "seq": 3, "job_id": job_id, "type": "checkpoint", "progress": None,
+                "step": "skill_loading", "message": "读取第三个 Skill", "at": "2026-08-17T09:00:02+00:00",
+            }
+            pending = jobs_dir / f"{job_id}.pending-event.json"
+            service.store.atomic_json(pending, {"record": pending_record, "event": conflicting})
+            first.close()
+
+            recovered = JobService(service, executor=DeferredExecutor())
+            snapshot = recovered.get(job_id)
+            events = recovered.events(job_id)
+
+            self.assertEqual(snapshot["status"], "interrupted")
+            self.assertEqual(snapshot["event_history_warning"]["code"], "job_event_history_repaired")
+            self.assertEqual([event["seq"] for event in events], [1, 2, 3, 4, 5])
+            self.assertEqual(events[3]["storage_repair"]["reason"], "pending_sequence_conflict")
+            self.assertEqual(events[-1]["type"], "interrupted")
+            self.assertTrue((jobs_dir / f"{job_id}.events.jsonl.recovery.bak").exists())
+            self.assertTrue((jobs_dir / f"{job_id}.pending-event.json.recovery.bak").exists())
+            self.assertFalse(pending.exists())
+            recovered.close()
+
+    def test_corrupt_pending_is_quarantined_without_breaking_job_reads(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = TaskService(WorkspaceStore(root))
+            service.create("corrupt-pending")
+            service.command("corrupt-pending", "to-clarification", "advance")
+            service.command("corrupt-pending", "to-narrative", "advance")
+            jobs = JobService(service, executor=DeferredExecutor())
+            created, _ = jobs.create("corrupt-pending", "narrative.generate", {}, "corrupt-key")
+            job_id = created["job_id"]
+            jobs_dir = Path(root) / "corrupt-pending" / "jobs"
+            pending = jobs_dir / f"{job_id}.pending-event.json"
+            pending.write_text("{not-json", encoding="utf-8")
+
+            snapshot = jobs.get(job_id)
+
+            self.assertEqual(snapshot["status"], "queued")
+            self.assertEqual(snapshot["event_history_warning"]["code"], "job_event_history_degraded")
+            self.assertTrue((jobs_dir / f"{job_id}.pending-event.json.corrupt.bak").exists())
+            self.assertFalse(pending.exists())
+            jobs.close()
+
+    def test_checkpoint_history_failure_does_not_kill_business_job(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = ProgressService(WorkspaceStore(root))
+            service.create("history-warning")
+            service.command("history-warning", "to-clarification", "advance")
+            service.command("history-warning", "to-narrative", "advance")
+            executor = DeferredExecutor()
+            jobs = JobService(service, executor=executor)
+            created, _ = jobs.create("history-warning", "narrative.generate", {}, "history-key")
+            original = jobs._append_event
+
+            def fail_checkpoint(record, event_type, **values):
+                if event_type == "checkpoint":
+                    raise OSError(errno.EIO, "injected event history failure")
+                return original(record, event_type, **values)
+
+            with patch.object(jobs, "_append_event", side_effect=fail_checkpoint):
+                function, args = executor.calls.pop(0)
+                function(*args)
+
+            snapshot = jobs.get(created["job_id"])
+            self.assertEqual(snapshot["status"], "succeeded")
+            self.assertEqual(snapshot["event_history_warning"]["code"], "job_event_history_degraded")
+            self.assertEqual([event["type"] for event in jobs.events(created["job_id"])], ["queued", "started", "succeeded"])
+            jobs.close()
 
 
 if __name__ == "__main__":

@@ -1,11 +1,12 @@
-import { api } from "./api.js?v=2026.08.17.082310785785";
+import { api } from "./api.js?v=2026.08.17.095744983694";
 
 const TERMINAL = new Set(["succeeded", "failed", "cancelled", "interrupted"]);
 const EVENT_TYPES = ["queued", "started", "progress", "checkpoint", "succeeded", "failed", "cancelled", "interrupted", "heartbeat"];
 
 export class JobTracker {
-  constructor({ pollInterval = 1000, maxStreamFailures = 2, reconnectBaseDelay = 250, recoveryInterval = 1000, maxRecoveryAttempts = 3 } = {}) {
+  constructor({ pollInterval = 1000, maxPollInterval = 16000, maxStreamFailures = 2, reconnectBaseDelay = 250, recoveryInterval = 1000, maxRecoveryAttempts = 3 } = {}) {
     this.pollInterval = pollInterval;
+    this.maxPollInterval = maxPollInterval;
     this.maxStreamFailures = maxStreamFailures;
     this.reconnectBaseDelay = reconnectBaseDelay;
     this.recoveryInterval = recoveryInterval;
@@ -24,7 +25,8 @@ export class JobTracker {
     this.stop(job.job_id);
     const track = {
       job, callbacks, source: null, timer: null, reconnectTimer: null, recoveryTimer: null,
-      seq: 0, seen: new Set(), stopped: false, streamFailures: 0, recoveryAttempts: 0, polling: false,
+      seq: 0, seen: new Set(), stopped: false, streamFailures: 0, recoveryAttempts: 0,
+      pollFailures: 0, polling: false,
     };
     this.tracks.set(job.job_id, track);
     callbacks.onUpdate?.(job, "initial");
@@ -35,10 +37,11 @@ export class JobTracker {
     try {
       await this.syncHistory(track);
       const job = await api.getJob(track.job.job_id);
+      track.pollFailures = 0;
       track.job = job;
       track.callbacks.onUpdate?.(job, "hydrated");
     } catch (error) {
-      track.callbacks.onError?.(error);
+      this.transportError(track, error, "hydrate");
     }
     if (track.stopped) return;
     if (TERMINAL.has(track.job.status)) return this.finish(track, track.job);
@@ -116,18 +119,20 @@ export class JobTracker {
     if (track.stopped || track.timer) return;
     track.polling = true;
     const run = async () => {
+      let delay = this.pollInterval;
       track.timer = null;
       if (track.stopped || !track.polling) return;
       try {
         await this.syncHistory(track);
         const job = await api.getJob(track.job.job_id);
+        track.pollFailures = 0;
         track.job = job;
         track.callbacks.onUpdate?.(job, "polling");
         if (TERMINAL.has(job.status)) return this.finish(track, job);
       } catch (error) {
-        track.callbacks.onError?.(error);
+        delay = this.transportError(track, error, "polling");
       }
-      if (track.polling) track.timer = window.setTimeout(run, this.pollInterval);
+      if (track.polling) track.timer = window.setTimeout(run, delay);
     };
     track.timer = window.setTimeout(run, immediate ? 0 : this.pollInterval);
   }
@@ -148,13 +153,27 @@ export class JobTracker {
     try {
       await this.syncHistory(track);
       const job = await api.getJob(track.job.job_id);
+      track.pollFailures = 0;
       track.job = job;
       track.callbacks.onUpdate?.(job, "reconciled");
       if (TERMINAL.has(job.status)) this.finish(track, job);
     } catch (error) {
-      track.callbacks.onError?.(error);
+      this.transportError(track, error, "reconcile");
       this.poll(track);
     }
+  }
+
+  transportError(track, error, channel) {
+    track.pollFailures += 1;
+    const delay = Math.min(this.pollInterval * (2 ** (track.pollFailures - 1)), this.maxPollInterval);
+    track.callbacks.onTransport?.("storage-error", {
+      attempt: track.pollFailures,
+      delay,
+      channel,
+      seq: track.seq,
+    });
+    track.callbacks.onError?.(error, { channel, attempt: track.pollFailures, delay });
+    return delay;
   }
 
   finish(track, job) {
