@@ -636,7 +636,8 @@ class TaskService:
         if scope=="global": rules.append(prompt.strip())
         else: exceptions.setdefault(slide_id,[]).append((f"元素 {element_id}: " if scope=="element" else "")+prompt.strip())
         outline=self._current_version(task_id,"outline"); data=json.loads(self.version(task_id,outline)); assets=controlled_assets(self.input_view(task_id)["manifest"],self.store.resource_root(task_id))
-        source=render(data["markdown"],ids,rules,exceptions,assets) if isinstance(self.builder,FakeHtmlBuilder) else self.builder.build(data["markdown"],action="sample",slide_ids=ids,rules=rules,exceptions=exceptions,assets=assets,previous_html=sample["html"],prompt=prompt,scope=scope,slide_id=slide_id,element_id=element_id)
+        previous_slides="".join(self._slide_fragments(sample["html"]).get(sid,"") for sid in ids)
+        source=render(data["markdown"],ids,rules,exceptions,assets) if isinstance(self.builder,FakeHtmlBuilder) else self.builder.build(data["markdown"],action="sample",slide_ids=ids,rules=rules,exceptions=exceptions,assets=assets,previous_slides=previous_slides,prompt=prompt,scope=scope,slide_id=slide_id,element_id=element_id)
         html_text=validate_html(source,ids,assets.values())
         version=len(self.versions(task_id,"sample"))+1; ch=digest(html_text.encode()); model=DeckArtifact.parse({"artifact_id":f"sample-{ch[:16]}","task_id":task_id,"version":version,"kind":"sample","outline_hash":outline,"content_hash":ch,"created_at":now(),"schema_version":"1.0"})
         h=self._record_p3(task_id,"sample",model,{"html":html_text,"selection_hash":view["selection"]["hash"],"parent":sample["hash"],"summary":prompt.strip(),"scope":scope,"scope_understanding":understanding,"slide_id":slide_id,"element_id":element_id,"global_rules":rules,"local_exceptions":exceptions,"build":"success"},"sample_modify","user")
@@ -651,13 +652,46 @@ class TaskService:
             or sample["metadata"].get("selection_hash") != selection["hash"]):
             raise ConflictError("须先基于当前大纲和页面选择重新生成样品")
         state=TaskState.parse(self.get(task_id)); new=transition(state,"confirm_sample",actor="user")
-        result={"confirmed_outline_hash":outline,"confirmed_sample_hash":sample["hash"],"confirmed_content_hash":sample["content_hash"],"selection_hash":view["selection"]["hash"]}
+        pages=self._slide_fragments(sample["html"])
+        if set(pages) != set(selection["slide_ids"]): raise ConflictError("样品页面边界无效，无法确认")
+        confirmed_pages={sid:{"html":fragment,"sha256":digest(fragment.encode())} for sid,fragment in pages.items()}
+        result={"confirmed_outline_hash":outline,"confirmed_sample_hash":sample["hash"],"confirmed_content_hash":sample["content_hash"],"selection_hash":view["selection"]["hash"],"confirmed_pages":confirmed_pages}
         event={"event_id":hashlib.sha256(f"{task_id}:confirm-sample:{sample['hash']}".encode()).hexdigest()[:24],"command_id":f"confirm-sample-{sample['hash'][:16]}","action":"confirm_sample_version","actor":"user","request_hash":sample["hash"],"at":utcnow(),"from":state.to_dict(),"to":new.to_dict(),"result":result}
         self.store.commit(task_id,new.to_dict(),event); return self.sample_view(task_id)
 
     @staticmethod
     def _slide_fragments(html_text):
-        return {m.group(1):m.group(0) for m in re.finditer(r'<section class="slide" id="([A-Za-z0-9_-]+)"[\s\S]*?</section>',html_text)}
+        tag_re=re.compile(r'<section\b[^>]*>|</section\s*>',re.I)
+        id_re=re.compile(r'\bid=["\']([A-Za-z0-9_-]+)["\']',re.I)
+        class_re=re.compile(r'\bclass=["\']([^"\']*)["\']',re.I)
+        fragments={}; stack=[]
+        for match in tag_re.finditer(html_text):
+            tag=match.group(0)
+            if tag.lower().startswith('</'):
+                if not stack: continue
+                start,sid=stack.pop()
+                if sid is not None:
+                    if sid in fragments: raise ValidationError("HTML 包含重复页面 ID")
+                    fragments[sid]=html_text[start:match.end()]
+                continue
+            identifier=id_re.search(tag); classes=class_re.search(tag)
+            is_slide=bool(classes and "slide" in classes.group(1).split())
+            sid=identifier.group(1) if is_slide and identifier else None
+            # Only top-level slide sections define page boundaries. Nested
+            # sections remain byte-for-byte inside their owning page.
+            stack.append((match.start(),sid if not stack else None))
+        if stack: raise ValidationError("HTML section 标签未闭合")
+        return fragments
+
+    @classmethod
+    def _replace_slide_fragments(cls,html_text,replacements):
+        fragments=cls._slide_fragments(html_text)
+        spans=[]
+        for sid,old in fragments.items():
+            start=html_text.find(old)
+            spans.append((start,start+len(old),replacements.get(sid,old)))
+        for start,end,value in sorted(spans,reverse=True): html_text=html_text[:start]+value+html_text[end:]
+        return html_text
     def deck_view(self,task_id):
         current=self._current_version(task_id,"deck")
         result={"state":self.get(task_id),"deck":None,"versions":self.versions(task_id,"deck")}
@@ -680,7 +714,11 @@ class TaskService:
         outline=self._current_version(task_id,"outline"); data=json.loads(self.version(task_id,outline)); ids=list(data["slide_ids"])
         sample=sample_view["sample"]; meta=sample["metadata"]
         assets=controlled_assets(self.input_view(task_id)["manifest"],self.store.resource_root(task_id))
-        sample_fragments=self._slide_fragments(sample["html"])
+        confirmation=sample_view["confirmation"] or {}
+        confirmed_pages=confirmation.get("confirmed_pages") or {}
+        sample_fragments={sid:item["html"] for sid,item in confirmed_pages.items()}
+        if not sample_fragments or any(digest(fragment.encode()) != confirmed_pages[sid].get("sha256") for sid,fragment in sample_fragments.items()):
+            raise ConflictError("确认样品原始页面或 SHA-256 无效")
         if isinstance(self.builder,FakeHtmlBuilder):
             html_text=render(data["markdown"],ids,meta.get("global_rules",[]),meta.get("local_exceptions",{}),assets)
         else:
@@ -694,13 +732,13 @@ class TaskService:
                 generated.update(self._slide_fragments(validate_html(partial,batch,assets.values())))
             ordered={**generated,**sample_fragments}
             shell=render(data["markdown"],ids,meta.get("global_rules",[]),meta.get("local_exceptions",{}),assets)
-            html_text=re.sub(r'<section class="slide" id="([A-Za-z0-9_-]+)"[\s\S]*?</section>',lambda match:ordered[match.group(1)],shell)
+            html_text=self._replace_slide_fragments(shell,ordered)
         html_text=validate_html(html_text,ids,assets.values()); deck_fragments=self._slide_fragments(html_text)
-        # Confirmed fragments are immutable and are merged by the server.
-        if not isinstance(self.builder,FakeHtmlBuilder):
-            for sid,fragment in sample_fragments.items():
-                html_text=re.sub(rf'<section class="slide" id="{re.escape(sid)}"[\s\S]*?</section>',lambda _m,f=fragment:f,html_text,count=1)
-            html_text=validate_html(html_text,ids,assets.values()); deck_fragments=self._slide_fragments(html_text)
+        # Confirmed fragments are immutable and are merged by the server for
+        # every builder implementation, including deterministic test/fallback
+        # builders.
+        html_text=self._replace_slide_fragments(html_text,sample_fragments)
+        html_text=validate_html(html_text,ids,assets.values()); deck_fragments=self._slide_fragments(html_text)
         preserved={sid:digest(deck_fragments[sid].encode())==digest(fragment.encode()) for sid,fragment in sample_fragments.items()}
         if not all(preserved.values()): raise ConflictError("确认样品发生未提示变化")
         result=self._record_deck(task_id,html_text,outline,{"parent":self._current_version(task_id,"deck"),"summary":"生成未检查候选稿","scope":"global","affected":ids,"sample_hash":sample["hash"],"sample_pages_preserved":preserved,"outline_consistent":True,"inspection_status":"pending","global_rules":meta.get("global_rules",[]),"local_exceptions":meta.get("local_exceptions",{})},"deck_generate")
@@ -733,7 +771,9 @@ class TaskService:
         else:
             for sid in affected: exceptions.setdefault(sid,[]).append((f"元素 {element_id}: " if inferred=="element" else "")+prompt.strip())
         assets=controlled_assets(self.input_view(task_id)["manifest"],self.store.resource_root(task_id))
-        source=render(markdown,all_ids,rules,exceptions,assets) if isinstance(self.builder,FakeHtmlBuilder) else self.builder.build(markdown,action="deck",slide_ids=all_ids,rules=rules,exceptions=exceptions,assets=assets,previous_html=deck["html"],prompt=prompt,scope=inferred,affected_slide_ids=affected,element_id=element_id)
+        deck_slides=self._slide_fragments(deck["html"])
+        previous_slides="".join(deck_slides.get(sid,"") for sid in all_ids)
+        source=render(markdown,all_ids,rules,exceptions,assets) if isinstance(self.builder,FakeHtmlBuilder) else self.builder.build(markdown,action="deck",slide_ids=all_ids,rules=rules,exceptions=exceptions,assets=assets,previous_slides=previous_slides,prompt=prompt,scope=inferred,affected_slide_ids=affected,element_id=element_id)
         html_text=validate_html(source,all_ids,assets.values())
         before=deck["metadata"]["page_hashes"]; after={sid:digest(fragment.encode()) for sid,fragment in self._slide_fragments(html_text).items()}; actual=[sid for sid in all_ids if before[sid]!=after[sid]]
         if any(s not in affected for s in actual): raise ConflictError("修改超出声明影响范围")

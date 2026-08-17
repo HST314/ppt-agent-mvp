@@ -54,6 +54,7 @@ class OpenAIResponsesClient:
         self.structured_output = getattr(config, "structured_output", "auto") or "auto"
         self._text_format_unsupported = False
         self._client = sdk_client
+        self.last_provider_call_count = 0
 
     def _request_timeout(self) -> float:
         return getattr(self.config, "request_timeout_seconds", getattr(self.config, "timeout_seconds", 60))
@@ -68,13 +69,20 @@ class OpenAIResponsesClient:
 
     supports_execution_cancellation = True
 
-    def create(self, *, input: Any, tools: list[dict] | None = None, response_schema: dict | None = None, tool_choice: Any = None, timeout_seconds: float | None = None) -> ModelTurn:
+    def create(self, *, input: Any, tools: list[dict] | None = None, response_schema: dict | None = None, tool_choice: Any = None, timeout_seconds: float | None = None, provider_call_limit: int | None = None) -> ModelTurn:
         from .execution import cancellation_state, checkpoint
 
         use_format = bool(response_schema) and self.structured_output != "prompt" and not self._text_format_unsupported
         empty_attempts = 0
         timeout_attempts = 0
+        provider_calls = 0
+        self.last_provider_call_count = 0
         while True:
+            if provider_call_limit is not None and provider_calls >= provider_call_limit:
+                raise GatewayError(
+                    "模型阶段真实请求次数已达到上限",
+                    audit_details={"category": "provider_call_limit", "retryable": False},
+                )
             request: dict[str, Any] = {"model": self.config.model, "input": input}
             if tools:
                 request["tools"] = tools
@@ -98,6 +106,8 @@ class OpenAIResponsesClient:
             monitor = threading.Thread(target=abort_on_cancel, name="ppt-model-cancellation", daemon=False)
             monitor.start()
             try:
+                provider_calls += 1
+                self.last_provider_call_count = provider_calls
                 response = request_client.responses.create(**request)
             except (APITimeoutError, TimeoutError, socket.timeout) as exc:
                 checkpoint()
