@@ -293,26 +293,65 @@ class AgentGateway:
         action = context.pop("action", "deck")
         if action not in {"sample", "deck", "inspection"}:
             raise ValidationError("Agent HTML 阶段无效")
-        # Inspection repair still generates deck HTML; inspection itself uses
-        # inspect() and can never return a modified artifact.
         stage = "deck" if action == "inspection" else action
-        expected=list(context.get("slide_ids") or [])
-        value=self._run(stage, {"outline": outline, **context})
-        slides=value.get("slides")
-        if not isinstance(slides,list) or [item.get("slide_id") for item in slides if isinstance(item,dict)] != expected:
+        expected = list(context.get("slide_ids") or [])
+        value = self._run(stage, {"outline": outline, **context})
+        slides = value.get("slides")
+        if not isinstance(slides, list) or [item.get("slide_id") for item in slides if isinstance(item, dict)] != expected:
             raise ValidationError("模型页面片段与请求页面不一致")
-        fragments=[]
+        
+        fragments = []
         for item in slides:
-            fragment=item.get("html")
-            pattern=rf'^<section class="slide" id="{re.escape(item["slide_id"])}" data-slide-id="{re.escape(item["slide_id"])}">[\s\S]*</section>$'
-            if not isinstance(fragment,str) or not re.fullmatch(pattern,fragment.strip()):
+            fragment = item.get("html")
+            if not isinstance(fragment, str) or not fragment.strip():
                 raise ValidationError("模型页面片段契约无效")
-            fragments.append(fragment.strip())
-        rules=" · ".join(html.escape(str(x)) for x in context.get("rules",[]))
-        # Public shell is versioned server code. It is never sent to, copied by,
-        # or editable by the model.
-        return '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><style>html,body{margin:0;background:#111827;color:#f8fafc;font-family:system-ui}.slide{box-sizing:border-box;width:1280px;height:720px;padding:72px;margin:24px auto;background:linear-gradient(135deg,#172033,#253858);overflow:hidden}.slide h1{font-size:46px}.slide p{font-size:25px;line-height:1.5}small{display:block;color:#93c5fd}</style></head><body><aside hidden data-global-rules="'+rules+'"></aside>'+''.join(fragments)+'</body></html>'
+            
+            fragment = fragment.strip()
+            # 兼容模型偶尔包裹的代码围栏
+            if fragment.startswith("```"):
+                fragment = re.sub(r"^```[a-zA-Z]*\s*", "", fragment)
+                fragment = re.sub(r"\s*```$", "", fragment).strip()
 
+            sid = item["slide_id"]
+            # 校验是否为以 <section ...> 开始并以 </section> 结束的独立片段
+            tag_match = re.match(r'^<section\b(?P<attrs>[^>]*)>[\s\S]*</section>$', fragment, re.I)
+            if not tag_match:
+                raise ValidationError("模型页面片段契约无效")
+
+            attrs_str = tag_match.group("attrs")
+            id_match = re.search(r'\bid=["\']([A-Za-z0-9_-]+)["\']', attrs_str, re.I)
+            data_id_match = re.search(r'\bdata-slide-id=["\']([A-Za-z0-9_-]+)["\']', attrs_str, re.I)
+            class_match = re.search(r'\bclass=["\']([^"\']*)["\']', attrs_str, re.I)
+
+            # 检查 class 必须包含 slide
+            if not class_match or "slide" not in class_match.group(1).split():
+                raise ValidationError("模型页面片段契约无效")
+
+            # 校验 id / data-slide-id 是否与请求的 slide_id 匹配
+            extracted_id = (id_match.group(1) if id_match else None) or (data_id_match.group(1) if data_id_match else None)
+            if extracted_id is not None and extracted_id != sid:
+                raise ValidationError("模型页面片段契约无效")
+
+            # 确保同时具备标准的 id 和 data-slide-id 属性
+            if not id_match:
+                fragment = re.sub(r'^<section\b', f'<section id="{sid}"', fragment, count=1, flags=re.I)
+            if not data_id_match:
+                fragment = re.sub(r'^<section\b', f'<section data-slide-id="{sid}"', fragment, count=1, flags=re.I)
+
+            fragments.append(fragment)
+
+        rules = " · ".join(html.escape(str(x)) for x in context.get("rules", []))
+        return (
+            '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width"><style>'
+            'html,body{margin:0;background:#111827;color:#f8fafc;font-family:system-ui}'
+            '.slide{box-sizing:border-box;width:1280px;height:720px;padding:72px;margin:24px auto;'
+            'background:linear-gradient(135deg,#172033,#253858);overflow:hidden}'
+            '.slide h1{font-size:46px}.slide p{font-size:25px;line-height:1.5}'
+            'small{display:block;color:#93c5fd}</style></head><body>'
+            '<aside hidden data-global-rules="' + rules + '"></aside>' + ''.join(fragments) + '</body></html>'
+        )
+    
     def inspect(self, original_outline, html):
         value = self._run("inspection", {"original_outline": original_outline, "html": html})
         return {**value, "model": self.model}
