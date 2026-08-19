@@ -1,5 +1,6 @@
 """AC-18 historical desktop journey, migrated to the FastAPI single shell."""
 
+import json
 import socket
 import tempfile
 import threading
@@ -40,7 +41,8 @@ class DesktopJourney(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.service = TaskService(WorkspaceStore(self.tmp.name), inspector=PassingInspector())
         port = free_port()
-        self.server = uvicorn.Server(uvicorn.Config(create_app(self.service), host="127.0.0.1", port=port, log_level="critical"))
+        self.app = create_app(self.service)
+        self.server = uvicorn.Server(uvicorn.Config(self.app, host="127.0.0.1", port=port, log_level="critical"))
         self.thread = threading.Thread(target=self.server.run, daemon=True)
         self.thread.start()
         deadline = time.monotonic() + 5
@@ -58,6 +60,16 @@ class DesktopJourney(unittest.TestCase):
         self.server.should_exit = True
         self.thread.join(5)
         self.tmp.cleanup()
+
+    def wait_for_job(self, operation, timeout=10):
+        deadline=time.monotonic()+timeout; jobs=[]
+        while time.monotonic()<deadline:
+            jobs=[job for job in self.app.state.job_service.list("desktop") if job["operation"]==operation]
+            if jobs and jobs[-1]["status"] in {"succeeded","failed","cancelled","interrupted"}:
+                if jobs[-1]["status"]=="succeeded": return jobs[-1]
+                self.fail(f"{operation} did not succeed: {json.dumps(jobs[-1],ensure_ascii=False,sort_keys=True)}")
+            time.sleep(.05)
+        self.fail(f"{operation} did not reach a terminal state: jobs={json.dumps(jobs,ensure_ascii=False,sort_keys=True)}, state={json.dumps(self.service.get('desktop'),ensure_ascii=False,sort_keys=True)}")
 
     def test_create_to_delivery_and_post_delivery_derivation(self):
         page = self.page
@@ -82,6 +94,9 @@ class DesktopJourney(unittest.TestCase):
         page.get_by_role("button", name="生成 HTML 样品").click()
         page.get_by_role("button", name="确认当前样品并进入全稿").wait_for()
         page.get_by_role("button", name="确认当前样品并进入全稿").click()
+        self.wait_for_job("deck.generate")
+        page.reload()
+        page.get_by_role("heading", name="全稿", exact=True).wait_for()
         page.get_by_role("link", name="前往自检与修改", exact=True).wait_for()
         self.assertEqual(page.get_by_role("button", name="提交全稿修改").count(), 0)
         self.assertEqual(page.locator('.stage-link[href$="stage=review"]').get_attribute("data-status"), "available")

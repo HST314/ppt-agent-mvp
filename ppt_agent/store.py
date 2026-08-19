@@ -1,23 +1,54 @@
 from __future__ import annotations
 
-import errno, hashlib, json, os, re, shutil, threading, time, uuid
+import errno, hashlib, json, os, re, shutil, threading, time, uuid, weakref
 from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime, timezone
+
+import portalocker
 
 from .errors import ConflictError, NotFoundError, ValidationError
 HASH=re.compile(r"^[0-9a-f]{64}$")
 
 
+class _TaskLock:
+    """A thread-reentrant mutex backed by an inter-process file lock."""
+    def __init__(self,path):
+        self.path=path; self.thread_lock=threading.RLock(); self.owner=None; self.depth=0; self.file_lock=None
+    def __enter__(self):
+        self.thread_lock.acquire(); owner=threading.get_ident()
+        try:
+            if self.owner==owner:
+                self.depth+=1
+                return self
+            self.path.parent.mkdir(parents=True,exist_ok=True)
+            self.file_lock=portalocker.Lock(str(self.path),mode="a+b",timeout=60,check_interval=.05)
+            self.file_lock.acquire(); self.owner=owner; self.depth=1
+            return self
+        except BaseException:
+            self.file_lock=None; self.thread_lock.release(); raise
+    def __exit__(self,exc_type,exc,tb):
+        self.depth-=1
+        if self.depth==0:
+            self.owner=None
+            try: self.file_lock.release()
+            finally: self.file_lock=None
+        self.thread_lock.release()
+
+
 class WorkspaceStore:
-    def __init__(self, root, fault=None): self.root=Path(root).resolve(); self.root.mkdir(parents=True,exist_ok=True); self._locks={}; self._guard=threading.Lock(); self.fault=fault
+    _shared_locks=weakref.WeakValueDictionary(); _shared_guard=threading.Lock()
+    def __init__(self, root, fault=None): self.root=Path(root).resolve(); self.root.mkdir(parents=True,exist_ok=True); self._guard=threading.Lock(); self.fault=fault
     def _task(self, task_id):
         if not task_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in task_id): raise ValidationError("task_id 格式无效")
         p=(self.root/task_id).resolve()
         if self.root not in p.parents: raise ValidationError("任务路径越界")
         return p
     def lock(self, task_id):
-        with self._guard: return self._locks.setdefault(task_id,threading.RLock())
+        self._task(task_id)
+        path=self.root/".task-locks"/f"{task_id}.lock"
+        key=str(path)
+        with self._shared_guard: return self._shared_locks.setdefault(key,_TaskLock(path))
     @contextmanager
     def transaction(self, task_id):
         """Rollback every task-local write when a multi-artifact action fails."""

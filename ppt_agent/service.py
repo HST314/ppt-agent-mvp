@@ -193,6 +193,29 @@ class TaskService:
         if state.stage not in {state.stage.DECK,state.stage.REVIEW}:
             raise ConflictError("当前阶段的候选全稿不可修改；如需调整，请从已交付版本显式派生新候选")
         return state
+    def _candidate_write_token(self,task_id,allowed_stages=None):
+        """Capture the state which a prepared deck candidate is allowed to replace."""
+        with self.store.lock(task_id):
+            self._require_actionable(task_id)
+            state=TaskState.parse(self.get(task_id))
+            allowed=set(allowed_stages or {"deck","review"})
+            serialized=state.to_dict()
+            if serialized["stage"] not in allowed:
+                raise ConflictError("当前阶段不允许写入候选全稿")
+            return {
+                "stage":serialized["stage"],
+                "revision":serialized["revision"],
+                "parent_deck_hash":self._current_version(task_id,"deck"),
+            }
+    def _assert_candidate_write_token(self,task_id,token):
+        state=TaskState.parse(self.get(task_id)).to_dict()
+        current={
+            "stage":state["stage"],
+            "revision":state["revision"],
+            "parent_deck_hash":self._current_version(task_id,"deck"),
+        }
+        if current != token:
+            raise ConflictError("候选全稿准备期间任务状态或父版本已变更，未提交过期结果")
     def command(self,task_id,command_id,action,actor="system",payload=None):
         request={"action":action,"actor":actor,"payload":payload or {}}
         with self.store.lock(task_id):
@@ -741,11 +764,19 @@ class TaskService:
         metadata={"source":action,"operator":actor,**metadata,"html":html_text,"page_hashes":{sid:digest(fragment.encode()) for sid,fragment in fragments.items()}}
         self._record_p3(task_id,"deck",model,metadata,action,actor)
         return self.deck_view(task_id)
+    def _commit_candidate_deck(self,task_id,html_text,outline_hash,metadata,action,token,actor="system",before_commit=None):
+        """Publish a prepared candidate only if its complete parent snapshot still wins."""
+        with self.store.transaction(task_id):
+            self._assert_candidate_write_token(task_id,token)
+            if metadata.get("parent") != token["parent_deck_hash"]:
+                raise ConflictError("候选全稿父版本与提交令牌不一致")
+            if before_commit is not None:
+                outline_hash=before_commit()
+            return self._record_deck(task_id,html_text,outline_hash,metadata,action,actor)
     def generate_deck(self,task_id):
-        self._require_actionable(task_id)
-        sample_view=self.sample_view(task_id); self._require_current_sample_confirmation(task_id)
-        state=TaskState.parse(self.get(task_id))
-        if state.stage not in {state.stage.SAMPLE,state.stage.DECK}: raise ConflictError("当前阶段不能生成全稿")
+        with self.store.lock(task_id):
+            sample_view=self.sample_view(task_id); self._require_current_sample_confirmation(task_id)
+            token=self._candidate_write_token(task_id,{"sample","deck"})
         outline=self._current_version(task_id,"outline"); data=json.loads(self.version(task_id,outline)); ids=list(data["slide_ids"])
         sample=sample_view["sample"]; meta=sample["metadata"]
         assets=controlled_assets(self.input_view(task_id)["manifest"],self.store.resource_root(task_id))
@@ -776,15 +807,17 @@ class TaskService:
         html_text=validate_html(html_text,ids,assets); deck_fragments=self._slide_fragments(html_text)
         preserved={sid:digest(deck_fragments[sid].encode())==digest(fragment.encode()) for sid,fragment in sample_fragments.items()}
         if not all(preserved.values()): raise ConflictError("确认样品发生未提示变化")
-        result=self._record_deck(task_id,html_text,outline,{"parent":self._current_version(task_id,"deck"),"summary":"生成未检查候选稿","scope":"global","affected":ids,"sample_hash":sample["hash"],"sample_pages_preserved":preserved,"outline_consistent":True,"inspection_status":"pending","global_rules":meta.get("global_rules",[]),"local_exceptions":meta.get("local_exceptions",{})},"deck_generate")
-        if state.stage==state.stage.SAMPLE:
+        result=self._commit_candidate_deck(task_id,html_text,outline,{"parent":token["parent_deck_hash"],"summary":"生成未检查候选稿","scope":"global","affected":ids,"sample_hash":sample["hash"],"sample_pages_preserved":preserved,"outline_consistent":True,"inspection_status":"pending","global_rules":meta.get("global_rules",[]),"local_exceptions":meta.get("local_exceptions",{})},"deck_generate",token)
+        if token["stage"]=="sample":
             self.command(task_id,f"to-deck-{sample['hash'][:12]}","advance","system")
             result=self.deck_view(task_id)
         return result
     def modify_deck(self,task_id,prompt,change_type="visual",scope=None,slide_ids=None,element_id=None):
-        self._require_candidate_mutable(task_id)
-        view=self.deck_view(task_id); deck=view["deck"]
+        with self.store.lock(task_id):
+            token=self._candidate_write_token(task_id)
+            view=self.deck_view(task_id); deck=view["deck"]
         if not deck: raise ConflictError("尚未生成全稿")
+        if deck["hash"]!=token["parent_deck_hash"]: raise ConflictError("当前候选全稿版本已变更")
         if not isinstance(prompt,str) or not prompt.strip(): raise ValidationError("修改 Prompt 不得为空")
         if change_type not in {"visual","content"}: raise ValidationError("修改类型只能是 visual 或 content")
         all_ids=list(deck["metadata"]["page_hashes"]); slide_ids=slide_ids or []
@@ -814,16 +847,16 @@ class TaskService:
         if any(s not in affected for s in actual): raise ConflictError("修改超出声明影响范围")
         # Cross-artifact edits are prepared and validated above. Only successful
         # render/validation may publish the outline and deck versions.
-        if pending_outline:
-            outline_hash=self._record_p3(task_id,"outline",pending_outline[0],pending_outline[1],"outline_edit","user")
-        return self._record_deck(task_id,html_text,outline_hash,{"parent":deck["hash"],"summary":prompt.strip(),"scope":inferred,"change_type":change_type,"affected":actual,"requested_affected":affected,"unchanged":[s for s in all_ids if s not in actual],"scope_understanding":understanding,"element_id":element_id,"outline_consistent":True,"global_rules":rules,"local_exceptions":exceptions},"deck_modify","user")
+        publish_outline=(lambda:self._record_p3(task_id,"outline",pending_outline[0],pending_outline[1],"outline_edit","user")) if pending_outline else None
+        return self._commit_candidate_deck(task_id,html_text,outline_hash,{"parent":deck["hash"],"summary":prompt.strip(),"scope":inferred,"change_type":change_type,"affected":actual,"requested_affected":affected,"unchanged":[s for s in all_ids if s not in actual],"scope_understanding":understanding,"element_id":element_id,"outline_consistent":True,"global_rules":rules,"local_exceptions":exceptions},"deck_modify",token,"user",publish_outline)
     def rollback_deck(self,task_id,target_hash):
-        self._require_candidate_mutable(task_id)
-        known={v["hash"] for v in self.versions(task_id,"deck")}
-        if target_hash not in known: raise ValidationError("目标全稿版本不存在")
-        target=json.loads(self.version(task_id,target_hash)); meta=next(v["metadata"] for v in self.versions(task_id,"deck") if v["hash"]==target_hash)
-        current_outline=self._current_version(task_id,"outline"); inconsistent=target["outline_hash"]!=current_outline
-        return self._record_deck(task_id,meta["html"],target["outline_hash"],{"parent":self._current_version(task_id,"deck"),"rollback_from":target_hash,"summary":f"回退自 {target_hash[:12]}","scope":"global","affected":list(meta["page_hashes"]),"outline_consistent":not inconsistent,"regenerate_required":list(meta["page_hashes"]) if inconsistent else [],"global_rules":meta.get("global_rules",[]),"local_exceptions":meta.get("local_exceptions",{})},"deck_rollback","user")
+        with self.store.lock(task_id):
+            token=self._candidate_write_token(task_id)
+            known={v["hash"] for v in self.versions(task_id,"deck")}
+            if target_hash not in known: raise ValidationError("目标全稿版本不存在")
+            target=json.loads(self.version(task_id,target_hash)); meta=next(v["metadata"] for v in self.versions(task_id,"deck") if v["hash"]==target_hash)
+            current_outline=self._current_version(task_id,"outline"); inconsistent=target["outline_hash"]!=current_outline
+        return self._commit_candidate_deck(task_id,meta["html"],target["outline_hash"],{"parent":token["parent_deck_hash"],"rollback_from":target_hash,"summary":f"回退自 {target_hash[:12]}","scope":"global","affected":list(meta["page_hashes"]),"outline_consistent":not inconsistent,"regenerate_required":list(meta["page_hashes"]) if inconsistent else [],"global_rules":meta.get("global_rules",[]),"local_exceptions":meta.get("local_exceptions",{})},"deck_rollback",token,"user")
 
     def inspection_view(self,task_id):
         deck=self.deck_view(task_id)["deck"]; reports=self.versions(task_id,"inspection")
@@ -867,10 +900,13 @@ class TaskService:
         return {**report.to_dict(),"hash":h,"metadata":metadata}
 
     def _prepare_auto_fix(self,task_id,report,round_number,issue_ids=None):
-        self._require_candidate_mutable(task_id)
+        with self.store.lock(task_id):
+            token=self._candidate_write_token(task_id)
+            deck=self.deck_view(task_id)["deck"]
+        if not deck or deck["hash"]!=token["parent_deck_hash"]: raise ConflictError("当前候选全稿版本已变更")
         selected=[item for item in report["issues"] if issue_ids is None or item["issue_id"] in set(issue_ids)]
         if not selected: raise ValidationError("检查修复范围为空")
-        deck=self.deck_view(task_id)["deck"]; affected=list(dict.fromkeys(i["slide_id"] for i in selected if i["slide_id"]))
+        affected=list(dict.fromkeys(i["slide_id"] for i in selected if i["slide_id"]))
         if not affected: affected=list(deck["metadata"]["page_hashes"])
         outline=json.loads(self.version(task_id,deck["outline_hash"]))["markdown"]
         assets=controlled_assets(self.input_view(task_id)["manifest"],self.store.resource_root(task_id))
@@ -886,11 +922,11 @@ class TaskService:
         html_text=self._replace_slide_fragments(deck["html"],{slide_id:candidate_slides[slide_id] for slide_id in affected})
         html_text=validate_html(html_text,list(deck["metadata"]["page_hashes"]),assets)
         metadata={"parent":deck["hash"],"summary":f"自动修复第 {round_number} 轮","scope":"page","affected":affected,"outline_consistent":True,"global_rules":deck["metadata"].get("global_rules",[]),"local_exceptions":deck["metadata"].get("local_exceptions",{}),"inspection_report_hash":report["hash"],"inspection_issue_ids":[item["issue_id"] for item in selected],"auto_fix_round":round_number}
-        return html_text,deck["outline_hash"],metadata
+        return html_text,deck["outline_hash"],metadata,token
 
     def _auto_fix(self,task_id,report,round_number,prepared=None):
-        html_text,outline_hash,metadata=prepared or self._prepare_auto_fix(task_id,report,round_number)
-        return self._record_deck(task_id,html_text,outline_hash,metadata,"deck_auto_fix","system")["deck"]
+        html_text,outline_hash,metadata,token=prepared or self._prepare_auto_fix(task_id,report,round_number)
+        return self._commit_candidate_deck(task_id,html_text,outline_hash,metadata,"deck_auto_fix",token,"system")["deck"]
 
     def run_inspection(self,task_id,max_rounds=2,affected_slide_ids=None,_prepared_raw=None):
         metric_started=time.monotonic()
@@ -941,9 +977,20 @@ class TaskService:
         # performed when no repaired deck exists.
         prepared_fix=self._prepare_auto_fix(task_id,report,1,[issue_id]) if action=="agent_fix" else None
         created=utcnow(); payload={"task_id":task_id,"issue_id":issue_id,"action":action,"actor":actor,"target_deck_hash":report["deck_hash"],"rationale":(rationale or "按当前处置执行").strip(),"created_at":created,"schema_version":"1.0"}
-        model=IssueDisposition.parse({"disposition_id":f"disposition-{digest(canonical(payload))[:16]}",**payload}); h=self.store.put_version(task_id,"issue-disposition",canonical(model.to_dict()),{"report_hash":report["hash"],"severity":issue["severity"],"code":issue["code"],"sequence":len(self.versions(task_id,"issue-disposition"))+1})
+        model=IssueDisposition.parse({"disposition_id":f"disposition-{digest(canonical(payload))[:16]}",**payload})
+        def record_disposition():
+            return self.store.put_version(task_id,"issue-disposition",canonical(model.to_dict()),{"report_hash":report["hash"],"severity":issue["severity"],"code":issue["code"],"sequence":len(self.versions(task_id,"issue-disposition"))+1})
         if action=="agent_fix":
-            self._auto_fix(task_id,report,1,prepared_fix)
+            html_text,outline_hash,metadata,token=prepared_fix
+            with self.store.transaction(task_id):
+                self._assert_candidate_write_token(task_id,token)
+                if metadata.get("parent")!=token["parent_deck_hash"]: raise ConflictError("候选全稿父版本与提交令牌不一致")
+                h=record_disposition()
+                self._record_deck(task_id,html_text,outline_hash,metadata,"deck_auto_fix","system")
+        else:
+            with self.store.transaction(task_id):
+                self._require_candidate_mutable(task_id)
+                h=record_disposition()
         return {**self.inspection_view(task_id),"disposition_hash":h}
 
     def dispose_issues(self,task_id,issue_ids,action,rationale):
@@ -1112,14 +1159,15 @@ class TaskService:
         return self.publish_delivery(task_id,actor)
 
     def derive_from_delivery(self,task_id,delivery_hash,prompt,slide_ids=None):
-        record=next((x for x in self.versions(task_id,"delivery") if x["hash"]==delivery_hash),None)
-        if not record: raise ValidationError("交付版本不存在")
-        delivered=json.loads(self.version(task_id,delivery_hash)); current=TaskState.parse(self.get(task_id))
-        if current.status!=current.status.COMPLETED: raise ConflictError("只有已完成任务可从交付派生")
-        deck_record=next(x for x in self.versions(task_id,"deck") if x["hash"]==delivered["deck_hash"])
-        target=json.loads(self.version(task_id,delivered["deck_hash"])); meta=deck_record["metadata"]
-        reopened=TaskState(**{**current.__dict__,"stage":current.stage.DECK,"status":current.status.READY,"delivery_confirmed":False,"blockers_resolved":False,"revision":current.revision+1})
-        event={"event_id":digest(f"{task_id}:derive:{delivery_hash}:{current.revision}".encode())[:24],"command_id":f"derive-{delivery_hash[:16]}-{current.revision}","action":"derive_delivery","actor":"user","request_hash":fingerprint({"prompt":prompt,"slide_ids":slide_ids}),"at":utcnow(),"from":current.to_dict(),"to":reopened.to_dict(),"result":{"delivery_hash":delivery_hash,"deck_hash":delivered["deck_hash"]}}
-        self.store.commit(task_id,reopened.to_dict(),event)
-        self._record_deck(task_id,meta["html"],target["outline_hash"],{"parent":delivered["deck_hash"],"derived_from_delivery":delivery_hash,"summary":"从已交付版本派生候选","scope":"global","affected":[],"outline_consistent":True,"global_rules":meta.get("global_rules",[]),"local_exceptions":meta.get("local_exceptions",{})},"delivery_derive","user")
+        with self.store.transaction(task_id):
+            record=next((x for x in self.versions(task_id,"delivery") if x["hash"]==delivery_hash),None)
+            if not record: raise ValidationError("交付版本不存在")
+            delivered=json.loads(self.version(task_id,delivery_hash)); current=TaskState.parse(self.get(task_id))
+            if current.status!=current.status.COMPLETED: raise ConflictError("只有已完成任务可从交付派生")
+            deck_record=next(x for x in self.versions(task_id,"deck") if x["hash"]==delivered["deck_hash"])
+            target=json.loads(self.version(task_id,delivered["deck_hash"])); meta=deck_record["metadata"]
+            reopened=TaskState(**{**current.__dict__,"stage":current.stage.DECK,"status":current.status.READY,"delivery_confirmed":False,"blockers_resolved":False,"revision":current.revision+1})
+            event={"event_id":digest(f"{task_id}:derive:{delivery_hash}:{current.revision}".encode())[:24],"command_id":f"derive-{delivery_hash[:16]}-{current.revision}","action":"derive_delivery","actor":"user","request_hash":fingerprint({"prompt":prompt,"slide_ids":slide_ids}),"at":utcnow(),"from":current.to_dict(),"to":reopened.to_dict(),"result":{"delivery_hash":delivery_hash,"deck_hash":delivered["deck_hash"]}}
+            self.store.commit(task_id,reopened.to_dict(),event)
+            self._record_deck(task_id,meta["html"],target["outline_hash"],{"parent":delivered["deck_hash"],"derived_from_delivery":delivery_hash,"summary":"从已交付版本派生候选","scope":"global","affected":[],"outline_consistent":True,"global_rules":meta.get("global_rules",[]),"local_exceptions":meta.get("local_exceptions",{})},"delivery_derive","user")
         return self.modify_deck(task_id,prompt,scope="page" if slide_ids else "global",slide_ids=slide_ids or [])

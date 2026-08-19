@@ -1,8 +1,11 @@
-import hashlib, json, tempfile, unittest
+import hashlib, json, tempfile, threading, unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 from ppt_agent.errors import ConflictError, GateError
+from ppt_agent.gateways import FakeHtmlBuilder
 from ppt_agent.offline import verify_delivery
+from ppt_agent.p4 import render
 from ppt_agent.service import TaskService
 from ppt_agent.store import WorkspaceStore
 
@@ -14,6 +17,15 @@ class PassingInspector:
 class BlockingInspector:
     def inspect(self, outline, html):
         return {"passed":False,"issues":[{"issue_id":"overflow","severity":"blocker","level":"element","code":"overflow","message":"元素溢出","slide_id":"slide-1","element_id":"title","evidence":"超出边界","suggestion":"缩小字号"}],"model":"fixture"}
+
+
+class BlockingBuilder:
+    def __init__(self):
+        self.started=threading.Event(); self.release=threading.Event()
+    def build(self,outline,**context):
+        self.started.set()
+        if not self.release.wait(5): raise RuntimeError("blocking builder was not released")
+        return render(outline,context["slide_ids"],context.get("rules"),context.get("exceptions"),context.get("assets"))
 
 
 class DeliveryJourney(unittest.TestCase):
@@ -78,6 +90,37 @@ class DeliveryJourney(unittest.TestCase):
         finalized=self.svc.finalize_deck("task",deck["hash"],"review")
         self.assertEqual(finalized["state"]["stage"],"delivery")
         self.assertEqual(len(self.svc.versions("task","final-deck")),1)
+
+    def test_blocked_builder_cannot_publish_after_concurrent_finalization(self):
+        deck=self.svc.deck_view("task")["deck"]
+        before_versions=self.svc.versions("task","deck")
+        builder=BlockingBuilder(); self.svc.builder=builder
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending=pool.submit(self.svc.modify_deck,"task","统一使用蓝色主题")
+            self.assertTrue(builder.started.wait(2))
+            peer=TaskService(WorkspaceStore(self.tmp.name),inspector=PassingInspector())
+            finalized=peer.finalize_deck("task",deck["hash"],"review")["finalization"]
+            builder.release.set()
+            with self.assertRaises(ConflictError): pending.result(timeout=3)
+        self.assertEqual(self.svc.get("task")["stage"],"delivery")
+        self.assertEqual(self.svc.versions("task","deck"),before_versions)
+        self.assertEqual(self.svc.deck_view("task")["deck"]["hash"],deck["hash"])
+        self.assertEqual(self.svc.finalization_view("task")["current"]["hash"],finalized["hash"])
+
+    def test_candidate_cas_rejects_a_stale_parent_while_stage_stays_mutable(self):
+        parent=self.svc.deck_view("task")["deck"]
+        before=len(self.svc.versions("task","deck"))
+        builder=BlockingBuilder(); self.svc.builder=builder
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            stale=pool.submit(self.svc.modify_deck,"task","旧请求：改为蓝色")
+            self.assertTrue(builder.started.wait(2))
+            self.svc.builder=FakeHtmlBuilder()
+            winner=self.svc.modify_deck("task","新请求：改为红色")["deck"]
+            builder.release.set()
+            with self.assertRaises(ConflictError): stale.result(timeout=3)
+        self.assertEqual(len(self.svc.versions("task","deck")),before+1)
+        self.assertEqual(winner["metadata"]["parent"],parent["hash"])
+        self.assertEqual(self.svc.deck_view("task")["deck"]["hash"],winner["hash"])
 
     def test_delivery_stage_rejects_every_candidate_write_and_preserves_finalization(self):
         original=self.svc.deck_view("task")["deck"]
