@@ -122,8 +122,8 @@ class WorkspaceStore:
         p=self._task(task_id)/"artifacts"/digest
         if not p.exists(): raise NotFoundError("版本不存在")
         return p.read_bytes()
-    def publish_delivery(self,task_id,delivery_id,files):
-        """Publish an immutable delivery directory only after every file is ready."""
+    def publish_delivery(self,task_id,delivery_id,files,verifier=None):
+        """Verify a complete staging tree before atomically publishing it."""
         if not delivery_id or Path(delivery_id).name != delivery_id: raise ValidationError("delivery_id 格式无效")
         base=self._task(task_id)/"deliveries"; base.mkdir(exist_ok=True)
         target=base/delivery_id
@@ -140,6 +140,7 @@ class WorkspaceStore:
                     path=(staging/relative).resolve()
                     if staging.resolve() not in path.parents: raise ValidationError("交付文件路径越界")
                     path.parent.mkdir(parents=True,exist_ok=True); path.write_bytes(content)
+                if verifier is not None: verifier(staging)
                 if self.fault: self.fault("before_delivery_publish")
                 os.replace(staging,target)
                 if self.fault: self.fault("after_delivery_publish")

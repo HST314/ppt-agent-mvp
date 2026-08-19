@@ -1,6 +1,6 @@
-import { api } from "../api.js?v=2026.08.19.043945581370";
-import { badge, button, confirmationDialog, element, field, formatTime, metadataList, shortHash } from "../components/index.js?v=2026.08.19.043945581370";
-import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.19.043945581370";
+import { api } from "../api.js?v=2026.08.19.051824935370";
+import { badge, button, confirmationDialog, element, field, formatTime, metadataList, shortHash } from "../components/index.js?v=2026.08.19.051824935370";
+import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.19.051824935370";
 
 export async function render(context) {
   const [view, deckView] = await Promise.all([
@@ -53,14 +53,14 @@ function deliveryStage(view, deck, context) {
       metadataList([["终稿", shortHash(finalization?.deck_hash)], ["终稿记录", shortHash(finalization?.hash)], ["最近交付", shortHash(latest?.hash)], ["交付次数", view.deliveries?.length || 0], ["任务修订", view.state.revision]]),
     ]),
     section("终稿摘要", finalization ? [
-      badge(inspectionStatus(finalization.inspection_status), finalization.inspection_status === "passed" ? "success" : "warning"),
+      badge(inspectionStatus(finalization.inspection_status), ["passed", "issues_disposed"].includes(finalization.inspection_status) ? "success" : "warning"),
       metadataList([["来源页面", finalization.source === "review" ? "自检与修改" : "全稿"], ["遗留问题", finalization.unresolved_issue_count], ["其中阻断", finalization.blocking_issue_count]]),
     ] : [badge("尚未确定", "warning"), button("返回全稿", { href: `/tasks/${encodeURIComponent(context.taskId)}?stage=deck`, kind: "secondary" })]),
   ]);
 }
 
 function inspectionStatus(status) {
-  return ({ unchecked: "未执行检查", stale: "检查报告对应旧版本", passed: "检查通过", issues_remaining: "带遗留问题确认" })[status] || "未记录";
+  return ({ unchecked: "未执行检查", stale: "检查报告对应旧版本", passed: "检查通过", issues_disposed: "问题已全部处置", issues_remaining: "带遗留问题确认" })[status] || "未记录";
 }
 
 function derivePanel(latest, context) {

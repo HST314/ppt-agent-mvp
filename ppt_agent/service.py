@@ -187,6 +187,12 @@ class TaskService:
     def _require_actionable(self,task_id):
         status=self.get(task_id)["status"]
         if status in {"paused","cancelled","failed","completed"}: raise ConflictError(f"任务状态 {status} 不允许启动新动作")
+    def _require_candidate_mutable(self,task_id):
+        self._require_actionable(task_id)
+        state=TaskState.parse(self.get(task_id))
+        if state.stage not in {state.stage.DECK,state.stage.REVIEW}:
+            raise ConflictError("当前阶段的候选全稿不可修改；如需调整，请从已交付版本显式派生新候选")
+        return state
     def command(self,task_id,command_id,action,actor="system",payload=None):
         request={"action":action,"actor":actor,"payload":payload or {}}
         with self.store.lock(task_id):
@@ -776,7 +782,7 @@ class TaskService:
             result=self.deck_view(task_id)
         return result
     def modify_deck(self,task_id,prompt,change_type="visual",scope=None,slide_ids=None,element_id=None):
-        self._require_actionable(task_id)
+        self._require_candidate_mutable(task_id)
         view=self.deck_view(task_id); deck=view["deck"]
         if not deck: raise ConflictError("尚未生成全稿")
         if not isinstance(prompt,str) or not prompt.strip(): raise ValidationError("修改 Prompt 不得为空")
@@ -812,7 +818,7 @@ class TaskService:
             outline_hash=self._record_p3(task_id,"outline",pending_outline[0],pending_outline[1],"outline_edit","user")
         return self._record_deck(task_id,html_text,outline_hash,{"parent":deck["hash"],"summary":prompt.strip(),"scope":inferred,"change_type":change_type,"affected":actual,"requested_affected":affected,"unchanged":[s for s in all_ids if s not in actual],"scope_understanding":understanding,"element_id":element_id,"outline_consistent":True,"global_rules":rules,"local_exceptions":exceptions},"deck_modify","user")
     def rollback_deck(self,task_id,target_hash):
-        self._require_actionable(task_id)
+        self._require_candidate_mutable(task_id)
         known={v["hash"] for v in self.versions(task_id,"deck")}
         if target_hash not in known: raise ValidationError("目标全稿版本不存在")
         target=json.loads(self.version(task_id,target_hash)); meta=next(v["metadata"] for v in self.versions(task_id,"deck") if v["hash"]==target_hash)
@@ -861,6 +867,7 @@ class TaskService:
         return {**report.to_dict(),"hash":h,"metadata":metadata}
 
     def _prepare_auto_fix(self,task_id,report,round_number,issue_ids=None):
+        self._require_candidate_mutable(task_id)
         selected=[item for item in report["issues"] if issue_ids is None or item["issue_id"] in set(issue_ids)]
         if not selected: raise ValidationError("检查修复范围为空")
         deck=self.deck_view(task_id)["deck"]; affected=list(dict.fromkeys(i["slide_id"] for i in selected if i["slide_id"]))
@@ -887,9 +894,8 @@ class TaskService:
 
     def run_inspection(self,task_id,max_rounds=2,affected_slide_ids=None,_prepared_raw=None):
         metric_started=time.monotonic()
-        self._require_actionable(task_id)
+        state=self._require_candidate_mutable(task_id)
         if not isinstance(max_rounds,int) or isinstance(max_rounds,bool) or max_rounds<0 or max_rounds>10: raise ValidationError("max_rounds 必须为 0 到 10 的整数")
-        state=TaskState.parse(self.get(task_id))
         # Obtain the Gateway result before advancing deck -> review.  Public
         # callers therefore observe the exact pre-call snapshot on ambiguity.
         deck=self.deck_view(task_id)["deck"]
@@ -916,13 +922,13 @@ class TaskService:
         return {**self.inspection_view(task_id),"rounds":rounds}
 
     def switch_inspection_mode(self,task_id,mode):
-        self._require_actionable(task_id)
+        self._require_candidate_mutable(task_id)
         if mode not in {"manual","auto"}: raise ValidationError("mode 只能是 manual 或 auto")
         self.command(task_id,f"inspection-mode-{mode}-{self.get(task_id)['revision']}",f"switch_{mode}","user")
         return self.inspection_view(task_id)
 
     def dispose_issue(self,task_id,issue_id,action,rationale,actor="user"):
-        self._require_actionable(task_id)
+        self._require_candidate_mutable(task_id)
         view=self.inspection_view(task_id); report=view["report"]
         if not report or report["stale"]: raise ConflictError("当前 HTML 版本没有有效检查报告")
         issue=next((x for x in report["issues"] if x["issue_id"]==issue_id),None)
@@ -984,6 +990,8 @@ class TaskService:
                 inspection_status="unchecked" if not report else "stale"
             elif report["passed"]:
                 inspection_status="passed"
+            elif not inspection["unresolved"]:
+                inspection_status="issues_disposed"
             else:
                 inspection_status="issues_remaining"
             finalized_at=utcnow()
@@ -1028,6 +1036,21 @@ class TaskService:
         snapshot=self.input_view(task_id)
         existing_delivery=next((r for r in self.versions(task_id,"delivery") if json.loads(self.version(task_id,r["hash"]))["deck_hash"]==deck_hash),None)
         delivery_id=(json.loads(self.version(task_id,existing_delivery["hash"]))["delivery_id"] if existing_delivery else f"delivery-{len(self.versions(task_id,'delivery'))+1}-{deck_hash[:12]}")
+
+        # A delivery fact is the domain idempotency boundary.  Replays for the
+        # same finalized deck return that immutable fact even when the caller
+        # lost the first response or uses a different transport idempotency key.
+        if existing_delivery:
+            model=DeliveryManifest.parse(json.loads(self.version(task_id,existing_delivery["hash"])))
+            published_root=self.store.delivery_root(task_id,delivery_id)
+            verified=verify_delivery(published_root)
+            final=self.get(task_id)
+            if final["status"]!="completed":
+                final=self.command(task_id,f"confirm-delivery-{existing_delivery['hash'][:16]}","confirm_delivery","user",{"deck_hash":deck_hash,"delivery_hash":existing_delivery["hash"]})
+            self.store.clear_delivery_intent(task_id,delivery_id)
+            hashes={**verified,"manifest.json":digest((published_root/"manifest.json").read_bytes())}
+            return {"state":final,"delivery":{**model.to_dict(),"hash":existing_delivery["hash"],"file_hashes":hashes},"result":self.status_summary(task_id)}
+
         intent=self.store.delivery_intent(task_id,delivery_id,{"task_id":task_id,"deck_hash":deck_hash})
         confirmed_at=intent["confirmed_at"]
         warnings=[]
@@ -1078,9 +1101,8 @@ class TaskService:
         hashes={name:digest(content) for name,content in files.items()}
         package_manifest={"delivery_id":delivery_id,"task_id":task_id,"deck_hash":deck_hash,"confirmed_by":"user","confirmed_at":confirmed_at,"files":hashes}
         files["manifest.json"]=canonical(package_manifest); hashes["manifest.json"]=digest(files["manifest.json"])
-        self.store.publish_delivery(task_id,delivery_id,files)
+        self.store.publish_delivery(task_id,delivery_id,files,verifier=verify_delivery)
         model=DeliveryManifest.parse({"delivery_id":delivery_id,"task_id":task_id,"deck_hash":deck_hash,"files":tuple(files),"confirmed_by":"user","confirmed_at":confirmed_at,"schema_version":"1.0"})
-        verify_delivery(self.store.delivery_root(task_id,delivery_id))
         return complete(model,hashes,len(localization_records))
 
     def confirm_delivery(self,task_id,deck_hash,actor="user"):

@@ -1,7 +1,7 @@
-import { api } from "../api.js?v=2026.08.19.043945581370";
-import { badge, button, confirmationDialog, element, field, metadataList, shortHash, versionTimeline } from "../components/index.js?v=2026.08.19.043945581370";
-import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.19.043945581370";
-import { comparePanel, deckPreview, modificationPanel } from "./deck.js?v=2026.08.19.043945581370";
+import { api } from "../api.js?v=2026.08.19.051824935370";
+import { badge, button, confirmationDialog, element, field, metadataList, shortHash, versionTimeline } from "../components/index.js?v=2026.08.19.051824935370";
+import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.19.051824935370";
+import { comparePanel, deckPreview, modificationPanel } from "./deck.js?v=2026.08.19.051824935370";
 
 export async function render(context) {
   const [view, deckView] = await Promise.all([api.inspection(context.taskId, context.controller), api.deck(context.taskId, context.controller)]);
@@ -18,19 +18,20 @@ function reviewStage(view, deckView, context) {
   const blockers = issues.filter((issue) => issue.severity === "blocker");
   const warnings = issues.filter((issue) => issue.severity !== "blocker");
   const historyMessage = actionMessage();
+  const mutable = ["deck", "review"].includes(view.state.stage);
   const history = versionTimeline(deckView.versions || [], "deck", {
     currentHash: view.deck?.hash,
-    onRollback: (item) => runAction({ region: historyMessage, action: () => api.rollbackDeck(context.taskId, item.hash), success: "历史全稿已复制为新的候选版本。", refresh: context.refresh }).catch(() => {}),
+    onRollback: mutable ? (item) => runAction({ region: historyMessage, action: () => api.rollbackDeck(context.taskId, item.hash), success: "历史全稿已复制为新的候选版本。", refresh: context.refresh }).catch(() => {}) : null,
   });
 
   return stageGrid([
-    finalizePanel(view, context),
+    mutable ? finalizePanel(view, context) : frozenPanel(context),
     view.deck ? section("当前候选预览", [location, preview], { description: "可浏览、定位问题；检查不是确定终稿的前置条件。" }) : null,
-    inspectionControls(view, context),
-    view.deck ? modificationPanel(view.deck, context) : null,
+    mutable ? inspectionControls(view, context) : null,
+    mutable && view.deck ? modificationPanel(view.deck, context) : null,
     report?.stale ? section("检查报告已过期", element("div", { className: "notice notice--warning" }, [element("strong", { text: "当前全稿已变化" }), element("p", { text: "旧报告仍可追溯，若需最新质量结论请重新检查；也可以带该状态直接确定终稿。" })])) : null,
-    report ? section("阻断问题", issueGroup(blockers, active, context, preview, location), { description: `${blockers.length} 项；可以修复、记录处置或带遗留问题确定终稿。` }) : null,
-    report ? section("普通警告", issueGroup(warnings, active, context, preview, location), { description: `${warnings.length} 项；处置可追溯，但不阻断终稿确认。` }) : null,
+    report ? section("阻断问题", mutable ? issueGroup(blockers, active, context, preview, location) : readOnlyIssueGroup(blockers, active, preview, location), { description: mutable ? `${blockers.length} 项；可以修复、记录处置或带遗留问题确定终稿。` : `${blockers.length} 项；终稿冻结后仅供追溯。` }) : null,
+    report ? section("普通警告", mutable ? issueGroup(warnings, active, context, preview, location) : readOnlyIssueGroup(warnings, active, preview, location), { description: mutable ? `${warnings.length} 项；处置可追溯，但不阻断终稿确认。` : `${warnings.length} 项；终稿冻结后仅供追溯。` }) : null,
     view.deck ? comparePanel(deckView, context) : null,
   ], [
     section("检查摘要", report ? [
@@ -40,6 +41,13 @@ function reviewStage(view, deckView, context) {
     section("终稿策略", [badge("检查可跳过", "primary"), element("p", { className: "muted", text: "未检查、报告过期或仍有遗留问题时，确认框会明确记录状态，但不会阻断确定终稿。" })]),
     section("全稿版本", [history, historyMessage]),
     section("检查历史", reportHistory(view)),
+  ]);
+}
+
+function frozenPanel(context) {
+  return section("终稿已冻结", [
+    element("div", { className: "notice notice--success" }, [element("strong", { text: "当前候选已进入交付阶段" }), element("p", { text: "历史自检内容保持只读；修改、回退、复检和处置入口已关闭。需要调整时，请在交付完成后显式派生新候选。" })]),
+    button("返回交付", { href: `/tasks/${encodeURIComponent(context.taskId)}?stage=delivery`, kind: "primary" }),
   ]);
 }
 
@@ -82,6 +90,21 @@ function inspectionControls(view, context) {
 function issueGroup(issues, active, context, preview, location) {
   if (!issues.length) return element("div", { className: "empty-state empty-state--compact" }, [element("p", { text: "本组暂无问题。" })]);
   return element("div", { className: "issue-list" }, issues.map((issue) => issueCard(issue, active.get(issue.issue_id), context, preview, location, issues)));
+}
+
+function readOnlyIssueGroup(issues, active, preview, location) {
+  if (!issues.length) return element("div", { className: "empty-state empty-state--compact" }, [element("p", { text: "本组暂无问题。" })]);
+  return element("div", { className: "issue-list" }, issues.map((issue) => {
+    const disposition = active.get(issue.issue_id);
+    return element("article", { className: `issue-card issue-card--${issue.severity}` }, [
+      element("div", { className: "issue-card__header" }, [
+        element("div", {}, [badge(issue.severity === "blocker" ? "阻断" : "警告", issue.severity === "blocker" ? "danger" : "warning"), element("strong", { text: issue.message })]),
+        button("定位", { kind: "ghost", onClick: () => locateIssue(issue, preview, location) }),
+      ]),
+      metadataList([["级别", issue.level], ["位置", issue.slide_id ? `${issue.slide_id}${issue.element_id ? ` / ${issue.element_id}` : ""}` : "整稿"], ["问题 code", issue.code], ["证据", issue.evidence], ["建议", issue.suggestion]]),
+      disposition ? element("div", { className: "notice" }, [element("strong", { text: `已处置：${disposition.action}` }), element("p", { text: disposition.rationale })]) : element("p", { className: "muted", text: "终稿确认时未记录处置。" }),
+    ]);
+  }));
 }
 
 function issueCard(issue, disposition, context, preview, location, group) {

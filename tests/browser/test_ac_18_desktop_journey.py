@@ -92,6 +92,13 @@ class DesktopJourney(unittest.TestCase):
 
         page.get_by_role("heading", name="交付", exact=True).wait_for()
         page.get_by_text("未执行检查", exact=True).first.wait_for()
+        page.goto(self.base + "/tasks/desktop?stage=review")
+        page.get_by_role("heading", name="自检与修改", exact=True).wait_for()
+        page.get_by_text("历史自检内容保持只读", exact=False).wait_for()
+        for label in ("确定终稿", "执行独立检查", "提交全稿修改", "保存处置", "非破坏回退"):
+            self.assertEqual(page.get_by_role("button", name=label, exact=True).count(),0)
+        page.get_by_role("link", name="返回交付", exact=True).click()
+        page.get_by_role("heading", name="交付", exact=True).wait_for()
         page.get_by_role("button", name="将离线包写入工程文件夹").click()
         page.get_by_role("dialog").get_by_role("button", name="开始写入并校验").click()
         page.get_by_text("已完成", exact=True).first.wait_for()

@@ -2,12 +2,18 @@ import hashlib, json, tempfile, unittest
 from unittest.mock import patch
 
 from ppt_agent.errors import ConflictError, GateError
+from ppt_agent.offline import verify_delivery
 from ppt_agent.service import TaskService
 from ppt_agent.store import WorkspaceStore
 
 
 class PassingInspector:
     def inspect(self, outline, html): return {"passed": True, "issues": [], "model": "fixture"}
+
+
+class BlockingInspector:
+    def inspect(self, outline, html):
+        return {"passed":False,"issues":[{"issue_id":"overflow","severity":"blocker","level":"element","code":"overflow","message":"元素溢出","slide_id":"slide-1","element_id":"title","evidence":"超出边界","suggestion":"缩小字号"}],"model":"fixture"}
 
 
 class DeliveryJourney(unittest.TestCase):
@@ -73,6 +79,44 @@ class DeliveryJourney(unittest.TestCase):
         self.assertEqual(finalized["state"]["stage"],"delivery")
         self.assertEqual(len(self.svc.versions("task","final-deck")),1)
 
+    def test_delivery_stage_rejects_every_candidate_write_and_preserves_finalization(self):
+        original=self.svc.deck_view("task")["deck"]
+        candidate=self.svc.modify_deck("task","统一使用蓝色主题")["deck"]
+        finalized=self.svc.finalize_deck("task",candidate["hash"],"review")["finalization"]
+        before_versions=self.svc.versions("task","deck")
+
+        for action in (
+            lambda:self.svc.rollback_deck("task",original["hash"]),
+            lambda:self.svc.modify_deck("task","改为红色主题"),
+            lambda:self.svc.run_inspection("task",0),
+            lambda:self.svc.switch_inspection_mode("task","auto"),
+        ):
+            with self.subTest(action=action), self.assertRaises(ConflictError): action()
+
+        self.assertEqual(self.svc.versions("task","deck"),before_versions)
+        self.assertEqual(self.svc.deck_view("task")["deck"]["hash"],candidate["hash"])
+        self.assertEqual(self.svc.finalization_view("task")["current"]["hash"],finalized["hash"])
+
+    def test_disposed_report_is_not_recorded_as_having_remaining_issues(self):
+        self.svc.inspector=BlockingInspector()
+        self.svc.run_inspection("task",0)
+        disposed=self.svc.dispose_issue("task","overflow","waive","用户接受该版式风险")
+        self.assertEqual(disposed["unresolved"],[])
+        finalization=self.svc.finalize_deck("task",disposed["deck"]["hash"],"review")["finalization"]
+        self.assertEqual(finalization["inspection_status"],"issues_disposed")
+        self.assertEqual(finalization["unresolved_issue_count"],0)
+        self.assertEqual(finalization["blocking_issue_count"],0)
+
+    def test_publish_replay_returns_the_same_domain_fact(self):
+        deck=self.svc.deck_view("task")["deck"]
+        self.svc.finalize_deck("task",deck["hash"],"review")
+        first=self.svc.publish_delivery("task")
+        second=self.svc.publish_delivery("task")
+        for field in ("hash","delivery_id","deck_hash","confirmed_at","file_hashes"):
+            self.assertEqual(second["delivery"][field],first["delivery"][field])
+        self.assertEqual(second["state"],first["state"])
+        self.assertEqual(len(self.svc.versions("task","delivery")),1)
+
     def test_pause_stops_new_work_and_resume_preserves_last_version(self):
         before=self.svc.deck_view("task")["deck"]["hash"]
         self.svc.command("task","pause-1","pause","user")
@@ -89,6 +133,15 @@ class DeliveryFaultTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store=WorkspaceStore(tmp,fault=fault); store.create("task",{"task_id":"task","stage":"created","status":"ready","mode":"manual","sample_confirmed":False,"blockers_resolved":False,"delivery_confirmed":False,"revision":0,"waiting_reason":None,"required_action":None})
             with self.assertRaises(RuntimeError): store.publish_delivery("task","delivery-1",{"deck.html":b"ok"})
+            self.assertEqual(list((store._task("task")/"deliveries").iterdir()),[])
+
+    def test_staging_verification_failure_publishes_no_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store=WorkspaceStore(tmp); store.create("task",{"task_id":"task","stage":"created","status":"ready","mode":"manual","sample_confirmed":False,"blockers_resolved":False,"delivery_confirmed":False,"revision":0,"waiting_reason":None,"required_action":None})
+            html=b'<html><script src="https://cdn.example/app.js"></script></html>'
+            manifest=json.dumps({"files":{"deck.html":hashlib.sha256(html).hexdigest()}},sort_keys=True,separators=(",",":")).encode()
+            with self.assertRaisesRegex(ValueError,"external URLs"):
+                store.publish_delivery("task","delivery-1",{"deck.html":html,"manifest.json":manifest},verifier=verify_delivery)
             self.assertEqual(list((store._task("task")/"deliveries").iterdir()),[])
 
     def test_post_publish_breakpoints_are_idempotently_recoverable(self):

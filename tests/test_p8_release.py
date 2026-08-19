@@ -1,4 +1,4 @@
-import io, json, logging, tempfile, unittest
+import io, json, logging, subprocess, sys, tempfile, unittest
 from pathlib import Path
 
 from ppt_agent.api import App
@@ -42,6 +42,13 @@ class P8ReleaseTests(unittest.TestCase):
             self.assertEqual(len(records),1); self.assertEqual(records[0]["action"],"POST /v1/tasks")
             self.assertEqual(records[0]["status"],201); self.assertFalse(records[0]["failed"])
             self.assertIn("duration_ms",records[0]); self.assertIn("diagnostic_id",records[0])
+
+    def test_p0_documentation_gate_accepts_every_indexed_adr(self):
+        root=Path(__file__).resolve().parents[1]
+        result=subprocess.run([sys.executable,"scripts/verify_p0.py"],cwd=root,capture_output=True,text=True)
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        index=(root/"docs/adr/README.md").read_text(encoding="utf-8")
+        self.assertIn("| 0006 | 终稿事实、可选检查与安全图片离线本地化 | 已采纳 |",index)
 
 
 if __name__ == "__main__": unittest.main()

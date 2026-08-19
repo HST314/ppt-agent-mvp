@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import json
 import socket
@@ -12,6 +13,7 @@ from unittest.mock import patch
 
 from ppt_agent.errors import ValidationError
 from ppt_agent.offline import build_zip, download_remote_image, external_urls, localize_delivery_html, validate_zip_members, verify_delivery
+from ppt_agent.p4 import validate_image_url
 from ppt_agent.service import TaskService
 from ppt_agent.store import WorkspaceStore
 
@@ -113,6 +115,19 @@ class OfflineDeliveryTests(unittest.TestCase):
             findings = external_urls(root)
             self.assertIn("app.js", findings)
             self.assertIn("index.html", findings)
+
+    def test_runtime_scan_does_not_treat_valid_base64_slashes_as_a_remote_url(self):
+        image=b"\x89PNG\r\n\x1a\n"+b"\xff\xff\xff"
+        uri="data:image/png;base64,"+base64.b64encode(image).decode()
+        self.assertIn("//",uri)
+        self.assertEqual(validate_image_url(uri),uri)
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            html=f'<html><body><img src="{uri}"></body></html>'.encode()
+            (root/"deck.html").write_bytes(html)
+            (root/"manifest.json").write_text(json.dumps({"files":{"deck.html":hashlib.sha256(html).hexdigest()}}),encoding="utf-8")
+            self.assertEqual(external_urls(root),{})
+            self.assertEqual(verify_delivery(root),{"deck.html":hashlib.sha256(html).hexdigest()})
 
     def test_embedded_html_runtime_urls_block_all_delivery_entrypoints(self):
         cases = {

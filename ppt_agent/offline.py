@@ -21,6 +21,7 @@ ASSET_ROOT = Path(__file__).with_name("offline_assets")
 
 
 REMOTE_URL = re.compile(r"(?:https?:)?//[^\s\"'<>]+", re.I)
+CSS_IMPORT = re.compile(r"@import\s+(?:url\(\s*)?(['\"])(.*?)\1\s*\)?", re.I | re.S)
 RUNTIME_TEXT_SUFFIXES = {".html", ".htm", ".css", ".js", ".mjs", ".svg"}
 MAX_REMOTE_IMAGES = 30
 MAX_REMOTE_IMAGE_BYTES = 10 * 1024 * 1024
@@ -76,7 +77,9 @@ class _HTMLRuntimeURLs(HTMLParser):
     @staticmethod
     def _css_urls(source: str) -> list[str]:
         without_comments = re.sub(r"/\*.*?\*/", "", source, flags=re.S)
-        return REMOTE_URL.findall(without_comments)
+        candidates = _css_image_urls(without_comments)
+        candidates.extend(match.group(2).strip() for match in CSS_IMPORT.finditer(without_comments))
+        return [value for value in candidates if _external_reference(value)]
 
     def handle_starttag(self, tag, attrs):
         tag = tag.lower()
@@ -85,7 +88,10 @@ class _HTMLRuntimeURLs(HTMLParser):
         for name, value in attrs:
             name = name.lower()
             if value and name in self.URL_ATTRIBUTES:
-                self.urls.extend(REMOTE_URL.findall(value))
+                if name == "srcset":
+                    self.urls.extend(REMOTE_URL.findall(value))
+                elif _external_reference(value):
+                    self.urls.append(value.strip())
             elif value and name == "style":
                 self.urls.extend(self._css_urls(value))
             elif value and name == "srcdoc":
@@ -139,6 +145,13 @@ class _ImageReferences(HTMLParser):
 
 def _css_image_urls(source: str) -> list[str]:
     return [((match.group(2) if match.group(1) else match.group(3)) or "").strip() for match in CSS_URL.finditer(source)]
+
+
+def _external_reference(value: str) -> bool:
+    """Classify one parsed runtime reference without scanning inside data payloads."""
+    candidate = value.strip()
+    parsed = urlsplit(candidate)
+    return parsed.scheme.lower() in {"http", "https"} or candidate.startswith("//")
 
 
 def _public_http_target(value: str):

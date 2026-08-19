@@ -1,6 +1,6 @@
-import { api } from "../api.js?v=2026.08.19.043945581370";
-import { badge, button, confirmationDialog, element, field, metadataList, previewFrame, previewUrl, shortHash } from "../components/index.js?v=2026.08.19.043945581370";
-import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.19.043945581370";
+import { api } from "../api.js?v=2026.08.19.051824935370";
+import { badge, button, confirmationDialog, element, field, metadataList, previewFrame, previewUrl, shortHash } from "../components/index.js?v=2026.08.19.051824935370";
+import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.19.051824935370";
 
 export async function render(context) {
   const view = await api.deck(context.taskId, context.controller);
@@ -10,6 +10,7 @@ export async function render(context) {
 
 function deckStage(view, context) {
   const deck = view.deck;
+  const frozen = view.state.stage === "delivery";
   const generationMessage = actionMessage();
   const generationActive = context.shell.active_jobs.some((job) => job.operation === "deck.generate");
   const generate = button("重试生成全稿", { kind: "secondary", disabled: Boolean(deck) || generationActive, reason: generationActive ? "全稿生成正在运行" : "已有可用全稿", mutates: true, requiresRuntime: true });
@@ -39,11 +40,15 @@ function deckStage(view, context) {
       generationMessage,
     ]) : null,
     section("全稿浏览", [deck ? fullScreenAction(previewRegion) : null, previewRegion], { description: deck ? `当前候选 v${deck.version} · ${Object.keys(deck.metadata?.page_hashes || {}).length} 页` : "生成完成后在此全屏浏览" }),
-    deck ? section("选择下一步", [
+    deck && !frozen ? section("选择下一步", [
       element("p", { text: "可直接确定终稿，也可进入自检与修改；两条路径都不会强制要求检查通过。" }),
       element("div", { className: "button-row" }, [finalize, button("前往自检与修改", { href: `/tasks/${encodeURIComponent(context.taskId)}?stage=review`, kind: "secondary" })]),
       finalizeMessage,
     ], { className: "finalize-actions" }) : null,
+    deck && frozen ? section("终稿已冻结", [
+      element("p", { text: "当前版本已进入交付阶段，全稿页仅供浏览。需要调整时，请在交付完成后从不可变交付版本派生新候选。" }),
+      button("返回交付", { href: `/tasks/${encodeURIComponent(context.taskId)}?stage=delivery`, kind: "primary" }),
+    ]) : null,
   ], [
     section("当前候选", deck ? [
       badge(`v${deck.version}`, "primary"),
