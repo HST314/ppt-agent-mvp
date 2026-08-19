@@ -18,7 +18,8 @@ class FSMTests(unittest.TestCase):
   s=TaskState("t",stage=Stage.SAMPLE,mode="auto")
   with self.assertRaises(GateError):transition(s,"advance")
   with self.assertRaises(GateError):transition(s,"confirm_sample",actor="system")
-  s=transition(s,"confirm_sample",actor="user"); self.assertEqual(transition(s,"advance").stage,Stage.DECK)
+  s=transition(s,"confirm_sample",actor="user"); self.assertEqual(s.stage,Stage.DECK)
+  self.assertEqual(transition(s,"advance").stage,Stage.REVIEW)
   d=TaskState("t",stage=Stage.DELIVERY,blockers_resolved=True)
   with self.assertRaises(GateError):transition(d,"confirm_delivery",actor="system")
   self.assertEqual(transition(d,"confirm_delivery",actor="user").status,RunStatus.COMPLETED)
@@ -56,7 +57,7 @@ class ServiceTests(unittest.TestCase):
    first=svc.command("t","1","advance"); self.assertEqual(first,svc.command("t","1","advance")); self.assertEqual(len(svc.events("t")),1)
    for n in range(2,5):svc.command("t",str(n),"advance")
    with self.assertRaises(GateError):svc.command("t","x","advance")
-   svc.command("t","5","confirm_sample","user");svc.command("t","6","advance");svc.command("t","7","advance");svc.command("t","8","advance")
+   svc.command("t","5","confirm_sample","user");svc.command("t","6","advance");svc.command("t","7","advance")
    self.assertNotEqual(svc.get("t")["status"],"completed");svc.command("t","9","resolve_blockers","user");svc.command("t","10","confirm_delivery","user");self.assertEqual(svc.get("t")["status"],"completed")
  def test_inspector_has_isolated_input(self):
   calls=[]; result=FakeInspectionGateway(calls=calls).inspect("original","<html/>");self.assertFalse(result["passed"]);self.assertEqual(result["issues"][0]["severity"],"blocker");self.assertEqual(set(calls[0]),{"outline","html"})

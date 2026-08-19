@@ -1,61 +1,11 @@
+# Safe local default: starts without credentials or network access.
+# Copy config/ppt-agent.agent.example.yaml and set PPT_AGENT_CONFIG when using real models.
 gateway:
-  mode: agent
+  mode: fake
 
-models:
-  generation:
-    provider: openai_responses
-    model: deepseek-v4-flash-ga-260731
-    api_key_env: MODEL_API_KEY
-    base_url_env: MODEL_BASE_URL
-    # 单次 HTTP 请求超时（秒，1-600）
-    request_timeout_seconds: 180
-    # 整轮 Agent 运行预算（10 分钟）覆盖多轮只读 Skill 往返
-    run_timeout_seconds: 600
-    # 外层持久化 Job 必须严格大于 Agent 预算，预留 30 秒校验/保存收尾
-    job_timeout_seconds: 630
-    max_steps: 30
-    max_tool_calls: 40
-    max_provider_calls: 8
-    # HTML 阶段独立预算：探索提前停止，并为最终生成与 Schema 纠错保留请求。
-    stage_budgets:
-      sample:
-        max_steps: 8
-        max_tool_calls: 4
-        max_provider_calls: 6
-        max_exploration_rounds: 2
-        max_unique_files: 4
-        max_skill_bytes: 131072
-        reserved_final_calls: 2
-      deck:
-        max_steps: 12
-        max_tool_calls: 8
-        max_provider_calls: 10
-        max_exploration_rounds: 3
-        max_unique_files: 4
-        max_skill_bytes: 131072
-        reserved_final_calls: 2
-    # 结构化输出模式：auto=默认，端点不支持 text.format 时自动降级；json_schema=强制发送；prompt=从不发送
-    structured_output: auto
-  inspection:
-    provider: openai_responses
-    model: deepseek-v4-flash-ga-260731
-    api_key_env: MODEL_API_KEY
-    base_url_env: MODEL_BASE_URL
-    request_timeout_seconds: 180
-    run_timeout_seconds: 600
-    job_timeout_seconds: 630
-    max_steps: 30
-    max_tool_calls: 40
-    max_provider_calls: 8
-    fallback_to_generation: true
-
-# 澄清阶段运行参数（仅 agent 模式的模型澄清使用）
 clarification:
-  # 每轮最多问题数（1-10）
   max_questions_per_round: 3
-  # 最多轮次（1-5）；模型某轮返回 0 题会提前确认结束
   max_rounds: 3
-  # 提问风格：minimal=只问阻断交付的关键问题；comprehensive=积极全面追问（偏好类问题可跳过）
   style: comprehensive
 
 skills:

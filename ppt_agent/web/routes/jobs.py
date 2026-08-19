@@ -8,7 +8,7 @@ from fastapi.responses import StreamingResponse
 
 from ...errors import ValidationError
 from ..dependencies import job_service
-from ..jobs import JobService, TERMINAL
+from ..jobs import JobService, OPERATIONS, TERMINAL
 from ..protocol import exact, json_body
 
 router = APIRouter(prefix="/v1", tags=["jobs"])
@@ -23,10 +23,12 @@ async def create_job(task_id: str, request: Request, jobs: JobService = Depends(
 
 
 @router.get("/tasks/{task_id}/jobs")
-def list_jobs(task_id: str, status_filter: str | None = Query(default=None, alias="status"), jobs: JobService = Depends(job_service)):
+def list_jobs(task_id: str, status_filter: str | None = Query(default=None, alias="status"), operation: str | None = Query(default=None), limit: int = Query(default=25,ge=1,le=100), before: str | None = Query(default=None), jobs: JobService = Depends(job_service)):
     if status_filter not in {None, "active", "queued", "running", "cancellation_requested", "succeeded", "failed", "cancelled", "interrupted"}:
         raise ValidationError("Job status 筛选无效")
-    return {"jobs": jobs.list(task_id, status_filter)}
+    if operation is not None and operation not in OPERATIONS:
+        raise ValidationError("Job operation 筛选无效")
+    return jobs.list_page(task_id,status_filter,operation,limit,before)
 
 
 @router.get("/jobs/{job_id}")

@@ -1,5 +1,6 @@
 import json
 import tempfile
+import threading
 import time
 import unittest
 from types import SimpleNamespace
@@ -28,7 +29,26 @@ class FastAPIAppTests(unittest.TestCase):
         self.client.__exit__(None, None, None)
         self.tmp.cleanup()
 
+    def wait_for_runtime_probe(self,client,timeout=3):
+        deadline=time.monotonic()+timeout
+        while time.monotonic()<deadline:
+            response=client.get("/v1/runtime/status").json()
+            if response["model_capabilities"].get("checked"):
+                return response
+            time.sleep(.01)
+        self.fail("后台模型能力探测未在时限内完成")
+
+    def wait_for_startup(self,client,timeout=3):
+        deadline=time.monotonic()+timeout
+        while time.monotonic()<deadline:
+            response=client.get("/v1/runtime/status").json()
+            if response["startup_status"]!="starting":
+                return response
+            time.sleep(.01)
+        self.fail("后台初始化未在时限内完成")
+
     def test_health_shell_static_and_retired_legacy_routes(self):
+        self.wait_for_startup(self.client)
         health = self.client.get("/healthz")
         self.assertEqual(health.status_code, 200)
         self.assertEqual(health.json()["web_runtime"], "fastapi")
@@ -70,6 +90,37 @@ class FastAPIAppTests(unittest.TestCase):
         self.assertEqual(legacy.status_code, 404)
         self.assertNotIn("unsafe-inline", legacy.headers["content-security-policy"])
 
+    def test_liveness_opens_before_background_runtime_readiness(self):
+        class BlockingRuntimeService(TaskService):
+            def __init__(self,store):
+                super().__init__(store)
+                self.probe_started=threading.Event()
+                self.release_probe=threading.Event()
+
+            def initialize_runtime(self):
+                self.probe_started.set()
+                self.release_probe.wait(3)
+                return super().initialize_runtime()
+
+        with tempfile.TemporaryDirectory() as root:
+            service=BlockingRuntimeService(WorkspaceStore(root))
+            try:
+                with TestClient(create_app(service)) as client:
+                    self.assertTrue(service.probe_started.wait(1))
+                    self.assertEqual(client.get("/livez").status_code,200)
+                    starting=client.get("/v1/runtime/status").json()
+                    self.assertEqual(starting["startup_status"],"starting")
+                    self.assertEqual(starting["startup_components"],{"recovery":"ready","runtime":"starting"})
+                    self.assertFalse(starting["runtime_ready"])
+                    self.assertEqual(client.get("/readyz").status_code,503)
+                    service.release_probe.set()
+                    ready=self.wait_for_startup(client)
+                    self.assertEqual(ready["startup_status"],"ready")
+                    self.assertTrue(ready["runtime_ready"])
+                    self.assertEqual(client.get("/readyz").status_code,200)
+            finally:
+                service.release_probe.set()
+
     def test_failed_startup_model_probe_marks_readiness_unavailable(self):
         class ProbeFailure:
             model="probe-model"
@@ -78,6 +129,7 @@ class FastAPIAppTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             service=TaskService(WorkspaceStore(root),generator=ProbeFailure())
             with TestClient(create_app(service)) as client:
+                self.wait_for_runtime_probe(client)
                 health_response=client.get("/healthz")
                 ready_response=client.get("/readyz")
                 live_response=client.get("/livez")
@@ -141,7 +193,7 @@ class FastAPIAppTests(unittest.TestCase):
                 gateway = AgentGateway(adapter, skill=SkillRuntime.builtin(), model=config.model)
                 service = TaskService(WorkspaceStore(root), generator=gateway, clarifier=gateway)
                 with TestClient(create_app(service)) as client:
-                    status = client.get("/v1/runtime/status").json()["model_capabilities"]
+                    status = self.wait_for_runtime_probe(client)["model_capabilities"]
                     persisted = client.get("/v1/runtime/probes?limit=1").json()["probes"][0]
                     client.post("/v1/tasks", json={"task_id": f"probe-{fail_at}", "mode": "manual"})
                     blocked = client.post(
@@ -213,7 +265,7 @@ class FastAPIAppTests(unittest.TestCase):
                 gateway = AgentGateway(adapter, skill=SkillRuntime.builtin(), model=config.model)
                 service = TaskService(WorkspaceStore(root), generator=gateway, clarifier=gateway)
                 with TestClient(create_app(service)) as client:
-                    status = client.get("/v1/runtime/status").json()["model_capabilities"]
+                    status = self.wait_for_runtime_probe(client)["model_capabilities"]
                     persisted = client.get("/v1/runtime/probes?limit=1").json()["probes"][0]
                     client.post("/v1/tasks", json={"task_id": f"probe-{scenario}", "mode": "manual"})
                     blocked = client.post(
@@ -404,6 +456,33 @@ class FastAPIAppTests(unittest.TestCase):
         self.assertEqual(imported.status_code,200)
         shell=self.client.get("/v1/tasks/quick/shell").json()
         self.assertEqual((shell["task"]["mode"],shell["task"]["stage"]),("quick","sample"))
+
+    def test_confirm_sample_unlocks_deck_before_generation_finishes_and_replays_job(self):
+        self.service.create("deck-gate", "manual")
+        self.service.import_input("deck-gate", {"goal":"发布","audience":"客户","topic":"方案","页数":3})
+        self.service.generate_narrative("deck-gate")
+        self.service.confirm_narrative("deck-gate")
+        self.service.generate_outline("deck-gate")
+        self.service.confirm_outline("deck-gate")
+        self.service.generate_sample("deck-gate")
+
+        response=self.client.post("/v1/tasks/deck-gate/samples/confirm",json={"auto_generate":True})
+        self.assertEqual(response.status_code,200)
+        first=response.json()
+        self.assertEqual(first["state"]["stage"],"deck")
+        self.assertEqual(first["deck_job"]["operation"],"deck.generate")
+        shell=self.client.get("/v1/tasks/deck-gate/shell").json()
+        self.assertEqual(next(item for item in shell["stages"] if item["id"]=="deck")["status"],"current")
+        self.assertEqual(next(item for item in shell["stages"] if item["id"]=="sample")["status"],"completed")
+
+        replay=self.client.post("/v1/tasks/deck-gate/samples/confirm",json={"auto_generate":True})
+        self.assertEqual(replay.status_code,200)
+        self.assertEqual(replay.json()["deck_job"]["job_id"],first["deck_job"]["job_id"])
+        deadline=time.monotonic()+3
+        while time.monotonic()<deadline:
+            if self.client.get(f"/v1/jobs/{first['deck_job']['job_id']}").json()["status"] in {"succeeded","failed","cancelled","interrupted"}:
+                break
+            time.sleep(.01)
 
     def test_empty_resources_and_unstructured_markdown_return_clarifications(self):
         self.client.post("/v1/tasks", json={"task_id": "missing-input", "mode": "manual"})

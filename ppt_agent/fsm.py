@@ -46,7 +46,11 @@ def transition(s: TaskState, action: str, *, actor: str="system") -> TaskState:
     if action == "switch_auto": return replace(s,mode="auto",revision=s.revision+1)
     if action == "confirm_sample":
         if s.stage != Stage.SAMPLE or actor != "user": raise GateError("样品必须由用户在样品阶段确认")
-        return replace(s,sample_confirmed=True,status=RunStatus.READY,waiting_reason=None,required_action=None,revision=s.revision+1)
+        # Confirming the immutable sample is also the authoritative boundary
+        # between sample work and full-deck work.  The deck generation Job may
+        # fail or take minutes; neither outcome is allowed to move the user
+        # back behind an already-satisfied manual gate.
+        return replace(s,stage=Stage.DECK,sample_confirmed=True,status=RunStatus.READY,waiting_reason=None,required_action=None,revision=s.revision+1)
     if action == "resolve_blockers":
         if actor != "user": raise GateError("阻断问题必须由用户处置")
         return replace(s,blockers_resolved=True,revision=s.revision+1)

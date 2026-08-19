@@ -12,10 +12,10 @@
 默认离线/fake 启动无需 `.env`：
 
 ```bash
-python3 scripts/start.py --data .ppt-agent-data --host 127.0.0.1 --port 8000
+python -m uvicorn main_front:app --host 127.0.0.1 --port 8000
 ```
 
-该命令启动 FastAPI/Uvicorn Web 适配层。`/livez` 只检查 Web 进程存活并始终以 200 表示存活；`/readyz` 检查真实模型运行契约，未就绪时返回 503。兼容端点 `/healthz` 与 readiness 使用相同的 200/503 语义；浏览器轮询 `/v1/runtime/status`，该端点固定返回 200，并通过 `runtime_ready` 表达模型状态，避免预期的未就绪状态污染浏览器控制台。真实模型模式必须满足 `runtime_ready=true` 且 `model_capabilities.status=ready`。启动按顺序验证基础文本响应、严格 JSON Schema、强制函数调用与结果回传；任一检查失败即停止，状态中保留 `probe_id`、`failed_check` 与精确业务错误码，依赖模型的 Job 在入队和执行前都会关闭失败。脱敏且可跨重启读取的探测记录由 `GET /v1/runtime/probes` 导出，只保存检查状态、HTTP/SDK 类别、request-id 哈希和响应 ID 哈希。修复配置或等待供应商恢复后，在工作台“显示与连接”执行显式重新检测。`/`、`/tasks/{task_id}` 和 `/components` 使用独立 `frontend/` 静态资源。8 阶段交互全部位于统一应用壳；旧 `/tasks/{task_id}/outline|samples|deck|inspection|delivery` 深链会规范化到对应阶段，`/legacy/**` 已下线。
+该命令启动 FastAPI/Uvicorn Web 适配层。Web 端口先开放，历史 Job 扫描与模型能力探测在后台执行；`/livez` 只检查 Web 进程存活并始终返回 200，`/readyz` 检查真实模型运行契约，未就绪时返回 503。兼容端点 `/healthz` 与 readiness 使用相同的 200/503 语义；浏览器轮询 `/v1/runtime/status`，通过 `startup_status` 与 `runtime_ready` 区分“后端已启动 / 模型检测中 / 可用或失败”。真实模型模式必须满足 `runtime_ready=true` 且 `model_capabilities.status=ready`。启动按顺序验证基础文本响应、严格 JSON Schema、强制函数调用与结果回传；任一检查失败即停止，状态中保留 `probe_id`、`failed_check` 与精确业务错误码，依赖模型的 Job 在入队和执行前都会关闭失败。脱敏且可跨重启读取的探测记录由 `GET /v1/runtime/probes` 导出。修复配置后可在“设置 → 系统与显示”重新检测。`/`、`/tasks/{task_id}` 和 `/components` 使用独立 `frontend/` 静态资源。
 
 样品、全稿和自检预览由 `/v1/tasks/{task_id}/previews/{hash}` 提供。端点只接受当前任务内 `sample`/`deck` 版本，返回 `no-store`、`SAMEORIGIN` 与禁止脚本的独立 CSP；HTTP(S)、Base64 与相对图片仅作为展示资源开放。相对资源再经 `/preview-assets/{hash}/{path}` 校验当前任务、版本、manifest 与文件 hash。应用壳 CSP 不允许内联脚本或样式。预览异常时先核对 hash 与资源清单，不要绕过端点直接读取工作区文件。
 
@@ -29,7 +29,9 @@ python3 scripts/start.py --data .ppt-agent-data --host 127.0.0.1 --port 8000
 - 活动 Job 不清理。MVP 终态 Job 至少保留 7 天；当前版本由运维在备份后按 `finished_at` 清理任务目录内的终态 `jobs/*.json` 及同名事件文件，不得清理活动状态。
 - SSE 事件与 Job 错误只包含步骤、诊断 ID、`agent_audit_id` 和业务版本引用，不能写入完整 Prompt、客户资料、密钥或模型推理。按任务导出脱敏审计使用 `GET /v1/tasks/{task_id}/agent-audits`，可用 `job_id` 查询参数收窄；按 Job 导出使用 `GET /v1/jobs/{job_id}/agent-audits`。关联审计同时镜像到任务目录的 `agent-audit.jsonl`，因此任务目录归档会自带该任务审计。工具错误码区分 `invalid_arguments`、`path_not_in_lock`、`quota_exceeded`、`unauthorized_tool` 与其余校验错误。
 
-仓库默认 `config/ppt-agent.yaml` 为 Agent 模式示例。真实 API 应复制 `config/ppt-agent.agent.example.yaml` 为本地配置，并配置 `provider: openai_responses`、模型与保存环境变量名称的 `api_key_env`/`base_url_env`；秘密值只放 `.env`，不要写进 YAML 或日志。`request_timeout_seconds` 必须小于 `run_timeout_seconds`，`job_timeout_seconds` 又必须严格大于 Agent 运行预算。规划阶段使用全局 30 步、40 次只读工具和 8 次 provider 请求；样品独立使用 8 步/4 工具/6 provider、最多 2 轮探索并预留最后 2 次请求；全稿独立使用 12 步/8 工具/10 provider、最多 3 轮探索并预留最后 2 次请求。收敛点按 Agent 步数与 provider 请求上限的较小值计算，确保在请求耗尽前可达。样品/全稿只读取版本化 `references/design-pack-v1.md`，已读路径不会重复注入正文。检查模型未配置时只有显式 `fallback_to_generation: true` 才允许回退。所有阶段仍不具备联网、Shell、写文件或状态机能力。
+仓库默认 `config/ppt-agent.yaml` 为无需凭证的 fake 模式。真实 API 应复制 `config/ppt-agent.agent.example.yaml` 为本地配置，并用 `PPT_AGENT_CONFIG` 指向它；配置 `provider: openai_responses`、模型与保存环境变量名称的 `api_key_env`/`base_url_env`，秘密值只放 `.env`。`request_timeout_seconds` 必须小于 `run_timeout_seconds`，`job_timeout_seconds` 又必须严格大于 Agent 运行预算。规划阶段使用全局 30 步、40 次只读工具和 8 次 provider 请求；样品独立使用 8 步/4 工具/6 provider、最多 2 轮探索并预留最后 2 次请求；全稿独立使用 12 步/8 工具/10 provider、最多 3 轮探索并预留最后 2 次请求。样品/全稿只读取版本化 `references/design-pack-v1.md`。检查模型未配置时只有显式 `fallback_to_generation: true` 才允许回退。
+
+任务分支通过 `branches.json` 和分支检查点/事件头保存，版本与资源继续使用共享的内容寻址存储。Job 创建时绑定 `branch_id + head_revision + parent_hash`；存在活动 Job 时禁止切换分支。历史阶段只读，继续编辑应从顶部创作进度节点派生新分支。
 
 创建任务时可选择 `quick` 快速生成模式，并必须提交 `target_slide_count`（1–200）。该页数会写入冻结任务卡成为强约束；快速模式固定使用一轮 minimal 澄清，只保留阻断题，澄清完成后自动保存叙事、大纲并推进到样品门禁。
 
@@ -72,6 +74,6 @@ python3 scripts/verify_offline_delivery.py .ppt-agent-data/tasks/<task-id>/deliv
 
 所有模型故障都保留稳定业务码与诊断 ID；Agent 路径还会返回可关联的 `agent_audit_id`。脱敏审计只保存 HTTP 状态、SDK 异常类型、可重试标志和供应商 request-id 哈希，不保存密钥、完整 Prompt、原始响应或内部推理。超时与连接中断属于结果可能未知，操作人员必须先查供应商记录和任务摘要，最后由用户选择重试、修改输入或人工处理。
 
-备份应复制整个数据目录并保留权限；恢复时先停止服务，将备份复制到新目录后以 `--data` 指向该目录启动。内核会重放 `pending-commit.json` 完成原子提交；交付目录和历史版本不可覆盖。恢复后运行测试，并抽查 `/summary`、版本列表、事件列表与交付 manifest hash。
+备份应复制整个数据目录并保留权限；恢复时先停止服务，将备份复制到新目录后以 `PPT_AGENT_DATA` 指向该目录启动。内核会重放分支内的 `pending-commit.json` 完成原子提交；交付目录和历史版本不可覆盖。恢复后运行测试，并抽查 `/summary`、分支、版本列表、事件列表与交付 manifest hash。
 
 日志和工单只记录诊断 ID、动作、耗时和结果类别；不得记录 API key、完整 Prompt、供应商原始响应或内部推理。

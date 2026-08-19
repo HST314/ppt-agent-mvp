@@ -116,7 +116,7 @@ class FailureRecoveryBrowserGate(unittest.TestCase):
 
         # 2. Back to input stage: the frozen source is backfilled and the
         # submit action stays disabled while nothing changed.
-        page.locator(".stage-list").get_by_role("link", name="任务/资料").click()
+        page.locator(".progress-rail").get_by_role("link", name="任务/资料").click()
         page.get_by_role("heading", name="更新任务资料").wait_for()
         self.dismiss_resource_reminder(page)
         textarea = page.get_by_label("任务卡内容")

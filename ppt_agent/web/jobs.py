@@ -40,7 +40,7 @@ OPERATION_STAGES = {
     "outline.generate": {"narrative", "outline"},
     "samples.generate": {"outline", "sample"},
     "samples.modify": {"outline", "sample"},
-    "deck.generate": {"sample", "deck"},
+    "deck.generate": {"deck"},
     "deck.modify": {"deck", "review"},
     "inspection.run": {"deck", "review"},
     "inspection.fix": {"review"},
@@ -106,7 +106,7 @@ class JobService:
     execution metadata and references needed to refresh the business view.
     """
 
-    def __init__(self, service, *, executor: ThreadPoolExecutor | None = None, defer_queued_recovery: bool = False):
+    def __init__(self, service, *, executor: ThreadPoolExecutor | None = None, defer_queued_recovery: bool = False, defer_recovery_scan: bool = False):
         self.service = service
         self.store = service.store
         self.operation_budgets = dict(OPERATION_BUDGET_SECONDS)
@@ -122,13 +122,39 @@ class JobService:
             self.operation_budgets.update({operation: generation_timeout for operation in GENERATION_OPERATIONS})
         if inspection_timeout:
             self.operation_budgets.update({operation:inspection_timeout for operation in {"inspection.run","inspection.fix"}})
+        self.apply_runtime_settings()
         self.executor = executor or ThreadPoolExecutor(max_workers=4, thread_name_prefix="ppt-job")
         self._guard = threading.RLock()
         self._submitted: set[str] = set()
         self._recovered_queued: list[tuple[str, str]] = []
-        self._recover()
-        if not defer_queued_recovery:
+        self._recovery_initialized=False
+        self._recovery_complete=False
+        if not defer_recovery_scan:
+            self.initialize_recovery()
+        if not defer_queued_recovery and self._recovery_complete:
             self.resume_recovered_queued()
+
+    def apply_runtime_settings(self) -> None:
+        configured=self.service.job_timeouts() if hasattr(self.service,"job_timeouts") else {}
+        generation=configured.get("generation_timeout_seconds")
+        inspection=configured.get("inspection_timeout_seconds")
+        delivery=configured.get("delivery_timeout_seconds")
+        if generation: self.operation_budgets.update({operation:generation for operation in GENERATION_OPERATIONS})
+        if inspection: self.operation_budgets.update({operation:inspection for operation in {"inspection.run","inspection.fix"}})
+        if delivery: self.operation_budgets["delivery.publish"]=delivery
+
+    def initialize_recovery(self) -> None:
+        with self._guard:
+            if self._recovery_initialized: return
+            self._recovery_initialized=True
+        try:
+            self._recover()
+        except Exception:
+            with self._guard:
+                self._recovery_initialized=False
+            raise
+        with self._guard:
+            self._recovery_complete=True
 
     def close(self) -> None:
         self.executor.shutdown(wait=False, cancel_futures=False)
@@ -551,9 +577,11 @@ class JobService:
         if not isinstance(idempotency_key, str) or not idempotency_key.strip() or len(idempotency_key) > 200:
             raise ValidationError("idempotency_key 无效")
         self._validate_payload(operation, payload)
-        state = self.service.get(task_id)
         fingerprint = _fingerprint(operation, payload)
         with self._guard, self.store.lock(task_id):
+            if not self._recovery_complete:
+                raise ConflictError("后台任务恢复中，请稍后重试")
+            state = self.service.get(task_id)
             records = self._records(task_id)
             previous = next((item for item in records if item["idempotency_key"] == idempotency_key), None)
             if previous:
@@ -570,6 +598,9 @@ class JobService:
             if active:
                 raise ActiveJobConflict(active["job_id"])
             job_id = f"job_{uuid.uuid4().hex}"
+            branch=self.store.branch_context(task_id)
+            try: parent_hash=self.service.status_summary(task_id).get("latest_artifacts",{}).get("deck")
+            except Exception: parent_hash=None
             record = {
                 "job_id": job_id,
                 "task_id": task_id,
@@ -590,6 +621,9 @@ class JobService:
                 "deadline_seconds": self.operation_budgets[operation],
                 "deadline_at": None,
                 "metrics": None,
+                "branch_id":branch["branch_id"],
+                "head_revision":state.get("revision",branch.get("head_revision")),
+                "parent_hash":parent_hash,
             }
             self._write(record)
             self._publish_event(record, "queued", message="任务已进入执行队列")
@@ -632,7 +666,16 @@ class JobService:
                     if metrics:
                         current["metrics"] = metrics
                     self._publish_event(current, "checkpoint", message=message or step, metrics=current.get("metrics"))
-            with execution_scope(lambda: self._read(task_id, job_id).get("cancellation_requested", False), deadline, publish_progress):
+            expected_head={"revision":record.get("head_revision")}
+            branch=self.store.branch_context(task_id)
+            if branch["branch_id"]!=record.get("branch_id") or branch["head_revision"]!=expected_head["revision"]:
+                raise ConflictError("Job 创建后分支或分支头已变化，请在当前分支重新提交")
+            def publication_guard():
+                current=self.store.branch_context(task_id)
+                if current["branch_id"]!=record.get("branch_id") or current["head_revision"]!=expected_head["revision"]:
+                    raise ConflictError("Job 所属分支或分支头已变化，拒绝写入过期结果")
+            def publication_advance(state): expected_head["revision"]=state.get("revision",expected_head["revision"])
+            with execution_scope(lambda: self._read(task_id, job_id).get("cancellation_requested", False), deadline, publish_progress, publication_guard, publication_advance):
                 # Readiness can change after enqueue or while a queued job is being
                 # recovered. Never cross the model boundary without a fresh gate.
                 try:
@@ -731,7 +774,9 @@ class JobService:
         if operation == "deck.modify":
             return self.service.modify_deck(task_id, payload["prompt"], payload.get("change_type", "visual"), payload.get("scope"), payload.get("slide_ids"), payload.get("element_id"))
         if operation == "inspection.run":
-            return self.service.run_inspection(task_id, payload.get("max_rounds", 2), payload.get("affected_slide_ids"))
+            rounds=payload.get("max_rounds")
+            if rounds is None and hasattr(self.service,"default_inspection_rounds"): rounds=self.service.default_inspection_rounds()
+            return self.service.run_inspection(task_id, 2 if rounds is None else rounds, payload.get("affected_slide_ids"))
         if operation == "inspection.fix":
             return self.service.dispose_issue(task_id, payload["issue_id"], "agent_fix", payload.get("rationale", ""), "user")
         if operation == "delivery.publish":
@@ -744,6 +789,7 @@ class JobService:
             "job_id", "task_id", "operation", "status", "progress", "current_step", "last_seq",
             "created_at", "started_at", "finished_at", "result", "error", "cancellation_requested",
             "deadline_seconds", "deadline_at", "metrics", "event_history_warning",
+            "branch_id", "head_revision", "parent_hash",
         )
         return {key: record.get(key) for key in keys}
 
@@ -763,6 +809,31 @@ class JobService:
         elif status:
             records = [item for item in records if item["status"] == status]
         return [self.public(item) for item in records]
+
+    def list_page(self,task_id,status=None,operation=None,limit=25,before=None):
+        records=self.list(task_id,status)
+        if operation: records=[item for item in records if item["operation"]==operation]
+        records=sorted(records,key=lambda item:(item["created_at"],item["job_id"]),reverse=True)
+        if before:
+            index=next((idx for idx,item in enumerate(records) if item["job_id"]==before),None)
+            if index is None: raise ValidationError("Job 分页游标无效")
+            records=records[index+1:]
+        page=records[:limit]
+        return {"jobs":page,"next_cursor":page[-1]["job_id"] if len(records)>limit else None}
+
+    def create_branch(self,task_id,branch_id,source_branch=None,source_revision=None,switch=True):
+        """Serialize branch changes with Job admission for the same task."""
+        with self._guard, self.store.lock(task_id):
+            if any(item["status"] in ACTIVE for item in self._records(task_id)):
+                raise ConflictError("存在活动 Job 时不能创建并切换分支")
+            return self.store.branch_from(task_id,branch_id,source_branch,source_revision,switch)
+
+    def switch_branch(self,task_id,branch_id):
+        """Prevent a Job from being admitted between the active check and switch."""
+        with self._guard, self.store.lock(task_id):
+            if any(item["status"] in ACTIVE for item in self._records(task_id)):
+                raise ConflictError("存在活动 Job 时不能切换分支")
+            return self.store.switch_branch(task_id,branch_id)
 
     def latest_by_operation(self, task_id: str) -> list[dict[str, Any]]:
         latest: dict[str, dict[str, Any]] = {}

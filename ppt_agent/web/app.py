@@ -3,7 +3,9 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 import hashlib
 import json
+import logging
 from pathlib import Path
+import threading
 
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
@@ -28,13 +30,29 @@ def create_app(
     frontend = frontend.resolve()
     if not (frontend / "index.html").is_file():
         raise RuntimeError(f"frontend assets missing: {frontend}")
-    coordinator = JobService(service, defer_queued_recovery=True)
+    coordinator = JobService(service, defer_queued_recovery=True, defer_recovery_scan=True)
+    shutdown=threading.Event()
+    bootstrap={"recovery":"starting","runtime":"starting"}
+
+    def initialize_background():
+        try:
+            coordinator.initialize_recovery()
+            bootstrap["recovery"]="ready"
+            capabilities=service.initialize_runtime()
+            bootstrap["runtime"]="ready" if capabilities.get("ready") else "unavailable"
+            if capabilities.get("ready") and not shutdown.is_set(): coordinator.resume_recovered_queued()
+        except Exception:
+            pending="recovery" if bootstrap["recovery"]=="starting" else "runtime"
+            bootstrap[pending]="failed"
+            logging.exception("background startup initialization failed")
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        service.initialize_runtime()
-        coordinator.resume_recovered_queued()
+        thread=threading.Thread(target=initialize_background,name="ppt-startup",daemon=True)
+        thread.start()
         yield
+        shutdown.set()
+        thread.join(timeout=1)
         coordinator.close()
 
     app = FastAPI(
@@ -49,19 +67,30 @@ def create_app(
     app.state.frontend_root = frontend
     app.state.frontend_build = FRONTEND_BUILD
 
+    def startup_status():
+        statuses=set(bootstrap.values())
+        if "failed" in statuses: return "failed"
+        if "starting" in statuses: return "starting"
+        if "unavailable" in statuses: return "unavailable"
+        return "ready"
+
     def runtime_payload():
         capabilities=service.runtime_health()
         config_summary=service.runtime_config_summary()
+        startup=startup_status()
+        ready=capabilities["ready"] and startup=="ready"
         return {
-            "status": "ok" if capabilities["ready"] else "unavailable",
+            "status": "ok" if ready else "unavailable",
             "stage": "P8",
-            "runtime_ready": capabilities["ready"],
+            "runtime_ready": ready,
             "web_runtime": "fastapi",
             "frontend_build": FRONTEND_BUILD,
             "backend_commit": backend_commit(),
             "config_summary_sha256": hashlib.sha256(json.dumps(config_summary,sort_keys=True,separators=(",",":")).encode()).hexdigest(),
             "clarification_mode":"model" if service.clarifier is not None else "fake",
             "model_capabilities":capabilities,
+            "startup_status":startup,
+            "startup_components":dict(bootstrap),
         }
 
     @app.middleware("http")
@@ -105,7 +134,8 @@ def create_app(
 
     @app.post("/v1/runtime/recheck", tags=["runtime"])
     def recheck_runtime():
-        service.initialize_runtime()
+        capabilities=service.initialize_runtime()
+        bootstrap["runtime"]="ready" if capabilities.get("ready") else "unavailable"
         return runtime_payload()
 
     @app.get("/v1/runtime/probes", tags=["runtime"])

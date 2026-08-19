@@ -1,10 +1,10 @@
-import { api, ApiError } from "./api.js?v=2026.08.19.051824935370";
-import { JobTracker } from "./job-tracker.js?v=2026.08.19.051824935370";
-import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.19.051824935370";
-import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.19.051824935370";
-import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.19.051824935370";
-import { inlineError, setBusy } from "./components/index.js?v=2026.08.19.051824935370";
-import { renderStage } from "./stages/index.js?v=2026.08.19.051824935370";
+import { api, ApiError } from "./api.js?v=2026.08.19.081751755538";
+import { JobTracker } from "./job-tracker.js?v=2026.08.19.081751755538";
+import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.19.081751755538";
+import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.19.081751755538";
+import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.19.081751755538";
+import { inlineError, setBusy } from "./components/index.js?v=2026.08.19.081751755538";
+import { renderStage } from "./stages/index.js?v=2026.08.19.081751755538";
 
 const app = document.getElementById("app");
 const APP_BUILD = document.querySelector('meta[name="app-build"]')?.content || "unknown";
@@ -36,7 +36,7 @@ const OPERATION_STAGES = {
   "outline.generate": ["narrative", "outline"],
   "samples.generate": ["outline", "sample"],
   "samples.modify": ["outline", "sample"],
-  "deck.generate": ["sample", "deck"],
+  "deck.generate": ["deck"],
   "deck.modify": ["deck", "review"],
   "inspection.run": ["deck", "review"],
   "inspection.fix": ["review"],
@@ -116,7 +116,12 @@ function topbar(context = {}) {
   const connection = runtimeStatusBadges();
   const build = badge(`Build ${APP_BUILD}`, "primary");
   build.classList.add("badge--build");
-  const settingsButton = iconButton("settings", "打开设置", openSettings);
+  const settingsButton = context.task ? null : iconButton("settings", "打开设置", openSettings);
+  const primaryNav = context.task ? element("nav", { className: "primary-nav", "aria-label": "任务一级导航" }, [
+    taskViewLink(context.task.task_id, "workspace", "工作区", context.route?.view),
+    taskViewLink(context.task.task_id, "status", "状态", context.route?.view),
+    taskViewLink(context.task.task_id, "settings", "设置", context.route?.view),
+  ]) : null;
   const bar = element("header", { className: "topbar" }, [
     context.onMenu ? iconButton("menu", "打开任务与阶段导航", context.onMenu, "menu-button") : null,
     home,
@@ -124,7 +129,9 @@ function topbar(context = {}) {
       element("span", { className: "context-label", text: "当前任务" }),
       element("strong", { text: context.task.task_id }),
       badge(taskModeLabel(context.task.mode)),
+      context.branch ? badge(`分支 ${context.branch.branch_id}`, "primary") : null,
     ]) : null,
+    primaryNav,
     element("div", { className: "topbar__actions" }, [
       connection,
       build,
@@ -134,6 +141,11 @@ function topbar(context = {}) {
     ]),
   ]);
   return bar;
+}
+
+function taskViewLink(taskId, view, label, current) {
+  const href = `/tasks/${encodeURIComponent(taskId)}${view === "workspace" ? "" : `?view=${view}`}`;
+  return element("a", { className: "primary-nav__link", href, "aria-current": current === view ? "page" : null, onClick: intercept, text: label });
 }
 
 function runtimeStatusBadges() {
@@ -149,7 +161,9 @@ function renderRuntimeBadges(group) {
   const backendTone = runtimeState.backendReachable === null ? "warning" : runtimeState.backendReachable ? "success" : "danger";
   let modelLabel = "模型检测中";
   let modelTone = "warning";
-  if (runtimeState.health?.clarification_mode === "fake" && runtimeState.runtimeReady) {
+  if (runtimeState.health?.startup_status === "starting") {
+    modelLabel = "后台初始化中";
+  } else if (runtimeState.health?.clarification_mode === "fake" && runtimeState.runtimeReady) {
     modelLabel = "模型：本地模式";
     modelTone = "primary";
   } else if (runtimeState.runtimeReady === true) {
@@ -208,7 +222,11 @@ function updateRuntimeUI() {
     }
     if (!control.disabled) control.dataset.runtimeDisabled = "true";
     control.disabled = true;
-    const reason = runtimeState.backendReachable === false ? "后端服务当前不可达" : "模型运行时不可用，请先重新检测";
+    const reason = runtimeState.backendReachable === false
+      ? "后端服务当前不可达"
+      : runtimeState.health?.startup_status === "starting"
+        ? "后台正在恢复任务并检测运行时，请稍后"
+        : "模型运行时不可用，请先重新检测";
     control.title = reason;
     control.setAttribute("aria-description", reason);
   });
@@ -336,10 +354,10 @@ async function renderWorkspace(route, generation) {
     sidebar = workspaceSidebar(shell, recent.tasks, selected, closeDrawer);
     scrim = element("button", { className: "drawer-scrim", type: "button", "aria-label": "关闭导航", onClick: closeDrawer });
     const page = element("div", { className: "app-shell" }, [
-      topbar({ task: shell.task, onMenu: openDrawer }),
+      topbar({ task: shell.task, branch: shell.branch, route, onMenu: openDrawer }),
       element("div", { className: "shell-grid" }, [
         sidebar,
-        workspaceMain(shell, selected),
+        workspaceMain(shell, selected, route),
       ]),
       scrim,
     ]);
@@ -359,17 +377,22 @@ async function renderWorkspace(route, generation) {
     }, { signal: activeController.signal });
     replaceApp(page);
     shell.active_jobs.forEach((job) => connectJob(job, route));
-    const recentJob = latestRelevantJob(shell, selected);
+    const recentJob = route.view === "workspace" ? latestRelevantJob(shell, selected) : null;
     if (recentJob && ["succeeded", "failed", "cancelled", "interrupted"].includes(recentJob.status)) {
       hydrateJobDetails(recentJob);
     }
     await reconcileStoredIntents(shell.task.task_id, shell.active_jobs, route);
     if (generation !== renderGeneration) return;
-    if (!lockedStage(selected)) {
+    if (route.view === "status") {
+      await renderStatusView(shell, route, generation);
+    } else if (route.view === "settings") {
+      await renderSettingsView(shell, route, generation);
+    } else if (!lockedStage(selected)) {
       try {
         const content = await renderStage(selected.id, stageContext(shell, selected, route, generation));
         if (generation !== renderGeneration) return;
         enforceTaskActionState(content, shell.task);
+        enforceStageAccess(content, selected);
         document.getElementById("stage-content")?.replaceChildren(content);
         updateRuntimeUI();
       } catch (error) {
@@ -384,65 +407,45 @@ async function renderWorkspace(route, generation) {
 }
 
 function workspaceSidebar(shell, recent, selected, closeDrawer) {
-  const stages = element("ol", { className: "stage-list" });
-  shell.stages.forEach((stage, index) => {
-    const isSelected = stage.id === selected.id;
-    const label = element("span", { className: "stage-label" }, [
-      element("span", { text: stage.label }),
-      stage.lock_reason ? element("small", { text: stage.lock_reason.replace("前置条件：", "") }) : null,
-    ]);
-    const link = element("a", {
-      className: "stage-link",
-      href: stage.href,
-      "aria-current": isSelected ? "step" : null,
-      "aria-disabled": stage.status === "locked" ? "true" : null,
-      "data-status": stage.status,
-      title: stage.lock_reason,
-      onClick: (event) => {
-        if (stage.status === "locked") {
-          event.preventDefault();
-          showToast(stage.lock_reason);
-          return;
-        }
-        intercept(event);
-        closeDrawer();
-      },
-    }, [element("span", { className: "stage-index", text: stage.status === "completed" ? "✓" : stage.status === "skipped" ? "—" : String(index + 1) }), label]);
-    stages.append(element("li", { className: "stage-item" }, link));
-  });
   return element("aside", { className: "sidebar", "aria-label": "任务与阶段导航", "data-open": "false", onKeydown: (event) => {
     if (event.key === "Escape") closeDrawer();
   } }, [
     iconButton("close", "关闭导航", closeDrawer, "sidebar__close"),
     element("div", { className: "sidebar__section" }, [button("新建任务", { href: "/", kind: "primary", block: true })]),
-    element("section", { className: "sidebar__section", "aria-labelledby": "stage-heading" }, [
-      element("h2", { className: "sidebar__heading", id: "stage-heading", text: "8 阶段工作流" }),
-      stages,
-    ]),
     element("section", { className: "sidebar__section", "aria-labelledby": "tasks-heading" }, [
-      element("h2", { className: "sidebar__heading", id: "tasks-heading", text: "最近任务" }),
-      renderTaskList(recent.slice(0, 8), "暂无其他任务", shell.task.task_id),
+      element("h2", { className: "sidebar__heading", id: "tasks-heading", text: "任务目录" }),
+      renderTaskList(recent.slice(0, 20), "暂无其他任务", shell.task.task_id),
     ]),
   ]);
 }
 
-function workspaceMain(shell, selected) {
+function workspaceMain(shell, selected, route) {
   const current = shell.stages.find((stage) => stage.status === "current");
   const locked = selected.status === "locked";
   const [statusLabel, tone] = STATUS[shell.task.status] || [shell.task.status, ""];
+  const viewCopy = {
+    workspace: [selected.label, locked ? selected.lock_reason : selected.id === current.id ? "这是任务当前的权威阶段。" : `正在查看只读历史；当前阶段为“${current.label}”。`],
+    status: ["运行状态", "查看全部 Job、领域事件与 Agent 审计历史。"],
+    settings: ["任务与运行设置", "参数保存后会立即用于新 Job；当前 Job 保持启动时快照。"],
+  }[route.view];
+  const stageJobs = shell.active_jobs.filter((job) => OPERATION_STAGES[job.operation]?.includes(selected.id));
   const main = element("main", { className: "workspace", id: "main-content", tabIndex: -1 }, [
     element("div", { className: "workspace__inner" }, [
       element("header", { className: "workspace-header" }, [
         element("div", {}, [
-          element("p", { className: "eyebrow", text: `阶段 ${shell.stages.findIndex((stage) => stage.id === selected.id) + 1} / 8` }),
-          element("h1", { text: selected.label }),
-          element("p", { text: locked ? selected.lock_reason : selected.status === "available" ? `该阶段已满足前置门禁；任务当前阶段仍为“${current.label}”。` : selected.id === current.id ? "这是任务当前的权威阶段。" : `正在查看已完成阶段；当前阶段为“${current.label}”。` }),
+          element("p", { className: "eyebrow", text: route.view === "workspace" ? `阶段 ${shell.stages.findIndex((stage) => stage.id === selected.id) + 1} / 8` : "PPT Agent 控制台" }),
+          element("h1", { text: viewCopy[0] }),
+          element("p", { text: viewCopy[1] }),
         ]),
         badge(statusLabel, tone),
       ]),
-      element("div", { id: "active-job-region", "aria-live": "polite" }, shell.active_jobs.map(jobPanel)),
-      latestJobFailure(shell, selected),
-      element("div", { id: "stage-content" }, locked ? lockedState(selected, current) : [
+      route.view === "workspace" ? creationProgress(shell, selected) : null,
+      route.view === "workspace" ? element("div", { id: "active-job-region", className: "workspace-jobs", "aria-live": "polite" }, stageJobs.map((job) => jobPanel(job, { detailed: false }))) : null,
+      route.view === "workspace" ? latestJobFailure(shell, selected) : null,
+      element("div", { id: "stage-content" }, route.view !== "workspace" ? [
+        element("div", { className: "skeleton skeleton--title" }),
+        element("div", { className: "card", role: "status" }, [element("span", { className: "sr-only", text: `正在加载${viewCopy[0]}` }), element("div", { className: "skeleton skeleton--line" }), element("div", { className: "skeleton skeleton--line" })]),
+      ] : locked ? lockedState(selected, current) : [
         element("div", { className: "skeleton skeleton--title" }),
         element("div", { className: "card", role: "status" }, [element("span", { className: "sr-only", text: `正在加载${selected.label}` }), element("div", { className: "skeleton skeleton--line" }), element("div", { className: "skeleton skeleton--line" })]),
       ]),
@@ -450,6 +453,33 @@ function workspaceMain(shell, selected) {
   ]);
   window.requestAnimationFrame(() => main.focus({ preventScroll: true }));
   return main;
+}
+
+function creationProgress(shell, selected) {
+  const finished = shell.stages.filter((item) => ["completed", "skipped"].includes(item.status)).length;
+  const current = shell.stages.find((item) => item.status === "current");
+  return element("section", { className: "creation-progress card", "aria-labelledby": "creation-progress-title" }, [
+    element("div", { className: "creation-progress__header" }, [
+      element("div", {}, [element("p", { className: "eyebrow", text: "创作进度" }), element("h2", { id: "creation-progress-title", text: `${finished} / ${shell.stages.length} 个阶段完成` })]),
+      badge(`当前：${current?.label || selected.label}`, "primary"),
+    ]),
+    element("ol", { className: "progress-rail" }, shell.stages.map((stage, index) => {
+      const disabled = stage.status === "locked";
+      const link = element("a", {
+        className: "progress-node", href: stage.href, "data-status": stage.status,
+        "aria-current": stage.id === selected.id ? "step" : null,
+        "aria-disabled": disabled ? "true" : null, title: stage.lock_reason,
+        onClick: (event) => { if (disabled) event.preventDefault(); else intercept(event); },
+      }, [
+        element("span", { className: "progress-node__index", text: stage.status === "completed" ? "✓" : stage.status === "skipped" ? "—" : String(index + 1) }),
+        element("span", { className: "progress-node__label", text: stage.label }),
+        stage.lock_reason ? element("small", { text: stage.lock_reason.replace("前置条件：", "") }) : null,
+      ]);
+      const derive = ["completed", "skipped"].includes(stage.status) && Number.isInteger(stage.revision) ? button("从此派生", { kind: "ghost", onClick: () => navigate(`/tasks/${encodeURIComponent(shell.task.task_id)}?view=settings&branch_from_revision=${encodeURIComponent(stage.revision)}&branch_from_stage=${encodeURIComponent(stage.id)}`) }) : null;
+      derive?.classList.add("progress-node__branch");
+      return element("li", { className: "progress-node-wrap" }, [link, derive]);
+    })),
+  ]);
 }
 
 function lockedState(selected, current) {
@@ -461,7 +491,7 @@ function lockedState(selected, current) {
   ]);
 }
 
-function jobPanel(job) {
+function jobPanel(job, { detailed = false } = {}) {
   const hasProgress = typeof job.progress === "number";
   const terminal = ["succeeded", "failed", "cancelled", "interrupted"].includes(job.status);
   const historyWarning = job.event_history_warning;
@@ -476,6 +506,7 @@ function jobPanel(job) {
   const panel = element("section", {
     className: `job-panel ${job.status === "failed" || job.status === "interrupted" ? "job-panel--failed" : ""}`,
     id: `job-${job.job_id}`,
+    "data-detailed": detailed ? "true" : "false",
     "aria-label": failed ? "最近一次后台任务失败" : terminal ? "最近一次后台任务执行详情" : "活动后台任务",
     role: failed ? "alert" : null,
   }, [
@@ -488,7 +519,7 @@ function jobPanel(job) {
       badge(jobStatus(job).label, jobStatus(job).tone),
     ]),
     progress(hasProgress ? job.progress : null, hasProgress ? `${job.progress}%` : "等待下一业务检查点", businessStep),
-    element("dl", { className: "job-panel__meta" }, [
+    detailed ? element("dl", { className: "job-panel__meta" }, [
       element("div", {}, [
         element("dt", { text: job.started_at ? "已用时" : "等待时长" }),
         element("dd", {
@@ -514,7 +545,7 @@ function jobPanel(job) {
       metricItem("Agent 步数", budgetLabel(metrics.agent_step, metrics.max_steps)),
       metricItem("模型请求", budgetLabel(metrics.provider_calls, metrics.max_provider_calls)),
       metricItem("只读工具调用", budgetLabel(metrics.tool_calls, metrics.max_tool_calls)),
-    ]),
+    ]) : element("p", { className: "field__hint", text: `${job.branch_id ? `分支 ${job.branch_id} · ` : ""}${job.started_at ? `已运行 ${formatDuration(elapsedSeconds(job.started_at, job.finished_at))}` : "等待执行资源"}` }),
     job.status === "cancellation_requested" || job.cancellation_requested ? element("p", {
       className: "job-panel__cancel-feedback",
       role: "status",
@@ -527,7 +558,7 @@ function jobPanel(job) {
         ? `${historyWarning.message}；原始记录已备份。`
         : `${historyWarning.message}；系统会自动重试，业务任务无需重新提交。`,
     }) : null,
-    element("p", { className: "field__hint", text: "可以安全离开此页；再次打开任务时会自动恢复显示。" }),
+    element("p", { className: "field__hint", text: detailed ? "执行历史已持久化；可以安全离开此页。" : "可以安全离开此页；详细历史请在“状态”中查看。" }),
     job.operation !== "clarification.generate" && !["succeeded", "failed", "cancelled", "interrupted"].includes(job.status) ? button(job.cancellation_requested ? "已请求取消" : "取消后台任务", { kind: "ghost", disabled: job.cancellation_requested, onClick: async () => {
       try {
         const next = await api.cancelJob(job.job_id);
@@ -538,7 +569,7 @@ function jobPanel(job) {
     } }) : null,
     job.error ? inlineError(job.error.message || "后台任务失败", job.error.diagnostic_id) : null,
     job.error?.agent_audit_id ? element("p", { className: "field__hint", text: `Agent 审计 ID：${job.error.agent_audit_id}` }) : null,
-    executionDetails(job, events, audits),
+    detailed ? executionDetails(job, events, audits) : null,
   ]);
   if (failed) {
     const presentation = JOB_ERROR_PRESENTATIONS[job.error?.code];
@@ -621,7 +652,7 @@ function eventTone(event) {
 function latestJobFailure(shell, selected) {
   const latest = latestRelevantJob(shell, selected);
   if (!latest || !["succeeded", "failed", "cancelled", "interrupted"].includes(latest.status)) return null;
-  return jobPanel(latest);
+  return jobPanel(latest, { detailed: false });
 }
 
 function latestRelevantJob(shell, selected) {
@@ -793,12 +824,21 @@ function enforceTaskActionState(content, task) {
   });
 }
 
+function enforceStageAccess(content, stage) {
+  if (!["completed", "skipped"].includes(stage.status)) return;
+  content.querySelectorAll('[data-mutates="true"]').forEach((control) => {
+    control.disabled = true;
+    control.title = "历史阶段为只读；如需继续编辑，请从该节点创建分支";
+    control.setAttribute("aria-description", control.title);
+  });
+}
+
 function updateJobPanel(job) {
   const old = document.getElementById(`job-${job.job_id}`);
   if (!old) return;
   const executionWasOpen = old.querySelector(":scope > .job-execution")?.open;
   const auditWasOpen = old.querySelector(".job-audit")?.open;
-  const next = jobPanel(job);
+  const next = jobPanel(job, { detailed: old.dataset.detailed === "true" });
   if (executionWasOpen) next.querySelector(":scope > .job-execution")?.setAttribute("open", "");
   if (auditWasOpen) next.querySelector(".job-audit")?.setAttribute("open", "");
   old.replaceWith(next);
@@ -914,6 +954,155 @@ function jobBusinessStep(job) {
   };
   if (steps[job.current_step]) return steps[job.current_step];
   return operations[job.operation] || "业务操作执行中";
+}
+
+async function renderStatusView(shell, route, generation) {
+  const region=document.getElementById("stage-content");
+  try {
+    const [jobResponse,eventResponse,auditResponse]=await Promise.all([
+      api.jobs(shell.task.task_id,{limit:25}),
+      api.taskEvents(shell.task.task_id,{limit:100}),
+      api.taskAgentAudits(shell.task.task_id),
+    ]);
+    if (generation!==renderGeneration) return;
+    const status=element("select",{className:"select",id:"job-status-filter"},[
+      element("option",{value:"",text:"全部状态"}),
+      ...["active","succeeded","failed","cancelled","interrupted"].map((value)=>element("option",{value,text:({active:"活动中",succeeded:"已完成",failed:"失败",cancelled:"已取消",interrupted:"已中断"})[value]})),
+    ]);
+    const operation=element("select",{className:"select",id:"job-operation-filter"},[
+      element("option",{value:"",text:"全部操作"}),
+      ...Object.keys(OPERATION_STAGES).map((value)=>element("option",{value,text:operationLabel(value)})),
+    ]);
+    const list=element("div",{className:"status-job-list","aria-live":"polite"});
+    let cursor=jobResponse.next_cursor;
+    const appendJobs=(jobs,append=false)=>{
+      const panels=jobs.map((job)=>jobPanel(job,{detailed:true}));
+      if (append) list.append(...panels); else list.replaceChildren(...(panels.length ? panels : [element("div",{className:"empty-state empty-state--compact"},element("p",{text:"没有符合条件的 Job。"}))]));
+      jobs.forEach(hydrateJobDetails);
+    };
+    appendJobs(jobResponse.jobs);
+    const loadMore=button("加载更早记录",{kind:"secondary",disabled:!cursor,reason:"已显示全部记录",onClick:async(event)=>{
+      const control=event.currentTarget; setBusy(control,true,"正在加载…");
+      try {
+        const response=await api.jobs(shell.task.task_id,{status:status.value,operation:operation.value,limit:25,before:cursor});
+        appendJobs(response.jobs,true); cursor=response.next_cursor; control.disabled=!cursor; control.textContent=cursor ? "加载更早记录" : "已显示全部记录";
+      } catch (error) { showToast(describeError(error)); setBusy(control,false); }
+    }});
+    const applyFilters=async()=>{
+      const response=await api.jobs(shell.task.task_id,{status:status.value,operation:operation.value,limit:25});
+      cursor=response.next_cursor; appendJobs(response.jobs); loadMore.disabled=!cursor; loadMore.textContent=cursor ? "加载更早记录" : "已显示全部记录";
+    };
+    status.addEventListener("change",()=>applyFilters().catch((error)=>showToast(describeError(error))));
+    operation.addEventListener("change",()=>applyFilters().catch((error)=>showToast(describeError(error))));
+    const events=eventResponse.events || [];
+    const audits=auditResponse.audits || [];
+    region.replaceChildren(element("div",{className:"status-layout"},[
+      element("section",{className:"card status-section"},[
+        element("div",{className:"card__header"},[element("div",{},[element("h2",{text:"Job 历史"}),element("p",{className:"muted",text:"按服务端分页读取；展开单项可查看完整事件与 Agent 审计。"})]),badge(`${jobResponse.jobs.length}${cursor ? "+" : ""} 条`)]),
+        element("div",{className:"status-filters"},[status,operation]),list,loadMore,
+      ]),
+      element("section",{className:"card status-section"},[
+        element("div",{className:"card__header"},[element("div",{},[element("h2",{text:"领域事件"}),element("p",{className:"muted",text:`当前分支 ${shell.branch.branch_id} 的权威状态变化。`})]),badge(`${events.length}${eventResponse.next_revision!==null ? "+" : ""} 条`)]),
+        events.length ? element("ol",{className:"domain-timeline"},events.map((item)=>element("li",{},[
+          element("span",{className:"domain-timeline__marker","aria-hidden":"true"}),
+          element("div",{},[element("strong",{text:domainActionLabel(item.action)}),element("p",{text:`${stageLabel(item.from?.stage)} → ${stageLabel(item.to?.stage)} · 修订 ${item.to?.revision ?? "—"}`}),element("small",{text:formatClock(item.at)})]),
+        ]))) : element("p",{className:"muted",text:"尚无领域事件。"}),
+      ]),
+      element("section",{className:"card status-section"},[
+        element("div",{className:"card__header"},[element("div",{},[element("h2",{text:"Agent 审计"}),element("p",{className:"muted",text:"历史持续保留；技术详情按运行折叠展示。"})]),badge(`${audits.length} 次`)]),
+        audits.length ? element("div",{className:"audit-list"},audits.slice().reverse().map((item)=>element("details",{className:"audit-item"},[element("summary",{text:`${stageLabel(item.stage)} · ${item.model || "unknown"} · ${item.audit_id || "审计记录"}`}),element("pre",{className:"code-block job-audit__json",text:JSON.stringify(item,null,2),tabIndex:0})]))) : element("p",{className:"muted",text:"尚无 Agent 审计。"}),
+      ]),
+    ]));
+  } catch (error) {
+    if (generation===renderGeneration) region?.replaceChildren(inlineError(describeError(error),error?.diagnosticId));
+  }
+}
+
+function domainActionLabel(action) {
+  return ({import_input:"导入任务资料",rebuild_input:"重建任务资料",confirm_outline:"确认逐页大纲",confirm_sample_version:"确认样品并进入全稿",deck_generate:"生成全稿",deck_modify:"修改全稿",inspection_complete:"完成质量检查",finalize_deck:"确定终稿",confirm_delivery:"完成交付"})[action] || action || "状态更新";
+}
+
+async function renderSettingsView(shell, route, generation) {
+  const region=document.getElementById("stage-content");
+  try {
+    const [settings,branches]=await Promise.all([api.settings(activeController),api.branches(shell.task.task_id,activeController)]);
+    if (generation!==renderGeneration) return;
+    const tabs=element("div",{className:"settings-tabs",role:"tablist","aria-label":"设置分组"});
+    const panels=element("div",{className:"settings-panels"});
+    const groups=[];
+    const register=(id,label,panel)=>{
+      const tab=button(label,{kind:"ghost",onClick:()=>selectSetting(id)}); tab.id=`settings-tab-${id}`; tab.setAttribute("role","tab"); tab.setAttribute("aria-controls",`settings-panel-${id}`);
+      panel.id=`settings-panel-${id}`; panel.setAttribute("role","tabpanel"); panel.setAttribute("aria-labelledby",tab.id); groups.push({id,tab,panel}); tabs.append(tab); panels.append(panel);
+    };
+    const selectSetting=(id)=>groups.forEach((item)=>{ const active=item.id===id; item.tab.setAttribute("aria-selected",String(active)); item.tab.tabIndex=active ? 0 : -1; item.panel.hidden=!active; });
+    register("workflow","工作流",settingsGroup("澄清与工作流",settings,"workflow"));
+    register("generation","生成与全稿",settingsGroup("生成 Job",settings,"jobs"));
+    register("review","自检与交付",settingsGroup("自检默认值",settings,"review"));
+    register("models","模型",modelSettings(settings.models));
+    register("branches","分支",branchSettings(shell,branches,route));
+    register("system","系统与显示",systemSettings());
+    selectSetting("workflow");
+    region.replaceChildren(element("div",{className:"settings-layout"},[tabs,panels]));
+  } catch (error) {
+    if (generation===renderGeneration) region?.replaceChildren(inlineError(describeError(error),error?.diagnosticId));
+  }
+}
+
+function settingsGroup(title,settings,group) {
+  const schema=settings.schema[group]; const values=settings.values[group]; const controls={}; const message=element("div",{className:"stage-message",role:"status","aria-live":"polite"});
+  const fields=Object.entries(schema).map(([key,definition])=>{
+    let control;
+    if (definition.type==="select") control=element("select",{className:"select",id:`setting-${group}-${key}`},definition.options.map((value)=>element("option",{value,text:value,selected:value===values[key]})));
+    else control=element("input",{className:"input",id:`setting-${group}-${key}`,type:"number",min:definition.minimum,max:definition.maximum,value:values[key]});
+    controls[key]=control;
+    return element("div",{className:"field"},[element("label",{className:"field__label",htmlFor:control.id,text:definition.label}),control,definition.minimum!==undefined ? element("span",{className:"field__hint",text:`允许范围：${definition.minimum}–${definition.maximum}`}) : null]);
+  });
+  const save=button("保存并立即生效",{kind:"primary",mutates:true,onClick:async()=>{
+    const payload={}; payload[group]=Object.fromEntries(Object.entries(controls).map(([key,control])=>[key,schema[key].type==="integer" ? Number(control.value) : control.value]));
+    setBusy(save,true,"正在保存…"); message.replaceChildren();
+    try { await api.updateSettings(payload); message.append(element("p",{className:"success-message",text:"设置已保存；新 Job 将立即采用。"})); }
+    catch (error) { message.replaceChildren(inlineError(describeError(error),error?.diagnosticId)); }
+    finally { setBusy(save,false); }
+  }});
+  return element("section",{className:"card settings-panel"},[element("div",{className:"card__header"},[element("div",{},[element("h2",{text:title}),element("p",{className:"muted",text:"保存采用原子更新；当前运行不会被中途改写。"})])]),...fields,save,message]);
+}
+
+function modelSettings(models) {
+  const gateways=models.gateways || [];
+  return element("section",{className:"card settings-panel"},[
+    element("div",{className:"card__header"},[element("div",{},[element("h2",{text:"模型与凭证状态"}),element("p",{className:"muted",text:"仅显示环境变量名称和安全摘要，不回显密钥。"})]),badge(models.mode==="agent" ? "Agent 模式" : "本地模式","primary")]),
+    gateways.length ? element("div",{className:"model-list"},gateways.map((item)=>element("article",{className:"notice"},[element("strong",{text:item.model}),element("p",{text:`${item.type} · Key ${item.config?.api_key_env || "—"} · Base URL ${item.config?.base_url_env || "—"}`} )]))) : element("p",{className:"muted",text:"当前使用本地确定性模式，无外部模型凭证。"}),
+    runtimeStatusBadges(),runtimeProbeDetails(),
+  ]);
+}
+
+function branchSettings(shell,branches,route) {
+  const name=element("input",{className:"input",id:"new-branch-name",placeholder:"例如 refine-layout",pattern:"[A-Za-z0-9][A-Za-z0-9._-]{0,63}"});
+  const create=button("从当前节点创建并切换",{kind:"primary",mutates:true}); const message=element("div",{className:"stage-message",role:"status","aria-live":"polite"});
+  const sourceRevision=route.sourceRevision ?? shell.task.revision;
+  const sourceStage=route.sourceStage ? stageLabel(route.sourceStage) : stageLabel(shell.task.stage);
+  create.addEventListener("click",async()=>{
+    setBusy(create,true,"正在创建…");
+    try { await api.createBranch(shell.task.task_id,{branch_id:name.value.trim(),source_branch:branches.active,source_revision:sourceRevision,switch:true}); showToast("分支已创建并切换"); navigate(`/tasks/${encodeURIComponent(shell.task.task_id)}`); }
+    catch (error) { message.replaceChildren(inlineError(describeError(error),error?.diagnosticId)); setBusy(create,false); }
+  });
+  return element("section",{className:"card settings-panel"},[
+    element("div",{className:"card__header"},[element("div",{},[element("h2",{text:"创作分支"}),element("p",{className:"muted",text:"历史节点只读；继续创作会派生分支，并复用不可变版本与资源。"})]),badge(`当前 ${branches.active}`,"primary")]),
+    element("div",{className:"branch-create"},[element("div",{className:"field"},[element("label",{className:"field__label",htmlFor:name.id,text:"新分支名称"}),name,element("span",{className:"field__hint",text:`来源：${branches.active} · ${sourceStage} · 修订 ${sourceRevision}`})]),create]),message,
+    element("ul",{className:"branch-list"},branches.branches.map((item)=>element("li",{},[element("div",{},[element("strong",{text:item.branch_id}),element("small",{text:`${stageLabel(item.stage)} · 修订 ${item.head_revision}${item.parent ? ` · 来自 ${item.parent}` : ""}`})]),item.active ? badge("当前","success") : button("切换",{kind:"secondary",disabled:shell.active_jobs.length>0,reason:"存在活动 Job 时不能切换",onClick:async()=>{ try { await api.switchBranch(shell.task.task_id,item.branch_id); showToast(`已切换到 ${item.branch_id}`); navigate(`/tasks/${encodeURIComponent(shell.task.task_id)}`); } catch(error) { showToast(describeError(error)); } }})]))),
+  ]);
+}
+
+function systemSettings() {
+  const current=document.documentElement.dataset.theme;
+  return element("section",{className:"card settings-panel"},[
+    element("div",{className:"card__header"},[element("div",{},[element("h2",{text:"系统与显示"}),element("p",{className:"muted",text:runtimeVersionText()})])]),
+    runtimeStatusBadges(),runtimeProbeDetails(),
+    element("div",{className:"button-row"},[
+      button(current==="dark" ? "切换浅色主题" : "切换深色主题",{onClick:(event)=>{ const next=document.documentElement.dataset.theme==="dark" ? "light" : "dark"; applyTheme(next); event.currentTarget.textContent=next==="dark" ? "切换浅色主题" : "切换深色主题"; }}),
+      button("重新检测模型",{kind:"secondary",onClick:async(event)=>{ const control=event.currentTarget; setBusy(control,true,"正在检测…"); await refreshRuntimeStatus(true); setBusy(control,false); }}),
+    ]),
+  ]);
 }
 
 function renderComponents() {

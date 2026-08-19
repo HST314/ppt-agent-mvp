@@ -83,15 +83,22 @@ class SamplePageTests(unittest.TestCase):
         for token in ("sample-compare-left", "sample-compare-right", "对比样品版本", "previewUrl"):
             self.assertIn(token, module)
 
-    def test_modify_confirm_and_selection_changes_preserve_history(self):
-        generated = self.act("generate", {})
+    def test_confirm_advances_to_deck_and_freezes_sample_history(self):
+        self.act("generate", {})
         self.act("confirm", {})
-        self.assertTrue(self.svc.sample_view("task")["confirmation"])
-        self.act("modify", {"prompt": "统一加深背景", "scope": "global"})
-        self.assertFalse(self.svc.sample_view("task")["confirmation"])
-        ids = list(reversed(generated["selection"]["slide_ids"]))
-        self.act("select", {"slide_ids": ids})
-        self.assertGreaterEqual(len(self.svc.sample_view("task")["versions"]), 2)
+        frozen = self.svc.sample_view("task")
+        self.assertTrue(frozen["confirmation"])
+        self.assertEqual(frozen["state"]["stage"], "deck")
+
+        status, _headers, result = self.call(
+            "POST",
+            "/v1/tasks/task/samples/modify",
+            {"prompt": "统一加深背景", "scope": "global"},
+        )
+        self.assertEqual(status, 409, result)
+        current = self.svc.sample_view("task")
+        self.assertEqual(current["confirmation"], frozen["confirmation"])
+        self.assertEqual(current["versions"], frozen["versions"])
 
     def test_empty_and_single_version_states_are_expressed_in_module(self):
         module = (ROOT / "frontend/static/js/stages/sample.js").read_text()

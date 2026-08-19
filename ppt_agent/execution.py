@@ -6,6 +6,8 @@ from .errors import ConflictError, GatewayError
 _cancelled = contextvars.ContextVar("ppt_agent_cancelled", default=None)
 _deadline = contextvars.ContextVar("ppt_agent_deadline", default=None)
 _progress = contextvars.ContextVar("ppt_agent_progress", default=None)
+_publication_guard = contextvars.ContextVar("ppt_agent_publication_guard", default=None)
+_publication_advance = contextvars.ContextVar("ppt_agent_publication_advance", default=None)
 
 class ExecutionCancelled(ConflictError):
     def __init__(self): super().__init__("后台任务已取消")
@@ -15,15 +17,22 @@ class ExecutionDeadlineExceeded(GatewayError):
         super().__init__("阶段执行超过硬截止时间", code="stage_deadline_exceeded")
 
 @contextmanager
-def execution_scope(cancelled, deadline, progress=None):
-    ct, dt, pt = _cancelled.set(cancelled), _deadline.set(deadline), _progress.set(progress)
+def execution_scope(cancelled, deadline, progress=None, publication_guard=None, publication_advance=None):
+    ct, dt, pt, gt, at = _cancelled.set(cancelled), _deadline.set(deadline), _progress.set(progress), _publication_guard.set(publication_guard), _publication_advance.set(publication_advance)
     try: yield
-    finally: _progress.reset(pt); _deadline.reset(dt); _cancelled.reset(ct)
+    finally: _publication_advance.reset(at); _publication_guard.reset(gt); _progress.reset(pt); _deadline.reset(dt); _cancelled.reset(ct)
 
 def checkpoint():
     cancelled, deadline = _cancelled.get(), _deadline.get()
     if cancelled is not None and cancelled(): raise ExecutionCancelled()
     if deadline is not None and time.monotonic() >= deadline: raise ExecutionDeadlineExceeded()
+    guard=_publication_guard.get()
+    if guard is not None: guard()
+
+def publication_committed(state):
+    """Advance the Job-owned branch head after one of its commits succeeds."""
+    callback=_publication_advance.get()
+    if callback is not None: callback(state)
 
 def progress(step, message=None, details=None):
     """Publish a real business checkpoint without coupling domain code to Jobs."""

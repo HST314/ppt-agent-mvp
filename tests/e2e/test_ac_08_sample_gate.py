@@ -4,7 +4,7 @@ from .support import SampleJourney
 
 
 class AC08SampleGateE2E(SampleJourney):
-    def test_repeated_adjustment_and_confirmation_invalidation(self):
+    def test_repeated_adjustment_then_confirmation_freezes_history(self):
         first = self.ok("/v1/tasks/journey/samples/generate", {})
         slide_id = first["selection"]["slide_ids"][0]
         second = self.ok("/v1/tasks/journey/samples/modify", {"prompt": "当前页增加留白", "slide_id": slide_id})
@@ -16,13 +16,14 @@ class AC08SampleGateE2E(SampleJourney):
 
         confirmed = self.ok("/v1/tasks/journey/samples/confirm", {})
         self.assertTrue(confirmed["state"]["sample_confirmed"])
+        self.assertEqual(confirmed["state"]["stage"], "deck")
         self.assertEqual(confirmed["confirmation"]["confirmed_sample_hash"], confirmed["sample"]["hash"])
 
-        changed = self.ok("/v1/tasks/journey/samples/modify", {"prompt": "统一增加对比度"})
-        self.assertFalse(changed["state"]["sample_confirmed"])
-        self.assertIsNone(changed["confirmation"])
-        status, raw = self.call("POST", "/v1/tasks/journey/actions", {"command_id": "premature-deck", "action": "advance"})
+        status, raw = self.call("POST", "/v1/tasks/journey/samples/modify", {"prompt": "统一增加对比度"})
         self.assertTrue(status.startswith("409"), raw.decode())
+        frozen = self.get_json("/v1/tasks/journey/samples")
+        self.assertTrue(frozen["state"]["sample_confirmed"])
+        self.assertEqual(len(frozen["versions"]), 3)
 
 
 if __name__ == "__main__":

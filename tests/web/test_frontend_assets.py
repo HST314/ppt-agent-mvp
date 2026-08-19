@@ -37,7 +37,10 @@ class FrontendAssetTests(unittest.TestCase):
         self.assertIn("prefers-reduced-motion", css)
         self.assertIn("max-width: 1023px", css)
         self.assertIn("max-width: 767px", css)
-        self.assertNotIn("overflow-x: auto;", css)
+        body_rule = re.search(r"^body\s*\{(?P<body>.*?)\}", css, re.S | re.M).group("body")
+        self.assertIn("overflow-x: hidden", body_rule)
+        self.assertIn(".progress-rail", css)
+        self.assertIn("overflow-x: auto", css)
 
         app = (FRONTEND / "static/js/app.js").read_text()
         self.assertNotIn("/legacy/", app)

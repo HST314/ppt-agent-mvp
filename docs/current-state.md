@@ -27,7 +27,7 @@
 ```bash
 python3 scripts/export_schemas.py
 python3 -m unittest discover -s tests -v
-python3 scripts/start.py --data .ppt-agent-data
+PPT_AGENT_DATA=.ppt-agent-data python3 -m uvicorn main_front:app
 ```
 
 健康检查返回 `stage=P8`、`runtime_ready=true`。机器契约见 `docs/openapi.yaml`。

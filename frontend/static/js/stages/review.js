@@ -1,15 +1,15 @@
-import { api } from "../api.js?v=2026.08.19.051824935370";
-import { badge, button, confirmationDialog, element, field, metadataList, shortHash, versionTimeline } from "../components/index.js?v=2026.08.19.051824935370";
-import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.19.051824935370";
-import { comparePanel, deckPreview, modificationPanel } from "./deck.js?v=2026.08.19.051824935370";
+import { api } from "../api.js?v=2026.08.19.081751755538";
+import { badge, button, confirmationDialog, element, field, metadataList, shortHash, versionTimeline } from "../components/index.js?v=2026.08.19.081751755538";
+import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.19.081751755538";
+import { comparePanel, deckPreview, modificationPanel } from "./deck.js?v=2026.08.19.081751755538";
 
 export async function render(context) {
-  const [view, deckView] = await Promise.all([api.inspection(context.taskId, context.controller), api.deck(context.taskId, context.controller)]);
+  const [view, deckView, settings] = await Promise.all([api.inspection(context.taskId, context.controller), api.deck(context.taskId, context.controller), api.settings(context.controller)]);
   context.assertCurrent();
-  return reviewStage(view, deckView, context);
+  return reviewStage(view, deckView, settings.values.review.default_max_rounds, context);
 }
 
-function reviewStage(view, deckView, context) {
+function reviewStage(view, deckView, defaultRounds, context) {
   const report = view.report;
   const preview = view.deck ? deckPreview(view.deck, context.taskId) : null;
   const location = element("p", { className: "muted", role: "status", "aria-live": "polite", text: "选择问题后会在预览中定位对应页面或元素。" });
@@ -27,7 +27,7 @@ function reviewStage(view, deckView, context) {
   return stageGrid([
     mutable ? finalizePanel(view, context) : frozenPanel(context),
     view.deck ? section("当前候选预览", [location, preview], { description: "可浏览、定位问题；检查不是确定终稿的前置条件。" }) : null,
-    mutable ? inspectionControls(view, context) : null,
+    mutable ? inspectionControls(view, defaultRounds, context) : null,
     mutable && view.deck ? modificationPanel(view.deck, context) : null,
     report?.stale ? section("检查报告已过期", element("div", { className: "notice notice--warning" }, [element("strong", { text: "当前全稿已变化" }), element("p", { text: "旧报告仍可追溯，若需最新质量结论请重新检查；也可以带该状态直接确定终稿。" })])) : null,
     report ? section("阻断问题", mutable ? issueGroup(blockers, active, context, preview, location) : readOnlyIssueGroup(blockers, active, preview, location), { description: mutable ? `${blockers.length} 项；可以修复、记录处置或带遗留问题确定终稿。` : `${blockers.length} 项；终稿冻结后仅供追溯。` }) : null,
@@ -68,13 +68,13 @@ function finalizePanel(view, context) {
   return section("确定终稿", [element("p", { text: `当前检查状态：${status}` }), finalize, message], { description: "自检、人工 Prompt 修改与问题处置均为可选；该操作始终绑定当前候选 hash。", className: "finalize-actions" });
 }
 
-function inspectionControls(view, context) {
+function inspectionControls(view, defaultRounds, context) {
   const message = actionMessage();
   const mode = element("select", { className: "select", id: "inspection-mode" }, [
     element("option", { value: "manual", text: "manual · 人工审核", selected: view.state.mode === "manual" }),
     element("option", { value: "auto", text: "auto · 有界自动修复", selected: view.state.mode === "auto" }),
   ]);
-  const rounds = element("input", { className: "input", id: "inspection-rounds", type: "number", min: 0, max: 10, value: 2 });
+  const rounds = element("input", { className: "input", id: "inspection-rounds", type: "number", min: 0, max: 10, value: defaultRounds });
   const slides = element("input", { className: "input", id: "inspection-slides", placeholder: "留空为全检；或 slide-2, slide-4" });
   const saveMode = button("保存模式", { kind: "secondary", mutates: true });
   saveMode.addEventListener("click", () => runAction({ buttonNode: saveMode, region: message, action: () => api.setInspectionMode(context.taskId, mode.value), success: "检查模式将在下一项动作生效。", refresh: context.refresh }).catch(() => {}));

@@ -49,13 +49,17 @@ class P4Tests(unittest.TestCase):
         (self.s.store.resource_root("asset")/"hero.png").write_bytes(PNG+b"tampered")
         with self.assertRaisesRegex(ValidationError,"内容已变化"):
             self.s.generate_sample("asset")
-    def test_confirmation_binds_exact_versions_and_never_auto_skips(self):
+    def test_confirmation_binds_exact_versions_and_enters_deck_atomically(self):
         self.s.generate_sample("p4")
         view=self.s.confirm_sample("p4"); fact=view["confirmation"]
         self.assertEqual(fact["confirmed_outline_hash"],view["outline_hash"]); self.assertEqual(fact["confirmed_sample_hash"],view["sample"]["hash"])
-        self.assertTrue(view["state"]["sample_confirmed"]); self.assertEqual(view["state"]["stage"],"sample")
-        changed=self.s.modify_sample("p4","统一加深背景","global")
-        self.assertFalse(changed["state"]["sample_confirmed"]); self.assertIsNone(changed["confirmation"])
+        self.assertTrue(view["state"]["sample_confirmed"]); self.assertEqual(view["state"]["stage"],"deck")
+        revision=view["state"]["revision"]
+        replay=self.s.confirm_sample("p4")
+        self.assertEqual(replay["state"]["revision"],revision)
+        self.assertEqual(replay["confirmation"],fact)
+        with self.assertRaisesRegex(ConflictError,"历史样品只读"):
+            self.s.modify_sample("p4","统一加深背景","global")
         self.s.create("auto",mode="auto"); self.s.import_input("auto",{"goal":"发布","audience":"客户","topic":"方案","页数":2})
         with self.assertRaises(Exception): self.s.command("auto","skip-sample","advance")
     def test_last_success_survives_invalid_modification_and_ui_is_sandboxed(self):
@@ -67,15 +71,11 @@ class P4Tests(unittest.TestCase):
         module=Path("frontend/static/js/stages/sample.js").read_text(); components=Path("frontend/static/js/components/index.js").read_text()
         self.assertIn("确认当前样品并进入全稿",module); self.assertIn('sandbox: allowInspection ? "allow-same-origin" : ""',components)
     def test_selection_and_outline_changes_invalidate_confirmation_and_block_advance(self):
-        first=self.s.generate_sample("p4"); self.s.confirm_sample("p4")
-        ids=list(first["selection"]["slide_ids"]); ids.reverse()
-        changed=self.s.select_samples("p4",ids)
-        self.assertFalse(changed["state"]["sample_confirmed"]); self.assertIsNone(changed["confirmation"])
-        with self.assertRaises(ConflictError): self.s.command("p4","advance-after-selection","advance")
         self.s.generate_sample("p4"); self.s.confirm_sample("p4")
         outline=self.s.planning_view("p4")["outline"]["markdown"]
         changed=self.s.edit_outline("p4",outline+"\n<!-- changed -->\n")
         self.assertFalse(changed["state"]["sample_confirmed"])
+        self.assertEqual(changed["state"]["stage"],"outline")
         with self.assertRaises(ConflictError): self.s.command("p4","advance-after-outline","advance")
     def test_html_security_negative_matrix(self):
         base='<!doctype html><html><body><section data-slide-id="slide-1">x</section></body></html>'

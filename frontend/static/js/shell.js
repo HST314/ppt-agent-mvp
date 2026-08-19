@@ -78,6 +78,14 @@ export function iconButton(name, label, onClick, extraClass = "") {
 
 export function showToast(message) {
   const region = document.getElementById("toast-region");
+  if (!region || !message) return;
+  const duplicate = [...region.querySelectorAll(".toast")].find((item) => item.textContent === message);
+  if (duplicate) {
+    duplicate.classList.remove("toast--repeat");
+    window.requestAnimationFrame(() => duplicate.classList.add("toast--repeat"));
+    return;
+  }
+  while (region.childElementCount >= 3) region.firstElementChild?.remove();
   const toast = element("div", { className: "toast", text: message, role: "status" });
   region.append(toast);
   window.setTimeout(() => toast.remove(), 4500);

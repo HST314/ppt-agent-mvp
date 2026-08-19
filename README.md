@@ -64,7 +64,7 @@ python -m pip install -r requirements.txt
 ### 3. 启动本地服务
 
 ```bash
-python scripts/start.py --data .ppt-agent-data --host 127.0.0.1 --port 8000
+python -m uvicorn main_front:app --host 127.0.0.1 --port 8000
 ```
 
 浏览器打开：
@@ -73,7 +73,7 @@ python scripts/start.py --data .ppt-agent-data --host 127.0.0.1 --port 8000
 - 健康检查：<http://127.0.0.1:8000/healthz>
 - 组件与交互状态：<http://127.0.0.1:8000/components>
 
-看到健康检查中的 `"status": "ok"` 和 `"runtime_ready": true`，说明服务已就绪。真实模型模式会在启动时分别验证严格 JSON Schema，以及合法工具调用 → `function_call_output` → 最终结构化结果的完整回合；探测失败时服务仍提供诊断端点，但 `/healthz` 返回 `status=unavailable`、`runtime_ready=false`，不能接收生产流量。
+Web 存活端点会先开放，历史 Job 恢复和真实模型能力探测在后台继续。看到 `/readyz` 中 `"runtime_ready": true`，说明依赖模型的操作已就绪；检测期间工作台会显示“后台初始化中”。真实模型模式会分别验证严格 JSON Schema，以及合法工具调用 → `function_call_output` → 最终结构化结果的完整回合；探测失败时服务仍可打开并提供诊断，但 `/readyz` 返回 503，模型 Job 不会入队。
 
 澄清阶段不开放 Skill 工具，模型直接根据冻结原文、规范化任务卡和资源摘要输出问题。其他阶段的工具错误按模型回合计数：同一响应的所有调用会完整返回结果，连续两个没有任何有效调用的错误回合才会失败关闭。
 
@@ -113,7 +113,7 @@ python scripts/start.py --data .ppt-agent-data --host 127.0.0.1 --port 8000
 .ppt-agent-data/demo/resources/
 ```
 
-如果启动时使用了 `--data /path/to/data`，对应路径就是：
+如果启动时设置了 `PPT_AGENT_DATA=/path/to/data`，对应路径就是：
 
 ```text
 /path/to/data/demo/resources/
@@ -195,12 +195,13 @@ MODEL_BASE_URL=https://your-provider.example/v1
 
 ```bash
 PPT_AGENT_CONFIG=config/ppt-agent.local.yaml \
-python3 scripts/start.py --data .ppt-agent-data --host 127.0.0.1 --port 8000
+PPT_AGENT_DATA=.ppt-agent-data \
+python -m uvicorn main_front:app --host 127.0.0.1 --port 8000
 ```
 
 真实模式要求兼容 Responses API 的模型端点。Base URL 必须使用 HTTPS，本机回环调试地址除外。生成与检查推荐使用独立模型配置；如果检查模型回退到生成模型，必须在配置中显式开启。
 
-启动后用 `/livez` 检查 Web 进程存活，用 `/readyz` 检查真实模型运行契约；模型认证、模型名、限流、上游故障或能力探测失败时 `/readyz` 返回 503，依赖模型的 Job 不会入队。修复配置或等待上游恢复后，可从工作台“显示与连接”执行一次显式重新检测。`/healthz` 保留兼容用途，并与 readiness 使用相同的 200/503 语义。
+启动后用 `/livez` 检查 Web 进程存活，用 `/readyz` 检查真实模型运行契约；模型认证、模型名、限流、上游故障或能力探测失败时 `/readyz` 返回 503，依赖模型的 Job 不会入队。修复配置或等待上游恢复后，可从工作台“设置 → 系统与显示”执行一次显式重新检测。`/healthz` 保留兼容用途，并与 readiness 使用相同的 200/503 语义。
 
 ## 工作流与架构
 

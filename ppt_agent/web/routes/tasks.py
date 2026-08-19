@@ -58,6 +58,7 @@ def get_shell(task_id: str, service: TaskService = Depends(task_service), jobs: 
     finalization = service.finalization_view(task_id)["current"]
     delivery_available = bool(finalization)
     current_index = next(index for index, item in enumerate(STAGES) if item[0] == state["stage"])
+    task_events=service.events(task_id)
     stages = []
     for index, (key, label, prerequisite) in enumerate(STAGES):
         if index == current_index:
@@ -76,6 +77,7 @@ def get_shell(task_id: str, service: TaskService = Depends(task_service), jobs: 
             "status": item_status,
             "lock_reason": f"前置条件：{prerequisite}" if item_status == "locked" else None,
             "href": f"/tasks/{task_id}?stage={key}",
+            "revision": state.get("revision") if index==current_index else next((event.get("from",{}).get("revision") for event in reversed(task_events) if event.get("from",{}).get("stage")==key and event.get("to",{}).get("stage")!=key),None),
         })
     return {
         "task": state,
@@ -83,7 +85,36 @@ def get_shell(task_id: str, service: TaskService = Depends(task_service), jobs: 
         "stages": stages,
         "active_jobs": jobs.list(task_id, "active"),
         "latest_jobs": jobs.latest_by_operation(task_id),
+        "branch": service.store.branch_context(task_id),
     }
+
+
+@router.get("/settings")
+def get_settings(service: TaskService = Depends(task_service)):
+    return service.settings_view()
+
+
+@router.put("/settings")
+async def update_settings(request: Request, service: TaskService = Depends(task_service), jobs: JobService = Depends(job_service)):
+    body=await json_body(request)
+    result=service.update_settings(body); jobs.apply_runtime_settings(); return result
+
+
+@router.get("/tasks/{task_id}/branches")
+def get_branches(task_id: str, service: TaskService = Depends(task_service)):
+    return service.store.branches(task_id)
+
+
+@router.post("/tasks/{task_id}/branches", status_code=status.HTTP_201_CREATED)
+async def create_branch(task_id: str, request: Request, service: TaskService = Depends(task_service), jobs: JobService = Depends(job_service)):
+    body=await json_body(request); exact(body,{"branch_id","source_branch","source_revision","switch"},{"branch_id"})
+    return jobs.create_branch(task_id,body["branch_id"],body.get("source_branch"),body.get("source_revision"),body.get("switch",True))
+
+
+@router.post("/tasks/{task_id}/branches/{branch_id}/switch")
+async def switch_branch(task_id: str, branch_id: str, request: Request, service: TaskService = Depends(task_service), jobs: JobService = Depends(job_service)):
+    body=await json_body(request); exact(body,set())
+    return jobs.switch_branch(task_id,branch_id)
 
 
 @router.get("/tasks/{task_id}/input")
@@ -312,8 +343,11 @@ async def command(task_id: str, request: Request, service: TaskService = Depends
 
 
 @router.get("/tasks/{task_id}/events")
-def get_events(task_id: str, service: TaskService = Depends(task_service)):
-    return {"events": service.events(task_id)}
+def get_events(task_id: str, limit: int = Query(default=100,ge=1,le=500), before_revision: int | None = Query(default=None,ge=0), service: TaskService = Depends(task_service)):
+    events=list(reversed(service.events(task_id)))
+    if before_revision is not None: events=[item for item in events if item.get("to",{}).get("revision",0)<before_revision]
+    page=events[:limit]
+    return {"events":page,"next_revision":page[-1].get("to",{}).get("revision") if len(events)>limit else None}
 
 
 @router.post("/tasks/{task_id}/versions/compare")

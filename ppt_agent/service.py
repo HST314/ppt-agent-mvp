@@ -52,6 +52,24 @@ class TaskService:
             if hasattr(gateway,"set_audit_sink"): gateway.set_audit_sink(self.store.append_agent_audit)
         if self._runtime_gateways():
             self._runtime_capabilities={"checked":False,"ready":False,"status":"not_checked","models":[]}
+        saved=self.store.runtime_settings()
+        workflow=saved.get("workflow",{}) if isinstance(saved,dict) else {}
+        generation_timeout=max((getattr(gateway,"job_timeout_seconds",0) for gateway in (self.clarifier,self.generator,self.builder) if gateway is not None),default=0) or 630
+        inspection_timeout=getattr(self.inspector,"job_timeout_seconds",0) or 630
+        self._clarification_config=ClarificationConfig(
+            workflow.get("max_questions_per_round",self._clarification_config.max_questions_per_round),
+            workflow.get("max_rounds",self._clarification_config.max_rounds),
+            workflow.get("style",self._clarification_config.style),
+        )
+        self._runtime_settings={
+            "workflow":self._clarification_config.public(),
+            "jobs":{
+                "generation_timeout_seconds":saved.get("jobs",{}).get("generation_timeout_seconds",generation_timeout),
+                "inspection_timeout_seconds":saved.get("jobs",{}).get("inspection_timeout_seconds",inspection_timeout),
+                "delivery_timeout_seconds":saved.get("jobs",{}).get("delivery_timeout_seconds",180),
+            },
+            "review":{"default_max_rounds":saved.get("review",{}).get("default_max_rounds",2)},
+        }
     def _runtime_gateways(self):
         return list({id(x):x for x in (self.generator,self.inspector,self.builder,self.clarifier) if hasattr(x,"probe_capabilities")}.values())
     def initialize_runtime(self):
@@ -128,6 +146,52 @@ class TaskService:
             "mode":"agent" if gateways else "fake",
             "gateways":sorted(gateway_summaries,key=lambda item:(item["model"],item["type"])),
         }
+    def settings_view(self):
+        with self._runtime_guard:
+            values=json.loads(json.dumps(self._runtime_settings))
+        return {
+            "values":values,
+            "models":self.runtime_config_summary(),
+            "schema":{
+                "workflow":{
+                    "max_questions_per_round":{"type":"integer","minimum":1,"maximum":10,"label":"每轮最多澄清问题"},
+                    "max_rounds":{"type":"integer","minimum":1,"maximum":5,"label":"最多澄清轮次"},
+                    "style":{"type":"select","options":["minimal","comprehensive"],"label":"澄清风格"},
+                },
+                "jobs":{
+                    "generation_timeout_seconds":{"type":"integer","minimum":30,"maximum":3660,"label":"生成 Job 时限（秒）"},
+                    "inspection_timeout_seconds":{"type":"integer","minimum":30,"maximum":3660,"label":"检查 Job 时限（秒）"},
+                    "delivery_timeout_seconds":{"type":"integer","minimum":30,"maximum":3660,"label":"交付 Job 时限（秒）"},
+                },
+                "review":{"default_max_rounds":{"type":"integer","minimum":0,"maximum":10,"label":"默认自动修复轮数"}},
+            },
+        }
+    def update_settings(self,value):
+        if not isinstance(value,dict) or set(value)-{"workflow","jobs","review"}: raise ValidationError("设置分组无效")
+        with self._runtime_guard:
+            merged=json.loads(json.dumps(self._runtime_settings))
+            for group,patch in value.items():
+                if not isinstance(patch,dict) or set(patch)-set(merged[group]): raise ValidationError(f"{group} 设置字段无效")
+                merged[group].update(patch)
+            workflow=merged["workflow"]
+            for key,minimum,maximum in (("max_questions_per_round",1,10),("max_rounds",1,5)):
+                item=workflow[key]
+                if isinstance(item,bool) or not isinstance(item,int) or not minimum<=item<=maximum: raise ValidationError(f"workflow.{key} 超出范围")
+            if workflow["style"] not in {"minimal","comprehensive"}: raise ValidationError("workflow.style 无效")
+            for key,item in merged["jobs"].items():
+                if isinstance(item,bool) or not isinstance(item,int) or not 30<=item<=3660: raise ValidationError(f"jobs.{key} 超出范围")
+            rounds=merged["review"]["default_max_rounds"]
+            if isinstance(rounds,bool) or not isinstance(rounds,int) or not 0<=rounds<=10: raise ValidationError("review.default_max_rounds 超出范围")
+            # Publish the durable snapshot before swapping the in-memory view;
+            # a failed write therefore cannot partially activate new settings.
+            self.store.save_runtime_settings(merged)
+            self._clarification_config=ClarificationConfig(workflow["max_questions_per_round"],workflow["max_rounds"],workflow["style"])
+            self._runtime_settings=merged
+        return self.settings_view()
+    def job_timeouts(self):
+        with self._runtime_guard: return dict(self._runtime_settings["jobs"])
+    def default_inspection_rounds(self):
+        with self._runtime_guard: return self._runtime_settings["review"]["default_max_rounds"]
     def require_runtime_ready(self):
         capabilities=self.runtime_health()
         if capabilities.get("ready"):
@@ -667,7 +731,9 @@ class TaskService:
     def generate_sample(self,task_id,prompt=None):
         from .execution import progress
         self._require_actionable(task_id)
-        view=self.sample_view(task_id); selection=view["selection"]
+        view=self.sample_view(task_id)
+        if view["state"]["stage"]!="sample": raise ConflictError("当前样品阶段已完成；历史样品只读")
+        selection=view["selection"]
         if not selection: view=self.select_samples(task_id); selection=view["selection"]
         outline=self._current_version(task_id,"outline")
         if selection["outline_hash"] != outline: raise ConflictError("样品选择已因大纲变化而失效")
@@ -684,6 +750,7 @@ class TaskService:
     def modify_sample(self,task_id,prompt,scope=None,slide_id=None,element_id=None):
         self._require_actionable(task_id)
         view=self.sample_view(task_id); sample=view["sample"]
+        if view["state"]["stage"]!="sample": raise ConflictError("当前样品阶段已完成；历史样品只读")
         if not sample: raise ConflictError("尚未生成样品")
         if not isinstance(prompt,str) or not prompt.strip(): raise ValidationError("修改 Prompt 不得为空")
         ids=list(view["selection"]["slide_ids"])
@@ -702,20 +769,30 @@ class TaskService:
         self._invalidate_sample_gate(task_id,h)
         return self.sample_view(task_id)
     def confirm_sample(self,task_id):
-        self._require_actionable(task_id)
-        view=self.sample_view(task_id); sample=view["sample"]; outline=self._current_version(task_id,"outline")
-        selection=view["selection"]
-        if (not sample or not selection or sample["outline_hash"] != outline
-            or selection["outline_hash"] != outline
-            or sample["metadata"].get("selection_hash") != selection["hash"]):
-            raise ConflictError("须先基于当前大纲和页面选择重新生成样品")
-        state=TaskState.parse(self.get(task_id)); new=transition(state,"confirm_sample",actor="user")
-        pages=self._slide_fragments(sample["html"])
-        if set(pages) != set(selection["slide_ids"]): raise ConflictError("样品页面边界无效，无法确认")
-        confirmed_pages={sid:{"html":fragment,"sha256":digest(fragment.encode())} for sid,fragment in pages.items()}
-        result={"confirmed_outline_hash":outline,"confirmed_sample_hash":sample["hash"],"confirmed_content_hash":sample["content_hash"],"selection_hash":view["selection"]["hash"],"confirmed_pages":confirmed_pages}
-        event={"event_id":hashlib.sha256(f"{task_id}:confirm-sample:{sample['hash']}".encode()).hexdigest()[:24],"command_id":f"confirm-sample-{sample['hash'][:16]}","action":"confirm_sample_version","actor":"user","request_hash":sample["hash"],"at":utcnow(),"from":state.to_dict(),"to":new.to_dict(),"result":result}
-        self.store.commit(task_id,new.to_dict(),event); return self.sample_view(task_id)
+        # Validation, the immutable confirmation fact and stage advancement are
+        # one task-local transaction.  A repeated request after a lost response
+        # returns the same fact without advancing revision a second time.
+        with self.store.lock(task_id):
+            self._require_actionable(task_id)
+            view=self.sample_view(task_id); sample=view["sample"]; outline=self._current_version(task_id,"outline")
+            selection=view["selection"]
+            if (not sample or not selection or sample["outline_hash"] != outline
+                or selection["outline_hash"] != outline
+                or sample["metadata"].get("selection_hash") != selection["hash"]):
+                raise ConflictError("须先基于当前大纲和页面选择重新生成样品")
+            state=TaskState.parse(self.get(task_id))
+            if state.stage==state.stage.DECK and state.sample_confirmed and view["confirmation"]:
+                return view
+            if state.stage!=state.stage.SAMPLE:
+                raise ConflictError("当前阶段不能确认样品")
+            pages=self._slide_fragments(sample["html"])
+            if set(pages) != set(selection["slide_ids"]): raise ConflictError("样品页面边界无效，无法确认")
+            new=transition(state,"confirm_sample",actor="user")
+            confirmed_pages={sid:{"html":fragment,"sha256":digest(fragment.encode())} for sid,fragment in pages.items()}
+            result={"confirmed_outline_hash":outline,"confirmed_sample_hash":sample["hash"],"confirmed_content_hash":sample["content_hash"],"selection_hash":view["selection"]["hash"],"confirmed_pages":confirmed_pages}
+            event={"event_id":hashlib.sha256(f"{task_id}:confirm-sample:{sample['hash']}".encode()).hexdigest()[:24],"command_id":f"confirm-sample-{sample['hash'][:16]}","action":"confirm_sample_version","actor":"user","request_hash":sample["hash"],"at":utcnow(),"from":state.to_dict(),"to":new.to_dict(),"result":result}
+            self.store.commit(task_id,new.to_dict(),event)
+            return self.sample_view(task_id)
 
     @staticmethod
     def _slide_fragments(html_text):
@@ -776,7 +853,7 @@ class TaskService:
     def generate_deck(self,task_id):
         with self.store.lock(task_id):
             sample_view=self.sample_view(task_id); self._require_current_sample_confirmation(task_id)
-            token=self._candidate_write_token(task_id,{"sample","deck"})
+            token=self._candidate_write_token(task_id,{"deck"})
         outline=self._current_version(task_id,"outline"); data=json.loads(self.version(task_id,outline)); ids=list(data["slide_ids"])
         sample=sample_view["sample"]; meta=sample["metadata"]
         assets=controlled_assets(self.input_view(task_id)["manifest"],self.store.resource_root(task_id))
@@ -807,11 +884,7 @@ class TaskService:
         html_text=validate_html(html_text,ids,assets); deck_fragments=self._slide_fragments(html_text)
         preserved={sid:digest(deck_fragments[sid].encode())==digest(fragment.encode()) for sid,fragment in sample_fragments.items()}
         if not all(preserved.values()): raise ConflictError("确认样品发生未提示变化")
-        result=self._commit_candidate_deck(task_id,html_text,outline,{"parent":token["parent_deck_hash"],"summary":"生成未检查候选稿","scope":"global","affected":ids,"sample_hash":sample["hash"],"sample_pages_preserved":preserved,"outline_consistent":True,"inspection_status":"pending","global_rules":meta.get("global_rules",[]),"local_exceptions":meta.get("local_exceptions",{})},"deck_generate",token)
-        if token["stage"]=="sample":
-            self.command(task_id,f"to-deck-{sample['hash'][:12]}","advance","system")
-            result=self.deck_view(task_id)
-        return result
+        return self._commit_candidate_deck(task_id,html_text,outline,{"parent":token["parent_deck_hash"],"summary":"生成未检查候选稿","scope":"global","affected":ids,"sample_hash":sample["hash"],"sample_pages_preserved":preserved,"outline_consistent":True,"inspection_status":"pending","global_rules":meta.get("global_rules",[]),"local_exceptions":meta.get("local_exceptions",{})},"deck_generate",token)
     def modify_deck(self,task_id,prompt,change_type="visual",scope=None,slide_ids=None,element_id=None):
         with self.store.lock(task_id):
             token=self._candidate_write_token(task_id)

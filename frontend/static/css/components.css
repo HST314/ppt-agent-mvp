@@ -71,6 +71,7 @@
 
 .toast-region { position: fixed; z-index: var(--z-toast); inset: auto max(var(--space-4), env(safe-area-inset-right)) max(var(--space-4), env(safe-area-inset-bottom)) auto; width: min(24rem, calc(100vw - 2rem)); display: grid; gap: var(--space-2); }
 .toast { padding: var(--space-3) var(--space-4); border: 1px solid var(--color-border-strong); border-radius: var(--radius-sm); background: var(--color-surface-raised); box-shadow: var(--shadow-md); }
+@media (prefers-reduced-motion: no-preference) { .toast--repeat { animation: toast-repeat 220ms ease-out; } @keyframes toast-repeat { 50% { transform: translateY(-.2rem); border-color: var(--color-primary); } } }
 
 .task-list { display: grid; gap: var(--space-2); margin: 0; padding: 0; list-style: none; }
 .task-link { width: 100%; min-height: 3.2rem; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: var(--space-3); padding: var(--space-2) var(--space-3); color: var(--color-foreground); text-decoration: none; border: 1px solid transparent; border-radius: var(--radius-sm); }

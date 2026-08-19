@@ -54,6 +54,13 @@ export const api = {
   listTasks: (controller) => request("/v1/tasks", { controller }),
   createTask: (payload) => request("/v1/tasks", { method: "POST", body: payload }),
   shell: (taskId, controller) => request(`/v1/tasks/${encodeURIComponent(taskId)}/shell`, { controller }),
+  settings: (controller) => request("/v1/settings", { controller }),
+  updateSettings: (payload) => request("/v1/settings", { method: "PUT", body: payload }),
+  branches: (taskId, controller) => request(`${taskPath(taskId)}/branches`, { controller }),
+  createBranch: (taskId, payload) => post(`${taskPath(taskId)}/branches`, payload),
+  switchBranch: (taskId, branchId) => post(`${taskPath(taskId)}/branches/${encodeURIComponent(branchId)}/switch`, {}),
+  taskEvents: (taskId, { limit = 100, beforeRevision = null } = {}) => request(`${taskPath(taskId)}/events?limit=${encodeURIComponent(limit)}${beforeRevision === null ? "" : `&before_revision=${encodeURIComponent(beforeRevision)}`}`),
+  taskAgentAudits: (taskId, jobId = null) => request(`${taskPath(taskId)}/agent-audits${jobId ? `?job_id=${encodeURIComponent(jobId)}` : ""}`),
   task: (taskId, controller) => request(taskPath(taskId), { controller }),
   input: (taskId, controller) => request(`${taskPath(taskId)}/input`, { controller }),
   importInput: (taskId, payload) => post(`${taskPath(taskId)}/input`, payload),
@@ -90,6 +97,13 @@ export const api = {
   jobEventHistory: (jobId, after = 0) => request(`/v1/jobs/${encodeURIComponent(jobId)}/event-history?after=${encodeURIComponent(after)}&limit=500`),
   jobAgentAudits: (jobId) => request(`/v1/jobs/${encodeURIComponent(jobId)}/agent-audits`),
   activeJobs: (taskId) => request(`/v1/tasks/${encodeURIComponent(taskId)}/jobs?status=active`),
+  jobs: (taskId, { status = "", operation = "", limit = 25, before = "" } = {}) => {
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (status) query.set("status", status);
+    if (operation) query.set("operation", operation);
+    if (before) query.set("before", before);
+    return request(`/v1/tasks/${encodeURIComponent(taskId)}/jobs?${query}`);
+  },
   createJob: (taskId, payload) => request(`/v1/tasks/${encodeURIComponent(taskId)}/jobs`, { method: "POST", body: payload }),
   cancelJob: (jobId) => request(`/v1/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST", body: {} }),
 };

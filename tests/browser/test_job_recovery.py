@@ -243,6 +243,8 @@ class JobRecoveryBrowserGate(unittest.TestCase):
         page.emulate_media(reduced_motion="reduce", color_scheme="dark")
         page.add_init_script("localStorage.setItem('ppt-agent:theme', 'dark')")
         self.start_first_job(page)
+        page.get_by_role("link", name="状态", exact=True).click()
+        page.get_by_role("heading", name="运行状态", exact=True).wait_for()
         panel = page.locator(".job-panel")
         panel.wait_for()
 

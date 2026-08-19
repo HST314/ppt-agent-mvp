@@ -20,11 +20,13 @@ export function currentRoute() {
   const taskId = decodeURIComponent(match[1]);
   const legacy = match[2];
   const stage = legacy ? LEGACY_STAGES.get(legacy) : url.searchParams.get("stage");
+  const view = ["workspace", "status", "settings"].includes(url.searchParams.get("view")) ? url.searchParams.get("view") : "workspace";
   if (legacy && stage) {
     const canonical = `/tasks/${encodeURIComponent(taskId)}?stage=${encodeURIComponent(stage)}`;
     window.history.replaceState({}, "", canonical);
   }
-  return { name: "workspace", taskId, stage: stage || null };
+  const sourceRevision = Number.parseInt(url.searchParams.get("branch_from_revision") || "", 10);
+  return { name: "workspace", taskId, stage: stage || null, view, sourceRevision: Number.isInteger(sourceRevision) ? sourceRevision : null, sourceStage: url.searchParams.get("branch_from_stage") || null };
 }
 
 export function navigate(path, { replace = false } = {}) {

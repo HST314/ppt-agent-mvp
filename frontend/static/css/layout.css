@@ -20,6 +20,10 @@
 .topbar__context { min-width: 0; display: flex; align-items: center; gap: var(--space-2); color: var(--color-muted-foreground); }
 .topbar__context strong { max-width: 18rem; color: var(--color-foreground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .topbar__actions { margin-inline-start: auto; display: flex; align-items: center; gap: var(--space-2); }
+.primary-nav { align-self: stretch; display: flex; align-items: center; gap: var(--space-1); }
+.primary-nav__link { min-height: 2.75rem; display: inline-flex; align-items: center; padding: 0 var(--space-3); color: var(--color-muted-foreground); border-radius: var(--radius-sm); font-weight: 700; text-decoration: none; }
+.primary-nav__link:hover { color: var(--color-foreground); background: var(--color-muted); }
+.primary-nav__link[aria-current="page"] { color: var(--color-primary); background: color-mix(in srgb, var(--color-primary) 10%, var(--color-surface)); }
 .runtime-status { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-1); }
 .topbar .menu-button { display: none; }
 
@@ -44,6 +48,26 @@
 .workspace__inner { width: min(100%, var(--content-max)); margin-inline: auto; }
 .workspace-header { display: flex; align-items: start; justify-content: space-between; gap: var(--space-4); margin-bottom: var(--space-5); }
 .workspace-header p { color: var(--color-muted-foreground); }
+.creation-progress { margin-bottom: var(--space-5); overflow: hidden; }
+.creation-progress__header { display: flex; align-items: start; justify-content: space-between; gap: var(--space-4); margin-bottom: var(--space-4); }
+.creation-progress__header h2, .creation-progress__header .eyebrow { margin-bottom: var(--space-1); }
+.progress-rail { display: grid; grid-template-columns: repeat(8, minmax(6.25rem, 1fr)); gap: var(--space-2); margin: 0; padding: 0 0 var(--space-2); overflow-x: auto; list-style: none; scrollbar-width: thin; }
+.progress-node { position: relative; min-height: 5rem; display: grid; grid-template-columns: 1.75rem minmax(0, 1fr); align-content: start; gap: var(--space-1) var(--space-2); padding: var(--space-3); color: var(--color-foreground); border: 1px solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-muted); text-decoration: none; }
+.progress-node:hover { color: var(--color-foreground); border-color: var(--color-primary); }
+.progress-node[aria-current="step"] { border-color: var(--color-primary); background: color-mix(in srgb, var(--color-primary) 8%, var(--color-surface)); box-shadow: inset 0 0 0 1px var(--color-primary); }
+.progress-node[data-status="completed"] { border-color: color-mix(in srgb, var(--color-success) 32%, var(--color-border)); }
+.progress-node[aria-disabled="true"] { color: var(--color-muted-foreground); }
+.progress-node__index { width: 1.75rem; height: 1.75rem; display: grid; place-items: center; color: var(--color-on-primary); background: var(--color-primary); border-radius: 50%; font-size: .75rem; font-weight: 800; }
+.progress-node[data-status="completed"] .progress-node__index { background: var(--color-success); }
+.progress-node[data-status="locked"] .progress-node__index { color: var(--color-muted-foreground); background: var(--color-surface); border: 1px solid var(--color-border-strong); }
+.progress-node__label { align-self: center; font-size: .875rem; font-weight: 750; }
+.progress-node small { grid-column: 1 / -1; color: var(--color-muted-foreground); font-size: .72rem; line-height: 1.3; }
+.progress-node-wrap { position: relative; min-width: 6.25rem; }
+.progress-node-wrap .progress-node { height: 100%; }
+.progress-node__branch { width: calc(100% - var(--space-2)); min-height: 2rem; position: absolute; z-index: 1; inset: auto var(--space-1) var(--space-1); padding: .2rem var(--space-1); font-size: .7rem; opacity: 0; }
+.progress-node-wrap:hover .progress-node__branch, .progress-node__branch:focus-visible { opacity: 1; }
+.progress-node-wrap:has(.progress-node__branch) .progress-node { padding-bottom: 2.35rem; }
+.workspace-jobs { display: grid; gap: var(--space-3); margin-bottom: var(--space-5); }
 
 .home { width: min(100% - 2rem, 72rem); margin-inline: auto; padding: clamp(2rem, 6vw, 5rem) 0 max(3rem, env(safe-area-inset-bottom)); }
 .home-hero { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(18rem, 0.8fr); gap: clamp(1.5rem, 5vw, 4rem); align-items: center; margin-bottom: clamp(2rem, 6vw, 4rem); }
@@ -62,8 +86,17 @@
 
 .drawer-scrim { display: none; }
 
+@media (max-width: 1180px) {
+  .topbar__context .context-label, .topbar__actions .badge--build { display: none; }
+}
+
 @media (max-width: 1023px) {
   .topbar .menu-button { display: inline-flex; }
+  .topbar__context .context-label, .topbar__actions .badge--connection, .topbar__actions .badge--build { display: none; }
+  .primary-nav { position: fixed; z-index: calc(var(--z-header) - 1); inset: calc(100dvh - 3.75rem - env(safe-area-inset-bottom)) 0 auto; height: calc(3.75rem + env(safe-area-inset-bottom)); align-self: auto; justify-content: space-around; padding: var(--space-1) max(var(--space-2), env(safe-area-inset-right)) max(var(--space-1), env(safe-area-inset-bottom)) max(var(--space-2), env(safe-area-inset-left)); border-top: 1px solid var(--color-border); background: color-mix(in srgb, var(--color-surface) 96%, transparent); backdrop-filter: blur(16px); }
+  .primary-nav__link { flex: 1; justify-content: center; }
+  .progress-node__branch { opacity: 1; }
+  .workspace { padding-bottom: calc(5rem + env(safe-area-inset-bottom)); }
   .shell-grid { grid-template-columns: 1fr; }
   .sidebar { position: fixed; z-index: var(--z-drawer); inset: 0 auto 0 0; width: min(21rem, calc(100vw - 3rem)); height: 100dvh; top: 0; transform: translateX(-105%); box-shadow: var(--shadow-md); }
   .sidebar[data-open="true"] { transform: translateX(0); }
@@ -75,7 +108,8 @@
 @media (max-width: 767px) {
   .topbar { gap: var(--space-2); }
   .topbar__title { display: none; }
-  .topbar__context .context-label, .topbar__actions .badge--connection, .topbar__actions .badge--build { display: none; }
+  .topbar__context .badge { display: none; }
+  .creation-progress__header { align-items: stretch; flex-direction: column; }
   .workspace-header { display: block; }
   .home-hero, .home-grid { grid-template-columns: 1fr; }
   .hero-art { min-height: 12rem; order: -1; }
