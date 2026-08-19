@@ -1,4 +1,5 @@
 """FastAPI application shell browser, responsive and accessibility gate."""
+import base64
 import socket
 import tempfile
 import threading
@@ -12,6 +13,27 @@ from ppt_agent.errors import GatewayError
 from ppt_agent.service import TaskService
 from ppt_agent.store import WorkspaceStore
 from ppt_agent.web import create_app
+
+PNG_1X1 = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+
+
+class BrowserImageBuilder:
+    version = "browser-image-builder"
+
+    def build(self, _outline, **context):
+        data_url = next(iter(context["assets"].values()))
+        sections = []
+        for index, slide_id in enumerate(context["slide_ids"]):
+            images = ""
+            if index == 0:
+                images = (
+                    f'<img id="data-image" src="{data_url}" alt="Base64">'
+                    '<img id="relative-image" src="hero.png" alt="Relative">'
+                    '<img id="remote-image" src="https://images.example/remote.png" alt="Remote">'
+                    '<div id="css-image" style="width:20px;height:20px;background-image:url(hero.png)"></div>'
+                )
+            sections.append(f'<section class="slide" id="{slide_id}" data-slide-id="{slide_id}">{images}</section>')
+        return '<!doctype html><html><head><meta charset="utf-8"></head><body>' + "".join(sections) + "</body></html>"
 
 
 def model_question():
@@ -140,11 +162,13 @@ class FastAPIShellBrowserGate(unittest.TestCase):
             page.get_by_role("heading", name="任务/资料").wait_for()
             self.assert_no_page_overflow(page)
             if width < 1024:
-                page.get_by_role("button", name="打开任务与阶段导航").click()
+                menu = page.get_by_role("button", name="打开任务与阶段导航")
+                menu.click()
                 self.assertEqual(page.locator(".sidebar").get_attribute("data-open"), "true")
                 self.assertEqual(page.locator(".stage-list > li").count(), 8)
                 page.keyboard.press("Escape")
                 self.assertEqual(page.locator(".sidebar").get_attribute("data-open"), "false")
+                self.assertTrue(menu.evaluate("node => document.activeElement === node"))
             duration = page.locator(".button").first.evaluate("node => getComputedStyle(node).transitionDuration")
             self.assertIn(duration, {"0s", "1e-05s", "0.00001s"})
             if width == 375:
@@ -160,6 +184,53 @@ class FastAPIShellBrowserGate(unittest.TestCase):
         page.get_by_role("button", name="打开确认对话框").click()
         self.assertTrue(page.get_by_role("dialog").is_visible())
         page.get_by_role("dialog").get_by_role("button", name="取消").click()
+        self.assertEqual(errors, [])
+        page.close()
+
+    def test_storage_security_error_falls_back_without_breaking_shell(self):
+        self.service.create("storage-denied")
+        page, errors = self.new_page(375, 820)
+        page.add_init_script("""
+            for (const method of ['getItem', 'setItem', 'removeItem']) {
+              Object.defineProperty(Storage.prototype, method, {
+                configurable: true,
+                value() { throw new DOMException('blocked by policy', 'SecurityError'); },
+              });
+            }
+        """)
+        page.goto(self.base + "/tasks/storage-denied")
+        page.get_by_role("heading", name="任务/资料", exact=True).wait_for()
+        page.get_by_role("button", name="打开任务与阶段导航").click()
+        page.keyboard.press("Escape")
+        page.get_by_role("button", name="切换深色主题").click()
+        self.assertEqual(page.locator("html").get_attribute("data-theme"), "dark")
+        self.assert_no_page_overflow(page)
+        self.assertEqual(errors, [])
+        page.close()
+
+    def test_preview_decodes_base64_relative_remote_and_css_images(self):
+        self.service.create("preview-images")
+        self.service.store.put_resource("preview-images", "hero.png", PNG_1X1)
+        self.service.import_input("preview-images", {"goal": "发布", "audience": "客户", "topic": "图片预览", "页数": 2})
+        self.service.generate_narrative("preview-images")
+        self.service.confirm_narrative("preview-images")
+        self.service.generate_outline("preview-images")
+        self.service.confirm_outline("preview-images")
+        self.service.builder = BrowserImageBuilder()
+        sample = self.service.generate_sample("preview-images")["sample"]
+
+        page, errors = self.new_page()
+        remote_requests = []
+        page.route("https://images.example/remote.png", lambda route: (
+            remote_requests.append(route.request.url),
+            route.fulfill(status=200, content_type="image/png", body=PNG_1X1),
+        )[-1])
+        page.goto(f"{self.base}/v1/tasks/preview-images/previews/{sample['hash']}")
+        page.locator("#remote-image").wait_for()
+        for selector in ("#data-image", "#relative-image", "#remote-image"):
+            self.assertTrue(page.locator(selector).evaluate("node => node.complete && node.naturalWidth === 1"))
+        self.assertIn("preview-assets", page.locator("#css-image").evaluate("node => getComputedStyle(node).backgroundImage"))
+        self.assertEqual(remote_requests, ["https://images.example/remote.png"])
         self.assertEqual(errors, [])
         page.close()
 

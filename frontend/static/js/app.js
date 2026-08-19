@@ -1,10 +1,10 @@
-import { api, ApiError } from "./api.js?v=2026.08.17.112846263255";
-import { JobTracker } from "./job-tracker.js?v=2026.08.17.112846263255";
-import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.17.112846263255";
-import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.17.112846263255";
-import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.17.112846263255";
-import { inlineError, setBusy } from "./components/index.js?v=2026.08.17.112846263255";
-import { renderStage } from "./stages/index.js?v=2026.08.17.112846263255";
+import { api, ApiError } from "./api.js?v=2026.08.19.043945581370";
+import { JobTracker } from "./job-tracker.js?v=2026.08.19.043945581370";
+import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.19.043945581370";
+import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.19.043945581370";
+import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.19.043945581370";
+import { inlineError, setBusy } from "./components/index.js?v=2026.08.19.043945581370";
+import { renderStage } from "./stages/index.js?v=2026.08.19.043945581370";
 
 const app = document.getElementById("app");
 const APP_BUILD = document.querySelector('meta[name="app-build"]')?.content || "unknown";
@@ -39,6 +39,8 @@ const OPERATION_STAGES = {
   "deck.generate": ["sample", "deck"],
   "deck.modify": ["deck", "review"],
   "inspection.run": ["deck", "review"],
+  "inspection.fix": ["review"],
+  "delivery.publish": ["delivery"],
 };
 
 const JOB_ERROR_PRESENTATIONS = {
@@ -314,13 +316,20 @@ async function renderWorkspace(route, generation) {
     document.title = `${shell.task.task_id} · PPT Agent`;
     let sidebar;
     let scrim;
-    const closeDrawer = () => {
+    const closeDrawer = (restoreFocus = true) => {
       sidebar.dataset.open = "false";
       scrim.dataset.open = "false";
+      if (window.matchMedia("(max-width: 1023px)").matches) {
+        sidebar.inert = true;
+        sidebar.setAttribute("aria-hidden", "true");
+      }
+      if (restoreFocus) document.querySelector(".menu-button")?.focus();
     };
     const openDrawer = () => {
       sidebar.dataset.open = "true";
       scrim.dataset.open = "true";
+      sidebar.inert = false;
+      sidebar.setAttribute("aria-hidden", "false");
       sidebar.querySelector("button, a")?.focus();
     };
     const selected = shell.stages.find((stage) => stage.id === route.stage) || shell.stages.find((stage) => stage.status === "current");
@@ -334,6 +343,20 @@ async function renderWorkspace(route, generation) {
       ]),
       scrim,
     ]);
+    if (window.matchMedia("(max-width: 1023px)").matches) {
+      sidebar.inert = true;
+      sidebar.setAttribute("aria-hidden", "true");
+    }
+    const drawerMedia = window.matchMedia("(max-width: 1023px)");
+    drawerMedia.addEventListener("change", (event) => {
+      if (event.matches && sidebar.dataset.open !== "true") {
+        sidebar.inert = true;
+        sidebar.setAttribute("aria-hidden", "true");
+      } else if (!event.matches) {
+        sidebar.inert = false;
+        sidebar.removeAttribute("aria-hidden");
+      }
+    }, { signal: activeController.signal });
     replaceApp(page);
     shell.active_jobs.forEach((job) => connectJob(job, route));
     const recentJob = latestRelevantJob(shell, selected);
@@ -384,7 +407,7 @@ function workspaceSidebar(shell, recent, selected, closeDrawer) {
         intercept(event);
         closeDrawer();
       },
-    }, [element("span", { className: "stage-index", text: stage.status === "completed" ? "✓" : String(index + 1) }), label]);
+    }, [element("span", { className: "stage-index", text: stage.status === "completed" ? "✓" : stage.status === "skipped" ? "—" : String(index + 1) }), label]);
     stages.append(element("li", { className: "stage-item" }, link));
   });
   return element("aside", { className: "sidebar", "aria-label": "任务与阶段导航", "data-open": "false", onKeydown: (event) => {
@@ -707,6 +730,7 @@ async function startJob(taskId, operation, payload, route, { buttonNode = null, 
     buttonNode,
     region,
     intent,
+    requiresRuntime: operation !== "delivery.publish",
     create: () => api.createJob(taskId, { operation, payload, idempotency_key: intent.value }),
   });
 }
@@ -726,12 +750,12 @@ async function retryClarification(taskId, route, { buttonNode = null, region = n
   return job;
 }
 
-async function startTrackedJob({ taskId, route, buttonNode, region, intent, create, busyLabel = "正在创建后台任务…" }) {
+async function startTrackedJob({ taskId, route, buttonNode, region, intent, create, requiresRuntime = true, busyLabel = "正在创建后台任务…" }) {
   region?.replaceChildren();
   setBusy(buttonNode, true, busyLabel);
   try {
-    await refreshRuntimeStatus();
-    if (!runtimeState.runtimeReady) {
+    if (requiresRuntime) await refreshRuntimeStatus();
+    if (requiresRuntime && !runtimeState.runtimeReady) {
       throw new ApiError("模型运行时不可用，请先在连接状态中重新检测", { code: "runtime_unavailable", status: 503 });
     }
     const job = await create();
@@ -1073,11 +1097,11 @@ function heroArt() {
 }
 
 function operationLabel(operation) {
-  return ({ "clarification.generate": "AI 阅读任务卡并生成问题", "narrative.generate": "生成叙事结构", "outline.generate": "生成逐页大纲", "samples.generate": "生成样品", "samples.modify": "修改样品", "deck.generate": "生成全稿", "deck.modify": "修改全稿", "inspection.run": "执行独立检查" })[operation] || operation;
+  return ({ "clarification.generate": "AI 阅读任务卡并生成问题", "narrative.generate": "生成叙事结构", "outline.generate": "生成逐页大纲", "samples.generate": "生成样品", "samples.modify": "修改样品", "deck.generate": "生成全稿", "deck.modify": "修改全稿", "inspection.run": "执行独立检查", "inspection.fix": "修复检查问题", "delivery.publish": "写入离线包" })[operation] || operation;
 }
 
 function stageLabel(stage) {
-  return ({ created: "任务/资料", clarification: "澄清", narrative: "叙事结构", outline: "逐页大纲", sample: "样品", deck: "全稿", review: "检查", delivery: "交付" })[stage] || stage;
+  return ({ created: "任务/资料", clarification: "澄清", narrative: "叙事结构", outline: "逐页大纲", sample: "样品", deck: "全稿", review: "自检与修改", delivery: "交付" })[stage] || stage;
 }
 
 function replaceApp(node) {

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-import base64, hashlib, html, re
+import base64, binascii, hashlib, html, re
 from html.parser import HTMLParser
+from pathlib import PurePosixPath
+from urllib.parse import unquote, urlsplit
 
 from .errors import ValidationError
 
@@ -87,7 +89,7 @@ SAFE_CSS_FUNCTIONS = {
     # 颜色
     "rgb", "rgba", "hsl", "hsla", "hwb", "lab", "lch", "oklab", "oklch", "color-mix", "color", "light-dark",
     # 渐变
-    "linear-gradient", "radial-gradient", "conic-gradient",
+    "linear-gradient", "radial-gradient", "conic-gradient", "url",
     "repeating-linear-gradient", "repeating-radial-gradient",
     # 2D / 3D 变形
     "translate", "translatex", "translatey", "translatez", "translate3d",
@@ -106,6 +108,101 @@ SAFE_CSS_FUNCTIONS = {
     "nth-child", "nth-last-child", "nth-of-type", "nth-last-of-type",
     "first-child", "last-child", "not", "is", "where", "has", "lang"
 }
+
+IMAGE_MEDIA_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+MAX_DATA_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_IMAGE_REFERENCES = 30
+CSS_URL = re.compile(r"url\s*\(\s*(?:(['\"])(.*?)\1|([^)]*))\s*\)", re.I | re.S)
+
+
+def _decoded_url(value: str) -> str:
+    decoded = _canonical(value).strip()
+    for _ in range(3):
+        current = unquote(decoded)
+        if current == decoded:
+            break
+        decoded = current
+    return decoded
+
+
+def _valid_image_bytes(media_type: str, data: bytes) -> bool:
+    return {
+        "image/png": data.startswith(b"\x89PNG\r\n\x1a\n"),
+        "image/jpeg": data.startswith(b"\xff\xd8\xff"),
+        "image/gif": data.startswith((b"GIF87a", b"GIF89a")),
+        "image/webp": len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP",
+    }.get(media_type, False)
+
+
+def validate_image_url(value: str) -> str:
+    """Validate one inert image reference without applying global text scans."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError("图片 URL 不能为空")
+    value = _decoded_url(value)
+    lowered = value.lower()
+    if lowered.startswith("data:"):
+        match = re.fullmatch(r"data:(image/(?:png|jpeg|gif|webp));base64,([a-z0-9+/=\s]+)", value, re.I)
+        if not match:
+            raise ValidationError("Base64 图片格式或媒体类型不允许")
+        try:
+            data = base64.b64decode(re.sub(r"\s+", "", match.group(2)), validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValidationError("Base64 图片内容无效") from exc
+        media_type = match.group(1).lower()
+        if len(data) > MAX_DATA_IMAGE_BYTES:
+            raise ValidationError("Base64 图片超过 10 MiB 限制")
+        if not _valid_image_bytes(media_type, data):
+            raise ValidationError("Base64 图片内容与媒体类型不匹配")
+        return value
+    parsed = urlsplit(value)
+    if parsed.scheme:
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+            raise ValidationError("图片 URL 协议或凭据不允许")
+        return value
+    if value.startswith(("//", "/", "\\", "?", "#")) or "\\" in value:
+        raise ValidationError("图片相对路径无效")
+    path = PurePosixPath(parsed.path)
+    if not parsed.path or path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        raise ValidationError("图片相对路径无效")
+    return value
+
+
+def _css_urls(css: str) -> list[str]:
+    matches = list(CSS_URL.finditer(css))
+    if len(re.findall(r"url\s*\(", css, re.I)) != len(matches):
+        raise ValidationError("CSS url() 语法无效")
+    urls = []
+    for match in matches:
+        value = (match.group(2) if match.group(1) else match.group(3) or "").strip()
+        urls.append(validate_image_url(value))
+    return urls
+
+
+def _css_declarations(block: str) -> list[str]:
+    declarations, current = [], []
+    quote = None
+    depth = 0
+    for character in block:
+        if quote:
+            current.append(character)
+            if character == quote:
+                quote = None
+        elif character in {"'", '"'}:
+            quote = character
+            current.append(character)
+        elif character == "(":
+            depth += 1
+            current.append(character)
+        elif character == ")":
+            depth = max(0, depth - 1)
+            current.append(character)
+        elif character == ";" and depth == 0:
+            declarations.append("".join(current))
+            current = []
+        else:
+            current.append(character)
+    declarations.append("".join(current))
+    return declarations
 
 
 def _canonical(value: str) -> str:
@@ -143,13 +240,11 @@ def _canonical(value: str) -> str:
     return "".join(result)
 
 
-def _validate_css(css: str) -> None:
+def _validate_css(css: str) -> list[str]:
     css = re.sub(r"/\*.*?\*/", "", _canonical(css), flags=re.S)
     
-    # 拦截 @import、外部资源引用与路径穿越，但允许本地 @media / @keyframes 规则
-    if re.search(r"@\s*(?:import|font-face|charset|namespace)\b", css, re.I) or re.search(
-        r"(?:https?|file|resources)\s*:|(?:^|[^:])/[/\\]|\.\.[/\\]", css, re.I
-    ):
+    # 外部 URL 只允许出现在背景图片 url() 中；其余主动加载规则仍禁止。
+    if re.search(r"@\s*(?:import|font-face|charset|namespace)\b", css, re.I):
         raise ValidationError("CSS 包含规则或任务外资源")
         
     # 检查 CSS 函数是否在安全白名单中
@@ -159,16 +254,23 @@ def _validate_css(css: str) -> None:
         raise ValidationError(f"CSS 包含不允许的函数: {', '.join(sorted(unallowed))}")
         
     # 检查 CSS 属性
+    urls = []
     for block in re.findall(r"\{([^{}]*)\}", css, re.S) or [css]:
-        for declaration in block.split(";"):
+        for declaration in _css_declarations(block):
             if not declaration.strip():
                 continue
             if ":" not in declaration:
                 raise ValidationError("CSS 声明无效")
-            prop = declaration.split(":", 1)[0].strip().lower()
+            prop, value = (part.strip() for part in declaration.split(":", 1))
+            prop = prop.lower()
             # 允许 CSS 变量 (--*) 以及白名单属性
             if not (prop.startswith("--") or prop in CSS_PROPERTIES):
                 raise ValidationError(f"CSS 属性不在白名单: {prop}")
+            declaration_urls = _css_urls(value)
+            if declaration_urls and prop not in {"background", "background-image"}:
+                raise ValidationError("CSS url() 仅允许用于背景图片")
+            urls.extend(declaration_urls)
+    return urls
 
 class _SafeHtmlParser(HTMLParser):
     def __init__(self, allowed_assets=()):
@@ -177,7 +279,21 @@ class _SafeHtmlParser(HTMLParser):
         self.styles = []
         self._in_style = False
         self.slide_ids = []
-        self.allowed_assets = set(allowed_assets)
+        keys = allowed_assets.keys() if isinstance(allowed_assets, dict) else ()
+        self.allowed_assets = {
+            variant
+            for uri in keys
+            if str(uri).startswith("resources://")
+            for variant in (str(uri).removeprefix("resources://"), f"resources/{str(uri).removeprefix('resources://')}")
+        }
+        self.image_references = 0
+
+    def _record_images(self, references):
+        for reference in references:
+            parsed = urlsplit(reference)
+            if not parsed.scheme and parsed.path.removeprefix("./") not in self.allowed_assets:
+                self.errors.append("相对图片不属于当前冻结资源清单")
+            self.image_references += 1
 
     def handle_starttag(self, tag, attrs):
         self._check(tag, attrs)
@@ -208,15 +324,18 @@ class _SafeHtmlParser(HTMLParser):
 
         if "style" in values:
             try:
-                _validate_css(values["style"])
+                self._record_images(_validate_css(values["style"]))
             except ValidationError as exc:
                 self.errors.append(str(exc))
         if tag == "style":
             self._in_style = True
         if tag == "img":
             src = values.get("src", "")
-            if src and src not in self.allowed_assets:
-                self.errors.append("图片不属于当前冻结资源清单")
+            if src:
+                try:
+                    self._record_images([validate_image_url(src)])
+                except ValidationError as exc:
+                    self.errors.append(str(exc))
         if "data-slide-id" in values:
             self.slide_ids.append(values["data-slide-id"])
 
@@ -307,24 +426,14 @@ def validate_html(value: str, expected_ids: list[str], allowed_assets=()):
     except Exception as exc:
         raise ValidationError("HTML 语法无效") from exc
     try:
-        _validate_css("\n".join(parser.styles))
+        parser._record_images(_validate_css("\n".join(parser.styles)))
     except ValidationError as exc:
         parser.errors.append(str(exc))
     if parser.errors:
         raise ValidationError(f"HTML 包含不允许的主动内容或任务外资源: {'; '.join(parser.errors[:3])}")
-    
-    # 检查非受控的远程或敏感协议（排除 SVG xmlns 等安全 URL）
-    scrubbed = value
-    for asset in allowed_assets:
-        scrubbed = scrubbed.replace(asset, "")
-    scrubbed = re.sub(r'xmlns="http://www.w3.org/2000/svg"', '', scrubbed)
-    scrubbed = re.sub(r'xmlns="http://www.w3.org/1999/xlink"', '', scrubbed)
-
-    if re.search(r"(?:\.\.[/\\]|file\s*:|resources\s*://|tasks?[/\\]|data\s*:)", _canonical(scrubbed), re.I):
-        raise ValidationError("HTML 包含路径穿越、跨任务或未解析资源引用")
+    if parser.image_references > MAX_IMAGE_REFERENCES:
+        raise ValidationError(f"HTML 图片引用超过 {MAX_IMAGE_REFERENCES} 个限制")
     actual = parser.slide_ids
     if actual != list(expected_ids):
         raise ValidationError("HTML 页面与样品选择不一致")
-    if re.search(r"占位|placeholder|lorem ipsum", value, re.I):
-        raise ValidationError("样品不得包含占位内容")
     return value

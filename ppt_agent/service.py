@@ -5,7 +5,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 from .config import ClarificationConfig
-from .errors import ConflictError, GatewayError, RuntimeUnavailableError, ValidationError
+from .errors import ConflictError, GatewayError, NotFoundError, RuntimeUnavailableError, ValidationError
 from .fsm import TaskState, transition
 from .gateways import FakeGenerationGateway, FakeHtmlBuilder, FakeInspectionGateway, FakeSkillLoader
 from .schema import DeliveryManifest, InspectionReport, IssueDisposition
@@ -14,7 +14,7 @@ from .schema import ClarificationSet, ResourceManifest, TaskCard, TaskInputSnaps
 from .schema import NarrativeDocument, SlideOutline, SampleSelection, DeckArtifact
 from .p3 import changed_slide_ids, narrative_markdown, normalize_outline_markdown, outline_markdown, parse_outline, requested_slide_count, structured_outline_markdown
 from .p4 import controlled_assets, infer_scope, recommend, render, validate_html
-from .offline import offline_assets, offline_player
+from .offline import localize_delivery_html, offline_assets, offline_player, verify_delivery
 
 def utcnow(): return datetime.now(timezone.utc).isoformat()
 def fingerprint(value): return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(",",":")).encode()).hexdigest()
@@ -646,7 +646,7 @@ class TaskService:
         if prompt: rules.append(prompt.strip())
         source=render(data["markdown"],selection["slide_ids"],rules,assets=assets) if isinstance(self.builder,FakeHtmlBuilder) else self.builder.build(data["markdown"],action="sample",slide_ids=selection["slide_ids"],rules=rules,assets=assets)
         progress("validating_html", "校验 HTML")
-        html_text=validate_html(source,selection["slide_ids"],assets.values())
+        html_text=validate_html(source,selection["slide_ids"],assets)
         version=len(self.versions(task_id,"sample"))+1; content_hash=digest(html_text.encode()); model=DeckArtifact.parse({"artifact_id":f"sample-{content_hash[:16]}","task_id":task_id,"version":version,"kind":"sample","outline_hash":outline,"content_hash":content_hash,"created_at":now(),"schema_version":"1.0"})
         prior=self._current_version(task_id,"sample"); meta={"html":html_text,"selection_hash":selection["hash"],"parent":prior,"summary":"生成真实 HTML 样品","scope":"global","global_rules":rules,"local_exceptions":{},"build":"success"}
         h=self._record_p3(task_id,"sample",model,meta,"sample_generate")
@@ -667,7 +667,7 @@ class TaskService:
         outline=self._current_version(task_id,"outline"); data=json.loads(self.version(task_id,outline)); assets=controlled_assets(self.input_view(task_id)["manifest"],self.store.resource_root(task_id))
         previous_slides="".join(self._slide_fragments(sample["html"]).get(sid,"") for sid in ids)
         source=render(data["markdown"],ids,rules,exceptions,assets) if isinstance(self.builder,FakeHtmlBuilder) else self.builder.build(data["markdown"],action="sample",slide_ids=ids,rules=rules,exceptions=exceptions,assets=assets,previous_slides=previous_slides,prompt=prompt,scope=scope,slide_id=slide_id,element_id=element_id)
-        html_text=validate_html(source,ids,assets.values())
+        html_text=validate_html(source,ids,assets)
         version=len(self.versions(task_id,"sample"))+1; ch=digest(html_text.encode()); model=DeckArtifact.parse({"artifact_id":f"sample-{ch[:16]}","task_id":task_id,"version":version,"kind":"sample","outline_hash":outline,"content_hash":ch,"created_at":now(),"schema_version":"1.0"})
         h=self._record_p3(task_id,"sample",model,{"html":html_text,"selection_hash":view["selection"]["hash"],"parent":sample["hash"],"summary":prompt.strip(),"scope":scope,"scope_understanding":understanding,"slide_id":slide_id,"element_id":element_id,"global_rules":rules,"local_exceptions":exceptions,"build":"success"},"sample_modify","user")
         self._invalidate_sample_gate(task_id,h)
@@ -758,16 +758,16 @@ class TaskService:
                 checkpoint(); batch=unconfirmed[index:index+3]
                 progress("generating_batch",f"生成未确认页面 {index+1}-{index+len(batch)} / {len(unconfirmed)}")
                 partial=self.builder.build(data["markdown"],action="deck",slide_ids=batch,rules=meta.get("global_rules",[]),exceptions=meta.get("local_exceptions",{}),assets=assets)
-                generated.update(self._slide_fragments(validate_html(partial,batch,assets.values())))
+                generated.update(self._slide_fragments(validate_html(partial,batch,assets)))
             ordered={**generated,**sample_fragments}
             shell=render(data["markdown"],ids,meta.get("global_rules",[]),meta.get("local_exceptions",{}),assets)
             html_text=self._replace_slide_fragments(shell,ordered)
-        html_text=validate_html(html_text,ids,assets.values()); deck_fragments=self._slide_fragments(html_text)
+        html_text=validate_html(html_text,ids,assets); deck_fragments=self._slide_fragments(html_text)
         # Confirmed fragments are immutable and are merged by the server for
         # every builder implementation, including deterministic test/fallback
         # builders.
         html_text=self._replace_slide_fragments(html_text,sample_fragments)
-        html_text=validate_html(html_text,ids,assets.values()); deck_fragments=self._slide_fragments(html_text)
+        html_text=validate_html(html_text,ids,assets); deck_fragments=self._slide_fragments(html_text)
         preserved={sid:digest(deck_fragments[sid].encode())==digest(fragment.encode()) for sid,fragment in sample_fragments.items()}
         if not all(preserved.values()): raise ConflictError("确认样品发生未提示变化")
         result=self._record_deck(task_id,html_text,outline,{"parent":self._current_version(task_id,"deck"),"summary":"生成未检查候选稿","scope":"global","affected":ids,"sample_hash":sample["hash"],"sample_pages_preserved":preserved,"outline_consistent":True,"inspection_status":"pending","global_rules":meta.get("global_rules",[]),"local_exceptions":meta.get("local_exceptions",{})},"deck_generate")
@@ -803,7 +803,7 @@ class TaskService:
         deck_slides=self._slide_fragments(deck["html"])
         previous_slides="".join(deck_slides.get(sid,"") for sid in all_ids)
         source=render(markdown,all_ids,rules,exceptions,assets) if isinstance(self.builder,FakeHtmlBuilder) else self.builder.build(markdown,action="deck",slide_ids=all_ids,rules=rules,exceptions=exceptions,assets=assets,previous_slides=previous_slides,prompt=prompt,scope=inferred,affected_slide_ids=affected,element_id=element_id)
-        html_text=validate_html(source,all_ids,assets.values())
+        html_text=validate_html(source,all_ids,assets)
         before=deck["metadata"]["page_hashes"]; after={sid:digest(fragment.encode()) for sid,fragment in self._slide_fragments(html_text).items()}; actual=[sid for sid in all_ids if before[sid]!=after[sid]]
         if any(s not in affected for s in actual): raise ConflictError("修改超出声明影响范围")
         # Cross-artifact edits are prepared and validated above. Only successful
@@ -860,20 +860,25 @@ class TaskService:
         h=self.store.put_version(task_id,"inspection",canonical(report.to_dict()),metadata)
         return {**report.to_dict(),"hash":h,"metadata":metadata}
 
-    def _prepare_auto_fix(self,task_id,report,round_number):
-        deck=self.deck_view(task_id)["deck"]; affected=list(dict.fromkeys(i["slide_id"] for i in report["issues"] if i["slide_id"]))
+    def _prepare_auto_fix(self,task_id,report,round_number,issue_ids=None):
+        selected=[item for item in report["issues"] if issue_ids is None or item["issue_id"] in set(issue_ids)]
+        if not selected: raise ValidationError("检查修复范围为空")
+        deck=self.deck_view(task_id)["deck"]; affected=list(dict.fromkeys(i["slide_id"] for i in selected if i["slide_id"]))
         if not affected: affected=list(deck["metadata"]["page_hashes"])
         outline=json.loads(self.version(task_id,deck["outline_hash"]))["markdown"]
         assets=controlled_assets(self.input_view(task_id)["manifest"],self.store.resource_root(task_id))
-        suggestions=[{"slide_id":i["slide_id"],"element_id":i["element_id"],"code":i["code"],"suggestion":i["suggestion"]} for i in report["issues"]]
+        suggestions=[{"issue_id":i["issue_id"],"slide_id":i["slide_id"],"element_id":i["element_id"],"code":i["code"],"suggestion":i["suggestion"]} for i in selected]
         if isinstance(self.builder,FakeHtmlBuilder):
             rules=list(deck["metadata"].get("global_rules",[])); exceptions={k:list(v) for k,v in deck["metadata"].get("local_exceptions",{}).items()}
             for slide_id in affected: exceptions.setdefault(slide_id,[]).append(f"检查修复第 {round_number} 轮："+"；".join(s["suggestion"] for s in suggestions if s["slide_id"]==slide_id))
             html_text=render(outline,list(deck["metadata"]["page_hashes"]),rules,exceptions,assets)
         else:
             html_text=self.builder.build(outline,action="inspection",slide_ids=list(deck["metadata"]["page_hashes"]),assets=assets,previous_html=deck["html"],inspection_report=report,suggestions=suggestions,affected_slide_ids=affected)
-        html_text=validate_html(html_text,list(deck["metadata"]["page_hashes"]),assets.values())
-        metadata={"parent":deck["hash"],"summary":f"自动修复第 {round_number} 轮","scope":"page","affected":affected,"outline_consistent":True,"global_rules":deck["metadata"].get("global_rules",[]),"local_exceptions":deck["metadata"].get("local_exceptions",{}),"inspection_report_hash":report["hash"],"auto_fix_round":round_number}
+        html_text=validate_html(html_text,list(deck["metadata"]["page_hashes"]),assets)
+        candidate_slides=self._slide_fragments(html_text)
+        html_text=self._replace_slide_fragments(deck["html"],{slide_id:candidate_slides[slide_id] for slide_id in affected})
+        html_text=validate_html(html_text,list(deck["metadata"]["page_hashes"]),assets)
+        metadata={"parent":deck["hash"],"summary":f"自动修复第 {round_number} 轮","scope":"page","affected":affected,"outline_consistent":True,"global_rules":deck["metadata"].get("global_rules",[]),"local_exceptions":deck["metadata"].get("local_exceptions",{}),"inspection_report_hash":report["hash"],"inspection_issue_ids":[item["issue_id"] for item in selected],"auto_fix_round":round_number}
         return html_text,deck["outline_hash"],metadata
 
     def _auto_fix(self,task_id,report,round_number,prepared=None):
@@ -928,7 +933,7 @@ class TaskService:
         # Build and validate the repair candidate before publishing the audit
         # disposition.  GatewayUnknownResult must not assert that a fix was
         # performed when no repaired deck exists.
-        prepared_fix=self._prepare_auto_fix(task_id,report,1) if action=="agent_fix" else None
+        prepared_fix=self._prepare_auto_fix(task_id,report,1,[issue_id]) if action=="agent_fix" else None
         created=utcnow(); payload={"task_id":task_id,"issue_id":issue_id,"action":action,"actor":actor,"target_deck_hash":report["deck_hash"],"rationale":(rationale or "按当前处置执行").strip(),"created_at":created,"schema_version":"1.0"}
         model=IssueDisposition.parse({"disposition_id":f"disposition-{digest(canonical(payload))[:16]}",**payload}); h=self.store.put_version(task_id,"issue-disposition",canonical(model.to_dict()),{"report_hash":report["hash"],"severity":issue["severity"],"code":issue["code"],"sequence":len(self.versions(task_id,"issue-disposition"))+1})
         if action=="agent_fix":
@@ -953,17 +958,53 @@ class TaskService:
         if not view["report"] or view["report"]["stale"]: raise ConflictError("当前 HTML 版本须先完成检查")
         return {"delivery_allowed":True,"warnings":[x for x in view["unresolved"] if x["severity"]=="warning"]}
 
+    def finalization_view(self,task_id):
+        deck=self.deck_view(task_id)["deck"]
+        records=self.versions(task_id,"final-deck")
+        finalizations=[]
+        for record in records:
+            value=json.loads(self.version(task_id,record["hash"]))
+            finalizations.append({**value,"hash":record["hash"],"metadata":record["metadata"],"stale":not deck or value["deck_hash"]!=deck["hash"]})
+        finalizations.sort(key=lambda item:(item["finalized_at"],item["hash"]))
+        current=next((item for item in reversed(finalizations) if not item["stale"]),None)
+        return {"current":current,"history":finalizations}
+
+    def finalize_deck(self,task_id,deck_hash,source="deck",actor="user"):
+        if actor!="user": raise ValidationError("终稿必须由用户明确确认")
+        with self.store.transaction(task_id):
+            self._require_actionable(task_id)
+            state=TaskState.parse(self.get(task_id)); deck=self.deck_view(task_id)["deck"]
+            if state.stage not in {state.stage.DECK,state.stage.REVIEW}: raise ConflictError("只能在全稿或自检与修改阶段确定终稿")
+            if not deck or deck["hash"]!=deck_hash: raise ConflictError("终稿必须绑定当前候选 HTML 版本")
+            existing=self.finalization_view(task_id)["current"]
+            if existing:
+                return {"state":self.get(task_id),"finalization":existing}
+            inspection=self.inspection_view(task_id); report=inspection["report"]
+            if not report or report["stale"]:
+                inspection_status="unchecked" if not report else "stale"
+            elif report["passed"]:
+                inspection_status="passed"
+            else:
+                inspection_status="issues_remaining"
+            finalized_at=utcnow()
+            payload={"finalization_id":f"final-{deck_hash[:16]}","task_id":task_id,"deck_hash":deck_hash,"finalized_by":"user","finalized_at":finalized_at,"source":source if source in {"deck","review"} else "deck","inspection_status":inspection_status,"inspection_report_hash":None if not report or report["stale"] else report["hash"],"unresolved_issue_count":len(inspection["unresolved"]),"blocking_issue_count":len(inspection["blocking_issues"]),"schema_version":"1.0"}
+            final_hash=self.store.put_version(task_id,"final-deck",canonical(payload),{"deck_hash":deck_hash,"source":payload["source"],"inspection_status":inspection_status})
+            new=TaskState(**{**state.__dict__,"stage":state.stage.DELIVERY,"status":state.status.READY,"waiting_reason":"final_ready","required_action":"publish_delivery","revision":state.revision+1})
+            event={"event_id":digest(f"{task_id}:finalize:{deck_hash}".encode())[:24],"command_id":f"finalize-{deck_hash[:16]}","action":"finalize_deck","actor":"user","request_hash":deck_hash,"at":finalized_at,"from":state.to_dict(),"to":new.to_dict(),"result":{"finalization_hash":final_hash,"deck_hash":deck_hash,"inspection_status":inspection_status}}
+            self.store.commit(task_id,new.to_dict(),event)
+        return {"state":new.to_dict(),"finalization":{**payload,"hash":final_hash,"metadata":{"deck_hash":deck_hash,"source":payload["source"],"inspection_status":inspection_status},"stale":False}}
+
     def delivery_view(self,task_id):
         deliveries=[]
         for record in self.versions(task_id,"delivery"):
             model=json.loads(self.version(task_id,record["hash"]))
             deliveries.append({**model,"hash":record["hash"],"metadata":record["metadata"]})
         deliveries.sort(key=lambda item:item["confirmed_at"])
-        return {"state":self.get(task_id),"deliveries":deliveries,"latest":deliveries[-1] if deliveries else None,"summary":self.status_summary(task_id)}
+        return {"state":self.get(task_id),"finalization":self.finalization_view(task_id)["current"],"deliveries":deliveries,"latest":deliveries[-1] if deliveries else None,"summary":self.status_summary(task_id)}
 
     def status_summary(self,task_id):
         state=self.get(task_id); latest={}
-        for kind in ("input-snapshot","narrative","outline","sample","deck","inspection","delivery"):
+        for kind in ("input-snapshot","narrative","outline","sample","deck","inspection","final-deck","delivery"):
             records=self.versions(task_id,kind)
             if not records: continue
             if kind in {"narrative","outline","sample","deck"}: current=self._current_version(task_id,kind)
@@ -975,16 +1016,13 @@ class TaskService:
         if state["status"]=="completed": progress=100
         return {"task_id":task_id,"stage":state["stage"],"progress":progress,"status":state["status"],"current_action":state.get("required_action"),"waiting_reason":state.get("waiting_reason"),"human_actions":[state["required_action"]] if state.get("required_action") else [],"latest_artifacts":latest,"error_summary":"task_failed" if state["status"]=="failed" else None}
 
-    def confirm_delivery(self,task_id,deck_hash,actor="user"):
-        if actor!="user": raise ValidationError("交付必须由用户明确确认")
+    def publish_delivery(self,task_id,actor="user"):
+        if actor!="user": raise ValidationError("写入工程文件夹必须由用户明确确认")
         state=TaskState.parse(self.get(task_id)); current=self.deck_view(task_id)["deck"]
         if state.status!=state.status.COMPLETED: self._require_actionable(task_id)
-        if not current or current["hash"]!=deck_hash: raise ConflictError("确认必须绑定当前候选 HTML 版本")
-        gate=self.assert_delivery_gate(task_id)
-        if not state.blockers_resolved:
-            self.command(task_id,f"delivery-gate-{deck_hash[:12]}","resolve_blockers","user",{"deck_hash":deck_hash}); state=TaskState.parse(self.get(task_id))
-        if state.stage==state.stage.REVIEW:
-            self.command(task_id,f"to-delivery-{deck_hash[:12]}","advance","user"); state=TaskState.parse(self.get(task_id))
+        finalization=self.finalization_view(task_id)["current"]
+        if not current or not finalization or finalization["deck_hash"]!=current["hash"]: raise ConflictError("请先将当前候选确定为终稿")
+        deck_hash=current["hash"]
         if state.stage!=state.stage.DELIVERY: raise ConflictError("当前阶段不能交付")
         narrative_hash=self._current_version(task_id,"narrative"); outline_hash=current["outline_hash"]
         snapshot=self.input_view(task_id)
@@ -992,9 +1030,47 @@ class TaskService:
         delivery_id=(json.loads(self.version(task_id,existing_delivery["hash"]))["delivery_id"] if existing_delivery else f"delivery-{len(self.versions(task_id,'delivery'))+1}-{deck_hash[:12]}")
         intent=self.store.delivery_intent(task_id,delivery_id,{"task_id":task_id,"deck_hash":deck_hash})
         confirmed_at=intent["confirmed_at"]
-        result_summary={"version":delivery_id,"status":{"stage":"delivery","status":"completed"},"description":"当前候选版本已通过检查并由用户明确确认交付"}
-        files={"deck.html":current["html"].encode(),"index.html":offline_player(current["html"]).encode(),"narrative.md":json.loads(self.version(task_id,narrative_hash))["markdown"].encode(),"outline.md":json.loads(self.version(task_id,outline_hash))["markdown"].encode(),"resource-manifest.json":canonical(snapshot["manifest"]),"result.json":canonical({"task_id":task_id,"deck_hash":deck_hash,"warnings":gate["warnings"],"confirmed_at":confirmed_at,**result_summary}),**offline_assets()}
+        warnings=[]
+        if finalization["unresolved_issue_count"]:
+            warnings=[{"code":"finalized_with_issues","count":finalization["unresolved_issue_count"],"inspection_status":finalization["inspection_status"]}]
+
+        def complete(model,hashes,localized_count,delivery_hash=None):
+            delivery_hash=delivery_hash or self.store.put_version(task_id,"delivery",canonical(model.to_dict()),{"file_hashes":hashes,"warnings":warnings,"issue_summary":{"unresolved":finalization["unresolved_issue_count"],"blockers":finalization["blocking_issue_count"]},"finalization_hash":finalization["hash"],"localized_resources":localized_count,"package":delivery_id})
+            if self.store.fault: self.store.fault("after_delivery_fact")
+            final=self.command(task_id,f"confirm-delivery-{delivery_hash[:16]}","confirm_delivery","user",{"deck_hash":deck_hash,"delivery_hash":delivery_hash})
+            if self.store.fault: self.store.fault("after_delivery_completed")
+            self.store.clear_delivery_intent(task_id,delivery_id)
+            return {"state":final,"delivery":{**model.to_dict(),"hash":delivery_hash,"file_hashes":hashes},"result":self.status_summary(task_id)}
+
+        # A crash can happen after the directory was atomically published but
+        # before the delivery fact/state commit.  Reuse the verified package;
+        # never re-download a remote image whose bytes may have changed.
+        try:
+            published_root=self.store.delivery_root(task_id,delivery_id)
+        except NotFoundError:
+            published_root=None
+        if published_root is not None:
+            verify_delivery(published_root)
+            package=json.loads((published_root/"manifest.json").read_text(encoding="utf-8"))
+            if package.get("delivery_id")!=delivery_id or package.get("task_id")!=task_id or package.get("deck_hash")!=deck_hash or package.get("confirmed_at")!=confirmed_at:
+                raise ConflictError("已发布离线包与当前交付事务不一致")
+            hashes={name:digest((published_root/name).read_bytes()) for name in package.get("files",{})}
+            if hashes!=package.get("files"):
+                raise ConflictError("已发布离线包 manifest 不一致")
+            hashes["manifest.json"]=digest((published_root/"manifest.json").read_bytes())
+            localized=json.loads((published_root/"localized-resources.json").read_text(encoding="utf-8")).get("resources",[])
+            if existing_delivery:
+                model=DeliveryManifest.parse(json.loads(self.version(task_id,existing_delivery["hash"])))
+                delivery_hash=existing_delivery["hash"]
+            else:
+                model=DeliveryManifest.parse({"delivery_id":delivery_id,"task_id":task_id,"deck_hash":deck_hash,"files":tuple([*package["files"],"manifest.json"]),"confirmed_by":"user","confirmed_at":confirmed_at,"schema_version":"1.0"})
+                delivery_hash=None
+            return complete(model,hashes,len(localized),delivery_hash)
+
         resource_root=self.store.resource_root(task_id)
+        localized_html,localized_resources,localization_records=localize_delivery_html(current["html"],snapshot["manifest"],resource_root)
+        result_summary={"version":delivery_id,"status":{"stage":"delivery","status":"completed"},"description":"用户确定的终稿已写入工程文件夹并通过离线校验"}
+        files={"deck.html":localized_html.encode(),"index.html":offline_player(localized_html).encode(),"narrative.md":json.loads(self.version(task_id,narrative_hash))["markdown"].encode(),"outline.md":json.loads(self.version(task_id,outline_hash))["markdown"].encode(),"resource-manifest.json":canonical(snapshot["manifest"]),"localized-resources.json":canonical({"resources":localization_records}),"result.json":canonical({"task_id":task_id,"deck_hash":deck_hash,"finalization_hash":finalization["hash"],"inspection_status":finalization["inspection_status"],"warnings":warnings,"confirmed_at":confirmed_at,**result_summary}),**offline_assets(),**localized_resources}
         for item in snapshot["manifest"].get("resources",[]):
             relative=Path(item["uri"].removeprefix("resources://"))
             source=resource_root/relative
@@ -1004,12 +1080,14 @@ class TaskService:
         files["manifest.json"]=canonical(package_manifest); hashes["manifest.json"]=digest(files["manifest.json"])
         self.store.publish_delivery(task_id,delivery_id,files)
         model=DeliveryManifest.parse({"delivery_id":delivery_id,"task_id":task_id,"deck_hash":deck_hash,"files":tuple(files),"confirmed_by":"user","confirmed_at":confirmed_at,"schema_version":"1.0"})
-        delivery_hash=self.store.put_version(task_id,"delivery",canonical(model.to_dict()),{"file_hashes":hashes,"warnings":gate["warnings"],"issue_summary":{"unresolved_warnings":len(gate["warnings"]),"blockers":0},"package":delivery_id})
-        if self.store.fault: self.store.fault("after_delivery_fact")
-        final=self.command(task_id,f"confirm-delivery-{delivery_hash[:16]}","confirm_delivery","user",{"deck_hash":deck_hash,"delivery_hash":delivery_hash})
-        if self.store.fault: self.store.fault("after_delivery_completed")
-        self.store.clear_delivery_intent(task_id,delivery_id)
-        return {"state":final,"delivery":{**model.to_dict(),"hash":delivery_hash,"file_hashes":hashes},"result":self.status_summary(task_id)}
+        verify_delivery(self.store.delivery_root(task_id,delivery_id))
+        return complete(model,hashes,len(localization_records))
+
+    def confirm_delivery(self,task_id,deck_hash,actor="user"):
+        """Compatibility wrapper for clients which previously combined both actions."""
+        if not self.finalization_view(task_id)["current"]:
+            self.finalize_deck(task_id,deck_hash,"review" if self.get(task_id)["stage"]=="review" else "deck",actor)
+        return self.publish_delivery(task_id,actor)
 
     def derive_from_delivery(self,task_id,delivery_hash,prompt,slide_ids=None):
         record=next((x for x in self.versions(task_id,"delivery") if x["hash"]==delivery_hash),None)

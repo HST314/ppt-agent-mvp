@@ -95,7 +95,7 @@ class SamplePageBrowserTests(unittest.TestCase):
         self.assertEqual(understanding["basis"], "prompt_semantics")
 
         page.get_by_role("button", name="确认当前样品并进入全稿").click()
-        page.get_by_text("当前样品已确认", exact=True).wait_for()
+        page.get_by_role("heading", name="全稿", exact=True).wait_for()
         self.assertTrue(self.svc.sample_view("task")["confirmation"])
 
 

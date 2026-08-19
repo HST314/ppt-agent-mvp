@@ -51,7 +51,7 @@ def transition(s: TaskState, action: str, *, actor: str="system") -> TaskState:
         if actor != "user": raise GateError("阻断问题必须由用户处置")
         return replace(s,blockers_resolved=True,revision=s.revision+1)
     if action == "confirm_delivery":
-        if s.stage != Stage.DELIVERY or actor != "user" or not s.blockers_resolved: raise GateError("须由用户解决或豁免阻断问题后确认交付")
+        if s.stage != Stage.DELIVERY or actor != "user": raise GateError("须由用户在交付阶段确认写入")
         return replace(s,delivery_confirmed=True,status=RunStatus.COMPLETED,waiting_reason=None,required_action=None,revision=s.revision+1)
     if action == "advance":
         if s.status == RunStatus.PAUSED: raise GateError("任务已暂停")

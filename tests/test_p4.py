@@ -1,4 +1,4 @@
-import io, tempfile, unittest
+import base64, io, tempfile, unittest
 from pathlib import Path
 
 from ppt_agent.api import App
@@ -80,10 +80,25 @@ class P4Tests(unittest.TestCase):
     def test_html_security_negative_matrix(self):
         base='<!doctype html><html><body><section data-slide-id="slide-1">x</section></body></html>'
         self.assertEqual(validate_html(base,["slide-1"]),base)
+        encoded=base64.b64encode(PNG).decode()
+        allowed=[
+            '<img src="https://images.example/hero.png">',
+            '<img src="http://images.example/hero.png">',
+            f'<img src="data:image/png;base64,{encoded}">',
+            '<img src="resources/hero.png">',
+            '<style>body{background-image:url("https://images.example/hero.png")}</style>',
+            '<div style="background:url(resources/hero.png)">placeholder / 占位 / lorem ipsum</div>',
+        ]
+        for fragment in allowed:
+            with self.subTest(allowed=fragment):
+                value=base.replace('</body>',fragment+'</body>')
+                assets={"resources://hero.png":f"data:image/png;base64,{encoded}"} if "resources/hero.png" in fragment else {}
+                self.assertEqual(validate_html(value,["slide-1"],assets),value)
+        with self.assertRaisesRegex(ValidationError,"冻结资源清单"):
+            validate_html(base.replace('</body>','<img src="resources/missing.png"></body>'),["slide-1"],{"resources://hero.png":f"data:image/png;base64,{encoded}"})
         attacks=[
             '<script>alert(1)</script>', '<img src=x onerror=alert(1)>',
             '<style>@import "https://evil.test/x.css"</style>', '<style>body{background:url(//evil.test/x)}</style>',
-            '<div style="background:url(https://evil.test/x)">x</div>',
             '<img srcset="https://evil.test/a 1x">', '<meta http-equiv="refresh" content="0;url=https://evil.test">',
             '<iframe src="https://evil.test"></iframe>', '<a href="../../secret">x</a>',
             '<img src="file:///etc/passwd">', '<img src="resources://other-task/secret">',

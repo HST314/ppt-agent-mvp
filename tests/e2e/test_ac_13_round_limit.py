@@ -14,4 +14,4 @@ class AC13RoundLimitE2E(test_ac_12_modes.AC12ModesE2E):
         status,page=self.call("GET","/tasks/journey/inspection")
         self.assertTrue(status.startswith("200")); self.assertIn('type="module"',page.decode())
         module=Path("frontend/static/js/stages/review.js").read_text()
-        for token in ("修复轮次","暂不可交付","Agent 修复","整稿人工浏览","定位"): self.assertIn(token,module)
+        for token in ("修复轮次","检查可跳过","Agent 修复","当前候选预览","定位","确定终稿"): self.assertIn(token,module)

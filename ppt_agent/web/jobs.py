@@ -31,6 +31,8 @@ OPERATIONS = {
     "deck.generate",
     "deck.modify",
     "inspection.run",
+    "inspection.fix",
+    "delivery.publish",
 }
 OPERATION_STAGES = {
     "clarification.generate": {"clarification"},
@@ -41,6 +43,8 @@ OPERATION_STAGES = {
     "deck.generate": {"sample", "deck"},
     "deck.modify": {"deck", "review"},
     "inspection.run": {"deck", "review"},
+    "inspection.fix": {"review"},
+    "delivery.publish": {"delivery"},
 }
 OPERATION_BUDGET_SECONDS = {
     "clarification.generate": 180,
@@ -51,10 +55,12 @@ OPERATION_BUDGET_SECONDS = {
     "deck.generate": 630,
     "deck.modify": 630,
     "inspection.run": 630,
+    "inspection.fix": 630,
+    "delivery.publish": 180,
 }
 GENERATION_OPERATIONS = {
     "clarification.generate", "narrative.generate", "outline.generate",
-    "samples.generate", "samples.modify", "deck.generate", "deck.modify",
+    "samples.generate", "samples.modify", "deck.generate", "deck.modify", "inspection.fix",
 }
 METRIC_KEYS = {
     "stage", "agent_step", "max_steps", "provider_calls", "max_provider_calls",
@@ -115,7 +121,7 @@ class JobService:
         if generation_timeout:
             self.operation_budgets.update({operation: generation_timeout for operation in GENERATION_OPERATIONS})
         if inspection_timeout:
-            self.operation_budgets["inspection.run"] = inspection_timeout
+            self.operation_budgets.update({operation:inspection_timeout for operation in {"inspection.run","inspection.fix"}})
         self.executor = executor or ThreadPoolExecutor(max_workers=4, thread_name_prefix="ppt-job")
         self._guard = threading.RLock()
         self._submitted: set[str] = set()
@@ -534,8 +540,10 @@ class JobService:
             "deck.generate": set(),
             "deck.modify": {"prompt", "change_type", "scope", "slide_ids", "element_id"},
             "inspection.run": {"max_rounds", "affected_slide_ids"},
+            "inspection.fix": {"issue_id", "rationale"},
+            "delivery.publish": set(),
         }[operation]
-        required = {"prompt"} if operation in {"samples.modify", "deck.modify"} else set()
+        required = ({"prompt"} if operation in {"samples.modify", "deck.modify"} else {"issue_id"} if operation=="inspection.fix" else set())
         if set(payload) - allowed or required - set(payload):
             raise ValidationError("Job payload 字段无效")
 
@@ -552,7 +560,8 @@ class JobService:
                 if previous["fingerprint"] != fingerprint:
                     raise ConflictError("相同 idempotency_key 对应了不同请求")
                 return self.public(previous), False
-            self.service.require_runtime_ready()
+            if operation != "delivery.publish":
+                self.service.require_runtime_ready()
             if state["status"] in {"paused", "cancelled", "failed", "completed"}:
                 raise ConflictError("当前任务状态不能启动长任务")
             if state["stage"] not in OPERATION_STAGES[operation]:
@@ -627,7 +636,8 @@ class JobService:
                 # Readiness can change after enqueue or while a queued job is being
                 # recovered. Never cross the model boundary without a fresh gate.
                 try:
-                    self.service.require_runtime_ready()
+                    if record["operation"] != "delivery.publish":
+                        self.service.require_runtime_ready()
                 except RuntimeUnavailableError as error:
                     if record["operation"] == "clarification.generate":
                         self.service.fail_clarification_for_runtime(task_id, error)
@@ -722,6 +732,10 @@ class JobService:
             return self.service.modify_deck(task_id, payload["prompt"], payload.get("change_type", "visual"), payload.get("scope"), payload.get("slide_ids"), payload.get("element_id"))
         if operation == "inspection.run":
             return self.service.run_inspection(task_id, payload.get("max_rounds", 2), payload.get("affected_slide_ids"))
+        if operation == "inspection.fix":
+            return self.service.dispose_issue(task_id, payload["issue_id"], "agent_fix", payload.get("rationale", ""), "user")
+        if operation == "delivery.publish":
+            return self.service.publish_delivery(task_id)
         raise ValidationError("不支持的 Job 操作")
 
     @staticmethod

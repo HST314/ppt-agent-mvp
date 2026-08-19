@@ -55,4 +55,5 @@ class AC10DeckEditE2E(SampleJourney):
         self.assertTrue(status.startswith("200")); self.assertIn('type="module"',page.decode())
         module=Path("frontend/static/js/stages/deck.js").read_text()
         self.assertIn("逐页版本对比",module); self.assertIn("compareDeck",module)
-        self.assertIn("versionTimeline",module)
+        review=Path("frontend/static/js/stages/review.js").read_text()
+        self.assertIn("versionTimeline",review); self.assertIn("modificationPanel",review)

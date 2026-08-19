@@ -1,4 +1,4 @@
-import { badge, button, element, icon } from "../shell.js?v=2026.08.17.112846263255";
+import { badge, button, element, icon } from "../shell.js?v=2026.08.19.043945581370";
 
 export { badge, button, element, icon };
 
@@ -107,8 +107,9 @@ export function confirmationDialog({ title, description, confirmLabel = "确认"
   const confirm = button(confirmLabel, { kind: danger ? "danger" : "primary", onClick: async () => {
     confirm.disabled = true;
     try {
-      await onConfirm();
+      const afterConfirm = await onConfirm();
       close();
+      if (typeof afterConfirm === "function") afterConfirm();
     } catch (_error) {
       confirm.disabled = false;
     }

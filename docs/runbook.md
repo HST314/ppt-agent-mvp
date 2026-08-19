@@ -17,7 +17,7 @@ python3 scripts/start.py --data .ppt-agent-data --host 127.0.0.1 --port 8000
 
 该命令启动 FastAPI/Uvicorn Web 适配层。`/livez` 只检查 Web 进程存活并始终以 200 表示存活；`/readyz` 检查真实模型运行契约，未就绪时返回 503。兼容端点 `/healthz` 与 readiness 使用相同的 200/503 语义；浏览器轮询 `/v1/runtime/status`，该端点固定返回 200，并通过 `runtime_ready` 表达模型状态，避免预期的未就绪状态污染浏览器控制台。真实模型模式必须满足 `runtime_ready=true` 且 `model_capabilities.status=ready`。启动按顺序验证基础文本响应、严格 JSON Schema、强制函数调用与结果回传；任一检查失败即停止，状态中保留 `probe_id`、`failed_check` 与精确业务错误码，依赖模型的 Job 在入队和执行前都会关闭失败。脱敏且可跨重启读取的探测记录由 `GET /v1/runtime/probes` 导出，只保存检查状态、HTTP/SDK 类别、request-id 哈希和响应 ID 哈希。修复配置或等待供应商恢复后，在工作台“显示与连接”执行显式重新检测。`/`、`/tasks/{task_id}` 和 `/components` 使用独立 `frontend/` 静态资源。8 阶段交互全部位于统一应用壳；旧 `/tasks/{task_id}/outline|samples|deck|inspection|delivery` 深链会规范化到对应阶段，`/legacy/**` 已下线。
 
-样品、全稿和检查预览由 `/v1/tasks/{task_id}/previews/{hash}` 提供。端点只接受当前任务内 `sample`/`deck` 版本，返回 `no-store`、`SAMEORIGIN` 与禁止脚本的独立 CSP；应用壳 CSP 不允许内联脚本或样式。预览异常时先核对 hash 是否属于当前任务及对应版本，不要绕过端点直接读取工作区文件。
+样品、全稿和自检预览由 `/v1/tasks/{task_id}/previews/{hash}` 提供。端点只接受当前任务内 `sample`/`deck` 版本，返回 `no-store`、`SAMEORIGIN` 与禁止脚本的独立 CSP；HTTP(S)、Base64 与相对图片仅作为展示资源开放。相对资源再经 `/preview-assets/{hash}/{path}` 校验当前任务、版本、manifest 与文件 hash。应用壳 CSP 不允许内联脚本或样式。预览异常时先核对 hash 与资源清单，不要绕过端点直接读取工作区文件。
 
 ### Job 与 SSE 恢复
 
@@ -38,11 +38,12 @@ python3 scripts/start.py --data .ppt-agent-data --host 127.0.0.1 --port 8000
 1. 创建任务并导入 JSON/Markdown 资料，处理阻断澄清项。
 2. 生成并人工确认叙事；生成并确认逐页大纲。
 3. 生成样品、按 Prompt 修改，并由用户确认当前样品版本。
-4. 生成全稿；在 manual/auto 模式下完成独立检查和问题处置。
-5. 当前检查未过期且无未处置 blocker 时，由用户绑定当前 `deck_hash` 确认交付。
-6. 对交付目录执行离线打包与校验；如需修改，从历史交付派生新候选并重新检查。
+4. 确认样品后系统自动创建 `deck.generate` Job；在全稿页直接确定终稿，或进入“自检与修改”。
+5. 可按需执行独立检查、`inspection.fix`、Prompt 修改和问题处置；检查状态不阻断用户绑定当前 `deck_hash` 确定终稿。
+6. 在交付页创建 `delivery.publish` Job；远程图片下载并校验、相对图片复制、引用改写后，通过临时目录原子发布并执行离线校验。
+7. 如需修改，从历史交付派生新候选并进入“自检与修改”；原交付保持不可变。
 
-所有生成、修改样品、修改全稿和检查操作从界面创建持久化 Job。短操作（回答、直接编辑、确认、回退、问题处置、交付）直接调用现有 `/v1` 接口；页面刷新后仍以服务端任务、版本和 Job 为权威状态。
+所有生成、修改样品、修改全稿、检查、单项 Agent 修复和离线写包操作从界面创建持久化 Job。短操作（回答、直接编辑、确认、回退和非 Agent 问题处置）直接调用 `/v1` 接口；页面刷新后仍以服务端任务、版本和 Job 为权威状态。
 
 ## 测试与离线验收
 

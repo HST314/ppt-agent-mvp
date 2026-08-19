@@ -9,7 +9,7 @@
 - P2：任务卡、澄清、受控资源扫描及冻结输入快照。
 - P3：叙事与逐页大纲生成、直接编辑、局部影响域、版本及人工确认。
 - P4：样品推荐/改选、真实 HTML、安全沙箱、冻结资源 hash 复核与内嵌、Prompt 作用域识别、精确版本确认门禁。
-- P5～P7：全稿生成与非破坏修改、独立检查和有界修复、显式确认交付、恢复及交付后派生。
+- P5～P7：样品确认后自动生成全稿、集中式自检与非破坏修改、精确 hash 终稿冻结、远程图片本地化、后台原子离线交付及交付后派生。
 - P8：真实 Gateway/分阶段 Skill、请求与资源大小限制、结构化动作指标、运行手册及验收矩阵。
 
 ## P0-01 基线证据（持续保留）
@@ -34,4 +34,4 @@ python3 scripts/start.py --data .ppt-agent-data
 
 ## 联合复验结论
 
-P7 交付与恢复已实现并独立验收通过。P8 第一门禁提供真实生成/检查/HTML 与分阶段 Skill 适配，deterministic fake 继续作为 CI 替身；9 类场景、安全和恢复证据见既有 E2E 与 `tests/test_p8_gateways.py`。第二门禁由 `tests/browser/test_ac_18_desktop_journey.py` 覆盖创建、输入、规划、样品、全稿、检查、交付及交付后派生的固定 Chromium 完整旅程，`scripts/verify_browser_gate.py` 强制浏览器用例零跳过。2026-08-12 独立复验在 Playwright 1.54.0、Chromium 139.0.7258.5（build v1181）环境执行，结果为 6/6 passed、0 failed、0 skipped，AC-18 通过。
+P7 交付与恢复已实现并独立验收通过。2026-08-19 流程升级将检查改为可选质量步骤，新增 `final-deck` 事实、`inspection.fix` / `delivery.publish` 持久化 Job、安全图片 URL/Base64/相对路径预览与离线本地化。P8 第一门禁提供真实生成/检查/HTML 与分阶段 Skill 适配，deterministic fake 继续作为 CI 替身；安全、恢复与真实图片解码证据见 E2E、单元测试与浏览器门禁。`scripts/verify_browser_gate.py` 强制浏览器用例零跳过。

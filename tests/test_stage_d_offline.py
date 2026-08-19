@@ -1,5 +1,6 @@
 import hashlib
 import json
+import socket
 import stat
 import subprocess
 import sys
@@ -7,8 +8,10 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
-from ppt_agent.offline import build_zip, external_urls, validate_zip_members, verify_delivery
+from ppt_agent.errors import ValidationError
+from ppt_agent.offline import build_zip, download_remote_image, external_urls, localize_delivery_html, validate_zip_members, verify_delivery
 from ppt_agent.service import TaskService
 from ppt_agent.store import WorkspaceStore
 
@@ -19,6 +22,43 @@ class PassingInspector:
 
 
 class OfflineDeliveryTests(unittest.TestCase):
+    def test_remote_download_pins_public_dns_result_and_rejects_mixed_private_answers(self):
+        public=(socket.AF_INET,socket.SOCK_STREAM,6,"",("93.184.216.34",80))
+        private=(socket.AF_INET,socket.SOCK_STREAM,6,"",("127.0.0.1",80))
+        with patch("ppt_agent.offline.socket.getaddrinfo",return_value=[public,private]), self.assertRaisesRegex(ValidationError,"内网"):
+            download_remote_image("http://images.example/hero.png")
+
+        png=b"\x89PNG\r\n\x1a\nremote"
+        observed={}
+        class Response:
+            status=200
+            class Headers(dict):
+                def get_content_type(self): return "image/png"
+            headers=Headers({"Content-Length":str(len(png))})
+            def read(self,_limit): return png
+        class Connection:
+            def __init__(self,address,port,timeout): observed.update(address=address,port=port,timeout=timeout)
+            def request(self,method,target,headers): observed.update(method=method,target=target,headers=headers)
+            def getresponse(self): return Response()
+            def close(self): observed["closed"]=True
+        with patch("ppt_agent.offline.socket.getaddrinfo",return_value=[public]), patch("ppt_agent.offline.http.client.HTTPConnection",Connection):
+            self.assertEqual(download_remote_image("http://images.example/hero.png?size=2"),(png,"image/png"))
+        self.assertEqual(observed["address"],"93.184.216.34")
+        self.assertEqual(observed["headers"]["Host"],"images.example")
+        self.assertEqual(observed["target"],"/hero.png?size=2")
+
+    def test_remote_and_relative_images_are_localized_before_delivery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); (root/"hero.png").write_bytes(b"local-image")
+            manifest={"resources":[{"uri":"resources://hero.png","content_hash":hashlib.sha256(b"local-image").hexdigest(),"media_type":"image/png"}]}
+            remote=b"\x89PNG\r\n\x1a\nremote"
+            source='<!doctype html><html><head><style>.hero{background:url("https://cdn.example/bg.png")}</style></head><body><img src="hero.png"><section data-slide-id="slide-1"></section></body></html>'
+            localized,files,records=localize_delivery_html(source,manifest,root,lambda _url:(remote,"image/png"))
+            self.assertNotIn("https://",localized)
+            self.assertIn('src="resources/hero.png"',localized)
+            self.assertEqual(files["resources/hero.png"],b"local-image")
+            self.assertEqual({item["source"] for item in records},{"remote","relative"})
+
     def actual_delivery(self, workspace: Path) -> Path:
         store = WorkspaceStore(workspace)
         service = TaskService(store, inspector=PassingInspector())

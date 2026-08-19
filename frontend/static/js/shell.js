@@ -1,4 +1,15 @@
 const SVG_NS = "http://www.w3.org/2000/svg";
+const memoryPreferences = new Map();
+
+function preference(method, key, value) {
+  try {
+    return value === undefined ? window.localStorage[method](key) : window.localStorage[method](key, value);
+  } catch (_error) {
+    if (method === "getItem") return memoryPreferences.get(key) ?? null;
+    if (method === "setItem") memoryPreferences.set(key, String(value));
+    return null;
+  }
+}
 
 export function element(tag, options = {}, children = []) {
   const node = document.createElement(tag);
@@ -74,10 +85,10 @@ export function showToast(message) {
 
 export function applyTheme(theme) {
   document.documentElement.dataset.theme = theme;
-  localStorage.setItem("ppt-agent:theme", theme);
+  preference("setItem", "ppt-agent:theme", theme);
   document.querySelector('meta[name="theme-color"]')?.setAttribute("content", theme === "dark" ? "#1b1626" : "#7c3aed");
 }
 
 export function preferredTheme() {
-  return localStorage.getItem("ppt-agent:theme") || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+  return preference("getItem", "ppt-agent:theme") || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
 }

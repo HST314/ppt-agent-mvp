@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
+import ipaddress
 import json
 import re
+import socket
+import ssl
 import stat
 import zipfile
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from urllib.parse import urljoin, urlsplit
+
+from .errors import ValidationError
+from .p4 import CSS_URL, IMAGE_MEDIA_TYPES, _valid_image_bytes, validate_image_url
 
 
 ASSET_ROOT = Path(__file__).with_name("offline_assets")
@@ -14,6 +22,11 @@ ASSET_ROOT = Path(__file__).with_name("offline_assets")
 
 REMOTE_URL = re.compile(r"(?:https?:)?//[^\s\"'<>]+", re.I)
 RUNTIME_TEXT_SUFFIXES = {".html", ".htm", ".css", ".js", ".mjs", ".svg"}
+MAX_REMOTE_IMAGES = 30
+MAX_REMOTE_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_REMOTE_TOTAL_BYTES = 50 * 1024 * 1024
+REMOTE_TIMEOUT_SECONDS = 10
+IMAGE_EXTENSIONS = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp"}
 
 
 def _without_js_comments(source: str) -> str:
@@ -96,6 +109,192 @@ class _HTMLRuntimeURLs(HTMLParser):
             self.urls.extend(REMOTE_URL.findall(_without_js_comments(data)))
         elif self.in_style:
             self.urls.extend(self._css_urls(data))
+
+
+class _ImageReferences(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.urls: list[str] = []
+        self.in_style = False
+
+    def handle_starttag(self, tag, attrs):
+        values = {str(name).lower(): value or "" for name, value in attrs}
+        if tag.lower() == "img" and values.get("src"):
+            self.urls.append(values["src"])
+        if values.get("style"):
+            self.urls.extend(_css_image_urls(values["style"]))
+        if tag.lower() == "style":
+            self.in_style = True
+
+    handle_startendtag = handle_starttag
+
+    def handle_endtag(self, tag):
+        if tag.lower() == "style":
+            self.in_style = False
+
+    def handle_data(self, data):
+        if self.in_style:
+            self.urls.extend(_css_image_urls(data))
+
+
+def _css_image_urls(source: str) -> list[str]:
+    return [((match.group(2) if match.group(1) else match.group(3)) or "").strip() for match in CSS_URL.finditer(source)]
+
+
+def _public_http_target(value: str):
+    value = validate_image_url(value)
+    parsed = urlsplit(value)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        raise ValidationError("远程图片仅支持 HTTP/HTTPS")
+    try:
+        addresses = {item[4][0] for item in socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)}
+    except OSError as exc:
+        raise ValidationError("远程图片域名解析失败") from exc
+    if not addresses:
+        raise ValidationError("远程图片域名没有可用地址")
+    public = []
+    for address in addresses:
+        ip = ipaddress.ip_address(address.split("%", 1)[0])
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
+            raise ValidationError("远程图片地址指向本机、内网或保留网段")
+        public.append(str(ip))
+    return value, parsed, sorted(set(public), key=lambda item:(ipaddress.ip_address(item).version,int(ipaddress.ip_address(item))))
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """Connect to the validated IP while retaining hostname TLS validation."""
+    def __init__(self,host,address,port,timeout):
+        super().__init__(host,port,timeout=timeout,context=ssl.create_default_context())
+        self.address=address
+
+    def connect(self):
+        raw=socket.create_connection((self.address,self.port),self.timeout,self.source_address)
+        try:
+            self.sock=self._context.wrap_socket(raw,server_hostname=self.host)
+        except BaseException:
+            raw.close()
+            raise
+
+
+def download_remote_image(url: str) -> tuple[bytes, str]:
+    for redirects in range(6):
+        connection=None
+        try:
+            url,parsed,addresses=_public_http_target(url)
+            host=parsed.hostname.encode("idna").decode("ascii")
+            port=parsed.port or (443 if parsed.scheme.lower()=="https" else 80)
+            connection=(_PinnedHTTPSConnection(host,addresses[0],port,REMOTE_TIMEOUT_SECONDS) if parsed.scheme.lower()=="https" else http.client.HTTPConnection(addresses[0],port,timeout=REMOTE_TIMEOUT_SECONDS))
+            target=parsed.path or "/"
+            if parsed.query: target+=f"?{parsed.query}"
+            default_port=443 if parsed.scheme.lower()=="https" else 80
+            host_header=host if port==default_port else f"{host}:{port}"
+            connection.request("GET",target,headers={"Host":host_header,"Accept":"image/png,image/jpeg,image/gif,image/webp","Accept-Encoding":"identity","User-Agent":"PPT-Agent-Offline-Packager/1.0"})
+            response=connection.getresponse()
+            if response.status in {301,302,303,307,308}:
+                location=response.headers.get("Location")
+                connection.close()
+                if not location: raise ValidationError("远程图片重定向缺少目标")
+                if redirects==5: raise ValidationError("远程图片重定向次数过多")
+                url=urljoin(url,location)
+                continue
+            if response.status<200 or response.status>=300:
+                connection.close()
+                raise ValidationError("远程图片下载失败")
+            media_type = response.headers.get_content_type().lower()
+            if media_type not in IMAGE_MEDIA_TYPES:
+                connection.close()
+                raise ValidationError("远程资源不是受支持的图片类型")
+            length = response.headers.get("Content-Length")
+            if length and int(length)>MAX_REMOTE_IMAGE_BYTES:
+                connection.close()
+                raise ValidationError("远程图片超过 10 MiB 限制")
+            data = response.read(MAX_REMOTE_IMAGE_BYTES + 1)
+            connection.close()
+        except ValidationError:
+            if connection is not None: connection.close()
+            raise
+        except (OSError,ValueError,http.client.HTTPException,ssl.SSLError) as exc:
+            if connection is not None: connection.close()
+            raise ValidationError("远程图片下载失败") from exc
+        if len(data)>MAX_REMOTE_IMAGE_BYTES:
+            raise ValidationError("远程图片超过 10 MiB 限制")
+        if not _valid_image_bytes(media_type,data):
+            raise ValidationError("远程图片内容与媒体类型不匹配")
+        return data,media_type
+    raise ValidationError("远程图片重定向次数过多")
+
+
+def _manifest_resource(url: str, manifest: dict, resource_root: Path) -> tuple[str, bytes, str]:
+    parsed = urlsplit(url)
+    path = parsed.path.removeprefix("./")
+    if path.startswith("resources/"):
+        path = path.removeprefix("resources/")
+    matches = {
+        item.get("uri", "").removeprefix("resources://"): item
+        for item in manifest.get("resources", [])
+    }
+    item = matches.get(path)
+    if not item:
+        raise ValidationError(f"相对图片不属于当前冻结资源清单: {url}")
+    source = (resource_root / path).resolve()
+    if resource_root.resolve() not in source.parents or not source.is_file():
+        raise ValidationError("相对图片不存在或路径越权")
+    data = source.read_bytes()
+    if hashlib.sha256(data).hexdigest() != item.get("content_hash"):
+        raise ValidationError("相对图片内容已变化")
+    if item.get("media_type") not in IMAGE_MEDIA_TYPES:
+        raise ValidationError("相对资源不是受支持的图片类型")
+    return f"resources/{PurePosixPath(path).as_posix()}", data, item["media_type"]
+
+
+def localize_delivery_html(deck_html: str, manifest: dict, resource_root: Path, fetcher=download_remote_image) -> tuple[str, dict[str, bytes], list[dict]]:
+    """Localize every remote/relative image while preserving inert Base64 images."""
+    parser = _ImageReferences()
+    parser.feed(deck_html)
+    parser.close()
+    unique = list(dict.fromkeys(parser.urls))
+    remote = [url for url in unique if urlsplit(url).scheme.lower() in {"http", "https"}]
+    if len(remote) > MAX_REMOTE_IMAGES:
+        raise ValidationError(f"远程图片超过 {MAX_REMOTE_IMAGES} 个限制")
+    replacements: dict[str, str] = {}
+    files: dict[str, bytes] = {}
+    records = []
+    total = 0
+    for url in unique:
+        validate_image_url(url)
+        parsed = urlsplit(url)
+        if parsed.scheme.lower() == "data":
+            continue
+        if parsed.scheme.lower() in {"http", "https"}:
+            data, media_type = fetcher(url)
+            total += len(data)
+            if total > MAX_REMOTE_TOTAL_BYTES:
+                raise ValidationError("远程图片总大小超过 50 MiB 限制")
+            name = f"resources/remote-{hashlib.sha256((url + hashlib.sha256(data).hexdigest()).encode()).hexdigest()[:20]}{IMAGE_EXTENSIONS[media_type]}"
+            source = "remote"
+        else:
+            name, data, media_type = _manifest_resource(url, manifest, resource_root)
+            source = "relative"
+        if name in files and files[name] != data:
+            raise ValidationError("离线资源文件名冲突")
+        files[name] = data
+        replacements[url] = name
+        records.append({"source": source, "original_url": url, "path": name, "media_type": media_type, "sha256": hashlib.sha256(data).hexdigest()})
+
+    def replace_css(match):
+        quote = match.group(1) or '"'
+        value = ((match.group(2) if match.group(1) else match.group(3)) or "").strip()
+        return f"url({quote}{replacements.get(value, value)}{quote})"
+
+    def replace_img(match):
+        prefix, quote, quoted, bare = match.groups()
+        value = quoted if quote else bare
+        replacement = replacements.get(value, value)
+        return f"{prefix}{quote or ''}{replacement}{quote or ''}"
+
+    localized = CSS_URL.sub(replace_css, deck_html)
+    localized = re.sub(r"(<img\b[^>]*?\bsrc\s*=\s*)(?:(['\"])(.*?)\2|([^\s>]+))", replace_img, localized, flags=re.I | re.S)
+    return localized, files, records
 
 
 def sha256(path: Path) -> str:

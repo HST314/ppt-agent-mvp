@@ -63,7 +63,7 @@ class InspectionPageBrowserTests(unittest.TestCase):
         self.posts = []
         self.page.on("request", lambda request: self.posts.append(request) if request.method == "POST" else None)
         self.page.goto(self.base + "/tasks/task?stage=review")
-        self.page.get_by_role("heading", name="检查", exact=True).wait_for()
+        self.page.get_by_role("heading", name="自检与修改", exact=True).wait_for()
 
     def tearDown(self):
         self.page.close()
@@ -74,7 +74,7 @@ class InspectionPageBrowserTests(unittest.TestCase):
     def test_locate_highlights_preview_and_batch_keeps_same_code(self):
         blocker = self.page.locator(".issue-card").filter(has_text="slide-1 / title")
         blocker.get_by_role("button", name="定位").click()
-        frame = self.page.frame_locator("#inspection-preview")
+        frame = self.page.frame_locator("#deck-preview-frame")
         self.assertEqual(frame.locator('[data-element-id="title"]').first.get_attribute("data-inspection-highlight"), "true")
         self.assertIn("slide-1 / title", self.page.get_by_role("status").filter(has_text="已定位").inner_text())
         blocker.get_by_label("处置动作").select_option("defer")

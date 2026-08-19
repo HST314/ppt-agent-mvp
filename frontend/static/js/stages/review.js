@@ -1,40 +1,63 @@
-import { api } from "../api.js?v=2026.08.17.112846263255";
-import { badge, button, element, field, metadataList, previewFrame, previewUrl, shortHash } from "../components/index.js?v=2026.08.17.112846263255";
-import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.17.112846263255";
+import { api } from "../api.js?v=2026.08.19.043945581370";
+import { badge, button, confirmationDialog, element, field, metadataList, shortHash, versionTimeline } from "../components/index.js?v=2026.08.19.043945581370";
+import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.19.043945581370";
+import { comparePanel, deckPreview, modificationPanel } from "./deck.js?v=2026.08.19.043945581370";
 
 export async function render(context) {
-  const view = await api.inspection(context.taskId, context.controller);
+  const [view, deckView] = await Promise.all([api.inspection(context.taskId, context.controller), api.deck(context.taskId, context.controller)]);
   context.assertCurrent();
-  return reviewStage(view, context);
+  return reviewStage(view, deckView, context);
 }
 
-function reviewStage(view, context) {
+function reviewStage(view, deckView, context) {
   const report = view.report;
-  const preview = view.deck ? previewFrame("", "检查结果对应的整稿预览", { id: "inspection-preview", allowInspection: true, src: previewUrl(context.taskId, view.deck.hash) }) : null;
+  const preview = view.deck ? deckPreview(view.deck, context.taskId) : null;
   const location = element("p", { className: "muted", role: "status", "aria-live": "polite", text: "选择问题后会在预览中定位对应页面或元素。" });
   const issues = report?.issues || [];
   const active = activeDispositions(view.dispositions || []);
   const blockers = issues.filter((issue) => issue.severity === "blocker");
   const warnings = issues.filter((issue) => issue.severity !== "blocker");
+  const historyMessage = actionMessage();
+  const history = versionTimeline(deckView.versions || [], "deck", {
+    currentHash: view.deck?.hash,
+    onRollback: (item) => runAction({ region: historyMessage, action: () => api.rollbackDeck(context.taskId, item.hash), success: "历史全稿已复制为新的候选版本。", refresh: context.refresh }).catch(() => {}),
+  });
 
   return stageGrid([
+    finalizePanel(view, context),
+    view.deck ? section("当前候选预览", [location, preview], { description: "可浏览、定位问题；检查不是确定终稿的前置条件。" }) : null,
     inspectionControls(view, context),
-    report?.stale ? section("检查报告已过期", element("div", { className: "notice notice--warning" }, [element("strong", { text: "当前全稿已变化" }), element("p", { text: "旧报告仍可追溯，但不能用于当前候选的交付门禁。请重新执行检查。" })])) : null,
-    section("阻断问题", issueGroup(blockers, active, context, preview, location), { description: `${blockers.length} 项；未处置的阻断问题会禁止交付。` }),
-    section("普通警告", issueGroup(warnings, active, context, preview, location), { description: `${warnings.length} 项；警告可以保留，但处置依据应可追溯。` }),
-    view.deck ? section("整稿人工浏览", [location, preview], { description: "检查模型只接收原始大纲与当前 HTML，不接收生成对话或模型自述。" }) : null,
+    view.deck ? modificationPanel(view.deck, context) : null,
+    report?.stale ? section("检查报告已过期", element("div", { className: "notice notice--warning" }, [element("strong", { text: "当前全稿已变化" }), element("p", { text: "旧报告仍可追溯，若需最新质量结论请重新检查；也可以带该状态直接确定终稿。" })])) : null,
+    report ? section("阻断问题", issueGroup(blockers, active, context, preview, location), { description: `${blockers.length} 项；可以修复、记录处置或带遗留问题确定终稿。` }) : null,
+    report ? section("普通警告", issueGroup(warnings, active, context, preview, location), { description: `${warnings.length} 项；处置可追溯，但不阻断终稿确认。` }) : null,
+    view.deck ? comparePanel(deckView, context) : null,
   ], [
     section("检查摘要", report ? [
       badge(report.stale ? "报告过期" : report.passed ? "检查通过" : "需要处置", report.stale ? "warning" : report.passed ? "success" : "danger"),
       metadataList([["报告 hash", shortHash(report.hash)], ["候选 hash", shortHash(report.deck_hash)], ["检查范围", report.metadata?.scope || "full"], ["修复轮次", report.metadata?.round ?? 0], ["问题总数", issues.length], ["未处置", view.unresolved?.length || 0]]),
     ] : [badge("尚未检查", "warning"), element("p", { className: "muted", text: "生成全稿后执行独立检查。" })]),
-    section("交付门禁", [
-      badge(view.delivery_allowed ? "可进入交付" : "暂不可交付", view.delivery_allowed ? "success" : "danger"),
-      element("p", { className: "muted", text: view.delivery_allowed ? "当前报告有效且没有未处置阻断问题。" : "需要有效检查报告，并处置全部阻断问题。" }),
-      view.delivery_allowed ? button("前往交付", { kind: "primary", href: `/tasks/${encodeURIComponent(context.taskId)}?stage=delivery` }) : null,
-    ]),
+    section("终稿策略", [badge("检查可跳过", "primary"), element("p", { className: "muted", text: "未检查、报告过期或仍有遗留问题时，确认框会明确记录状态，但不会阻断确定终稿。" })]),
+    section("全稿版本", [history, historyMessage]),
     section("检查历史", reportHistory(view)),
   ]);
+}
+
+function finalizePanel(view, context) {
+  const message = actionMessage();
+  const report = view.report;
+  const status = !report ? "未检查" : report.stale ? "报告对应旧版本" : report.passed ? "检查通过" : `仍有 ${view.unresolved?.length || 0} 项未处置`;
+  const finalize = button("确定终稿", { kind: "primary", disabled: !view.deck, reason: "请先生成全稿", mutates: true });
+  finalize.addEventListener("click", () => confirmationDialog({
+    title: "确认当前版本为终稿",
+    description: `候选 ${shortHash(view.deck?.hash)} · 检查状态：${status}。确定后将冻结该版本并进入交付。`,
+    confirmLabel: "确定终稿并前往交付",
+    onConfirm: async () => {
+      await runAction({ buttonNode: finalize, region: message, busyLabel: "正在冻结终稿…", action: () => api.finalizeDeck(context.taskId, { deck_hash: view.deck.hash, source: "review", actor: "user" }), success: "终稿已冻结。" });
+      return () => context.goTo("delivery");
+    },
+  }));
+  return section("确定终稿", [element("p", { text: `当前检查状态：${status}` }), finalize, message], { description: "自检、人工 Prompt 修改与问题处置均为可选；该操作始终绑定当前候选 hash。", className: "finalize-actions" });
 }
 
 function inspectionControls(view, context) {
@@ -64,21 +87,24 @@ function issueGroup(issues, active, context, preview, location) {
 function issueCard(issue, disposition, context, preview, location, group) {
   const message = actionMessage();
   const action = element("select", { className: "select", id: `issue-${issue.issue_id}-action` }, [
-    element("option", { value: "agent_fix", text: "Agent 修复" }),
-    element("option", { value: "manual", text: "手工已处理" }),
-    element("option", { value: "waive", text: "接受 / 豁免" }),
-    element("option", { value: "defer", text: "暂不处理" }),
+    element("option", { value: "agent_fix", text: "Agent 修复", selected: disposition?.action === "agent_fix" }),
+    element("option", { value: "manual", text: "手工已处理", selected: disposition?.action === "manual" }),
+    element("option", { value: "waive", text: "接受 / 豁免", selected: disposition?.action === "waive" }),
+    element("option", { value: "defer", text: "暂不处理", selected: disposition?.action === "defer" }),
   ]);
   const rationale = element("input", { className: "input", id: `issue-${issue.issue_id}-rationale`, value: disposition?.rationale || "", placeholder: "说明处置依据（豁免时必填）" });
   const save = button("保存处置", { kind: "secondary", mutates: true });
-  save.addEventListener("click", () => runAction({
-    buttonNode: save,
-    region: message,
-    action: () => api.disposeIssue(context.taskId, issue.issue_id, { action: action.value, rationale: rationale.value, actor: "user" }),
-    success: "问题处置已记录。",
-    refresh: context.refresh,
-  }).catch(() => {}));
+  save.addEventListener("click", () => {
+    if (action.value === "agent_fix") {
+      context.startJob("inspection.fix", { issue_id: issue.issue_id, rationale: rationale.value }, { buttonNode: save, region: message });
+      return;
+    }
+    runAction({ buttonNode: save, region: message, action: () => api.disposeIssue(context.taskId, issue.issue_id, { action: action.value, rationale: rationale.value, actor: "user" }), success: "问题处置已记录。", refresh: context.refresh }).catch(() => {});
+  });
   const batch = button("处置同 code 问题", { kind: "ghost", mutates: true });
+  const updateBatch = () => { batch.disabled = action.value === "agent_fix"; batch.title = batch.disabled ? "Agent 修复需逐项执行" : ""; };
+  action.addEventListener("change", updateBatch);
+  updateBatch();
   batch.addEventListener("click", () => {
     const ids = group.filter((item) => item.code === issue.code).map((item) => item.issue_id);
     runAction({ buttonNode: batch, region: message, action: () => api.disposeIssues(context.taskId, { issue_ids: ids, action: action.value, rationale: rationale.value }), success: `已处置 ${ids.length} 个同类问题。`, refresh: context.refresh }).catch(() => {});

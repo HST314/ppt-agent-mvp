@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Query, Request, status
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
+import hashlib
+import html
+import re
+from pathlib import PurePosixPath
+from urllib.parse import quote
 
 from ...errors import ConflictError, NotFoundError, RuntimeUnavailableError, ValidationError
 from ...service import TaskService
@@ -18,8 +23,8 @@ STAGES = (
     ("outline", "逐页大纲", "确认叙事结构"),
     ("sample", "样品", "完成并确认逐页大纲"),
     ("deck", "全稿", "确认当前样品"),
-    ("review", "检查", "生成完整演示稿"),
-    ("delivery", "交付", "通过检查并处置阻断问题"),
+    ("review", "自检与修改", "生成完整演示稿（可选）"),
+    ("delivery", "交付", "确定终稿"),
 )
 
 
@@ -50,18 +55,21 @@ def get_shell(task_id: str, service: TaskService = Depends(task_service), jobs: 
     state = service.get(task_id)
     summary = service.status_summary(task_id)
     review_available = state["stage"] == "deck" and bool(summary["latest_artifacts"].get("deck"))
-    delivery_available = False
-    if state["stage"] == "review":
-        delivery_available = service.inspection_view(task_id)["delivery_allowed"]
+    finalization = service.finalization_view(task_id)["current"]
+    delivery_available = bool(finalization)
     current_index = next(index for index, item in enumerate(STAGES) if item[0] == state["stage"])
     stages = []
     for index, (key, label, prerequisite) in enumerate(STAGES):
-        if key == "review" and review_available:
+        if index == current_index:
+            item_status = "current"
+        elif key == "review" and state["stage"]=="delivery" and finalization and finalization["source"]=="deck":
+            item_status = "skipped"
+        elif key == "review" and review_available:
             item_status = "available"
         elif key == "delivery" and delivery_available:
             item_status = "available"
         else:
-            item_status = "completed" if index < current_index else "current" if index == current_index else "locked"
+            item_status = "completed" if index < current_index else "locked"
         stages.append({
             "id": key,
             "label": label,
@@ -197,7 +205,7 @@ def get_samples(task_id: str, service: TaskService = Depends(task_service)):
 
 
 @router.post("/tasks/{task_id}/samples/{action}")
-async def change_samples(task_id: str, action: str, request: Request, service: TaskService = Depends(task_service)):
+async def change_samples(task_id: str, action: str, request: Request, service: TaskService = Depends(task_service), jobs: JobService = Depends(job_service)):
     body = await json_body(request)
     if action == "select":
         exact(body, {"slide_ids", "count"})
@@ -209,8 +217,17 @@ async def change_samples(task_id: str, action: str, request: Request, service: T
         exact(body, {"prompt", "scope", "slide_id", "element_id"}, {"prompt"})
         return service.modify_sample(task_id, body["prompt"], body.get("scope"), body.get("slide_id"), body.get("element_id"))
     if action == "confirm":
-        exact(body, set())
-        return service.confirm_sample(task_id)
+        exact(body, {"auto_generate"})
+        result=service.confirm_sample(task_id)
+        if body.get("auto_generate") is not True:
+            return result
+        confirmation=result["confirmation"]
+        try:
+            job,_=jobs.create(task_id,"deck.generate",{},f"deck-{confirmation['confirmed_sample_hash'][:16]}-{confirmation['confirmed_outline_hash'][:16]}")
+            result["deck_job"]=job
+        except RuntimeUnavailableError as error:
+            result["deck_job_error"]=error.public()["error"]
+        return result
     raise NotFoundError("接口不存在")
 
 
@@ -220,7 +237,7 @@ def get_deck(task_id: str, service: TaskService = Depends(task_service)):
 
 
 @router.post("/tasks/{task_id}/deck/{action}")
-async def change_deck(task_id: str, action: str, request: Request, service: TaskService = Depends(task_service)):
+async def change_deck(task_id: str, action: str, request: Request, service: TaskService = Depends(task_service), jobs: JobService = Depends(job_service)):
     body = await json_body(request)
     if action == "generate":
         exact(body, set())
@@ -234,6 +251,11 @@ async def change_deck(task_id: str, action: str, request: Request, service: Task
     if action == "compare":
         exact(body, {"left", "right"}, {"left", "right"})
         return service.compare_decks(task_id, body["left"], body["right"])
+    if action == "finalize":
+        exact(body, {"deck_hash", "source", "actor"}, {"deck_hash"})
+        if jobs.list(task_id,"active"):
+            raise ConflictError("仍有生成、修改或修复 Job 运行中，请等待完成或先取消")
+        return service.finalize_deck(task_id,body["deck_hash"],body.get("source","deck"),body.get("actor","user"))
     raise NotFoundError("接口不存在")
 
 
@@ -268,6 +290,9 @@ async def change_delivery(task_id: str, action: str, request: Request, service: 
     if action == "confirm":
         exact(body, {"deck_hash", "actor"}, {"deck_hash"})
         return service.confirm_delivery(task_id, body["deck_hash"], body.get("actor", "user"))
+    if action == "publish":
+        exact(body, set())
+        return service.publish_delivery(task_id)
     if action == "derive":
         exact(body, {"delivery_hash", "prompt", "slide_ids"}, {"delivery_hash", "prompt"})
         return service.derive_from_delivery(task_id, body["delivery_hash"], body["prompt"], body.get("slide_ids"))
@@ -310,14 +335,42 @@ def get_preview(task_id: str, digest: str, service: TaskService = Depends(task_s
     record = next((item for item in service.versions(task_id) if item["hash"] == digest and item["kind"] in {"sample", "deck"}), None)
     if not record or not isinstance(record.get("metadata", {}).get("html"), str):
         raise NotFoundError("预览版本不存在")
-    return HTMLResponse(record["metadata"]["html"], headers={
+    source=record["metadata"]["html"]
+    base=f'/v1/tasks/{quote(task_id, safe="")}/preview-assets/{digest}/'
+    source=re.sub(r"(<head\b[^>]*>)",lambda match:match.group(1)+f'<base href="{html.escape(base, quote=True)}">',source,count=1,flags=re.I)
+    return HTMLResponse(source, headers={
         "Content-Security-Policy": (
-            "default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src 'self'; "
-            "font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'"
+            "default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src 'self' data: http: https:; "
+            "font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'self'"
         ),
+        "Referrer-Policy": "no-referrer",
         "X-Frame-Options": "SAMEORIGIN",
+        "X-Content-Type-Options": "nosniff",
         "Cache-Control": "private, no-store",
     })
+
+
+@router.get("/tasks/{task_id}/preview-assets/{digest}/{asset_path:path}", include_in_schema=False)
+def get_preview_asset(task_id: str, digest: str, asset_path: str, service: TaskService = Depends(task_service)):
+    if len(digest)!=64 or any(char not in "0123456789abcdef" for char in digest):
+        raise ValidationError("预览版本 hash 无效")
+    if not any(item["hash"]==digest and item["kind"] in {"sample","deck"} for item in service.versions(task_id)):
+        raise NotFoundError("预览版本不存在")
+    relative=asset_path.removeprefix("resources/")
+    path=PurePosixPath(relative)
+    if path.is_absolute() or not relative or any(part in {"",".",".."} for part in path.parts):
+        raise ValidationError("预览资源路径无效")
+    manifest=service.input_view(task_id)["manifest"]
+    item=next((entry for entry in manifest.get("resources",[]) if entry.get("uri","").removeprefix("resources://")==relative),None)
+    if not item:
+        raise NotFoundError("预览资源不存在")
+    root=service.store.resource_root(task_id).resolve(); source=(root/relative).resolve()
+    if root not in source.parents or not source.is_file():
+        raise NotFoundError("预览资源不存在")
+    content=source.read_bytes()
+    if hashlib.sha256(content).hexdigest()!=item.get("content_hash"):
+        raise ConflictError("预览资源内容已变化")
+    return Response(content,media_type=item.get("media_type","application/octet-stream"),headers={"Cache-Control":"private, no-store","X-Content-Type-Options":"nosniff","Referrer-Policy":"no-referrer"})
 
 
 @router.get("/tasks/{task_id}/versions")
@@ -326,14 +379,23 @@ def get_versions(task_id: str, service: TaskService = Depends(task_service)):
 
 
 @router.post("/tasks/{task_id}/issues/dispositions/batch")
-async def dispose_issues(task_id: str, request: Request, service: TaskService = Depends(task_service)):
+async def dispose_issues(task_id: str, request: Request, service: TaskService = Depends(task_service), jobs: JobService = Depends(job_service)):
     body = await json_body(request)
     exact(body, {"issue_ids", "action", "rationale"}, {"issue_ids", "action"})
+    if body["action"]=="agent_fix":
+        if len(body["issue_ids"])!=1: raise ValidationError("Agent 修复需逐项执行")
+        report=service.inspection_view(task_id).get("report") or {}
+        job,_=jobs.create(task_id,"inspection.fix",{"issue_id":body["issue_ids"][0],"rationale":body.get("rationale","")},f"inspection-fix-{report.get('hash','none')[:16]}-{body['issue_ids'][0]}")
+        return {"job":job}
     return service.dispose_issues(task_id, body["issue_ids"], body["action"], body.get("rationale", ""))
 
 
 @router.post("/tasks/{task_id}/issues/{issue_id}/disposition")
-async def dispose_issue(task_id: str, issue_id: str, request: Request, service: TaskService = Depends(task_service)):
+async def dispose_issue(task_id: str, issue_id: str, request: Request, service: TaskService = Depends(task_service), jobs: JobService = Depends(job_service)):
     body = await json_body(request)
     exact(body, {"action", "rationale", "actor"}, {"action"})
+    if body["action"]=="agent_fix":
+        report=service.inspection_view(task_id).get("report") or {}
+        job,_=jobs.create(task_id,"inspection.fix",{"issue_id":issue_id,"rationale":body.get("rationale","")},f"inspection-fix-{report.get('hash','none')[:16]}-{issue_id}")
+        return {"job":job}
     return service.dispose_issue(task_id, issue_id, body["action"], body.get("rationale", ""), body.get("actor", "user"))

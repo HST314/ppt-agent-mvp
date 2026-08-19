@@ -17,7 +17,7 @@
 | AC-11 | 独立检查模型执行三级检查 | P6-01、P6-02 | 检查 API；检查页 | `tests/e2e/test_ac_11_inspection.py` |
 | AC-12 | manual 人审、auto 有界修复复检 | P6-03、P6-04 | 运行模式/检查 API；检查页 | `tests/e2e/test_ac_12_modes.py` |
 | AC-13 | 达上限进入人工且不虚假完成 | P6-03、P6-05 | 状态 API；检查页 | `tests/e2e/test_ac_13_round_limit.py` |
-| AC-14 | 阻断问题未处置不可交付 | P6-04、P7-01 | 问题处置/交付 API；检查页 | `tests/e2e/test_ac_12_modes.py::AC12ModesE2E.test_disposition_audit_and_delivery_blocker_gate` |
+| AC-14 | 终稿确认记录检查与遗留问题状态，但不以检查阻断交付 | P6-04、P7-01 | 终稿/交付 API；自检与修改页 | `tests/e2e/test_ac_15_17_delivery.py` |
 | AC-15 | 仅明确确认后完成 | P7-01、P7-02 | 交付确认 API；交付操作 | `tests/e2e/test_ac_15_17_delivery.py::DeliveryJourney::test_ac15_explicit_confirmation_is_only_completion_path` |
 | AC-16 | 交付包内容完整 | P7-02 | 交付 API；结果摘要 | `tests/e2e/test_ac_15_17_delivery.py::DeliveryJourney::test_ac16_bundle_is_complete_runnable_and_hash_verified` |
 | AC-17 | 交付后派生与非破坏回退 | P7-03、P7-04 | 派生/回退 API；版本页 | `tests/e2e/test_ac_15_17_delivery.py::DeliveryJourney::test_ac17_delivery_is_immutable_and_new_candidate_requires_reinspection`; `DeliveryFaultTests::test_post_publish_breakpoints_are_idempotently_recoverable` |
@@ -46,7 +46,7 @@
 | F6 叙事与大纲 | `frontend/static/js/stages/planning.js` | `tests/browser/test_fastapi_full_journey.py`、P3 回归 |
 | F7 样品 | `frontend/static/js/stages/sample.js`、版本预览端点 | `tests/browser/test_fastapi_full_journey.py`、P4 浏览器回归 |
 | F8 全稿 | `frontend/static/js/stages/deck.js` | `tests/browser/test_fastapi_full_journey.py`、AC-09/10 回归 |
-| F9 检查与人工审核 | `frontend/static/js/stages/review.js` | `tests/browser/test_fastapi_full_journey.py`、P6 浏览器回归 |
+| F9 自检、修改与终稿确认 | `frontend/static/js/stages/review.js` | `tests/browser/test_fastapi_full_journey.py`、P6 浏览器回归 |
 | F10 交付与派生 | `frontend/static/js/stages/delivery.js` | `tests/browser/test_fastapi_full_journey.py`、AC-15～17 回归 |
 | F11 旧 UI 下线 | `ppt_agent/api.py` 不再包含页面 HTML/CSS/JS；生产 `serve()` 直接运行 FastAPI；旧业务深链由 `pages.py` 进入统一壳，`/legacy/**` 返回 404 | `tests/web/test_audit_blockers.py`、`test_health_shell_static_and_retired_legacy_routes`、迁移后的 AC-18/P4/P6 浏览器回归 |
 

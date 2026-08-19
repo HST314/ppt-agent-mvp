@@ -1,60 +1,66 @@
-import { api } from "../api.js?v=2026.08.17.112846263255";
-import { badge, button, confirmationDialog, element, field, formatTime, metadataList, shortHash } from "../components/index.js?v=2026.08.17.112846263255";
-import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.17.112846263255";
+import { api } from "../api.js?v=2026.08.19.043945581370";
+import { badge, button, confirmationDialog, element, field, formatTime, metadataList, shortHash } from "../components/index.js?v=2026.08.19.043945581370";
+import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.19.043945581370";
 
 export async function render(context) {
-  const [view, deckView, inspection] = await Promise.all([
+  const [view, deckView] = await Promise.all([
     api.delivery(context.taskId, context.controller),
     api.deck(context.taskId, context.controller),
-    api.inspection(context.taskId, context.controller),
   ]);
   context.assertCurrent();
-  return deliveryStage(view, deckView.deck, inspection, context);
+  return deliveryStage(view, deckView.deck, context);
 }
 
-function deliveryStage(view, deck, inspection, context) {
+function deliveryStage(view, deck, context) {
   const latest = view.latest;
+  const finalization = view.finalization;
   const completed = view.state.status === "completed";
   const confirmMessage = actionMessage();
-  const confirm = button(completed ? "当前任务已完成" : "确认最终交付", { kind: "primary", disabled: completed || !deck || !inspection.delivery_allowed, reason: "需要当前候选通过检查且没有未处置阻断问题", mutates: true });
+  const confirm = button(completed ? "离线包已写入" : "将离线包写入工程文件夹", {
+    kind: "primary",
+    disabled: completed || !deck || !finalization,
+    reason: "请先在全稿或自检与修改页确定终稿",
+    mutates: true,
+  });
   confirm.addEventListener("click", () => confirmationDialog({
-    title: "确认最终交付",
-    description: `将当前候选 ${shortHash(deck?.hash)} 固化为不可变交付。后续修改只能从交付记录派生新候选。`,
-    confirmLabel: "确认并生成离线交付",
-    onConfirm: async () => runAction({ buttonNode: confirm, region: confirmMessage, busyLabel: "正在交付…", action: () => api.confirmDelivery(context.taskId, { deck_hash: deck.hash, actor: "user" }), success: "交付已确认并生成不可变离线文件。", refresh: context.refresh }),
+    title: "写入不可变离线包",
+    description: `终稿 ${shortHash(finalization?.deck_hash)} 将写入任务工程目录。网络图片会先下载、校验并改写为包内相对资源；失败时不会产生伪完成目录。`,
+    confirmLabel: "开始写入并校验",
+    onConfirm: async () => context.startJob("delivery.publish", {}, { buttonNode: confirm, region: confirmMessage }),
   }));
 
-  const blockers = inspection.blocking_issues || [];
-  const unresolvedWarnings = (inspection.unresolved || []).filter((item) => item.severity !== "blocker");
   return stageGrid([
-    section("最终交付确认", [
+    section("离线交付", [
       element("div", { className: "delivery-candidate" }, [
-        element("div", {}, [element("p", { className: "eyebrow", text: "当前候选" }), element("h2", { text: deck ? `全稿 v${deck.version}` : "尚无全稿候选" })]),
-        deck ? badge(shortHash(deck.hash), "primary") : badge("缺少候选", "danger"),
+        element("div", {}, [element("p", { className: "eyebrow", text: "已确定终稿" }), element("h2", { text: deck && finalization ? `全稿 v${deck.version}` : "尚未确定终稿" })]),
+        finalization ? badge(shortHash(finalization.deck_hash), "success") : badge("缺少终稿", "danger"),
       ]),
       element("div", { className: "gate-grid" }, [
-        gateItem("候选版本", Boolean(deck), deck ? "已生成" : "未生成"),
-        gateItem("有效检查", Boolean(inspection.report && !inspection.report.stale), inspection.report?.stale ? "报告过期" : inspection.report ? "报告有效" : "尚未检查"),
-        gateItem("阻断问题", blockers.length === 0, blockers.length ? `${blockers.length} 项未处置` : "已清零"),
-        gateItem("人工确认", completed, completed ? "已确认" : "等待用户"),
+        gateItem("终稿冻结", Boolean(finalization), finalization ? "已绑定精确 deck hash" : "待确定"),
+        gateItem("检查状态", Boolean(finalization), inspectionStatus(finalization?.inspection_status)),
+        gateItem("资源本地化", completed, completed ? "已校验" : "写包时执行"),
+        gateItem("工程写入", completed, completed ? "已完成" : "等待用户"),
       ]),
-      unresolvedWarnings.length ? element("div", { className: "notice notice--warning" }, [element("strong", { text: `${unresolvedWarnings.length} 项普通警告仍保留` }), element("p", { text: "普通警告不会阻断交付，但会写入交付摘要。" })]) : null,
+      finalization?.unresolved_issue_count ? element("div", { className: "notice notice--warning" }, [element("strong", { text: `终稿带有 ${finalization.unresolved_issue_count} 项遗留问题` }), element("p", { text: "该事实会写入结果摘要，但不会阻止离线交付。" })]) : null,
       confirm,
       confirmMessage,
-    ], { description: "最终交付必须由用户明确执行，并绑定当前候选 deck hash。" }),
+    ], { description: "写入使用后台 Job、临时目录与原子发布；刷新页面可恢复进度，同一终稿重复执行保持幂等。" }),
     latest ? derivePanel(latest, context) : section("交付后派生", element("p", { className: "muted", text: "完成首次交付后，可从不可变历史版本派生新的候选。" })),
-    section("不可变交付历史", deliveryHistory(view.deliveries || []), { description: "每次交付记录候选 hash、文件清单与摘要；历史内容不被后续修改覆盖。" }),
+    section("不可变交付历史", deliveryHistory(view.deliveries || []), { description: "每次交付记录终稿 hash、文件清单、本地化结果与检查摘要。" }),
   ], [
     section("交付状态", [
-      badge(completed ? "已完成" : "等待交付", completed ? "success" : "warning"),
-      metadataList([["当前候选", shortHash(deck?.hash)], ["最近交付", shortHash(latest?.hash)], ["交付次数", view.deliveries?.length || 0], ["任务修订", view.state.revision]]),
+      badge(completed ? "已完成" : "等待写入", completed ? "success" : "warning"),
+      metadataList([["终稿", shortHash(finalization?.deck_hash)], ["终稿记录", shortHash(finalization?.hash)], ["最近交付", shortHash(latest?.hash)], ["交付次数", view.deliveries?.length || 0], ["任务修订", view.state.revision]]),
     ]),
-    section("检查摘要", [
-      badge(inspection.delivery_allowed ? "门禁通过" : "门禁未通过", inspection.delivery_allowed ? "success" : "danger"),
-      metadataList([["报告", shortHash(inspection.report?.hash)], ["阻断", blockers.length], ["未处置警告", unresolvedWarnings.length]]),
-      !inspection.delivery_allowed ? button("返回检查", { href: `/tasks/${encodeURIComponent(context.taskId)}?stage=review`, kind: "secondary" }) : null,
-    ]),
+    section("终稿摘要", finalization ? [
+      badge(inspectionStatus(finalization.inspection_status), finalization.inspection_status === "passed" ? "success" : "warning"),
+      metadataList([["来源页面", finalization.source === "review" ? "自检与修改" : "全稿"], ["遗留问题", finalization.unresolved_issue_count], ["其中阻断", finalization.blocking_issue_count]]),
+    ] : [badge("尚未确定", "warning"), button("返回全稿", { href: `/tasks/${encodeURIComponent(context.taskId)}?stage=deck`, kind: "secondary" })]),
   ]);
+}
+
+function inspectionStatus(status) {
+  return ({ unchecked: "未执行检查", stale: "检查报告对应旧版本", passed: "检查通过", issues_remaining: "带遗留问题确认" })[status] || "未记录";
 }
 
 function derivePanel(latest, context) {
@@ -65,7 +71,7 @@ function derivePanel(latest, context) {
   const form = element("form", { onSubmit: async (event) => {
     event.preventDefault();
     const payload = { delivery_hash: latest.hash, prompt: prompt.value, slide_ids: parseSlideIds(slides.value) };
-    await runAction({ buttonNode: derive, region: message, busyLabel: "正在派生…", action: () => api.deriveDelivery(context.taskId, payload), success: "已从交付版本创建新候选，需要重新检查与确认。", refresh: () => context.goTo("deck") }).catch(() => {});
+    await runAction({ buttonNode: derive, region: message, busyLabel: "正在派生…", action: () => api.deriveDelivery(context.taskId, payload), success: "已从交付版本创建新候选。", refresh: () => context.goTo("review") }).catch(() => {});
   } }, [field("派生要求", prompt, { hint: "派生会重新打开任务，不会修改已交付文件。" }), field("限定页面（可选）", slides), derive, message]);
   return section("交付后派生", form, { description: `来源：${latest.delivery_id} · ${shortHash(latest.hash)}` });
 }
@@ -76,12 +82,12 @@ function deliveryHistory(deliveries) {
     const files = item.files || [];
     return element("li", { className: "delivery-item" }, [
       element("div", { className: "version-item__header" }, [element("strong", { text: item.delivery_id }), badge("不可变", "success")]),
-      metadataList([["交付时间", formatTime(item.confirmed_at)], ["候选 hash", shortHash(item.deck_hash)], ["交付记录 hash", shortHash(item.hash)], ["文件数", files.length]]),
-      element("details", {}, [element("summary", { text: "查看文件摘要" }), element("ul", { className: "compact-list" }, files.map((name) => element("li", {}, [element("strong", { text: name }), element("small", { className: "muted", text: shortHash(item.metadata?.file_hashes?.[name]) })]))) ]),
+      metadataList([["交付时间", formatTime(item.confirmed_at)], ["终稿 hash", shortHash(item.deck_hash)], ["交付记录 hash", shortHash(item.hash)], ["文件数", files.length]]),
+      element("details", {}, [element("summary", { text: "查看文件摘要" }), element("ul", { className: "compact-list" }, files.map((name) => element("li", {}, [element("strong", { text: name }), element("small", { className: "muted", text: shortHash(item.metadata?.file_hashes?.[name]) })])))]),
     ]);
   }));
 }
 
 function gateItem(label, passed, detail) {
-  return element("div", { className: `gate-item ${passed ? "gate-item--passed" : ""}` }, [badge(passed ? "通过" : "待处理", passed ? "success" : "warning"), element("strong", { text: label }), element("small", { className: "muted", text: detail })]);
+  return element("div", { className: `gate-item ${passed ? "gate-item--passed" : ""}` }, [badge(passed ? "完成" : "待处理", passed ? "success" : "warning"), element("strong", { text: label }), element("small", { className: "muted", text: detail })]);
 }

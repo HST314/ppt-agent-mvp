@@ -1,4 +1,5 @@
 import hashlib, json, tempfile, unittest
+from unittest.mock import patch
 
 from ppt_agent.errors import ConflictError, GateError
 from ppt_agent.service import TaskService
@@ -39,11 +40,38 @@ class DeliveryJourney(unittest.TestCase):
         self.assertEqual(result["status"],{"stage":"delivery","status":"completed"})
         self.assertTrue(result["description"])
 
-    def test_ac17_delivery_is_immutable_and_new_candidate_requires_reinspection(self):
+    def test_ac17_delivery_is_immutable_and_new_candidate_can_use_fast_path(self):
         deck=self.svc.deck_view("task")["deck"]; delivered=self.svc.confirm_delivery("task",deck["hash"])["delivery"]; root=self.store.delivery_root("task",delivered["delivery_id"]); before=(root/"deck.html").read_bytes()
         candidate=self.svc.derive_from_delivery("task",delivered["hash"],"统一使用蓝色主题")["deck"]
         self.assertNotEqual(candidate["hash"],deck["hash"]); self.assertEqual((root/"deck.html").read_bytes(),before); self.assertEqual(self.svc.get("task")["status"],"ready")
-        with self.assertRaises(ConflictError): self.svc.confirm_delivery("task",candidate["hash"])
+        result=self.svc.confirm_delivery("task",candidate["hash"])
+        self.assertEqual(result["state"]["status"],"completed")
+        self.assertEqual(self.svc.finalization_view("task")["current"]["inspection_status"],"stale")
+
+    def test_finalization_is_distinct_from_offline_publish(self):
+        deck=self.svc.deck_view("task")["deck"]
+        finalized=self.svc.finalize_deck("task",deck["hash"],"review")
+        self.assertEqual(finalized["state"]["stage"],"delivery")
+        self.assertNotEqual(finalized["state"]["status"],"completed")
+        self.assertFalse(self.svc.versions("task","delivery"))
+        delivered=self.svc.publish_delivery("task")
+        self.assertEqual(delivered["state"]["status"],"completed")
+
+    def test_finalization_fact_and_stage_advance_are_transactional(self):
+        deck=self.svc.deck_view("task")["deck"]
+        before=self.svc.get("task")
+        armed={"value":True}
+        def fault(point):
+            if armed["value"] and point=="after_prepare": raise RuntimeError("injected")
+        self.store.fault=fault
+        with self.assertRaises(RuntimeError):
+            self.svc.finalize_deck("task",deck["hash"],"review")
+        self.assertEqual(self.svc.get("task"),before)
+        self.assertEqual(self.svc.versions("task","final-deck"),[])
+        armed["value"]=False
+        finalized=self.svc.finalize_deck("task",deck["hash"],"review")
+        self.assertEqual(finalized["state"]["stage"],"delivery")
+        self.assertEqual(len(self.svc.versions("task","final-deck")),1)
 
     def test_pause_stops_new_work_and_resume_preserves_last_version(self):
         before=self.svc.deck_view("task")["deck"]["hash"]
@@ -80,6 +108,28 @@ class DeliveryFaultTests(unittest.TestCase):
                 self.assertEqual(recovered["state"]["status"],"completed")
                 self.assertEqual(len(svc.versions("task","delivery")),1)
                 self.assertEqual(len(list((store._task("task")/"deliveries").iterdir())),1)
+
+    def test_retry_reuses_published_remote_bytes_without_fetching_again(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            armed={"value":True}
+            def fault(point):
+                if armed["value"] and point=="after_delivery_publish": raise RuntimeError("injected")
+            store=WorkspaceStore(tmp,fault=fault); svc=TaskService(store,inspector=PassingInspector()); svc.create("task","manual")
+            svc.import_input("task",{"goal":"发布","audience":"客户","topic":"方案","页数":2})
+            svc.generate_narrative("task"); svc.confirm_narrative("task"); svc.generate_outline("task"); svc.confirm_outline("task")
+            svc.generate_sample("task"); svc.confirm_sample("task"); svc.generate_deck("task")
+            deck_hash=svc.deck_view("task")["deck"]["hash"]
+            localized_calls=[]
+            def localized(html,_manifest,_root):
+                localized_calls.append(True)
+                if len(localized_calls)>1: raise AssertionError("published retry must not fetch again")
+                return html,{"resources/remote-fixed.png":b"first-download"},[{"source":"remote","path":"resources/remote-fixed.png"}]
+            with patch("ppt_agent.service.localize_delivery_html",side_effect=localized):
+                with self.assertRaises(RuntimeError): svc.confirm_delivery("task",deck_hash)
+                armed["value"]=False
+                recovered=svc.confirm_delivery("task",deck_hash)
+            self.assertEqual(recovered["state"]["status"],"completed")
+            self.assertEqual(len(localized_calls),1)
 
 
 if __name__=="__main__": unittest.main()

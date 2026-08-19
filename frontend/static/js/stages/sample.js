@@ -1,6 +1,6 @@
-import { api } from "../api.js?v=2026.08.17.112846263255";
-import { badge, button, element, field, metadataList, previewFrame, previewUrl, shortHash, versionTimeline } from "../components/index.js?v=2026.08.17.112846263255";
-import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.17.112846263255";
+import { api } from "../api.js?v=2026.08.19.043945581370";
+import { badge, button, element, field, metadataList, previewFrame, previewUrl, shortHash, versionTimeline } from "../components/index.js?v=2026.08.19.043945581370";
+import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.19.043945581370";
 
 export async function render(context) {
   const [view, planning] = await Promise.all([
@@ -48,12 +48,11 @@ function sampleStage(view, planning, context) {
     },
   });
   const confirmMessage = actionMessage();
-  const confirm = button("确认当前样品并进入全稿", { kind: "primary", disabled: !sample, reason: "请先生成样品", mutates: true });
+  const confirm = button(view.confirmation ? "当前样品已确认" : "确认当前样品并进入全稿", { kind: "primary", disabled: !sample || Boolean(view.confirmation), reason: view.confirmation ? "已确认；请前往全稿重试生成" : "请先生成样品", mutates: true });
   confirm.addEventListener("click", async () => {
-    await runAction({ buttonNode: confirm, region: confirmMessage, busyLabel: "正在确认…", action: () => api.confirmSample(context.taskId), success: "当前样品已按 outline、selection 和内容 hash 绑定确认。", refresh: context.refresh }).catch(() => {});
+    const result = await runAction({ buttonNode: confirm, region: confirmMessage, busyLabel: "正在确认并启动全稿…", action: () => api.confirmSample(context.taskId), success: "样品已确认，全稿生成已启动。" }).catch(() => null);
+    if (result) context.goTo("deck");
   });
-  const generateDeckMessage = actionMessage();
-  const generateDeck = view.confirmation ? button("生成完整演示稿", { kind: "primary", mutates: true, requiresRuntime: true, onClick: () => context.startJob("deck.generate", {}, { buttonNode: generateDeck, region: generateDeckMessage }) }) : null;
 
   return stageGrid([
     section("样品页选择", selectionForm, {
@@ -69,8 +68,6 @@ function sampleStage(view, planning, context) {
       view.confirmation ? badge("当前样品已确认", "success") : badge("等待人工确认", "warning"),
       confirm,
       confirmMessage,
-      generateDeck,
-      generateDeckMessage,
     ]),
     section("选择依据", selection ? selectionReasons(selection) : element("p", { className: "muted", text: "保存选择后显示推荐依据。" })),
     section("版本时间线", history),

@@ -1,6 +1,6 @@
-import { api } from "../api.js?v=2026.08.17.112846263255";
-import { badge, button, element, field, metadataList, previewFrame, previewUrl, shortHash, versionTimeline } from "../components/index.js?v=2026.08.17.112846263255";
-import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.17.112846263255";
+import { api } from "../api.js?v=2026.08.19.043945581370";
+import { badge, button, confirmationDialog, element, field, metadataList, previewFrame, previewUrl, shortHash } from "../components/index.js?v=2026.08.19.043945581370";
+import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.19.043945581370";
 
 export async function render(context) {
   const view = await api.deck(context.taskId, context.controller);
@@ -11,49 +11,50 @@ export async function render(context) {
 function deckStage(view, context) {
   const deck = view.deck;
   const generationMessage = actionMessage();
-  const generate = button(deck ? "重新生成完整演示稿" : "生成完整演示稿", { kind: "primary", mutates: true, requiresRuntime: true });
+  const generationActive = context.shell.active_jobs.some((job) => job.operation === "deck.generate");
+  const generate = button("重试生成全稿", { kind: "secondary", disabled: Boolean(deck) || generationActive, reason: generationActive ? "全稿生成正在运行" : "已有可用全稿", mutates: true, requiresRuntime: true });
   generate.addEventListener("click", () => context.startJob("deck.generate", {}, { buttonNode: generate, region: generationMessage }));
 
   const previewRegion = element("div", { className: "deck-preview" });
   if (deck) previewRegion.append(deckPreview(deck, context.taskId));
   else previewRegion.append(element("div", { className: "empty-state empty-state--compact" }, [element("h2", { text: "尚未生成全稿" }), element("p", { text: "确认当前样品后即可通过后台 Job 生成整套 HTML 演示稿。" })]));
 
-  const modify = deck ? modificationPanel(deck, context) : null;
-  const compare = deck ? comparePanel(view, context) : null;
-  const historyMessage = actionMessage();
-  const history = versionTimeline(view.versions || [], "deck", {
-    currentHash: deck?.hash,
-    onPreview: (item) => {
-      previewRegion.replaceChildren(deckPreview({ ...deck, metadata: item.metadata, hash: item.hash }, context.taskId));
+  const finalizeMessage = actionMessage();
+  const finalize = button("确定终稿", { kind: "primary", disabled: !deck || generationActive, reason: generationActive ? "请等待当前生成完成" : "请先生成全稿", mutates: true });
+  finalize.addEventListener("click", () => confirmationDialog({
+    title: "将当前候选确定为终稿",
+    description: `将全稿 v${deck?.version || "—"}（${shortHash(deck?.hash)}）冻结为交付版本。自检与人工修改是可选步骤。`,
+    confirmLabel: "确定终稿并前往交付",
+    onConfirm: async () => {
+      await runAction({ buttonNode: finalize, region: finalizeMessage, busyLabel: "正在冻结终稿…", action: () => api.finalizeDeck(context.taskId, { deck_hash: deck.hash, source: "deck", actor: "user" }), success: "终稿已冻结。" });
+      return () => context.goTo("delivery");
     },
-    onRollback: (item) => runAction({ region: historyMessage, action: () => api.rollbackDeck(context.taskId, item.hash), success: "历史全稿已复制为新的候选版本。", refresh: context.refresh }).catch(() => {}),
-  });
+  }));
 
   return stageGrid([
-    section("全稿生成", [
-      element("p", { text: "生成会保留已确认样品页，并发布一份尚未检查的完整候选稿。" }),
+    !deck ? section("全稿生成", [
+      badge(generationActive ? "正在后台生成" : "生成尚未完成", generationActive ? "primary" : "warning"),
+      element("p", { text: generationActive ? "样品确认后已自动启动全稿生成；可以离开页面，进度会持续保存。" : "上次生成未成功完成，可保留已确认样品并重试。" }),
       generate,
       generationMessage,
-    ], { description: "该操作可能超过 10 秒，可以安全离开页面并稍后恢复。" }),
-    deck ? section("候选稿已发布", [
-      badge(deck.metadata?.inspection_status === "pending" ? "等待独立检查" : "候选稿可检查", "warning"),
-      element("p", { text: "候选生成与质量检查相互独立。请进入检查阶段，确认范围后再启动检查。" }),
-      button("前往独立检查", { href: `/tasks/${encodeURIComponent(context.taskId)}?stage=review`, kind: "primary" }),
-    ], { description: "进入检查页面不会自动调用模型；由你明确点击后才会执行。" }) : null,
-    modify,
-    section("演示稿预览", previewRegion, { description: deck ? `当前候选 v${deck.version} · ${Object.keys(deck.metadata?.page_hashes || {}).length} 页` : "固定比例沙箱预览" }),
-    compare,
+    ]) : null,
+    section("全稿浏览", [deck ? fullScreenAction(previewRegion) : null, previewRegion], { description: deck ? `当前候选 v${deck.version} · ${Object.keys(deck.metadata?.page_hashes || {}).length} 页` : "生成完成后在此全屏浏览" }),
+    deck ? section("选择下一步", [
+      element("p", { text: "可直接确定终稿，也可进入自检与修改；两条路径都不会强制要求检查通过。" }),
+      element("div", { className: "button-row" }, [finalize, button("前往自检与修改", { href: `/tasks/${encodeURIComponent(context.taskId)}?stage=review`, kind: "secondary" })]),
+      finalizeMessage,
+    ], { className: "finalize-actions" }) : null,
   ], [
     section("当前候选", deck ? [
       badge(`v${deck.version}`, "primary"),
       metadataList([["候选 hash", shortHash(deck.hash)], ["大纲 hash", shortHash(deck.outline_hash)], ["来源", deck.metadata?.source || "unknown"], ["操作者", deck.metadata?.operator || "system"], ["大纲一致", deck.metadata?.outline_consistent === false ? "否，需重新生成" : "是"]]),
       deck.metadata?.affected?.length ? element("p", { className: "muted", text: `受影响页面：${deck.metadata.affected.join("、")}` }) : null,
     ] : [badge("尚未生成", "warning")]),
-    section("版本时间线", [history, historyMessage]),
+    section("流程说明", [badge("质检可选", "primary"), element("p", { className: "muted", text: "确定终稿后直接进入交付；如需版本回退、Prompt 修改或自检，请进入“自检与修改”。" })]),
   ]);
 }
 
-function modificationPanel(deck, context) {
+export function modificationPanel(deck, context) {
   const message = actionMessage();
   const prompt = element("textarea", { className: "textarea", id: "deck-prompt", placeholder: "例如：仅调整 slide-3 的信息层级，保持内容不变" });
   const type = element("select", { className: "select", id: "deck-change-type" }, [element("option", { value: "visual", text: "纯视觉修改" }), element("option", { value: "content", text: "内容 / 叙事修改" })]);
@@ -80,7 +81,7 @@ function modificationPanel(deck, context) {
   return section("修改全稿", form, { description: "内容修改会同步产生新的权威大纲版本；视觉修改不会改变内容。" });
 }
 
-function deckPreview(deck, taskId) {
+export function deckPreview(deck, taskId) {
   const ids = Object.keys(deck.metadata?.page_hashes || {});
   const wrapper = previewFrame("", "完整 HTML 演示稿安全预览", { id: "deck-preview-frame", allowInspection: true, src: previewUrl(taskId, deck.hash) });
   const frame = wrapper.querySelector("iframe");
@@ -96,7 +97,16 @@ function deckPreview(deck, taskId) {
   return element("div", {}, [nav, status, wrapper]);
 }
 
-function comparePanel(view, context) {
+function fullScreenAction(previewRegion) {
+  const control = button("全屏浏览", { kind: "secondary" });
+  control.addEventListener("click", async () => {
+    const target = previewRegion.querySelector(".preview-aspect");
+    if (target?.requestFullscreen) await target.requestFullscreen();
+  });
+  return element("div", { className: "button-row deck-toolbar" }, [control]);
+}
+
+export function comparePanel(view, context) {
   const versions = (view.versions || []).slice().reverse();
   if (versions.length < 2) return section("逐页版本对比", element("p", { className: "muted", text: "至少生成两个全稿版本后可逐页对比。" }));
   const options = () => versions.map((item, index) => element("option", { value: item.hash, text: `v${versions.length - index} · ${item.metadata?.summary || shortHash(item.hash)}` }));
