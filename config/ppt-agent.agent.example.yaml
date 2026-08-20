@@ -56,7 +56,7 @@ clarification:
   # 最多轮次（1-5）；模型某轮返回 0 题会提前确认结束
   max_rounds: 3
   # 提问风格：minimal=只问阻断交付的关键问题；comprehensive=积极全面追问（偏好类问题可跳过）
-  style: comprehensive
+  style: minimal
 
 skills:
   active: guizang-ppt-skill
