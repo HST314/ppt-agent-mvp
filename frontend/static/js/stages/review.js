@@ -1,7 +1,7 @@
-import { api } from "../api.js?v=2026.08.20.114142303041";
-import { badge, button, confirmationDialog, element, field, metadataList, shortHash, versionTimeline } from "../components/index.js?v=2026.08.20.114142303041";
-import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.20.114142303041";
-import { comparePanel, deckPreview, modificationPanel } from "./deck.js?v=2026.08.20.114142303041";
+import { api } from "../api.js?v=2026.08.20.130612827541";
+import { badge, button, confirmationDialog, element, field, metadataList, shortHash, versionTimeline } from "../components/index.js?v=2026.08.20.130612827541";
+import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.20.130612827541";
+import { comparePanel, deckPreview, modificationPanel } from "./deck.js?v=2026.08.20.130612827541";
 
 export async function render(context) {
   const [view, deckView, settings] = await Promise.all([api.inspection(context.taskId, context.controller), api.deck(context.taskId, context.controller), api.settings(context.controller)]);

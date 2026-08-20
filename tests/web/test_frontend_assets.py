@@ -139,6 +139,28 @@ class FrontendAssetTests(unittest.TestCase):
         self.assertIn('"aria-live": "polite"', app)
         self.assertIn("event_history_warning", app)
 
+    def test_frontend_backend_version_mismatch_prompts_restart(self):
+        app = (FRONTEND / "static/js/app.js").read_text()
+        css = "\n".join(path.read_text() for path in (FRONTEND / "static/css").glob("*.css"))
+        # 校验信号来自后端就绪载荷：backend_commit 与 frontend_build 必须参与比较。
+        self.assertIn("runtimeState.health?.frontend_build", app)
+        self.assertIn("backend_commit", app)
+        self.assertIn("runtimeVersionMismatch", app)
+        # 不一致时必须明确提示重启：顶栏徽标、页面横幅与禁用原因三层提示。
+        self.assertIn("版本不一致·需重启", app)
+        self.assertIn("前端与后端版本不一致，请重启后端服务", app)
+        self.assertIn('"data-version-mismatch-banner"', app)
+        self.assertIn('role: "alert"', app)
+        self.assertIn("前端与后端版本不一致，请先重启后端服务", app)
+        self.assertIn("python -m uvicorn main_front:app", app)
+        self.assertIn("git rev-parse HEAD", app)
+        # 设置页展示完整版本与提交信息，并对未知 commit 给出说明。
+        self.assertIn('"data-runtime-version-details"', app)
+        for label in ("前端 Build", "后端 Build", "后端 commit", "前后端版本一致", "无法校验代码版本"):
+            self.assertIn(label, app)
+        self.assertIn(".version-banner", css)
+        self.assertIn(".version-warning", css)
+
 
 if __name__ == "__main__":
     unittest.main()

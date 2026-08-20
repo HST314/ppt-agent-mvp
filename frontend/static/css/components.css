@@ -49,6 +49,11 @@
 .inline-error { padding: var(--space-4); border-inline-start: 4px solid var(--color-destructive); border-radius: var(--radius-sm); color: var(--color-foreground); background: color-mix(in srgb, var(--color-destructive) 8%, var(--color-surface)); }
 .inline-error strong { display: block; color: var(--color-destructive); }
 
+.version-banner { display: grid; gap: var(--space-1); margin: var(--space-3) clamp(1rem, 2.5vw, 2.25rem) 0; padding: var(--space-3) var(--space-4); border-inline-start: 4px solid var(--color-destructive); border-radius: var(--radius-sm); color: var(--color-foreground); background: color-mix(in srgb, var(--color-destructive) 10%, var(--color-surface)); }
+.version-banner strong { color: var(--color-destructive); }
+.version-banner__steps { font-size: 0.875rem; color: var(--color-muted-foreground); }
+.version-warning { color: var(--color-destructive); font-weight: 650; }
+
 .empty-state { min-height: 16rem; display: grid; place-content: center; justify-items: center; gap: var(--space-3); padding: var(--space-8); text-align: center; color: var(--color-muted-foreground); }
 .empty-state h2 { margin: 0; color: var(--color-foreground); }
 .empty-state .icon { width: 2rem; height: 2rem; color: var(--color-primary); }

@@ -1,10 +1,10 @@
-import { api, ApiError } from "./api.js?v=2026.08.20.114142303041";
-import { JobTracker } from "./job-tracker.js?v=2026.08.20.114142303041";
-import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.20.114142303041";
-import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.20.114142303041";
-import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.20.114142303041";
-import { inlineError, setBusy } from "./components/index.js?v=2026.08.20.114142303041";
-import { renderStage } from "./stages/index.js?v=2026.08.20.114142303041";
+import { api, ApiError } from "./api.js?v=2026.08.20.130612827541";
+import { JobTracker } from "./job-tracker.js?v=2026.08.20.130612827541";
+import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.20.130612827541";
+import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.20.130612827541";
+import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.20.130612827541";
+import { inlineError, setBusy } from "./components/index.js?v=2026.08.20.130612827541";
+import { renderStage } from "./stages/index.js?v=2026.08.20.130612827541";
 
 const app = document.getElementById("app");
 const APP_BUILD = document.querySelector('meta[name="app-build"]')?.content || "unknown";
@@ -18,6 +18,7 @@ let activeController = null;
 let hasUnsavedDraft = false;
 let acceptedLocation = `${window.location.pathname}${window.location.search}${window.location.hash}`;
 let runtimeProbe = null;
+let versionMismatchNotified = false;
 let runtimeState = { browserOnline: navigator.onLine, backendReachable: null, runtimeReady: null, health: null };
 
 const STATUS = {
@@ -154,11 +155,18 @@ function runtimeStatusBadges() {
   return group;
 }
 
+function runtimeVersionMismatch() {
+  const backendBuild = runtimeState.health?.frontend_build;
+  if (!backendBuild || backendBuild === "unknown" || !APP_BUILD || APP_BUILD === "unknown") return false;
+  return backendBuild !== APP_BUILD;
+}
+
 function renderRuntimeBadges(group) {
   const browserLabel = runtimeState.browserOnline ? "浏览器在线" : "浏览器离线";
   const browserTone = runtimeState.browserOnline ? "success" : "danger";
   const backendLabel = runtimeState.backendReachable === null ? "后端检测中" : runtimeState.backendReachable ? "后端可达" : "后端不可达";
   const backendTone = runtimeState.backendReachable === null ? "warning" : runtimeState.backendReachable ? "success" : "danger";
+  const versionMismatch = runtimeVersionMismatch();
   let modelLabel = "模型检测中";
   let modelTone = "warning";
   if (runtimeState.health?.startup_status === "starting") {
@@ -173,7 +181,7 @@ function renderRuntimeBadges(group) {
     modelLabel = "模型不可用";
     modelTone = "danger";
   }
-  const signature = JSON.stringify([browserLabel, browserTone, backendLabel, backendTone, modelLabel, modelTone]);
+  const signature = JSON.stringify([browserLabel, browserTone, backendLabel, backendTone, modelLabel, modelTone, versionMismatch]);
   if (group.dataset.runtimeSignature === signature) return;
   group.dataset.runtimeSignature = signature;
   const browser = badge(browserLabel, browserTone);
@@ -184,6 +192,12 @@ function renderRuntimeBadges(group) {
   const failedCheck = runtimeState.health?.model_capabilities?.failed_check;
   const probeId = runtimeState.health?.model_capabilities?.probe_id;
   if (code) model.title = [`运行时错误：${code}`,failedCheck ? `失败检查：${runtimeCheckLabel(failedCheck)}` : null,phase ? `失败阶段：${runtimePhaseLabel(phase)}` : null,probeId ? `探测 ID：${probeId}` : null].filter(Boolean).join(" · ");
+  if (versionMismatch) {
+    const warning = badge("版本不一致·需重启", "danger");
+    warning.title = `前端 Build ${APP_BUILD} · 后端 Build ${runtimeState.health.frontend_build} · 后端 commit ${(runtimeState.health.backend_commit || "unknown").slice(0, 12)}`;
+    group.replaceChildren(browser, backend, model, warning);
+    return;
+  }
   group.replaceChildren(browser, backend, model);
 }
 
@@ -210,8 +224,10 @@ async function refreshRuntimeStatus(recheck = false) {
 function updateRuntimeUI() {
   document.querySelectorAll("[data-runtime-status]").forEach(renderRuntimeBadges);
   document.querySelectorAll("[data-runtime-probe-details]").forEach(renderRuntimeProbeDetails);
+  document.querySelectorAll("[data-runtime-version-details]").forEach(renderRuntimeVersionDetails);
+  const versionMismatch = runtimeVersionMismatch();
   document.querySelectorAll('[data-requires-runtime="true"]').forEach((control) => {
-    if (runtimeState.runtimeReady) {
+    if (runtimeState.runtimeReady && !versionMismatch) {
       if (control.dataset.runtimeDisabled === "true") {
         control.disabled = false;
         delete control.dataset.runtimeDisabled;
@@ -222,14 +238,73 @@ function updateRuntimeUI() {
     }
     if (!control.disabled) control.dataset.runtimeDisabled = "true";
     control.disabled = true;
-    const reason = runtimeState.backendReachable === false
-      ? "后端服务当前不可达"
-      : runtimeState.health?.startup_status === "starting"
-        ? "后台正在恢复任务并检测运行时，请稍后"
-        : "模型运行时不可用，请先重新检测";
+    const reason = versionMismatch
+      ? "前端与后端版本不一致，请先重启后端服务"
+      : runtimeState.backendReachable === false
+        ? "后端服务当前不可达"
+        : runtimeState.health?.startup_status === "starting"
+          ? "后台正在恢复任务并检测运行时，请稍后"
+          : "模型运行时不可用，请先重新检测";
     control.title = reason;
     control.setAttribute("aria-description", reason);
   });
+  syncVersionBanner();
+}
+
+function syncVersionBanner() {
+  document.querySelectorAll("[data-version-mismatch-banner]").forEach((node) => node.remove());
+  if (!runtimeVersionMismatch()) {
+    versionMismatchNotified = false;
+    return;
+  }
+  const shellNode = document.querySelector(".app-shell");
+  if (shellNode) {
+    const backendBuild = runtimeState.health?.frontend_build || "unknown";
+    const commit = (runtimeState.health?.backend_commit || "unknown").slice(0, 12);
+    const banner = element("div", { className: "version-banner", "data-version-mismatch-banner": "true", role: "alert" }, [
+      element("strong", { text: "前端与后端版本不一致，请重启后端服务" }),
+      element("span", { text: `页面资源为 Build ${APP_BUILD}，正在运行的后端为 Build ${backendBuild}（commit ${commit}）。后端进程仍在执行旧代码，模型探测与运行状态可能无效。` }),
+      element("span", { className: "version-banner__steps", text: "请在运行后端的终端按 Ctrl+C 停止，重新执行 python -m uvicorn main_front:app --host 127.0.0.1 --port 8000，确认 /readyz 的 backend_commit 与 git rev-parse HEAD 相同后刷新本页面。" }),
+    ]);
+    const header = shellNode.querySelector(".topbar");
+    if (header?.parentNode === shellNode) header.after(banner);
+    else shellNode.prepend(banner);
+  }
+  if (!versionMismatchNotified) {
+    versionMismatchNotified = true;
+    showToast("前端与后端版本不一致，请重启后端服务");
+  }
+}
+
+function runtimeVersionDetails() {
+  const container = element("div", { "data-runtime-version-details": "true" });
+  renderRuntimeVersionDetails(container);
+  return container;
+}
+
+function renderRuntimeVersionDetails(container) {
+  const health = runtimeState.health || {};
+  const backendBuild = health.frontend_build || null;
+  const commit = health.backend_commit || null;
+  const config = health.config_summary_sha256 || null;
+  const rows = [
+    ["前端 Build", APP_BUILD],
+    ["后端 Build", backendBuild || "未知"],
+    ["后端 commit", commit && commit !== "unknown" ? commit : "未知"],
+    ["配置摘要", config ? config.slice(0, 12) : "未知"],
+  ];
+  let status = "等待后端响应后校验版本";
+  let mismatch = false;
+  if (backendBuild) {
+    mismatch = runtimeVersionMismatch();
+    if (mismatch) status = "前后端版本不一致：后端进程仍在运行旧代码，请重启后端服务后刷新页面";
+    else if (!commit || commit === "unknown") status = "前后端 Build 一致；后端 commit 未知，无法校验代码版本";
+    else status = "前后端版本一致";
+  }
+  container.replaceChildren(
+    element("dl", { className: "metadata-list", "aria-label": "版本与提交信息" }, rows.map(([key, value]) => element("div", {}, [element("dt", { text: key }), element("dd", { text: value })]))),
+    element("p", { className: mismatch ? "version-warning" : "field__hint", text: status }),
+  );
 }
 
 async function renderHome(generation) {
@@ -1096,8 +1171,8 @@ function branchSettings(shell,branches,route) {
 function systemSettings() {
   const current=document.documentElement.dataset.theme;
   return element("section",{className:"card settings-panel"},[
-    element("div",{className:"card__header"},[element("div",{},[element("h2",{text:"系统与显示"}),element("p",{className:"muted",text:runtimeVersionText()})])]),
-    runtimeStatusBadges(),runtimeProbeDetails(),
+    element("div",{className:"card__header"},[element("div",{},[element("h2",{text:"系统与显示"}),element("p",{className:"muted",text:"前后端版本与后端提交校验。"})])]),
+    runtimeStatusBadges(),runtimeVersionDetails(),runtimeProbeDetails(),
     element("div",{className:"button-row"},[
       button(current==="dark" ? "切换浅色主题" : "切换深色主题",{onClick:(event)=>{ const next=document.documentElement.dataset.theme==="dark" ? "light" : "dark"; applyTheme(next); event.currentTarget.textContent=next==="dark" ? "切换浅色主题" : "切换深色主题"; }}),
       button("重新检测模型",{kind:"secondary",onClick:async(event)=>{ const control=event.currentTarget; setBusy(control,true,"正在检测…"); await refreshRuntimeStatus(true); setBusy(control,false); }}),
@@ -1207,7 +1282,7 @@ function openSettings() {
       element("div", { className: "field" }, [
         element("span", { className: "field__label", text: "服务连接" }),
         runtimeStatusBadges(),
-        element("p", { className: "field__hint", text: runtimeVersionText() }),
+        runtimeVersionDetails(),
         runtimeProbeDetails(),
         button("重新检测模型", { onClick: async (event) => {
           const control = event.currentTarget;
@@ -1227,12 +1302,6 @@ function openSettings() {
   document.body.append(dialog);
   dialog.addEventListener("cancel", () => window.setTimeout(() => dialog.remove(), 0), { once: true });
   dialog.showModal();
-}
-
-function runtimeVersionText() {
-  const commit = runtimeState.health?.backend_commit || "unknown";
-  const config = runtimeState.health?.config_summary_sha256 || "unknown";
-  return `前端 Build ${APP_BUILD} · 后端 ${commit.slice(0, 12)} · 配置 ${config.slice(0, 12)}`;
 }
 
 function runtimeProbeDetails() {
