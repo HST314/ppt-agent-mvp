@@ -75,9 +75,27 @@ class JobServiceTests(unittest.TestCase):
 
     def test_probe_failure_logs_full_redacted_chain_under_public_diagnostic_id(self):
         class FailingClient:
-            config=SimpleNamespace(api_key="secret-key")
+            config=SimpleNamespace(api_key="path-secret-9f5b")
             def probe_diagnostic_context(self):
-                return {"adapter":"test-adapter","sdk":"test-sdk","sdk_version":"1.2.3","endpoint":"https://provider.example/v1"}
+                return {
+                    "adapter":"test-adapter",
+                    "sdk":"test-sdk",
+                    "sdk_version":"1.2.3",
+                    "endpoint":"https://provider.example/v1/path-secret-9f5b",
+                    "request_path":"https://provider.example/v1/path-secret-9f5b/responses",
+                    "context":{
+                        "headers":{"Authorization":"Bearer bearer-context-secret"},
+                        "trace":"upstream Bearer bearer-trace-secret",
+                        "details":[
+                            "password=named-context-secret",
+                            '{"api_key":"json-named-context-secret"}',
+                            {
+                                "api_key":"structured-context-secret",
+                                "client_secret":["nested-structured-secret"],
+                            },
+                        ],
+                    },
+                }
 
         class FailingProbeGateway:
             model="probe-model"
@@ -85,7 +103,7 @@ class JobServiceTests(unittest.TestCase):
             def set_audit_sink(self,_sink): pass
             def probe_capabilities(self,probe_id=None):
                 try:
-                    raise AttributeError("parser exposed secret-key")
+                    raise AttributeError("parser exposed path-secret-9f5b")
                 except AttributeError as cause:
                     raise GatewayError(
                         "模型 SDK 返回了无法分类的失败，请联系管理员核对运行日志",
@@ -100,6 +118,7 @@ class JobServiceTests(unittest.TestCase):
 
         diagnostic_id=health["error"]["diagnostic_id"]
         log="\n".join(captured.output)
+        payload=json.loads(captured.records[0].getMessage())
         self.assertEqual(persisted["error"]["diagnostic_id"],diagnostic_id)
         self.assertIn(diagnostic_id,log)
         self.assertIn(health["probe_id"],log)
@@ -108,8 +127,21 @@ class JobServiceTests(unittest.TestCase):
         self.assertIn("The above exception was the direct cause",log)
         self.assertIn('"adapter": "test-adapter"',log)
         self.assertIn('"sdk_version": "1.2.3"',log)
-        self.assertIn("https://provider.example/v1",log)
-        self.assertNotIn("secret-key",log)
+        self.assertEqual(payload["endpoint"],"https://provider.example/v1/[REDACTED]")
+        self.assertEqual(payload["request_path"],"https://provider.example/v1/[REDACTED]/responses")
+        self.assertEqual(payload["context"]["headers"]["Authorization"],"[REDACTED]")
+        self.assertEqual(payload["context"]["trace"],"upstream Bearer [REDACTED]")
+        self.assertEqual(payload["context"]["details"][0],"password=[REDACTED]")
+        self.assertIn('[REDACTED]',payload["context"]["details"][1])
+        self.assertEqual(payload["context"]["details"][2]["api_key"],"[REDACTED]")
+        self.assertEqual(payload["context"]["details"][2]["client_secret"],["[REDACTED]"])
+        self.assertNotIn("path-secret-9f5b",log)
+        self.assertNotIn("bearer-context-secret",log)
+        self.assertNotIn("bearer-trace-secret",log)
+        self.assertNotIn("named-context-secret",log)
+        self.assertNotIn("json-named-context-secret",log)
+        self.assertNotIn("structured-context-secret",log)
+        self.assertNotIn("nested-structured-secret",log)
         self.assertNotIn("parser exposed",log)
 
     def test_stage_deadline_keeps_diagnostic_id_and_specific_error_code(self):

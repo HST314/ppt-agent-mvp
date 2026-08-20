@@ -8,10 +8,16 @@ from typing import Iterable
 
 
 _BEARER_RE = re.compile(r"(?i)(authorization\s*[:=]\s*(?:bearer\s+)?)[^\s,;]+")
+_BEARER_VALUE_RE = re.compile(r"(?i)(\bbearer\s+)[^\s,;}\[\]\\\"']+")
 _NAMED_SECRET_RE = re.compile(
     r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)"
-    r"(\s*[:=]\s*)"
+    r"([\"']?\s*[:=]\s*)"
     r"(?:[\"'](?:\\.|[^\"'])*[\"']|[^\s,;}]+)"
+)
+_SECRET_FIELD_RE = re.compile(
+    r"(?i)^(?:authorization|proxy[_-]?authorization|api[_-]?key|access[_-]?token|"
+    r"refresh[_-]?token|auth[_-]?token|bearer|password|passwd|secret|client[_-]?secret|"
+    r"private[_-]?key|credential(?:s)?|token)$"
 )
 _KNOWN_TOKEN_RE = re.compile(r"(?i)\b(?:sk|ghp|github_pat|bearer)[-_][a-z0-9._-]+")
 _URL_RE = re.compile(r"https?://[^\s\]\[()<>{}\"']+")
@@ -45,9 +51,37 @@ def redact_diagnostic_text(value: str, *, secrets: Iterable[str] = ()) -> str:
     ):
         redacted = redacted.replace(secret, "[REDACTED]")
     redacted = _BEARER_RE.sub(r"\1[REDACTED]", redacted)
+    redacted = _BEARER_VALUE_RE.sub(r"\1[REDACTED]", redacted)
     redacted = _NAMED_SECRET_RE.sub(r"\1\2[REDACTED]", redacted)
     redacted = _KNOWN_TOKEN_RE.sub("[REDACTED]", redacted)
     return _URL_RE.sub(_redact_url, redacted)
+
+
+def redact_diagnostic_payload(value: object, *, secrets: Iterable[str] = ()) -> object:
+    """Recursively redact every string in a structured diagnostic payload."""
+    secret_values = tuple(item for item in secrets if isinstance(item, str) and item)
+
+    def redact(item: object, *, secret_field: bool = False) -> object:
+        if isinstance(item, str):
+            if secret_field:
+                return "[REDACTED]"
+            return redact_diagnostic_text(item, secrets=secret_values)
+        if isinstance(item, dict):
+            redacted: dict[object, object] = {}
+            for key, nested in item.items():
+                safe_key = redact_diagnostic_text(key, secrets=secret_values) if isinstance(key, str) else key
+                named_secret = secret_field or (
+                    isinstance(key, str) and bool(_SECRET_FIELD_RE.fullmatch(key))
+                )
+                redacted[safe_key] = redact(nested, secret_field=named_secret)
+            return redacted
+        if isinstance(item, list):
+            return [redact(nested, secret_field=secret_field) for nested in item]
+        if isinstance(item, tuple):
+            return tuple(redact(nested, secret_field=secret_field) for nested in item)
+        return item
+
+    return redact(value)
 
 
 def sanitized_exception_chain(error: BaseException, *, secrets: Iterable[str] = ()) -> str:
@@ -104,11 +138,13 @@ def log_exception_chain(
     secrets: Iterable[str] = (),
 ) -> None:
     """Emit one searchable, structured server log for a runtime probe failure."""
+    secret_values = tuple(secrets)
     payload = {
         "event": "runtime_probe_exception",
         "diagnostic_id": diagnostic_id,
         "probe_id": probe_id,
         **dict(context or {}),
-        "exception_chain": sanitized_exception_chain(error, secrets=secrets),
+        "exception_chain": sanitized_exception_chain(error, secrets=secret_values),
     }
-    logging.getLogger("ppt_agent.runtime").error(json.dumps(payload, ensure_ascii=False))
+    safe_payload = redact_diagnostic_payload(payload, secrets=secret_values)
+    logging.getLogger("ppt_agent.runtime").error(json.dumps(safe_payload, ensure_ascii=False))
