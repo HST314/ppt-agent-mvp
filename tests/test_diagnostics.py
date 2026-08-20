@@ -75,9 +75,44 @@ class DiagnosticRedactionTests(unittest.TestCase):
         for sentinel in sentinels:
             self.assertNotIn(sentinel, serialized)
 
-    def test_named_secret_matching_does_not_redact_a_field_name_suffix(self):
-        value = "not-token=ordinary-value"
-        self.assertEqual(redact_diagnostic_text(value), value)
+    def test_named_secret_matching_does_not_redact_prefixed_field_names(self):
+        for field_name in self.SECRET_FIELD_NAMES:
+            for prefix in ("not-", "not_"):
+                prefixed_name = f"{prefix}{field_name}"
+                forms = (
+                    f"{prefixed_name}=ordinary-value",
+                    f"{prefixed_name}: ordinary-value",
+                    f'{{"{prefixed_name}": "ordinary-value"}}',
+                )
+                for value in forms:
+                    with self.subTest(field_name=field_name, prefix=prefix, value=value):
+                        self.assertEqual(redact_diagnostic_text(value), value)
+
+    def test_log_payload_preserves_all_prefixed_non_secret_field_names(self):
+        details = []
+        for field_name in self.SECRET_FIELD_NAMES:
+            for prefix in ("not-", "not_"):
+                prefixed_name = f"{prefix}{field_name}"
+                details.extend(
+                    (
+                        f"{prefixed_name}=ordinary-value",
+                        f"{prefixed_name}: ordinary-value",
+                        f'{{"{prefixed_name}": "ordinary-value"}}',
+                    )
+                )
+
+        with self.assertLogs("ppt_agent.runtime", level="ERROR") as captured:
+            log_exception_chain(
+                RuntimeError("provider message is private"),
+                diagnostic_id="diagnostic-negative-boundary-test",
+                probe_id="probe-negative-boundary-test",
+                context={"details": details},
+            )
+
+        serialized = captured.records[0].getMessage()
+        payload = json.loads(serialized)
+        self.assertEqual(payload["details"], details)
+        self.assertNotIn("[REDACTED]", json.dumps(payload["details"]))
 
 
 if __name__ == "__main__":

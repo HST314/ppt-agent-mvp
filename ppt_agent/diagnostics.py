@@ -7,7 +7,10 @@ import traceback
 from typing import Iterable
 
 
-_BEARER_RE = re.compile(r"(?i)(authorization\s*[:=]\s*(?:bearer\s+)?)[^\s,;]+")
+_BEARER_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_-])"
+    r"(authorization\s*[:=]\s*(?:bearer\s+)?)[^\s,;]+"
+)
 _BEARER_VALUE_RE = re.compile(r"(?i)(\bbearer\s+)[^\s,;}\[\]\\\"']+")
 _SECRET_FIELD_NAME_PATTERN = (
     r"(?:authorization|proxy[_-]?authorization|api[_-]?key|access[_-]?token|"
