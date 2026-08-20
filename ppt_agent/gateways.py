@@ -107,6 +107,10 @@ class AgentGateway:
 
     def set_audit_sink(self, sink): self.audit_sink = sink
 
+    def capability_probe_key(self):
+        key = getattr(self.client, "capability_probe_key", None)
+        return key() if callable(key) else None
+
     def _run(self, stage, payload):
         # Read quotas and audit are scoped to one stage invocation.  Reusing a
         # mutable SkillRuntime would let earlier stages consume later budgets.
@@ -209,17 +213,33 @@ class AgentGateway:
 
         check="basic_response"
         record(check,"started")
-        try:
-            basic=self.client.create(
-                input=[{"role":"system","content":"运行时连接探测。只返回 OK。"},{"role":"user","content":"OK"}],
-                tools=[],
-                response_schema=None,
-            )
-            if not isinstance(basic.text,str) or not basic.text.strip():
-                raise GatewayError("模型基础响应缺少文本结果")
-            record(check,"succeeded",response_id_sha256=hashlib.sha256((basic.response_id or "").encode()).hexdigest())
-        except Exception as exc:
-            failed(check,exc)
+        max_attempts=2
+        for attempt in range(1,max_attempts+1):
+            try:
+                basic=self.client.create(
+                    input=[{"role":"system","content":"运行时连接探测。只返回 OK。"},{"role":"user","content":"OK"}],
+                    tools=[],
+                    response_schema=None,
+                )
+                if not isinstance(basic.text,str) or not basic.text.strip():
+                    raise GatewayError("模型基础响应缺少文本结果")
+                record(check,"succeeded",attempt=attempt,response_id_sha256=hashlib.sha256((basic.response_id or "").encode()).hexdigest())
+                break
+            except Exception as exc:
+                details=exc.safe_audit_details() if isinstance(exc,GatewayError) else {}
+                sdk_parse_failure=details.get("category")=="sdk_error" or isinstance(exc,AttributeError)
+                if sdk_parse_failure and attempt < max_attempts:
+                    record(
+                        check,
+                        "retrying",
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                        error_code=getattr(exc,"code","capability_probe_failed"),
+                        diagnostic_id=getattr(exc,"diagnostic_id",None),
+                        **details,
+                    )
+                    continue
+                failed(check,exc)
 
         check="strict_json_schema"
         record(check,"started")

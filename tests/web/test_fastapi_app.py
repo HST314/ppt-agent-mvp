@@ -157,12 +157,12 @@ class FastAPIAppTests(unittest.TestCase):
         class ProbeSDK:
             def __init__(self, fail_at):
                 self.responses = self
-                self.fail_at = fail_at
+                self.fail_at = set(fail_at)
                 self.calls = 0
 
             def create(self, **_kwargs):
                 self.calls += 1
-                if self.calls == self.fail_at:
+                if self.calls in self.fail_at:
                     raise RuntimeError("raw provider message with secret-key")
                 responses = {
                     1: SimpleNamespace(output_text="OK", id="provider-basic-id", output=[]),
@@ -183,9 +183,9 @@ class FastAPIAppTests(unittest.TestCase):
             timeout_seconds=1,
         )
         cases = {
-            "basic_response": (1, "probe_basic_response_failed"),
-            "strict_json_schema": (2, "probe_invalid_output"),
-            "tool_round_trip": (3, "probe_tool_round_failed"),
+            "basic_response": ((1, 2), "probe_basic_response_failed"),
+            "strict_json_schema": ((2,), "probe_invalid_output"),
+            "tool_round_trip": ((3,), "probe_tool_round_failed"),
         }
         for failed_check, (fail_at, expected_code) in cases.items():
             with self.subTest(failed_check=failed_check), tempfile.TemporaryDirectory() as root:
@@ -195,9 +195,10 @@ class FastAPIAppTests(unittest.TestCase):
                 with TestClient(create_app(service)) as client:
                     status = self.wait_for_runtime_probe(client)["model_capabilities"]
                     persisted = client.get("/v1/runtime/probes?limit=1").json()["probes"][0]
-                    client.post("/v1/tasks", json={"task_id": f"probe-{fail_at}", "mode": "manual"})
+                    task_id=f"probe-{failed_check}"
+                    client.post("/v1/tasks", json={"task_id": task_id, "mode": "manual"})
                     blocked = client.post(
-                        f"/v1/tasks/probe-{fail_at}/input",
+                        f"/v1/tasks/{task_id}/input",
                         json={"source": {"topic": "probe lineage"}},
                     ).json()["clarification"]["error"]
 

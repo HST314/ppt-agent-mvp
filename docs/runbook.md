@@ -15,7 +15,7 @@
 python -m uvicorn main_front:app --host 127.0.0.1 --port 8000
 ```
 
-该命令启动 FastAPI/Uvicorn Web 适配层。Web 端口先开放，历史 Job 扫描与模型能力探测在后台执行；`/livez` 只检查 Web 进程存活并始终返回 200，`/readyz` 检查真实模型运行契约，未就绪时返回 503。兼容端点 `/healthz` 与 readiness 使用相同的 200/503 语义；浏览器轮询 `/v1/runtime/status`，通过 `startup_status` 与 `runtime_ready` 区分“后端已启动 / 模型检测中 / 可用或失败”。真实模型模式必须满足 `runtime_ready=true` 且 `model_capabilities.status=ready`。启动按顺序验证基础文本响应、严格 JSON Schema、强制函数调用与结果回传；任一检查失败即停止，状态中保留 `probe_id`、`failed_check` 与精确业务错误码，依赖模型的 Job 在入队和执行前都会关闭失败。脱敏且可跨重启读取的探测记录由 `GET /v1/runtime/probes` 导出。修复配置后可在“设置 → 系统与显示”重新检测。`/`、`/tasks/{task_id}` 和 `/components` 使用独立 `frontend/` 静态资源。
+该命令启动 FastAPI/Uvicorn Web 适配层。Web 端口先开放，历史 Job 扫描与模型能力探测在后台执行；`/livez` 只检查 Web 进程存活并始终返回 200，`/readyz` 检查真实模型运行契约，未就绪时返回 503。兼容端点 `/healthz` 与 readiness 使用相同的 200/503 语义；浏览器轮询 `/v1/runtime/status`，通过 `startup_status` 与 `runtime_ready` 区分“后端已启动 / 模型检测中 / 可用或失败”。真实模型模式必须满足 `runtime_ready=true` 且 `model_capabilities.status=ready`。启动按顺序验证基础文本响应、严格 JSON Schema、强制函数调用与结果回传；相同客户端、端点、模型、凭据和协议模式的网关只执行一次能力探测。基础探测遇到 SDK 响应解析异常时最多重试一次，其他业务调用不会因此扩大重试范围。任一检查最终失败即停止，状态中保留 `probe_id`、`failed_check` 与精确业务错误码，依赖模型的 Job 在入队和执行前都会关闭失败。脱敏且可跨重启读取的探测记录由 `GET /v1/runtime/probes` 导出；服务端日志会以同一 `diagnostic_id`、`probe_id` 输出无本地变量且已脱敏的完整异常因果链。修复配置后可在“设置 → 系统与显示”重新检测。`/`、`/tasks/{task_id}` 和 `/components` 使用独立 `frontend/` 静态资源。
 
 样品、全稿和自检预览由 `/v1/tasks/{task_id}/previews/{hash}` 提供。端点只接受当前任务内 `sample`/`deck` 版本，返回 `no-store`、`SAMEORIGIN` 与禁止脚本的独立 CSP；HTTP(S)、Base64 与相对图片仅作为展示资源开放。相对资源再经 `/preview-assets/{hash}/{path}` 校验当前任务、版本、manifest 与文件 hash。应用壳 CSP 不允许内联脚本或样式。预览异常时先核对 hash 与资源清单，不要绕过端点直接读取工作区文件。
 

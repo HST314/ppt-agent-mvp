@@ -173,6 +173,51 @@ class StageBAgentTests(unittest.TestCase):
         self.assertEqual(gateway.last_probe_audit["probe_id"],"runtime-probe-test")
         self.assertEqual([event["status"] for event in gateway.last_probe_audit["events"]],["started","succeeded"]*3)
 
+    def test_basic_probe_retries_one_sdk_parse_failure_then_recovers(self):
+        turns=[
+            ModelTurn("OK","basic"),
+            ModelTurn(OUTLINE_JSON,"schema"),
+            ModelTurn(None,"tools",(ModelToolCall("list_skill_files","{}","probe-call"),)),
+            ModelTurn('{"markdown":"probe-ok"}',"final"),
+        ]
+
+        class RetryClient(ScriptedClient):
+            def __init__(self): super().__init__(turns); self.calls=0
+            def create(self,**kwargs):
+                self.calls+=1
+                if self.calls==1:
+                    raise GatewayError(
+                        "SDK parse failed",
+                        audit_details={"category":"sdk_error","sdk_exception_type":"AttributeError","retryable":False},
+                    )
+                return super().create(**kwargs)
+
+        client=RetryClient()
+        gateway=AgentGateway(client,skill=SkillRuntime.builtin())
+        checks=gateway.probe_capabilities(probe_id="runtime-probe-retry")
+
+        self.assertTrue(all(checks.values()))
+        self.assertEqual(client.calls,5)
+        retry=gateway.last_probe_audit["events"][1]
+        self.assertEqual(retry["status"],"retrying")
+        self.assertEqual(retry["attempt"],1)
+        self.assertEqual(retry["max_attempts"],2)
+
+    def test_basic_probe_sdk_parse_retry_is_bounded(self):
+        class PersistentSDKFailure:
+            def __init__(self): self.calls=0
+            def create(self,**_kwargs):
+                self.calls+=1
+                raise AttributeError("response parser failed")
+
+        client=PersistentSDKFailure()
+        gateway=AgentGateway(client,skill=SkillRuntime.builtin())
+        with self.assertRaises(GatewayError) as caught:
+            gateway.probe_capabilities(probe_id="runtime-probe-bounded")
+        self.assertEqual(client.calls,2)
+        self.assertEqual(caught.exception.failed_check,"basic_response")
+        self.assertEqual([event["status"] for event in gateway.last_probe_audit["events"]],["started","retrying","failed"])
+
     def test_probe_failures_keep_failed_check_stable_code_and_secret_free_trace(self):
         basic=AgentGateway(ScriptedClient([ModelTurn(None,"empty")]),skill=SkillRuntime.builtin())
         with self.assertRaises(GatewayError) as caught:
@@ -597,6 +642,24 @@ class StageBAgentTests(unittest.TestCase):
                 if code != "gateway_error":
                     self.assertEqual(caught.exception.safe_audit_details()["attempts"], 2 if code == "model_timeout" else 1)
                 self.assertNotIn("raw sdk secret", json.dumps(caught.exception.public()))
+
+    def test_capability_probe_identity_ignores_stage_budgets_but_not_credentials(self):
+        common={
+            "provider":"openai_responses",
+            "model":"shared-model",
+            "api_key":"secret-key",
+            "base_url":"https://provider.example/v1",
+            "timeout_seconds":1,
+            "structured_output":"auto",
+        }
+        generation=OpenAIResponsesClient(SimpleNamespace(**common,stage_budgets={"deck":"generation-only"}))
+        inspection=OpenAIResponsesClient(SimpleNamespace(**common,stage_budgets={}))
+        other_key=OpenAIResponsesClient(SimpleNamespace(**{**common,"api_key":"different-key"}))
+
+        self.assertEqual(generation.capability_probe_key(),inspection.capability_probe_key())
+        self.assertNotEqual(generation.capability_probe_key(),other_key.capability_probe_key())
+        serialized=json.dumps({"generation":generation.capability_probe_key(),"inspection":inspection.capability_probe_key()})
+        self.assertNotIn("secret-key",serialized)
 
     def test_client_retries_a_timeout_once_then_returns_the_result(self):
         config = SimpleNamespace(model="m", api_key="secret-key", base_url="https://example.com", timeout_seconds=1)

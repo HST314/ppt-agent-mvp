@@ -5,6 +5,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 from .config import ClarificationConfig
+from .diagnostics import log_exception_chain
 from .errors import ConflictError, GatewayError, NotFoundError, RuntimeUnavailableError, ValidationError
 from .fsm import TaskState, transition
 from .gateways import FakeGenerationGateway, FakeHtmlBuilder, FakeInspectionGateway, FakeSkillLoader
@@ -87,9 +88,23 @@ class TaskService:
             started_at=utcnow()
             with self._runtime_guard:
                 self._runtime_capabilities={"checked":False,"ready":False,"status":"checking","models":[],"probe_id":probe_id,"checked_at":started_at}
-            models=[]; probe_events=[]
+            models=[]; probe_events=[]; probe_results={}
             try:
                 for gateway_index,gateway in enumerate(gateways):
+                    identity_method=getattr(gateway,"capability_probe_key",None)
+                    probe_key=identity_method() if callable(identity_method) else None
+                    if probe_key is not None and probe_key in probe_results:
+                        source_index,checks=probe_results[probe_key]
+                        models.append({"model":gateway.model,"checks":checks,"probe_reused":True,"probe_source_gateway_index":source_index})
+                        probe_events.append({
+                            "event":"probe_check",
+                            "gateway_index":gateway_index,
+                            "model":str(getattr(gateway,"model","unknown")),
+                            "check":"capability_contract",
+                            "status":"reused",
+                            "probe_source_gateway_index":source_index,
+                        })
+                        continue
                     method=gateway.probe_capabilities
                     parameters=inspect.signature(method).parameters
                     accepts_probe_id="probe_id" in parameters or any(item.kind==inspect.Parameter.VAR_KEYWORD for item in parameters.values())
@@ -106,6 +121,8 @@ class TaskService:
                         error.probe_id=probe_id
                         raise error
                     models.append({"model":gateway.model,"checks":checks})
+                    if probe_key is not None:
+                        probe_results[probe_key]=(gateway_index,dict(checks))
             except Exception as exc:
                 audit=getattr(gateway,"last_probe_audit",None) if "gateway" in locals() else None
                 if isinstance(audit,dict):
@@ -114,14 +131,38 @@ class TaskService:
                         if enriched not in probe_events: probe_events.append(enriched)
                 failed_check=getattr(exc,"failed_check",None) or "capability_contract"
                 if not isinstance(exc,GatewayError):
-                    exc=GatewayError(
+                    wrapped=GatewayError(
                         "模型能力探测发生无法分类的 SDK 故障",
                         code="capability_probe_failed",
                         audit_details={"category":"sdk_error","sdk_exception_type":type(exc).__name__,"retryable":False},
                     )
+                    wrapped.__cause__=exc
+                    wrapped.__suppress_context__=True
+                    exc=wrapped
                 public=exc.public()["error"]
                 error={key:public[key] for key in ("code","message","diagnostic_id","retryable","retry_after_seconds","agent_audit_id","probe_phase","terminal_reason","tool_calls","underlying_code") if key in public}
                 error.update({"probe_id":probe_id,"failed_check":failed_check})
+                client=getattr(gateway,"client",None) if "gateway" in locals() else None
+                config=getattr(client,"config",None)
+                secrets=[str(getattr(config,"api_key",""))] if config is not None else []
+                diagnostic_context_method=getattr(client,"probe_diagnostic_context",None)
+                try:
+                    client_context=diagnostic_context_method() if callable(diagnostic_context_method) else {}
+                except Exception as context_error:
+                    client_context={"diagnostic_context_error":type(context_error).__name__}
+                log_exception_chain(
+                    exc,
+                    diagnostic_id=error["diagnostic_id"],
+                    probe_id=probe_id,
+                    context={
+                        "gateway_index":gateway_index if "gateway_index" in locals() else None,
+                        "gateway_type":type(gateway).__name__ if "gateway" in locals() else None,
+                        "client_type":type(client).__name__ if client is not None else None,
+                        "model":str(getattr(gateway,"model","unknown")) if "gateway" in locals() else "unknown",
+                        **client_context,
+                    },
+                    secrets=secrets,
+                )
                 if not any(event.get("status")=="failed" for event in probe_events):
                     probe_events.append({"event":"probe_check","gateway_index":gateway_index,"model":str(getattr(gateway,"model","unknown")),"check":failed_check,"status":"failed","error_code":error["code"],"diagnostic_id":error["diagnostic_id"],**exc.safe_audit_details()})
                 completed_at=utcnow()

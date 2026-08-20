@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import socket
 import threading
 import time
@@ -95,6 +96,40 @@ class OpenAIResponsesClient:
             timeout=self._request_timeout(),
             max_retries=0,
         )
+
+    def capability_probe_key(self) -> str:
+        """Identify provider capabilities without exposing credential material.
+
+        Request/run budgets and stage limits do not change the model contract, so
+        generation and inspection clients with the same connection and protocol
+        settings deliberately share this identity.
+        """
+        value = {
+            "client": f"{type(self).__module__}.{type(self).__qualname__}",
+            "provider": str(getattr(self.config, "provider", "openai_responses")),
+            "model": str(self.config.model),
+            "base_url": str(self.config.base_url).rstrip("/"),
+            "api_key_sha256": hashlib.sha256(str(self.config.api_key).encode()).hexdigest(),
+            "structured_output": self.structured_output,
+        }
+        return hashlib.sha256(repr(sorted(value.items())).encode()).hexdigest()
+
+    def probe_diagnostic_context(self) -> dict:
+        try:
+            sdk_version = importlib.metadata.version("openai")
+        except importlib.metadata.PackageNotFoundError:
+            sdk_version = "unknown"
+        public = self.config.public() if hasattr(self.config, "public") else {}
+        endpoint = public.get("base_url")
+        return {
+            "adapter": f"{type(self).__module__}.{type(self).__qualname__}",
+            "provider": str(getattr(self.config, "provider", "openai_responses")),
+            "sdk": "openai",
+            "sdk_version": sdk_version,
+            "endpoint": endpoint,
+            "request_path": endpoint.rstrip("/") + "/responses" if isinstance(endpoint, str) else None,
+            "structured_output": self.structured_output,
+        }
 
     supports_execution_cancellation = True
 

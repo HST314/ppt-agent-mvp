@@ -6,6 +6,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from ppt_agent.errors import ConflictError, GatewayError, RuntimeUnavailableError
@@ -51,6 +52,66 @@ class ProgressService(TaskService):
 
 
 class JobServiceTests(unittest.TestCase):
+    def test_runtime_probe_deduplicates_equal_capability_identities(self):
+        class ProbeGateway:
+            def __init__(self,name,key): self.model=name; self.key=key; self.calls=0
+            def set_audit_sink(self,_sink): pass
+            def capability_probe_key(self): return self.key
+            def probe_capabilities(self,probe_id=None):
+                self.calls+=1
+                return {"basic_response":True,"strict_json_schema":True,"tool_round_trip":True}
+
+        with tempfile.TemporaryDirectory() as root:
+            generation=ProbeGateway("shared-model","same-config")
+            inspection=ProbeGateway("shared-model","same-config")
+            service=TaskService(WorkspaceStore(root),generator=generation,inspector=inspection)
+            health=service.initialize_runtime()
+
+        self.assertTrue(health["ready"])
+        self.assertEqual((generation.calls,inspection.calls),(1,0))
+        self.assertEqual(len(health["models"]),2)
+        self.assertTrue(health["models"][1]["probe_reused"])
+        self.assertEqual(health["models"][1]["probe_source_gateway_index"],0)
+
+    def test_probe_failure_logs_full_redacted_chain_under_public_diagnostic_id(self):
+        class FailingClient:
+            config=SimpleNamespace(api_key="secret-key")
+            def probe_diagnostic_context(self):
+                return {"adapter":"test-adapter","sdk":"test-sdk","sdk_version":"1.2.3","endpoint":"https://provider.example/v1"}
+
+        class FailingProbeGateway:
+            model="probe-model"
+            client=FailingClient()
+            def set_audit_sink(self,_sink): pass
+            def probe_capabilities(self,probe_id=None):
+                try:
+                    raise AttributeError("parser exposed secret-key")
+                except AttributeError as cause:
+                    raise GatewayError(
+                        "模型 SDK 返回了无法分类的失败，请联系管理员核对运行日志",
+                        audit_details={"category":"sdk_error","sdk_exception_type":"AttributeError"},
+                    ) from cause
+
+        with tempfile.TemporaryDirectory() as root:
+            service=TaskService(WorkspaceStore(root),generator=FailingProbeGateway())
+            with self.assertLogs("ppt_agent.runtime",level="ERROR") as captured:
+                health=service.initialize_runtime()
+            persisted=service.runtime_probes(1)[0]
+
+        diagnostic_id=health["error"]["diagnostic_id"]
+        log="\n".join(captured.output)
+        self.assertEqual(persisted["error"]["diagnostic_id"],diagnostic_id)
+        self.assertIn(diagnostic_id,log)
+        self.assertIn(health["probe_id"],log)
+        self.assertIn("AttributeError",log)
+        self.assertIn("GatewayError",log)
+        self.assertIn("The above exception was the direct cause",log)
+        self.assertIn('"adapter": "test-adapter"',log)
+        self.assertIn('"sdk_version": "1.2.3"',log)
+        self.assertIn("https://provider.example/v1",log)
+        self.assertNotIn("secret-key",log)
+        self.assertNotIn("parser exposed",log)
+
     def test_stage_deadline_keeps_diagnostic_id_and_specific_error_code(self):
         with tempfile.TemporaryDirectory() as root:
             service = DeadlineService(WorkspaceStore(root))
