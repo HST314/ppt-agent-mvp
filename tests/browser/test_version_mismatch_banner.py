@@ -60,7 +60,8 @@ class VersionMismatchBannerTests(unittest.TestCase):
                 patch.start()
                 self.addCleanup(patch.stop)
         port = free_port()
-        server = uvicorn.Server(uvicorn.Config(create_app(self.svc), host="127.0.0.1", port=port, log_level="critical"))
+        self.app = create_app(self.svc)
+        server = uvicorn.Server(uvicorn.Config(self.app, host="127.0.0.1", port=port, log_level="critical"))
         thread = threading.Thread(target=server.run, daemon=True)
         thread.start()
         deadline = time.monotonic() + 5
@@ -109,3 +110,77 @@ class VersionMismatchBannerTests(unittest.TestCase):
         details = dialog.locator("[data-runtime-version-details]")
         self.assertIn(FRONTEND_BUILD, details.text_content())
         self.assertIn("前后端版本一致", details.text_content())
+
+    def track_posts(self):
+        posts = []
+        self.page.on("request", lambda request: posts.append(request) if request.method == "POST" else None)
+        return posts
+
+    def force_click(self, locator):
+        # 单 JS 任务内完成启用与点击，避免 15 秒运行态轮询重新禁用造成竞态；
+        # 用于验证“即使按钮态被绕过，派发前二次校验仍然拦截”。
+        locator.evaluate("node => { node.disabled = false; node.click(); }")
+
+    def assert_blocked_dispatch(self, posts, fragment):
+        message = self.page.locator(".stage-message", has_text="版本不一致")
+        message.wait_for(timeout=10000)
+        self.assertIn("重启", message.text_content())
+        self.assertFalse(any(fragment in request.url for request in posts), f"不应发出 POST {fragment}")
+        self.assertEqual(self.app.state.job_service.list("task"), [])
+
+    def test_mismatch_blocks_sample_confirm_dispatch(self):
+        self.svc.create("task")
+        self.svc.import_input("task", {"goal": "发布", "audience": "客户", "topic": "方案", "页数": 3})
+        self.svc.generate_narrative("task")
+        self.svc.confirm_narrative("task")
+        self.svc.generate_outline("task")
+        self.svc.confirm_outline("task")
+        self.svc.generate_sample("task")
+        base = self.serve(stale=True)
+        posts = self.track_posts()
+        self.page.goto(base + "/tasks/task?stage=sample")
+        self.page.locator("[data-version-mismatch-banner]").wait_for(timeout=15000)
+        confirm = self.page.get_by_role("button", name="确认当前样品并进入全稿")
+        confirm.wait_for()
+        self.assertTrue(confirm.is_disabled())
+        self.assertIn("重启", confirm.get_attribute("title") or "")
+        self.force_click(confirm)
+        self.assert_blocked_dispatch(posts, "/samples/confirm")
+        self.assertFalse(self.svc.sample_view("task")["confirmation"])
+        self.assertEqual(self.svc.get("task")["stage"], "sample")
+
+    def test_mismatch_blocks_import_dispatch(self):
+        self.svc.create("task")
+        base = self.serve(stale=True)
+        posts = self.track_posts()
+        self.page.goto(base + "/tasks/task")
+        self.page.locator("[data-version-mismatch-banner]").wait_for(timeout=15000)
+        self.page.locator("#task-card-source").fill("演示目标：发布\n受众：客户\n核心主题：方案")
+        submit = self.page.get_by_role("button", name="导入并冻结资料")
+        submit.wait_for()
+        self.assertTrue(submit.is_disabled())
+        self.assertIn("重启", submit.get_attribute("title") or "")
+        self.force_click(submit)
+        self.assert_blocked_dispatch(posts, "/tasks/task/input")
+        self.assertIsNone(self.svc.input_view("task")["snapshot"])
+        self.assertEqual(self.svc.get("task")["stage"], "created")
+
+    def test_mismatch_blocks_answers_dispatch(self):
+        self.svc.create("task")
+        self.svc.import_input("task", {"goal": "发布新品"})
+        base = self.serve(stale=True)
+        posts = self.track_posts()
+        self.page.goto(base + "/tasks/task?stage=clarification")
+        self.page.locator("[data-version-mismatch-banner]").wait_for(timeout=15000)
+        self.page.locator(".question-card").first.wait_for()
+        others = self.page.locator(".question-other__input")
+        for index in range(others.count()):
+            others.nth(index).fill("测试答案")
+        submit = self.page.get_by_role("button", name="提交答案并继续")
+        submit.wait_for()
+        self.assertTrue(submit.is_disabled())
+        self.assertIn("重启", submit.get_attribute("title") or "")
+        self.force_click(submit)
+        self.assert_blocked_dispatch(posts, "/clarifications/answers")
+        self.assertEqual(self.svc.input_view("task")["clarification"]["answers"], {})
+        self.assertEqual(self.svc.get("task")["stage"], "clarification")

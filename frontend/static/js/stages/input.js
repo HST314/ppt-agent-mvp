@@ -1,6 +1,6 @@
-import { api } from "../api.js?v=2026.08.20.130612827541";
-import { badge, button, confirmationDialog, element, field, metadataList, shortHash } from "../components/index.js?v=2026.08.20.130612827541";
-import { actionMessage, invalidationNotice, runAction, section, stageGrid } from "./shared.js?v=2026.08.20.130612827541";
+import { api } from "../api.js?v=2026.08.20.141243404257";
+import { badge, button, confirmationDialog, element, field, metadataList, shortHash } from "../components/index.js?v=2026.08.20.141243404257";
+import { actionMessage, invalidationNotice, runAction, section, stageGrid } from "./shared.js?v=2026.08.20.141243404257";
 
 const FIELD_LABELS = { goal: "演示目标", audience: "主要受众", topic: "核心主题" };
 const WARNING_LABELS = {
@@ -43,11 +43,12 @@ function inputStage(view, context) {
     source.value = frozenSource;
   }
   const rebuild = element("input", { type: "checkbox", id: "rebuild-input", disabled: !view.snapshot || !["created", "clarification"].includes(view.state.stage) });
-  const submit = button(view.snapshot ? "重建资料快照" : "导入并冻结资料", { kind: "primary", type: "submit", mutates: true });
+  const submit = button(view.snapshot ? "重建资料快照" : "导入并冻结资料", { kind: "primary", type: "submit", mutates: true, requiresVersionMatch: true });
   const gateHint = element("p", { className: "field__hint", id: "rebuild-gate-hint", role: "status" });
   const updateGate = () => {
+    const enable = () => { if (submit.dataset.versionDisabled !== "true") submit.disabled = false; };
     if (!hasSnapshot) {
-      submit.disabled = false;
+      enable();
       gateHint.textContent = "";
       return;
     }
@@ -61,7 +62,7 @@ function inputStage(view, context) {
       gateHint.textContent = "资料已修改；请勾选“显式重建快照”后再提交。";
       return;
     }
-    submit.disabled = false;
+    enable();
     gateHint.textContent = "";
   };
   source.addEventListener("input", updateGate);
@@ -74,6 +75,7 @@ function inputStage(view, context) {
     action: () => api.importInput(context.taskId, { source: source.value, source_format: format.value, rebuild: rebuild.checked }),
     success: "资料已冻结，正在进入澄清阶段。",
     refresh: () => context.goTo(null),
+    requiresVersionMatch: true,
   });
   const form = element("form", { className: "stage-form", onSubmit: async (event) => {
     event.preventDefault();
@@ -145,7 +147,7 @@ function clarificationStage(view, context) {
     const message = actionMessage();
     const progress = element("strong", { className: "clarification-progress", role: "status", "aria-live": "polite" });
     const cards = questions.map((question, index) => questionCard(question, answers[question.question_id], index));
-    const submit = button("提交答案并继续", { kind: "primary", type: "submit", mutates: true });
+    const submit = button("提交答案并继续", { kind: "primary", type: "submit", mutates: true, requiresVersionMatch: true });
     const updateProgress = () => {
       const completed = cards.filter((card, index) => readAnswer(card, questions[index])).length;
       progress.textContent = `已完成 ${completed}/${questions.length}`;
@@ -175,6 +177,7 @@ function clarificationStage(view, context) {
         action: () => api.answerClarifications(context.taskId, submitted),
         success: "本轮回答已保存，正在刷新任务状态。",
         refresh: context.refresh,
+        requiresVersionMatch: true,
       }).catch(() => {});
     } }, [
       clarificationSource(clarification),

@@ -1,6 +1,6 @@
-import { api } from "../api.js?v=2026.08.20.130612827541";
-import { badge, button, element, field, metadataList, previewFrame, previewUrl, shortHash, versionTimeline } from "../components/index.js?v=2026.08.20.130612827541";
-import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.20.130612827541";
+import { api } from "../api.js?v=2026.08.20.141243404257";
+import { badge, button, element, field, metadataList, previewFrame, previewUrl, shortHash, versionTimeline } from "../components/index.js?v=2026.08.20.141243404257";
+import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.20.141243404257";
 
 export async function render(context) {
   const [view, planning] = await Promise.all([
@@ -48,9 +48,9 @@ function sampleStage(view, planning, context) {
     },
   });
   const confirmMessage = actionMessage();
-  const confirm = button(view.confirmation ? "当前样品已确认" : "确认当前样品并进入全稿", { kind: "primary", disabled: !sample || Boolean(view.confirmation), reason: view.confirmation ? "已确认；请前往全稿重试生成" : "请先生成样品", mutates: true });
+  const confirm = button(view.confirmation ? "当前样品已确认" : "确认当前样品并进入全稿", { kind: "primary", disabled: !sample || Boolean(view.confirmation), reason: view.confirmation ? "已确认；请前往全稿重试生成" : "请先生成样品", mutates: true, requiresVersionMatch: true });
   confirm.addEventListener("click", async () => {
-    const result = await runAction({ buttonNode: confirm, region: confirmMessage, busyLabel: "正在确认并启动全稿…", action: () => api.confirmSample(context.taskId), success: "样品已确认，全稿生成已启动。" }).catch(() => null);
+    const result = await runAction({ buttonNode: confirm, region: confirmMessage, busyLabel: "正在确认并启动全稿…", action: () => api.confirmSample(context.taskId), success: "样品已确认，全稿生成已启动。", requiresVersionMatch: true }).catch(() => null);
     if (result) context.goTo("deck");
   });
 

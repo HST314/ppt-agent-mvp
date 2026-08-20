@@ -1,5 +1,5 @@
-import { ApiError } from "../api.js?v=2026.08.20.130612827541";
-import { button, element, inlineError, setBusy } from "../components/index.js?v=2026.08.20.130612827541";
+import { ApiError } from "../api.js?v=2026.08.20.141243404257";
+import { button, element, inlineError, setBusy } from "../components/index.js?v=2026.08.20.141243404257";
 
 export function stageGrid(primary, aside, className = "") {
   return element("div", { className: `stage-grid ${className}`.trim() }, [
@@ -26,10 +26,17 @@ export function showActionError(region, error) {
   region.replaceChildren(inlineError(error instanceof ApiError ? error.message : "操作失败，请重试。", error?.diagnosticId));
 }
 
-export async function runAction({ buttonNode, region, action, success, refresh, busyLabel }) {
+let versionMatchGuard = null;
+
+export function setVersionMatchGuard(guard) {
+  versionMatchGuard = typeof guard === "function" ? guard : null;
+}
+
+export async function runAction({ buttonNode, region, action, success, refresh, busyLabel, requiresVersionMatch = false }) {
   region?.replaceChildren();
   setBusy(buttonNode, true, busyLabel);
   try {
+    if (requiresVersionMatch && versionMatchGuard) await versionMatchGuard();
     const result = await action();
     if (success) region?.append(element("p", { className: "success-message", text: success }));
     if (refresh) await refresh(result);

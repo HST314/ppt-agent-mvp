@@ -161,6 +161,37 @@ class FrontendAssetTests(unittest.TestCase):
         self.assertIn(".version-banner", css)
         self.assertIn(".version-warning", css)
 
+    def test_auto_enqueue_entries_are_version_gated_before_dispatch(self):
+        js = lambda name: (FRONTEND / "static/js" / name).read_text()
+        app = js("app.js")
+        shell = js("shell.js")
+        shared = js("stages/shared.js")
+        sample = js("stages/sample.js")
+        input_stage = js("stages/input.js")
+        # 派发前二次校验 mismatch：所有 Job 创建入口先过版本门禁，再过运行态门禁。
+        self.assertIn("ensureVersionMatchAllowed", app)
+        self.assertIn("await ensureVersionMatchAllowed();", app.split("async function ensureRuntimeActionAllowed", 1)[1])
+        self.assertIn("if (requiresRuntime) await ensureRuntimeActionAllowed();", app)
+        self.assertIn("runtimeVersionMismatch()", app.split("async function ensureVersionMatchAllowed", 1)[1])
+        # runAction 自动入队入口经统一版本守卫二次校验；按钮层用独立的版本门禁，
+        # 模型不可用但版本一致时不得误伤（后端对该场景有降级路径）。
+        self.assertIn("setVersionMatchGuard", app + shared)
+        self.assertIn("if (requiresVersionMatch && versionMatchGuard) await versionMatchGuard();", shared)
+        self.assertIn('"data-requires-version-match": options.requiresVersionMatch ? "true" : null', shell)
+        self.assertIn("[data-requires-version-match=\"true\"]", app)
+        # 样品确认（自动入队 deck.generate）：按钮与派发双重门禁。
+        confirm_block = sample.split("确认当前样品并进入全稿", 1)[1].split("goTo", 1)[0]
+        self.assertIn("requiresVersionMatch: true", confirm_block)
+        # 导入/重建（自动入队 clarification.generate）：按钮门禁且重建闸不与版本门禁互相覆盖。
+        self.assertIn('"重建资料快照" : "导入并冻结资料", { kind: "primary", type: "submit", mutates: true, requiresVersionMatch: true }', input_stage)
+        self.assertIn('submit.dataset.versionDisabled !== "true"', input_stage)
+        import_action = input_stage.split("api.importInput", 1)[1].split("});", 1)[0]
+        self.assertIn("requiresVersionMatch: true", import_action)
+        # 提交答案（可自动入队下一轮澄清）：按钮与派发双重门禁。
+        self.assertIn('"提交答案并继续", { kind: "primary", type: "submit", mutates: true, requiresVersionMatch: true }', input_stage)
+        answers_action = input_stage.split("api.answerClarifications", 1)[1].split("});", 1)[0]
+        self.assertIn("requiresVersionMatch: true", answers_action)
+
 
 if __name__ == "__main__":
     unittest.main()

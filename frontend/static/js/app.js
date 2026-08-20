@@ -1,10 +1,11 @@
-import { api, ApiError } from "./api.js?v=2026.08.20.130612827541";
-import { JobTracker } from "./job-tracker.js?v=2026.08.20.130612827541";
-import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.20.130612827541";
-import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.20.130612827541";
-import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.20.130612827541";
-import { inlineError, setBusy } from "./components/index.js?v=2026.08.20.130612827541";
-import { renderStage } from "./stages/index.js?v=2026.08.20.130612827541";
+import { api, ApiError } from "./api.js?v=2026.08.20.141243404257";
+import { JobTracker } from "./job-tracker.js?v=2026.08.20.141243404257";
+import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.20.141243404257";
+import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.20.141243404257";
+import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.20.141243404257";
+import { inlineError, setBusy } from "./components/index.js?v=2026.08.20.141243404257";
+import { renderStage } from "./stages/index.js?v=2026.08.20.141243404257";
+import { setVersionMatchGuard } from "./stages/shared.js?v=2026.08.20.141243404257";
 
 const app = document.getElementById("app");
 const APP_BUILD = document.querySelector('meta[name="app-build"]')?.content || "unknown";
@@ -75,6 +76,7 @@ window.addEventListener("offline", () => {
   updateRuntimeUI();
   if (!hasUnsavedDraft) renderRoute(currentRoute());
 });
+setVersionMatchGuard(ensureVersionMatchAllowed);
 renderRoute(currentRoute());
 refreshRuntimeStatus();
 window.setInterval(() => refreshRuntimeStatus(), 15_000);
@@ -248,7 +250,37 @@ function updateRuntimeUI() {
     control.title = reason;
     control.setAttribute("aria-description", reason);
   });
+  document.querySelectorAll('[data-requires-version-match="true"]').forEach((control) => {
+    if (!versionMismatch) {
+      if (control.dataset.versionDisabled === "true") {
+        control.disabled = false;
+        delete control.dataset.versionDisabled;
+        control.removeAttribute("aria-description");
+        control.title = "";
+      }
+      return;
+    }
+    if (!control.disabled) control.dataset.versionDisabled = "true";
+    control.disabled = true;
+    const reason = "前端与后端版本不一致，请先重启后端服务";
+    control.title = reason;
+    control.setAttribute("aria-description", reason);
+  });
   syncVersionBanner();
+}
+
+async function ensureVersionMatchAllowed() {
+  await refreshRuntimeStatus();
+  if (runtimeVersionMismatch()) {
+    throw new ApiError("前端与后端版本不一致，请先重启后端服务再执行该操作", { code: "version_mismatch", status: 409 });
+  }
+}
+
+async function ensureRuntimeActionAllowed() {
+  await ensureVersionMatchAllowed();
+  if (!runtimeState.runtimeReady) {
+    throw new ApiError("模型运行时不可用，请先在连接状态中重新检测", { code: "runtime_unavailable", status: 503 });
+  }
 }
 
 function syncVersionBanner() {
@@ -860,10 +892,7 @@ async function startTrackedJob({ taskId, route, buttonNode, region, intent, crea
   region?.replaceChildren();
   setBusy(buttonNode, true, busyLabel);
   try {
-    if (requiresRuntime) await refreshRuntimeStatus();
-    if (requiresRuntime && !runtimeState.runtimeReady) {
-      throw new ApiError("模型运行时不可用，请先在连接状态中重新检测", { code: "runtime_unavailable", status: 503 });
-    }
+    if (requiresRuntime) await ensureRuntimeActionAllowed();
     const job = await create();
     bindJobIntent(job, intent.storageKey);
     let activeRegion = document.getElementById("active-job-region");

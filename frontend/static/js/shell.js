@@ -66,6 +66,7 @@ export function button(label, options = {}) {
     "data-mutates": options.mutates ? "true" : null,
     "data-allow-completed": options.allowCompleted ? "true" : null,
     "data-requires-runtime": options.requiresRuntime ? "true" : null,
+    "data-requires-version-match": options.requiresVersionMatch ? "true" : null,
     onClick: options.onClick,
   });
   if (options.disabled && options.reason) node.setAttribute("aria-description", options.reason);
