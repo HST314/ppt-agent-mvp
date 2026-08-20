@@ -9,16 +9,17 @@ from typing import Iterable
 
 _BEARER_RE = re.compile(r"(?i)(authorization\s*[:=]\s*(?:bearer\s+)?)[^\s,;]+")
 _BEARER_VALUE_RE = re.compile(r"(?i)(\bbearer\s+)[^\s,;}\[\]\\\"']+")
-_NAMED_SECRET_RE = re.compile(
-    r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)"
-    r"([\"']?\s*[:=]\s*)"
-    r"(?:[\"'](?:\\.|[^\"'])*[\"']|[^\s,;}]+)"
-)
-_SECRET_FIELD_RE = re.compile(
-    r"(?i)^(?:authorization|proxy[_-]?authorization|api[_-]?key|access[_-]?token|"
+_SECRET_FIELD_NAME_PATTERN = (
+    r"(?:authorization|proxy[_-]?authorization|api[_-]?key|access[_-]?token|"
     r"refresh[_-]?token|auth[_-]?token|bearer|password|passwd|secret|client[_-]?secret|"
-    r"private[_-]?key|credential(?:s)?|token)$"
+    r"private[_-]?key|credential(?:s)?|token)"
 )
+_NAMED_SECRET_RE = re.compile(
+    rf"(?i)(?<![A-Za-z0-9_-])({_SECRET_FIELD_NAME_PATTERN})"
+    r"([\"']?\s*[:=]\s*)"
+    r'(?:"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|[^\s,;}]+)'
+)
+_SECRET_FIELD_RE = re.compile(rf"(?i)^{_SECRET_FIELD_NAME_PATTERN}$")
 _KNOWN_TOKEN_RE = re.compile(r"(?i)\b(?:sk|ghp|github_pat|bearer)[-_][a-z0-9._-]+")
 _URL_RE = re.compile(r"https?://[^\s\]\[()<>{}\"']+")
 _SAFE_ATTRIBUTE_ERROR_RE = re.compile(
