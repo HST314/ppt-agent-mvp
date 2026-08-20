@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import base64, binascii, hashlib, html, re
+from functools import lru_cache
 from html.parser import HTMLParser
 from pathlib import PurePosixPath
 from urllib.parse import unquote, urlsplit
 
 from .errors import ValidationError
+from .skill_runtime import SkillRuntime
 
 SLIDE = re.compile(r"^## \[([A-Za-z0-9_-]+)\]\s*(.*?)(?=^## \[|\Z)", re.M | re.S)
 
@@ -76,6 +78,7 @@ CSS_PROPERTIES = {
     "transform", "transform-origin", "transition", "transition-property", "transition-duration", "transition-timing-function",
     "object-fit", "object-position", "cursor", "pointer-events", "user-select",
     "mix-blend-mode", "filter", "backdrop-filter", "-webkit-backdrop-filter",
+    "-webkit-font-smoothing", "text-rendering", "will-change", "content", "animation",
     # SVG 样式
     "fill", "stroke", "stroke-width", "stroke-linecap", "stroke-linejoin", "stroke-dasharray", "stroke-opacity", "fill-opacity"
 }
@@ -106,13 +109,65 @@ SAFE_CSS_FUNCTIONS = {
     "cubic-bezier", "steps",
     # 选择器伪类/伪元素（防止样式表选择器中的括号被误判为未授权函数）
     "nth-child", "nth-last-child", "nth-of-type", "nth-last-of-type",
-    "first-child", "last-child", "not", "is", "where", "has", "lang"
+    "first-child", "last-child", "not", "is", "where", "has", "lang", "media"
 }
 
 IMAGE_MEDIA_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
 MAX_DATA_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_IMAGE_REFERENCES = 30
 CSS_URL = re.compile(r"url\s*\(\s*(?:(['\"])(.*?)\1|([^)]*))\s*\)", re.I | re.S)
+
+LOCKED_TEMPLATE_PATH = "assets/template.html"
+LOCKED_TEMPLATE_OVERRIDES = """
+html,body{width:100%;height:auto;min-height:100%;overflow:auto;background:var(--ink)}
+body{display:block;padding:24px 0}
+.slide{box-sizing:border-box;width:1280px;height:720px;min-width:1280px;min-height:720px;flex:none;margin:0 auto 24px;overflow:hidden;background:var(--paper);color:var(--ink)}
+.slide.light{background:var(--paper);color:var(--ink)}
+.slide.dark{background:var(--ink);color:var(--paper)}
+.slide>h1,.slide>h2,.slide [data-element-id="title"]{font-family:var(--serif-zh);font-size:52px;line-height:1.12;font-weight:700}
+.slide p,.slide li,.slide td,.slide th{font-family:var(--sans-zh);font-size:24px;line-height:1.5}
+.slide small{font-size:16px;line-height:1.4}
+""".strip()
+
+
+@lru_cache(maxsize=1)
+def locked_template() -> dict[str, str]:
+    """Load the inert style layer from the hash-locked built-in template.
+
+    The active scripts, external font links and example slides in the source
+    template never enter a generated deck.  Only its single locked ``style``
+    block is used, followed by fixed 1280x720 service-owned canvas overrides.
+    """
+    skill = SkillRuntime.builtin()
+    source = skill.read_locked_text(LOCKED_TEMPLATE_PATH)
+    blocks = re.findall(r"<style(?:\s[^>]*)?>([\s\S]*?)</style\s*>", source, re.I)
+    if len(blocks) != 1 or not blocks[0].strip():
+        raise ValidationError("锁定 PPT 模板必须包含唯一非空 style 块")
+    return {
+        "skill": skill.skill_name,
+        "version": skill.skill_version,
+        "path": LOCKED_TEMPLATE_PATH,
+        "sha256": skill.manifest[LOCKED_TEMPLATE_PATH],
+        "style": blocks[0].strip() + "\n" + LOCKED_TEMPLATE_OVERRIDES,
+    }
+
+
+def assemble_locked_template(sections, rules=None) -> str:
+    """Assemble validated slide fragments into the locked, script-free shell."""
+    template = locked_template()
+    rule_text = " · ".join(html.escape(str(item), quote=True) for item in (rules or []))
+    provenance = html.escape(
+        f"{template['skill']}@{template['version']}:{template['path']}#{template['sha256']}",
+        quote=True,
+    )
+    return (
+        '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        f'<meta name="ppt-template" content="{provenance}"><style>{template["style"]}</style>'
+        f'</head><body><aside hidden data-global-rules="{rule_text}" data-template="{provenance}"></aside>'
+        + "".join(sections)
+        + "</body></html>"
+    )
 
 
 def _decoded_url(value: str) -> str:
@@ -412,8 +467,7 @@ def render(markdown: str, slide_ids: list[str], rules=None, exceptions=None, ass
                 raise ValidationError("大纲引用不属于当前冻结资源清单")
             images.append(f'<img data-element-id="resource" src="{html.escape(assets[uri], quote=True)}" alt="{html.escape(alt, quote=True)}">')
         sections.append(f'<section class="slide" id="{sid}" data-slide-id="{sid}"><h1 data-element-id="title">{title}</h1><div data-element-id="body">{body}</div>{"".join(images)}{note}</section>')
-    rule_text = " · ".join(html.escape(x) for x in rules)
-    return '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><style>html,body{margin:0;background:#111827;color:#f8fafc;font-family:system-ui}.slide{box-sizing:border-box;width:1280px;height:720px;padding:72px;margin:24px auto;background:linear-gradient(135deg,#172033,#253858);overflow:hidden}.slide h1{font-size:46px}.slide p{font-size:25px;line-height:1.5}small{display:block;color:#93c5fd}</style></head><body><aside hidden data-global-rules="' + rule_text + '"></aside>' + "".join(sections) + "</body></html>"
+    return assemble_locked_template(sections, rules)
 
 
 def validate_html(value: str, expected_ids: list[str], allowed_assets=()):

@@ -176,6 +176,8 @@ python -m uvicorn main_front:app --host 127.0.0.1 --port 8000
 
 真实模式要求兼容 Responses API 的模型端点。Base URL 必须使用 HTTPS，本机回环调试地址除外。生成与检查推荐使用独立模型配置；如果检查模型回退到生成模型，必须在配置中显式开启。
 
+样品和全稿在提交模型结果前强制读取锁定的 `references/design-pack-v1.md`，公共壳从哈希锁定的 `assets/template.html` 静态样式层组装；零 Skill 读取不能再产生成功产物。独立检查同样强制读取 `references/checklist.md`，并合并本机 Chromium 的 1280×720 DOM 几何、溢出、字号和图片解码证据。浏览器缺失或测量失败会生成 blocker 并关闭通过，不能退化为假绿。
+
 启动后用 `/livez` 检查 Web 进程存活，用 `/readyz` 检查真实模型运行契约；模型认证、模型名、限流、上游故障或能力探测失败时 `/readyz` 返回 503，依赖模型的 Job 不会入队。修复配置或等待上游恢复后，可从工作台“设置 → 系统与显示”执行一次显式重新检测。设置页保存的工作流、Job 与自检默认值会原子更新当前全局 YAML，不会写入任务数据目录。`/healthz` 保留兼容用途，并与 readiness 使用相同的 200/503 语义。
 
 ## 工作流与架构
@@ -228,6 +230,8 @@ python3 -m pip install -r requirements-browser.txt
 python3 -m playwright install chromium
 python3 scripts/verify_browser_gate.py
 ```
+
+Playwright Python 包已属于运行时依赖；部署真实 Agent 模式时仍必须执行一次 `python3 -m playwright install chromium` 安装锁定浏览器二进制，否则自检会按失败关闭。
 
 修改任何 `frontend/` HTML、CSS 或 JavaScript 后，提交前运行 `python3 scripts/update_frontend_build.py` 生成新的不可复用资源版本；`python3 scripts/update_frontend_build.py --check` 是防止旧 Build 号误导部署识别的门禁。
 

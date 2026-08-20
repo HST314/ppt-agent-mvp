@@ -43,8 +43,17 @@ def _clarification_directive(config: ClarificationConfig, round_number: int) -> 
     )
 
 class TaskService:
-    def __init__(self,store,generator=None,inspector=None,skills=None,builder=None,clarifier=None,clarification_config=None,settings_store=None):
+    def __init__(self,store,generator=None,inspector=None,skills=None,builder=None,clarifier=None,clarification_config=None,settings_store=None,browser_inspector=None):
         self.store=store; self.generator=generator or FakeGenerationGateway(); self.inspector=inspector or FakeInspectionGateway(); self.skills=skills or FakeSkillLoader(); self.builder=builder or FakeHtmlBuilder(); self.clarifier=clarifier
+        if browser_inspector is False:
+            self.browser_inspector=None
+        elif browser_inspector is not None:
+            self.browser_inspector=browser_inspector
+        elif getattr(self.inspector,"requires_browser_evidence",False):
+            from .browser_inspection import ChromiumDeckInspector
+            self.browser_inspector=ChromiumDeckInspector()
+        else:
+            self.browser_inspector=None
         self._settings_store=settings_store
         self._clarification_config=clarification_config or ClarificationConfig()
         self._runtime_capabilities={"checked":False,"ready":True,"status":"not_required","models":[]}
@@ -1008,18 +1017,60 @@ class TaskService:
             normalized.append({"issue_id":item.get("issue_id") or f"issue-{index+1}","severity":item.get("severity","warning"),"level":level,"code":item.get("code","quality_issue"),"message":item.get("message","发现质量问题"),"slide_id":item.get("slide_id","") or "","element_id":item.get("element_id","") or "","evidence":item.get("evidence",item.get("message","发现质量问题")),"suggestion":item.get("suggestion","请人工检查并修复")})
         return normalized
 
+    def _call_inspector(self,outline,html_text,browser_evidence):
+        method=self.inspector.inspect
+        parameters=inspect.signature(method).parameters
+        accepts_evidence="browser_evidence" in parameters or any(
+            item.kind==inspect.Parameter.VAR_KEYWORD for item in parameters.values()
+        )
+        return method(outline,html_text,browser_evidence=browser_evidence) if accepts_evidence else method(outline,html_text)
+
+    def _prepare_inspection_result(self,task_id,deck):
+        outline=json.loads(self.version(task_id,deck["outline_hash"]))["markdown"]
+        browser_evidence=None
+        if self.browser_inspector is not None:
+            browser_evidence=self.browser_inspector.inspect(deck["html"],list(deck["metadata"]["page_hashes"]))
+        raw=self._call_inspector(outline,deck["html"],browser_evidence)
+        if not isinstance(raw,dict): raise ValidationError("检查响应契约无效")
+        model_issues=raw.get("issues",[])
+        if not isinstance(model_issues,list): raise ValidationError("检查响应 issues 必须是数组")
+        browser_issues=(browser_evidence or {}).get("issues",[])
+        combined=[]; seen=set()
+        for item in [*model_issues,*browser_issues]:
+            if not isinstance(item,dict): raise ValidationError("检查报告 issue 必须是对象")
+            identity=item.get("issue_id") or fingerprint(item)
+            if identity in seen: continue
+            seen.add(identity); combined.append(item)
+        browser_passed=True if browser_evidence is None else bool(browser_evidence.get("available")) and bool(browser_evidence.get("passed"))
+        return {
+            **raw,
+            "issues":combined,
+            "passed":bool(raw.get("passed",not model_issues)) and browser_passed and not combined,
+            **({"browser_evidence":browser_evidence} if browser_evidence is not None else {}),
+        }
+
     def _inspect_once(self,task_id,scope,affected,round_number,prepared_raw=None):
         deck=self.deck_view(task_id)["deck"]
         if not deck: raise ConflictError("尚未生成全稿")
-        outline=json.loads(self.version(task_id,deck["outline_hash"]))["markdown"]
-        # Deliberately pass only the original outline and review HTML. Generation
-        # dialogue, model self-description, resources and screenshots never cross this boundary.
+        # Deliberately pass only the original outline, review HTML and local
+        # Chromium measurements. Generation dialogue, model self-description,
+        # resources and screenshots never cross this boundary.
         skill=self.skills.load("inspection")
-        raw=prepared_raw if prepared_raw is not None else self.inspector.inspect(outline,deck["html"])
+        raw=prepared_raw if prepared_raw is not None else self._prepare_inspection_result(task_id,deck)
         issues=self._normalize_inspection_issues(raw.get("issues",[])); passed=bool(raw.get("passed",not issues)) and not issues
         created=utcnow(); seed=canonical({"deck_hash":deck["hash"],"issues":issues,"created_at":created})
         report=InspectionReport.parse({"report_id":f"report-{digest(seed)[:16]}","task_id":task_id,"deck_hash":deck["hash"],"issues":issues,"passed":passed,"created_at":created,"schema_version":"1.0"})
-        metadata={"deck_hash":deck["hash"],"scope":scope,"affected_slide_ids":affected,"includes_deck_consistency":True,"round":round_number,"model":raw.get("model","unknown"),"skill":{"action":"inspection","version":skill["version"],"hash":digest(skill["content"].encode())},"input_fields":["original_outline","html"],"excluded_fields":["generation_context","self_description","images","screenshots"]}
+        browser=raw.get("browser_evidence")
+        browser_meta=None if not isinstance(browser,dict) else {
+            "available":bool(browser.get("available")),
+            "passed":bool(browser.get("passed")),
+            "engine":browser.get("engine"),
+            "engine_version":browser.get("engine_version"),
+            "viewport":browser.get("viewport"),
+            "issue_count":len(browser.get("issues",[])),
+            "evidence_hash":fingerprint(browser),
+        }
+        metadata={"deck_hash":deck["hash"],"scope":scope,"affected_slide_ids":affected,"includes_deck_consistency":True,"includes_browser_render":browser_meta is not None,"browser_evidence":browser_meta,"round":round_number,"model":raw.get("model","unknown"),"skill":{"action":"inspection","version":skill["version"],"hash":digest(skill["content"].encode()),"files":skill.get("files",[])},"input_fields":["original_outline","html",*(["browser_evidence"] if browser_meta is not None else [])],"excluded_fields":["generation_context","self_description","images","screenshots"]}
         h=self.store.put_version(task_id,"inspection",canonical(report.to_dict()),metadata)
         return {**report.to_dict(),"hash":h,"metadata":metadata}
 
@@ -1064,8 +1115,7 @@ class TaskService:
         if any(x not in all_ids for x in affected_slide_ids): raise ValidationError("增量检查页面不存在")
         scope="incremental" if affected_slide_ids else "full"; affected=affected_slide_ids or all_ids
         if _prepared_raw is None:
-            outline=json.loads(self.version(task_id,deck["outline_hash"]))["markdown"]
-            _prepared_raw=self.inspector.inspect(outline,deck["html"])
+            _prepared_raw=self._prepare_inspection_result(task_id,deck)
         with self.store.transaction(task_id):
             if state.stage==state.stage.DECK: self.command(task_id,f"to-review-{self._current_version(task_id,'deck')[:12]}","advance","system"); state=TaskState.parse(self.get(task_id))
             if state.stage!=state.stage.REVIEW: raise ConflictError("当前阶段不能执行检查")

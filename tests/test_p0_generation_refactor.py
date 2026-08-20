@@ -6,6 +6,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 
 from ppt_agent.agent_runtime import AgentRuntime
+from ppt_agent.errors import GatewayError
 from ppt_agent.gateways import AgentGateway
 from ppt_agent.model_clients import ModelToolCall, ModelTurn
 from ppt_agent.model_clients import OpenAIResponsesClient
@@ -34,19 +35,37 @@ class BatchBuilder:
 class P0GenerationRefactorTests(unittest.TestCase):
     def test_sample_exposes_only_read_only_skill_tools_and_server_assembles_public_shell(self):
         fragment='<section class="slide" id="slide-1" data-slide-id="slide-1"><h1>样品</h1></section>'
-        client=RecordingClient([ModelTurn(json.dumps({"slides":[{"slide_id":"slide-1","html":fragment}]}),"r1")])
+        client=RecordingClient([
+            ModelTurn(None,"skill",(ModelToolCall("read_skill_file",'{"path":"references/design-pack-v1.md"}',"skill-call"),)),
+            ModelTurn(json.dumps({"slides":[{"slide_id":"slide-1","html":fragment}]}),"r1"),
+        ])
         gateway=AgentGateway(client,skill=SkillRuntime.builtin(),max_steps=100)
         html=gateway.build("## [slide-1] 样品",action="sample",slide_ids=["slide-1"])
-        self.assertEqual(len(client.inputs),1)
+        self.assertEqual(len(client.inputs),2)
         self.assertEqual(
             {tool["name"] for tool in client.inputs[0]["tools"]},
             {"read_skill_file"},
         )
+        self.assertEqual(client.inputs[0]["tool_choice"],{"type":"function","name":"read_skill_file"})
         path_schema=client.inputs[0]["tools"][0]["parameters"]["properties"]["path"]
         self.assertEqual(path_schema["enum"],["references/design-pack-v1.md"])
         self.assertNotIn("<!doctype html>",client.inputs[0]["input"][1]["content"])
         self.assertTrue(html.startswith("<!doctype html>"))
         self.assertIn(fragment,html)
+        self.assertIn('name="ppt-template"',html)
+        self.assertIn('assets/template.html#',html)
+        self.assertNotIn('linear-gradient(135deg,#172033,#253858)',html)
+        self.assertEqual(gateway.runtime.last_audit[-1]["applied_skill_files"],["references/design-pack-v1.md"])
+
+    def test_sample_cannot_finish_without_applying_required_design_pack(self):
+        fragment='<section class="slide" id="slide-1" data-slide-id="slide-1"><h1>样品</h1></section>'
+        client=RecordingClient([ModelTurn(json.dumps({"slides":[{"slide_id":"slide-1","html":fragment}]}),"r1")])
+
+        with self.assertRaises(GatewayError) as caught:
+            AgentRuntime(client,SkillRuntime.builtin()).run("sample",{"slide_ids":["slide-1"]})
+
+        self.assertEqual(caught.exception.code,"agent_required_skill_missing")
+        self.assertEqual(caught.exception.audit[-1]["unique_skill_files"],0)
 
     def test_sample_reads_lightweight_pack_once_and_deduplicates_same_round(self):
         fragment='<section class="slide" id="slide-1" data-slide-id="slide-1"><h1>样品</h1></section>'
@@ -179,7 +198,7 @@ class P0GenerationRefactorTests(unittest.TestCase):
                     self.assert_interleaving()
                     return type("Response",(),{"output_text":"{}","output":[],"id":"a-invalid"})()
                 self.b_done.set()
-                text='{"slides":[{"slide_id":"slide-1","html":"<section class=\\"slide\\" id=\\"slide-1\\" data-slide-id=\\"slide-1\\"><p>ok</p></section>"}]}'
+                text='{"markdown":"ok"}'
                 return type("Response",(),{"output_text":text,"output":[],"id":"b-valid"})()
             def assert_interleaving(self):
                 if not self.b_done.wait(2):
@@ -188,12 +207,12 @@ class P0GenerationRefactorTests(unittest.TestCase):
         config=type("Config",(),{"model":"m","api_key":"k","base_url":"https://example.com","timeout_seconds":3,"structured_output":"prompt"})()
         sdk=SDK(); client=OpenAIResponsesClient(config,sdk_client=sdk)
         def run(task):
-            return AgentRuntime(client,SkillRuntime.builtin(),max_provider_calls=2).run("sample",{"task":task})
+            return AgentRuntime(client,SkillRuntime.builtin(),max_provider_calls=2).run("narrative",{"task":task})
         with ThreadPoolExecutor(max_workers=2) as pool:
             future_a=pool.submit(run,"task-a")
             self.assertTrue(sdk.a_empty.wait(2))
             future_b=pool.submit(run,"task-b")
-            self.assertEqual(future_b.result(timeout=3).value["slides"][0]["slide_id"],"slide-1")
+            self.assertEqual(future_b.result(timeout=3).value["markdown"],"ok")
             with self.assertRaisesRegex(Exception,"真实请求次数"):
                 future_a.result(timeout=3)
         self.assertEqual(sdk.calls,{"task-a":2,"task-b":1})

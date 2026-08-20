@@ -1,18 +1,19 @@
 from __future__ import annotations
 
-import hashlib, html, json, os, re, socket, urllib.error, urllib.request, uuid
+import hashlib, json, os, re, socket, urllib.error, urllib.request, uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 from .errors import GatewayError, GatewayUnknownResult, ValidationError
 from .agent_runtime import AgentRuntime, STAGE_OUTPUT_SCHEMAS, STAGE_PROVIDER_SCHEMAS, _extract_json_object, normalize_rendering_output
 from .audit import current_agent_audit_context
+from .p4 import assemble_locked_template
 from .skill_runtime import SkillRuntime
 
 class GenerationGateway(Protocol):
     def generate(self, action:str, payload:dict, *, skill:str)->dict: ...
 class InspectionGateway(Protocol):
-    def inspect(self, original_outline:str, html:str)->dict: ...
+    def inspect(self, original_outline:str, html:str, *, browser_evidence:dict|None=None)->dict: ...
 class SkillLoader(Protocol):
     def load(self, action:str)->dict: ...
 class HtmlBuilder(Protocol):
@@ -56,6 +57,7 @@ class JsonHttpModelGateway:
             raise ValidationError("模型端点必须使用 HTTPS（本机回环地址除外）")
         self.endpoint,self.model,self.api_key=endpoint,model,api_key
         self.timeout,self.purpose=float(timeout),purpose
+        self.requires_browser_evidence=purpose=="independent_inspection"
     def _call(self,payload):
         body=json.dumps({"model":self.model,"purpose":self.purpose,**payload},ensure_ascii=False).encode()
         headers={"Content-Type":"application/json","Accept":"application/json"}
@@ -75,8 +77,8 @@ class JsonHttpModelGateway:
         value=self._call({"action":action,"input":payload,"skill":skill})
         if not isinstance(value.get("text"),str) or not value["text"].strip(): raise GatewayError("生成响应缺少 text")
         return {**value,"model":self.model}
-    def inspect(self,original_outline,html):
-        value=self._call({"original_outline":original_outline,"html":html})
+    def inspect(self,original_outline,html,*,browser_evidence=None):
+        value=self._call({"original_outline":original_outline,"html":html,"browser_evidence":browser_evidence})
         if not isinstance(value.get("passed"),bool) or not isinstance(value.get("issues"),list): raise GatewayError("检查响应契约无效")
         return {**value,"model":self.model}
 
@@ -96,6 +98,7 @@ class AgentGateway:
     remains the only owner of stages, versions, approvals and commits.
     """
     def __init__(self, client, *, skill=None, max_steps=12, max_tool_calls=24, max_provider_calls=8, run_timeout_seconds=300, job_timeout_seconds=330, model="agent", stage_budgets=None):
+        self.requires_browser_evidence = True
         self.client, self.model = client, model
         self.max_steps, self.max_tool_calls, self.max_provider_calls = max_steps, max_tool_calls, max_provider_calls
         self.run_timeout_seconds, self.job_timeout_seconds = run_timeout_seconds, job_timeout_seconds
@@ -322,20 +325,19 @@ class AgentGateway:
         for item in slides:
             fragments.append(item["html"])
 
-        rules = " · ".join(html.escape(str(x)) for x in context.get("rules", []))
-        return (
-            '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
-            '<meta name="viewport" content="width=device-width"><style>'
-            'html,body{margin:0;background:#111827;color:#f8fafc;font-family:system-ui}'
-            '.slide{box-sizing:border-box;width:1280px;height:720px;padding:72px;margin:24px auto;'
-            'background:linear-gradient(135deg,#172033,#253858);overflow:hidden}'
-            '.slide h1{font-size:46px}.slide p{font-size:25px;line-height:1.5}'
-            'small{display:block;color:#93c5fd}</style></head><body>'
-            '<aside hidden data-global-rules="' + rules + '"></aside>' + ''.join(fragments) + '</body></html>'
-        )
+        return assemble_locked_template(fragments, context.get("rules", []))
     
-    def inspect(self, original_outline, html):
-        value = self._run("inspection", {"original_outline": original_outline, "html": html})
+    def inspect(self, original_outline, html, *, browser_evidence=None):
+        value = self._run("inspection", {
+            "original_outline": original_outline,
+            "html": html,
+            "browser_evidence": browser_evidence or {
+                "available": False,
+                "passed": False,
+                "issues": [],
+                "reason": "browser_evidence_not_supplied",
+            },
+        })
         return {**value, "model": self.model}
 
 class LockedSkillMetadataLoader:
@@ -343,7 +345,17 @@ class LockedSkillMetadataLoader:
     def __init__(self, skill=None): self.skill = skill or SkillRuntime.builtin()
     def load(self, action):
         if action not in {"narrative", "outline", "sample", "deck", "inspection"}: raise ValidationError("Skill action 不在允许列表")
-        return {"action": action, "version": self.skill.skill_version, "content": ""}
+        files=sorted(self.skill.files_for_stage(action) or ())
+        if action in {"sample","deck"}:
+            files.append("assets/template.html")
+        file_hashes={name:self.skill.manifest[name] for name in files}
+        return {
+            "action":action,
+            "version":self.skill.skill_version,
+            "content":json.dumps(file_hashes,sort_keys=True,separators=(",",":")),
+            "files":files,
+            "file_hashes":file_hashes,
+        }
 
 def agent_gateways_from_config(config):
     if config.mode == "fake": return {}

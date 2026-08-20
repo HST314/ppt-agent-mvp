@@ -24,8 +24,9 @@ class P8GatewayTests(unittest.TestCase):
         self.assertEqual(result["text"],"generated"); self.assertEqual(Handler.seen[0][1]["purpose"],"generation")
         Handler.response={"passed":True,"issues":[]}
         inspector=JsonHttpModelGateway(self.endpoint,"checker","secret",1,"independent_inspection")
-        self.assertTrue(inspector.inspect("outline","<html>")["passed"])
-        sent=Handler.seen[-1][1]; self.assertEqual(set(sent)-{"model","purpose"},{"original_outline","html"}); self.assertNotIn("generation_context",sent)
+        evidence={"available":True,"passed":True,"issues":[]}
+        self.assertTrue(inspector.inspect("outline","<html>",browser_evidence=evidence)["passed"])
+        sent=Handler.seen[-1][1]; self.assertEqual(set(sent)-{"model","purpose"},{"original_outline","html","browser_evidence"}); self.assertEqual(sent["browser_evidence"],evidence); self.assertNotIn("generation_context",sent)
     def test_invalid_response_and_unknown_result_are_publicly_sanitized(self):
         Handler.response={"unexpected":True}
         with self.assertRaises(GatewayError) as caught: JsonHttpModelGateway(self.endpoint,"m","top-secret",1).generate("x",{},skill="s")

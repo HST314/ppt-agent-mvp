@@ -167,6 +167,16 @@ class SkillRuntime:
         self.total_bytes += size
         return {"path": name, "bytes": size, "media_type": mimetypes.guess_type(name)[0] or "application/octet-stream", "sha256": digest}
 
+    def read_locked_text(self, name: str) -> str:
+        """Read a verified server-owned text asset without charging Agent quota."""
+        path, raw = self._locked_bytes(name)
+        if path.suffix.lower() not in self.TEXT_SUFFIXES:
+            raise ValidationError("锁定模板不是文本文件")
+        try:
+            return raw.decode("utf-8")
+        except UnicodeError as exc:
+            raise ValidationError("锁定模板无法按 UTF-8 读取") from exc
+
     def dispatch(self, name: str, arguments: dict, *, allowed_files: frozenset[str] | None = None) -> dict:
         if name == "list_skill_files":
             return self.list_skill_files(allowed_files=allowed_files)

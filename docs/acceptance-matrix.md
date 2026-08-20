@@ -14,7 +14,7 @@
 | AC-08 | 样品可反复调整且确认门禁有效 | P4-03、P4-04 | 样品动作 API；样品页 | `tests/e2e/test_ac_08_sample_gate.py::AC08SampleGateE2E::test_repeated_adjustment_and_confirmation_invalidation`、`tests/test_p4_sample_page.py`（版本时间线/历史预览/差异对比 UI 交互）、`tests/test_p4_sample_page_browser.py`（真实浏览器执行页面 JS：自动识别提交/理解依据/歧义提示/确认门禁） |
 | AC-09 | 全稿页数等于最终大纲 | P5-01、P5-02 | 全稿生成 API；全稿页 | `tests/e2e/test_ac_09_full_deck.py` |
 | AC-10 | 整稿/页/元素修改、摘要、对比、版本 | P5-03、P5-04 | 修改/版本 API；全稿/版本页 | `tests/e2e/test_ac_10_deck_edit.py` |
-| AC-11 | 独立检查模型执行三级检查 | P6-01、P6-02 | 检查 API；检查页 | `tests/e2e/test_ac_11_inspection.py` |
+| AC-11 | 独立检查模型执行三级检查 | P6-01、P6-02 | 检查 API；检查页 | `tests/e2e/test_ac_11_inspection.py`、`tests/test_p0_hybrid_inspection.py`、`tests/browser/test_p0_hybrid_inspection_browser.py` |
 | AC-12 | manual 人审、auto 有界修复复检 | P6-03、P6-04 | 运行模式/检查 API；检查页 | `tests/e2e/test_ac_12_modes.py` |
 | AC-13 | 达上限进入人工且不虚假完成 | P6-03、P6-05 | 状态 API；检查页 | `tests/e2e/test_ac_13_round_limit.py` |
 | AC-14 | 终稿确认记录检查与遗留问题状态，但不以检查阻断交付 | P6-04、P7-01 | 终稿/交付 API；自检与修改页 | `tests/e2e/test_ac_15_17_delivery.py` |
@@ -27,7 +27,7 @@
 
 | 发布项 | 结论 | 可复验证据 | 遗留限制 |
 |---|---|---|---|
-| 真实 Gateway 与分阶段 Skill | 通过 | `tests/test_p8_gateways.py`、`tests/e2e/test_audit_regressions.py` | CI 使用确定性 fake；真实模型需显式配置 |
+| 真实 Gateway、必读分阶段 Skill 与锁定模板 | 通过 | `tests/test_p8_gateways.py`、`tests/test_p0_generation_refactor.py`、`tests/e2e/test_audit_regressions.py` | CI 使用确定性 fake；真实模型需显式配置 |
 | 安全、资源授权与大小边界 | 通过 | `tests/test_p8_release.py`、`tests/test_p4.py` | 单请求 2 MiB；单资源 16 MiB |
 | 动作级可观测性 | 通过 | `tests/test_p8_release.py`；JSON `action_metric` | 指标由部署环境采集聚合 |
 | 运维与恢复 | 通过 | `docs/runbook.md`、`tests/e2e/test_ac_15_17_delivery.py` | 文件工作区需由部署方纳入备份 |

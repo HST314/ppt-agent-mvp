@@ -14,6 +14,11 @@ from .skill_runtime import SkillRuntime
 STAGES = {"clarification", "narrative", "outline", "sample", "deck", "inspection"}
 PLANNING_STAGES = frozenset({"narrative", "outline", "inspection"})
 RENDERING_STAGES = frozenset({"sample", "deck"})
+REQUIRED_STAGE_FILES = {
+    "sample": frozenset({"references/design-pack-v1.md"}),
+    "deck": frozenset({"references/design-pack-v1.md"}),
+    "inspection": frozenset({"references/checklist.md"}),
+}
 MAX_PLANNING_FILE_READS = 2
 DATA_IMAGE = "data:image/"
 STAGE_PROMPTS = {
@@ -36,7 +41,7 @@ STAGE_PROMPTS = {
     ),
     "sample": "仅为外层状态机指定的样品页生成 section 片段，不得生成公共模板或扩展到全稿；优先直接使用输入和轻量 design pack 清单，最多进行两轮必要探索；每项 html 必须严格以 <section class=\"slide\" id=\"给定ID\" data-slide-id=\"给定ID\"> 开始并以 </section> 结束。",
     "deck": "仅为外层状态机给定的未确认页面生成 section 片段；不得重做确认样品、不得生成公共模板；优先直接使用输入和轻量 design pack 清单，避免重复探索；每项 html 必须严格以 <section class=\"slide\" id=\"给定ID\" data-slide-id=\"给定ID\"> 开始并以 </section> 结束。",
-    "inspection": "独立检查大纲与 HTML，仅报告有证据的问题，不得直接修改产物。",
+    "inspection": "独立检查大纲与 HTML；必须逐项应用检查清单并结合 browser_evidence 中的 Chromium 渲染测量，仅报告有证据的问题，不得直接修改产物。浏览器证据不可用或包含问题时不得返回 passed=true。",
 }
 
 
@@ -256,6 +261,9 @@ class AgentRuntime:
             raise ValidationError("Agent 输入无效")
         payload = self._text_only(payload)
         stage_files = self.skill.files_for_stage(stage)
+        required_files = REQUIRED_STAGE_FILES.get(stage, frozenset())
+        if stage_files is not None and not required_files.issubset(stage_files):
+            raise ValidationError("阶段必读 Skill 文件不在锁定白名单")
         stage_tools = _tools_for_stage(stage, stage_files)
         override = CLARIFICATION_OVERRIDE if stage == "clarification" else PRODUCT_OVERRIDE
         started, audit, tool_count, tool_error_rounds, schema_corrections = self.clock(), [], 0, 0, 0
@@ -290,7 +298,7 @@ class AgentRuntime:
         stage_file_contract = json.dumps(sorted(stage_files) if stage_files is not None else ["*"])
         tool_contract = self._stage_tool_contract(stage, stage_files)
         tool_schema_contract = json.dumps(stage_tools, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        audit.append({"event": "run", "stage": stage, "skill": self.skill.skill_name, "skill_version": self.skill.skill_version, "lock_sha256": hashlib.sha256(json.dumps(self.skill.manifest, sort_keys=True).encode()).hexdigest(), "input_sha256": hashlib.sha256(input_json.encode()).hexdigest(), "config_sha256": hashlib.sha256((STAGE_PROMPTS[stage]+override+stage_file_contract+tool_contract+tool_schema_contract).encode()).hexdigest(), "stage_files": sorted(stage_files or ()), "max_exploration_rounds": self.max_exploration_rounds, "max_unique_files": self.max_unique_files, "max_skill_bytes": self.max_skill_bytes, "reserved_final_calls": self.reserved_final_calls})
+        audit.append({"event": "run", "stage": stage, "skill": self.skill.skill_name, "skill_version": self.skill.skill_version, "lock_sha256": hashlib.sha256(json.dumps(self.skill.manifest, sort_keys=True).encode()).hexdigest(), "input_sha256": hashlib.sha256(input_json.encode()).hexdigest(), "config_sha256": hashlib.sha256((STAGE_PROMPTS[stage]+override+stage_file_contract+tool_contract+tool_schema_contract).encode()).hexdigest(), "stage_files": sorted(stage_files or ()), "required_skill_files": sorted(required_files), "max_exploration_rounds": self.max_exploration_rounds, "max_unique_files": self.max_unique_files, "max_skill_bytes": self.max_skill_bytes, "reserved_final_calls": self.reserved_final_calls})
         def probe_phase(reason: str) -> str:
             if stage == "clarification":
                 return "strict_json_schema"
@@ -313,6 +321,7 @@ class AgentRuntime:
                 "exploration_rounds": exploration_rounds,
                 "cumulative_skill_bytes": skill_bytes,
                 "unique_skill_files": len(successful_read_paths),
+                "applied_skill_files": sorted(successful_read_paths),
                 "repeated_skill_reads": repeated_read_count,
             }
             if phase:
@@ -356,7 +365,12 @@ class AgentRuntime:
                     dynamic_files = frozenset(stage_files - successful_read_paths)
                 request_tools = _tools_for_stage(stage, dynamic_files)
                 request_allowed_files = dynamic_files
-                if (
+                missing_required = frozenset(required_files - successful_read_paths)
+                if missing_required and not capability_probe:
+                    request_tools = [_read_skill_file_tool(missing_required)]
+                    request_allowed_files = missing_required
+                    tool_choice = {"type": "function", "name": "read_skill_file"}
+                elif (
                     force_final_output
                     or provider_call_budget.claimed >= self.max_provider_calls - self.reserved_final_calls
                     or (stage in RENDERING_STAGES and (
@@ -369,7 +383,7 @@ class AgentRuntime:
                     request_allowed_files = frozenset()
                     tool_choice = "none"
                     force_final_output = True
-                if recovery_active and not force_final_output:
+                if recovery_active and not force_final_output and not missing_required:
                     request_tools = self._recovery_tools(stage, stage_files, remaining_paths)
                     if stage in PLANNING_STAGES:
                         # The same immutable path set drives the recovery request
@@ -381,7 +395,10 @@ class AgentRuntime:
                     tool_choice = "none"
                 if capability_probe and stage != "clarification":
                     tool_choice = {"type": "function", "name": "list_skill_files"} if tool_count == 0 else "none"
-                request_schema = None if capability_probe and stage != "clarification" and tool_count == 0 else provider_schema
+                request_schema = None if (
+                    missing_required and not capability_probe
+                    or capability_probe and stage != "clarification" and tool_count == 0
+                ) else provider_schema
                 if step == convergence_step:
                     conversation.append({
                         "role": "user",
@@ -543,12 +560,21 @@ class AgentRuntime:
                     if tool_error_rounds >= self.max_tool_error_rounds:
                         fail("阶段工具契约连续不满足，生成已停止", "tool_error_limit")
                 if recovery_active:
-                    instruction = self._tool_recovery_instruction(stage, remaining_paths)
+                    missing_required = frozenset(required_files - successful_read_paths)
+                    instruction = (
+                        "当前阶段尚未应用必读 Skill 文件："
+                        + "、".join(sorted(missing_required))
+                        + "。下一轮必须调用 read_skill_file 读取其中一个合法路径，不能直接提交最终结果。"
+                        if missing_required
+                        else self._tool_recovery_instruction(stage, remaining_paths)
+                    )
                     conversation.append({"role": "user", "content": instruction})
                     audit.append({"step": step, "event": "tool_recovery_instruction", "attempt": tool_error_corrections})
                 continue
             if capability_probe and stage != "clarification" and tool_count == 0:
                 fail("模型忽略了强制工具调用要求", "capability_probe_failed")
+            if required_files - successful_read_paths:
+                fail("模型未读取当前阶段必需的锁定 Skill 文件", "required_skill_not_read")
             progress("validating_output", "校验模型输出与阶段 Schema", metrics())
             try:
                 value = _extract_json_object(turn.text or "")
@@ -593,7 +619,7 @@ class AgentRuntime:
                     fail(exc.message, "invalid_output", exc)
             if capability_probe and stage != "clarification" and not any(item.get("event") == "tool" for item in audit):
                 fail("模型未完成工具能力探测", "capability_probe_failed")
-            audit.append({"event": "terminal", "reason": "success", "tool_calls": tool_count, "provider_calls": provider_call_budget.claimed, "exploration_rounds": exploration_rounds, "cumulative_skill_bytes": skill_bytes, "unique_skill_files": len(successful_read_paths), "repeated_skill_reads": repeated_read_count})
+            audit.append({"event": "terminal", "reason": "success", "tool_calls": tool_count, "provider_calls": provider_call_budget.claimed, "exploration_rounds": exploration_rounds, "cumulative_skill_bytes": skill_bytes, "unique_skill_files": len(successful_read_paths), "applied_skill_files": sorted(successful_read_paths), "repeated_skill_reads": repeated_read_count})
             progress("agent_completed", "Agent 已提交有效阶段结果", metrics())
             self.last_audit = tuple(audit)
             return AgentResult(value, self.last_audit, turn.response_id)
@@ -612,6 +638,7 @@ class AgentRuntime:
                 "invalid_output": "agent_invalid_output",
                 "incomplete_after_tool_error": "agent_incomplete_after_tool_error",
                 "unauthorized_tool": "agent_unauthorized_tool",
+                "required_skill_not_read": "agent_required_skill_missing",
             }.get(reason, "gateway_error")
         if reason == "invalid_output":
             return "probe_tool_final_invalid_output" if tool_calls > 0 else "probe_invalid_output"
@@ -633,16 +660,17 @@ class AgentRuntime:
             return "工具契约：本阶段没有可用工具，请直接提交最终 JSON。"
         if stage in PLANNING_STAGES:
             allowed = "、".join(sorted(stage_files or ())) or "（无）"
+            required = "、".join(sorted(REQUIRED_STAGE_FILES.get(stage, ())))
             return (
                 "工具契约：本阶段仅提供 list_skill_files 与 read_skill_file，不提供 get_asset_info；"
                 f"read_skill_file.path 只允许：{allowed}。最多成功读取 {MAX_PLANNING_FILE_READS} 个文件；"
-                "不需要读取时请直接提交最终 JSON。"
+                + (f"提交最终 JSON 前必须成功读取：{required}。" if required else "不需要读取时请直接提交最终 JSON。")
             )
         if stage in RENDERING_STAGES:
             allowed = "、".join(sorted(stage_files or ())) or "（无）"
             return (
                 f"工具契约：轻量 design pack 的锁定文件清单为：{allowed}。"
-                "无需先调用 list_skill_files；read_skill_file.path 只能从该清单选择，已读路径不会再次返回正文。"
+                "无需先调用 list_skill_files；提交最终 JSON 前必须读取该 design pack；read_skill_file.path 只能从该清单选择，已读路径不会再次返回正文。"
                 "达到探索、唯一文件或字节预算后工具会被移除，必须提交最终 JSON。"
             )
         return "工具契约：仅可使用当前请求中提供的只读 Skill 工具；也可以不调用工具直接提交最终 JSON。"

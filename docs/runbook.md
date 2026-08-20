@@ -4,7 +4,7 @@
 
 - Python 3 与 `venv` 模块必须可用；Debian/Ubuntu 环境如缺失 `venv`，先安装与当前 Python 版本匹配的 `python3-venv` 系统包。
 - 在隔离环境安装测试依赖：`python3 -m venv .venv`，激活后执行 `python3 -m pip install -r requirements.txt pytest`。`PyYAML` 已在 `requirements.txt` 锁定，供 OpenAPI 契约门禁使用；标准回归仍以仓库内置 `unittest` 命令为准，pytest 用于审计/验收执行与结果汇总。
-- AC-18 浏览器门禁必须安装锁定依赖 `python3 -m pip install -r requirements-browser.txt`，再执行 `python3 -m playwright install chromium`。若 Chromium 报缺少共享库，由环境管理员按 Playwright 输出补齐系统浏览器依赖；不得以跳过浏览器用例作为替代。
+- Playwright Python 包随 `requirements.txt` 安装；真实 Agent 自检与 AC-18 浏览器门禁都必须再执行 `python3 -m playwright install chromium` 安装锁定浏览器二进制。若 Chromium 报缺少共享库，由环境管理员按 Playwright 输出补齐系统浏览器依赖；不得以跳过浏览器用例或模型单独检查作为替代。
 - 固定验收组合为 Playwright 1.54.0 与 Chromium 139.0.7258.5（build v1181）。运行 `python3 scripts/verify_browser_gate.py`，仅 0 failed、0 skipped 可视为门禁通过。
 
 ## 启动与配置
@@ -29,7 +29,7 @@ python -m uvicorn main_front:app --host 127.0.0.1 --port 8000
 - 活动 Job 不清理。MVP 终态 Job 至少保留 7 天；当前版本由运维在备份后按 `finished_at` 清理任务目录内的终态 `jobs/*.json` 及同名事件文件，不得清理活动状态。
 - SSE 事件与 Job 错误只包含步骤、诊断 ID、`agent_audit_id` 和业务版本引用，不能写入完整 Prompt、客户资料、密钥或模型推理。按任务导出脱敏审计使用 `GET /v1/tasks/{task_id}/agent-audits`，可用 `job_id` 查询参数收窄；按 Job 导出使用 `GET /v1/jobs/{job_id}/agent-audits`。关联审计同时镜像到任务目录的 `agent-audit.jsonl`，因此任务目录归档会自带该任务审计。工具错误码区分 `invalid_arguments`、`path_not_in_lock`、`quota_exceeded`、`unauthorized_tool` 与其余校验错误。
 
-仓库默认 `config/ppt-agent.yaml` 使用真实 `openai_responses` Gateway；配置只保存模型名与环境变量名称，秘密值只放 `.env`。设置页保存会原子更新该全局 YAML 的 `clarification`、`jobs` 与 `review`，不会在 `PPT_AGENT_DATA` 下创建设置文件。`request_timeout_seconds` 必须小于 `run_timeout_seconds`，`job_timeout_seconds` 又必须严格大于 Agent 运行预算。规划阶段使用全局 30 步、40 次只读工具和 8 次 provider 请求；样品独立使用 8 步/4 工具/6 provider、最多 2 轮探索并预留最后 2 次请求；全稿独立使用 12 步/8 工具/10 provider、最多 3 轮探索并预留最后 2 次请求。样品/全稿只读取版本化 `references/design-pack-v1.md`。检查模型未配置时只有显式 `fallback_to_generation: true` 才允许回退。
+仓库默认 `config/ppt-agent.yaml` 使用真实 `openai_responses` Gateway；配置只保存模型名与环境变量名称，秘密值只放 `.env`。设置页保存会原子更新该全局 YAML 的 `clarification`、`jobs` 与 `review`，不会在 `PPT_AGENT_DATA` 下创建设置文件。`request_timeout_seconds` 必须小于 `run_timeout_seconds`，`job_timeout_seconds` 又必须严格大于 Agent 运行预算。规划阶段使用全局 30 步、40 次只读工具和 8 次 provider 请求；样品独立使用 8 步/4 工具/6 provider、最多 2 轮探索并预留最后 2 次请求；全稿独立使用 12 步/8 工具/10 provider、最多 3 轮探索并预留最后 2 次请求。样品/全稿必须成功读取版本化 `references/design-pack-v1.md`，随后由服务端使用哈希锁定的 `assets/template.html` 静态样式层组装 1280×720 公共壳；未读必需文件直接失败。检查必须成功读取 `references/checklist.md`，并接收 Chromium DOM 测量；模型问题与浏览器问题由服务端合并，浏览器不可用、越界、滚动溢出、坏图或其他 blocker 都不能被模型的 `passed=true` 覆盖。检查报告元数据保留浏览器版本、视口、问题数和证据哈希。检查模型未配置时只有显式 `fallback_to_generation: true` 才允许回退。
 
 任务分支通过 `branches.json` 和分支检查点/事件头保存，版本与资源继续使用共享的内容寻址存储。Job 创建时绑定 `branch_id + head_revision + parent_hash`；存在活动 Job 时禁止切换分支。历史阶段只读，继续编辑应从顶部创作进度节点派生新分支。
 
@@ -69,6 +69,7 @@ python3 scripts/verify_offline_delivery.py .ppt-agent-data/tasks/<task-id>/deliv
 - `gateway_error`：无法进一步分类的 SDK/HTTP 故障；根据诊断 ID 检查运行日志，确认原因后再操作。
 - `probe_invalid_output` / `probe_tool_call_missing` / `probe_tool_round_failed` / `probe_tool_final_invalid_output` / `probe_step_limit`：分别表示严格 Schema 失败、未执行强制工具调用、工具结果回传失败、工具调用后最终 Schema 输出失败或步数边界未满足。结合 `failed_check`、`probe_phase`、`terminal_reason`、`tool_calls`、`underlying_code` 与 `probe_id` 查询 `/v1/runtime/probes`，确认模型能力与端点配置后再重新检测。
 - Skill 校验失败：不要直接修改内置文件；恢复经过评审的 Skill 与 `SKILL_LOCK.json` 配套版本。
+- 自检出现 `render_unavailable`：确认已执行 `python3 -m playwright install chromium` 且系统共享库齐全；修复后重新执行检查，禁止人工把缺失浏览器当作通过。
 - 离线校验失败：按错误中的 missing/extra/changed 或 URL 文件修复源交付并重新确认，禁止手改已发布目录。
 - 浏览器门禁 skipped：安装锁定 Playwright/Chromium 及系统共享库后重跑，不能把跳过当成功。
 

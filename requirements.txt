@@ -5,3 +5,4 @@ fastapi==0.115.6
 uvicorn==0.34.0
 httpx==0.28.1
 portalocker==4.1.0
+playwright==1.54.0

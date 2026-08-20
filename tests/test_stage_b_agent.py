@@ -324,17 +324,19 @@ class StageBAgentTests(unittest.TestCase):
         }
         for stage, final in finals.items():
             with self.subTest(stage=stage):
+                path = "references/checklist.md" if stage == "inspection" else "SKILL.md"
                 client = ScriptedClient([
-                    ModelTurn(None, "tool", (ModelToolCall("read_skill_file", '{"path":"SKILL.md"}', "call"),)),
+                    ModelTurn(None, "tool", (ModelToolCall("read_skill_file", json.dumps({"path":path}), "call"),)),
                     ModelTurn(final, "final"),
                 ])
                 AgentRuntime(client, SkillRuntime.builtin()).run(stage, {})
                 tools = client.inputs[0]["tools"]
-                self.assertEqual([tool["name"] for tool in tools], ["list_skill_files", "read_skill_file"])
+                expected_names = ["read_skill_file"] if stage == "inspection" else ["list_skill_files", "read_skill_file"]
+                self.assertEqual([tool["name"] for tool in tools], expected_names)
                 self.assertNotIn("get_asset_info", [tool["name"] for tool in tools])
                 self.assertEqual(
-                    tools[1]["parameters"]["properties"]["path"]["enum"],
-                    ["SKILL.md", "references/checklist.md"],
+                    tools[-1]["parameters"]["properties"]["path"]["enum"],
+                    ["references/checklist.md"] if stage == "inspection" else ["SKILL.md", "references/checklist.md"],
                 )
                 system = client.inputs[0]["input"][0]["content"]
                 self.assertIn("SKILL.md", system)
@@ -439,7 +441,10 @@ class StageBAgentTests(unittest.TestCase):
         self.assertEqual([item["error_code"] for item in recovery_errors], ["already_read", "already_read"])
 
     def test_image_content_is_removed_from_every_nested_model_input(self):
-        client = ScriptedClient([ModelTurn('{"slides":[{"slide_id":"slide-1","html":"<section class=\\"slide\\" id=\\"slide-1\\" data-slide-id=\\"slide-1\\"><p>ok</p></section>"}]}', "r")])
+        client = ScriptedClient([
+            ModelTurn(None,"skill",(ModelToolCall("read_skill_file",'{"path":"references/design-pack-v1.md"}',"skill-call"),)),
+            ModelTurn('{"slides":[{"slide_id":"slide-1","html":"<section class=\\"slide\\" id=\\"slide-1\\" data-slide-id=\\"slide-1\\"><p>ok</p></section>"}]}', "r"),
+        ])
         result = AgentRuntime(client, SkillRuntime.builtin()).run("deck", {
             "assets":{"resources://hero.png":"data:image/png;base64,SECRETBYTES"},
             "items":["ok", " DATA:IMAGE/JPEG;BASE64,MORESECRET"],
@@ -447,7 +452,7 @@ class StageBAgentTests(unittest.TestCase):
         serialized=json.dumps(client.inputs,ensure_ascii=False)
         self.assertEqual(result.value["slides"][0]["slide_id"],"slide-1")
         self.assertNotIn("SECRETBYTES",serialized); self.assertNotIn("MORESECRET",serialized)
-        self.assertEqual(serialized.count("[image-content-removed]"),2)
+        self.assertTrue(all(json.dumps(request,ensure_ascii=False).count("[image-content-removed]")==2 for request in client.inputs))
         self.assertEqual(len(result.audit[0]["input_sha256"]),64)
 
     def test_each_stage_has_a_strict_default_output_schema(self):
@@ -506,15 +511,16 @@ class StageBAgentTests(unittest.TestCase):
     def test_rendering_fragment_failure_gets_one_bounded_semantic_correction(self):
         bad=json.dumps({"slides":[{"slide_id":"slide-1","html":"<html><body>wrong shell</body></html>"}]})
         fixed=json.dumps({"slides":[{"slide_id":"slide-1","html":"```html\n<section class=\"slide\"><h1>ok</h1></section>\n```"}]})
-        client=ScriptedClient([ModelTurn(bad,"bad"),ModelTurn(fixed,"fixed")])
+        skill_turn=ModelTurn(None,"skill",(ModelToolCall("read_skill_file",'{"path":"references/design-pack-v1.md"}',"skill-call"),))
+        client=ScriptedClient([skill_turn,ModelTurn(bad,"bad"),ModelTurn(fixed,"fixed")])
         result=AgentRuntime(client,SkillRuntime.builtin()).run("sample",{"slide_ids":["slide-1"]})
         fragment=result.value["slides"][0]["html"]
         self.assertTrue(fragment.startswith('<section data-slide-id="slide-1" id="slide-1" class="slide">'))
         self.assertEqual(sum(item.get("event")=="semantic_correction" for item in result.audit),1)
-        self.assertIn("semantic_correction",str(client.inputs[1]["input"]))
-        self.assertEqual(client.inputs[1]["tool_choice"],"none")
+        self.assertIn("semantic_correction",str(client.inputs[2]["input"]))
+        self.assertEqual(client.inputs[2]["tool_choice"],"none")
 
-        exhausted=ScriptedClient([ModelTurn(bad,"bad-1"),ModelTurn(bad,"bad-2")])
+        exhausted=ScriptedClient([skill_turn,ModelTurn(bad,"bad-1"),ModelTurn(bad,"bad-2")])
         with self.assertRaises(GatewayError) as caught:
             AgentRuntime(exhausted,SkillRuntime.builtin()).run("deck",{"slide_ids":["slide-1"]})
         self.assertEqual(caught.exception.code,"agent_invalid_output")
@@ -532,7 +538,10 @@ class StageBAgentTests(unittest.TestCase):
     def test_schema_limits_deadline_and_failure_audit(self):
         with self.assertRaises(ValidationError):
             AgentRuntime(ScriptedClient([]), SkillRuntime.builtin()).run("deck", {}, response_schema=SCHEMA)
-        arbitrary = ScriptedClient([ModelTurn('{"passed":false,"issues":[{"arbitrary_secret_field":"x"}]}', "secret-response")])
+        arbitrary = ScriptedClient([
+            ModelTurn(None,"skill",(ModelToolCall("read_skill_file",'{"path":"references/checklist.md"}',"skill-call"),)),
+            ModelTurn('{"passed":false,"issues":[{"arbitrary_secret_field":"x"}]}', "secret-response"),
+        ])
         runtime = AgentRuntime(arbitrary, SkillRuntime.builtin(), max_schema_corrections=0)
         with self.assertRaises(GatewayError) as caught: runtime.run("inspection", {})
         self.assertEqual(caught.exception.audit[-1]["reason"], "invalid_output")
