@@ -1,11 +1,11 @@
-import { api, ApiError } from "./api.js?v=2026.08.20.152614537731";
-import { JobTracker } from "./job-tracker.js?v=2026.08.20.152614537731";
-import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.20.152614537731";
-import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.20.152614537731";
-import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.20.152614537731";
-import { inlineError, setBusy } from "./components/index.js?v=2026.08.20.152614537731";
-import { renderStage } from "./stages/index.js?v=2026.08.20.152614537731";
-import { setVersionMatchGuard } from "./stages/shared.js?v=2026.08.20.152614537731";
+import { api, ApiError } from "./api.js?v=2026.08.20.172432606707";
+import { JobTracker } from "./job-tracker.js?v=2026.08.20.172432606707";
+import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.20.172432606707";
+import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.20.172432606707";
+import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.20.172432606707";
+import { inlineError, setBusy } from "./components/index.js?v=2026.08.20.172432606707";
+import { renderStage } from "./stages/index.js?v=2026.08.20.172432606707";
+import { setVersionMatchGuard } from "./stages/shared.js?v=2026.08.20.172432606707";
 
 const app = document.getElementById("app");
 const APP_BUILD = document.querySelector('meta[name="app-build"]')?.content || "unknown";
@@ -473,7 +473,7 @@ async function renderWorkspace(route, generation) {
       sidebar.setAttribute("aria-hidden", "false");
       sidebar.querySelector("button, a")?.focus();
     };
-    const selected = shell.stages.find((stage) => stage.id === route.stage) || shell.stages.find((stage) => stage.status === "current");
+    const selected = shell.stages.find((stage) => stage.id === route.stage) || shell.stages.find((stage) => stage.status === "current") || shell.stages[shell.stages.length - 1];
     sidebar = workspaceSidebar(shell, recent.tasks, selected, closeDrawer);
     scrim = element("button", { className: "drawer-scrim", type: "button", "aria-label": "关闭导航", onClick: closeDrawer });
     const page = element("div", { className: "app-shell" }, [
@@ -515,7 +515,7 @@ async function renderWorkspace(route, generation) {
         const content = await renderStage(selected.id, stageContext(shell, selected, route, generation));
         if (generation !== renderGeneration) return;
         enforceTaskActionState(content, shell.task);
-        enforceStageAccess(content, selected);
+        enforceStageAccess(content, selected, shell.task);
         document.getElementById("stage-content")?.replaceChildren(content);
         updateRuntimeUI();
       } catch (error) {
@@ -547,7 +547,7 @@ function workspaceMain(shell, selected, route) {
   const locked = selected.status === "locked";
   const [statusLabel, tone] = STATUS[shell.task.status] || [shell.task.status, ""];
   const viewCopy = {
-    workspace: [selected.label, locked ? selected.lock_reason : selected.id === current.id ? "这是任务当前的权威阶段。" : `正在查看只读历史；当前阶段为“${current.label}”。`],
+    workspace: [selected.label, locked ? selected.lock_reason : !current ? "任务已完成，所有阶段均已结束；内容为只读状态。" : selected.id === current.id ? "这是任务当前的权威阶段。" : `正在查看只读历史；当前阶段为“${current.label}”。`],
     status: ["运行状态", "查看全部 Job、领域事件与 Agent 审计历史。"],
     settings: ["任务与运行设置", "参数保存后会立即用于新 Job；当前 Job 保持启动时快照。"],
   }[route.view];
@@ -584,7 +584,7 @@ function creationProgress(shell, selected) {
   return element("section", { className: "creation-progress card", "aria-labelledby": "creation-progress-title" }, [
     element("div", { className: "creation-progress__header" }, [
       element("div", {}, [element("p", { className: "eyebrow", text: "创作进度" }), element("h2", { id: "creation-progress-title", text: `${finished} / ${shell.stages.length} 个阶段完成` })]),
-      badge(`当前：${current?.label || selected.label}`, "primary"),
+      badge(current ? `当前：${current.label}` : shell.task.status === "completed" ? "已完成" : `当前：${selected.label}`, current ? "primary" : shell.task.status === "completed" ? "success" : "primary"),
     ]),
     element("ol", { className: "progress-rail" }, shell.stages.map((stage, index) => {
       const disabled = stage.status === "locked";
@@ -947,9 +947,11 @@ function enforceTaskActionState(content, task) {
   });
 }
 
-function enforceStageAccess(content, stage) {
+function enforceStageAccess(content, stage, task) {
   if (!["completed", "skipped"].includes(stage.status)) return;
   content.querySelectorAll('[data-mutates="true"]').forEach((control) => {
+    // 已完成任务的交付页是终态而非历史：显式允许完成后动作（如交付派生）保持可用。
+    if (task?.status === "completed" && control.dataset.allowCompleted === "true") return;
     control.disabled = true;
     control.title = "历史阶段为只读；如需继续编辑，请从该节点创建分支";
     control.setAttribute("aria-description", control.title);

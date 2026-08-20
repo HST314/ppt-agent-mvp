@@ -736,24 +736,20 @@ go(Number.isFinite(initialSlide) ? initialSlide : 0);
 <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
 <script>lucide.createIcons();</script>
 
-<!-- ============ Motion One 动效引擎（本地优先,CDN 兜底） ============
-     加载策略:先 ./assets/motion.min.js(本地,离线可用),失败 fallback 到 jsDelivr CDN
+<!-- ============ Motion One 动效引擎（本地 UMD,file:// 直接可用） ============
+     加载策略:./assets/motion.min.js 是 UMD 构建,经典脚本加载后挂 window.Motion,
+     file:// 双击打开与交付 ZIP 内均可工作,不依赖 ES 模块导入或外部 CDN
+     （交付校验要求包内零外链,请勿改为 https 远程脚本）。
      加载完成后挂 window.__playSlide / window.__pipeAdvance,
      导航脚本会在翻页中段调用 __playSlide(idx),键盘/滚轮/触屏会在翻页前调用 __pipeAdvance()
-     双双失败时会兜底把所有 [data-anim] 设为可见,不让动效破坏阅读
+     Motion 缺失时兜底把所有 [data-anim] 设为可见,不让动效破坏阅读
 -->
+<script src="./assets/motion.min.js"></script>
 <script type="module">
-let motion;
-try {
-  motion = await import('./assets/motion.min.js');
-} catch(e1) {
-  try {
-    motion = await import('https://cdn.jsdelivr.net/npm/motion@11.11.17/+esm');
-  } catch(e2) {
-    console.warn('[motion] local + CDN both failed, disabling animations', e1, e2);
-    document.querySelectorAll('[data-anim]').forEach(el=>{el.style.opacity='1';el.style.transform='none'});
-    document.querySelectorAll('[data-animate="pipeline"] [data-anim]').forEach(el=>el.style.opacity='1');
-  }
+const motion = window.Motion || null;
+if(!motion){
+  document.querySelectorAll('[data-anim]').forEach(el=>{el.style.opacity='1';el.style.transform='none'});
+  document.querySelectorAll('[data-animate="pipeline"] [data-anim]').forEach(el=>el.style.opacity='1');
 }
 
 if(motion){

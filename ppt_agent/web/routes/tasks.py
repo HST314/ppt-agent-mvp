@@ -62,7 +62,9 @@ def get_shell(task_id: str, service: TaskService = Depends(task_service), jobs: 
     stages = []
     for index, (key, label, prerequisite) in enumerate(STAGES):
         if index == current_index:
-            item_status = "current"
+            # A completed task has finished the delivery stage too; render it as
+            # done (8/8) instead of forever "current".
+            item_status = "completed" if key == "delivery" and state["status"] == "completed" else "current"
         elif key == "review" and state["stage"]=="delivery" and finalization and finalization["source"]=="deck":
             item_status = "skipped"
         elif key == "review" and review_available:

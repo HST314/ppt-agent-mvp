@@ -1,4 +1,4 @@
-import { badge, button, element, icon } from "../shell.js?v=2026.08.20.152614537731";
+import { badge, button, element, icon } from "../shell.js?v=2026.08.20.172432606707";
 
 export { badge, button, element, icon };
 
@@ -56,6 +56,9 @@ export function metadataList(items) {
   ]));
 }
 
+const PREVIEW_CANVAS_WIDTH = 1280;
+const PREVIEW_CANVAS_HEIGHT = 720;
+
 export function previewFrame(html, title, { id = "", allowInspection = false, src = "" } = {}) {
   const frame = element("iframe", {
     className: "preview-frame",
@@ -65,7 +68,38 @@ export function previewFrame(html, title, { id = "", allowInspection = false, sr
     sandbox: allowInspection ? "allow-same-origin" : "",
   });
   frame.src = src || "about:blank";
-  return element("div", { className: "preview-aspect" }, frame);
+  const aspect = element("div", { className: "preview-aspect" }, frame);
+  scalePreviewToFit(aspect, frame);
+  return aspect;
+}
+
+/**
+ * Keep the iframe at the logical 1280×720 canvas and scale the whole frame to
+ * fit the container width (or the full viewport in fullscreen), so every
+ * preview shows the complete canvas instead of a clipped region.
+ */
+export function scalePreviewToFit(aspect, frame) {
+  const apply = () => {
+    const width = aspect.clientWidth;
+    if (!width) return;
+    const fullscreen = document.fullscreenElement === aspect;
+    const scale = fullscreen
+      ? Math.min(width / PREVIEW_CANVAS_WIDTH, aspect.clientHeight / PREVIEW_CANVAS_HEIGHT)
+      : width / PREVIEW_CANVAS_WIDTH;
+    frame.style.transform = `scale(${scale})`;
+    if (!fullscreen) {
+      // 全局 box-sizing: border-box：显式高度包含边框，需补偿后内容区才正好等于缩放画布高度
+      const computed = getComputedStyle(aspect);
+      const borders = (parseFloat(computed.borderTopWidth) || 0) + (parseFloat(computed.borderBottomWidth) || 0);
+      aspect.style.height = `${PREVIEW_CANVAS_HEIGHT * scale + borders}px`;
+    }
+  };
+  if (typeof ResizeObserver === "function") {
+    const observer = new ResizeObserver(apply);
+    observer.observe(aspect);
+  }
+  document.addEventListener("fullscreenchange", apply);
+  apply();
 }
 
 export function previewUrl(taskId, hash) {

@@ -76,7 +76,7 @@ layouts.md 使用的所有类（`h-hero` / `h-xl` / `h-sub` / `h-md` / `lead` / 
 | `directional` | 左进 → 分割 → 右进,用于对比 | Layout 9 Before/After |
 | `pipeline` | 手动推进,按 →/空格 一步步点亮 | Layout 6 流水线 |
 
-**降级保底**:如果 motion.min.js 本地 + CDN 都加载失败,脚本会强制把所有 `data-anim` 元素设为 `opacity:1`,内容永远可读。
+**降级保底**:motion.min.js 以经典脚本(UMD,`window.Motion`)本地加载,`file://` 直接可用;如果 Motion 缺失,脚本会强制把所有 `data-anim` 元素设为 `opacity:1`,内容永远可读。不要改成远程 CDN 脚本或 ES 模块导入(交付离线校验拒绝外链,`file://` 下模块会被 CORS 拦截)。
 
 **不需要动效的页面**:如果某页想完全跳过动效,不加任何 `data-anim` 即可 —— Motion One 只对带标记的元素生效。
 

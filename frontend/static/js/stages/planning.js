@@ -1,6 +1,6 @@
-import { api } from "../api.js?v=2026.08.20.152614537731";
-import { badge, button, element, field, formatTime, metadataList, shortHash, versionTimeline } from "../components/index.js?v=2026.08.20.152614537731";
-import { actionMessage, codeBlock, draftGuard, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.20.152614537731";
+import { api } from "../api.js?v=2026.08.20.172432606707";
+import { badge, button, element, field, formatTime, metadataList, shortHash, versionTimeline } from "../components/index.js?v=2026.08.20.172432606707";
+import { actionMessage, codeBlock, draftGuard, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.20.172432606707";
 
 export async function render(context) {
   const view = await api.planning(context.taskId, context.controller);
@@ -47,7 +47,8 @@ function planningStage(view, kind, context) {
   });
   confirm.addEventListener("click", async () => {
     const action = kind === "narrative" ? api.confirmNarrative : api.confirmOutline;
-    await runAction({ buttonNode: confirm, region: confirmMessage, busyLabel: "正在确认…", action: () => action(context.taskId), success: "当前版本已确认。", refresh: context.refresh }).catch(() => {});
+    const result = await runAction({ buttonNode: confirm, region: confirmMessage, busyLabel: "正在确认…", action: () => action(context.taskId), success: "当前版本已确认。" }).catch(() => null);
+    if (result) context.goTo(kind === "narrative" ? "outline" : "sample");
   });
 
   const currentHash = document?.hash;

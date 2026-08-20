@@ -423,14 +423,14 @@ def offline_player(deck_html: str) -> str:
     """Turn the frozen deck into a local-first slide player."""
     head = """<style id="offline-player-style">
 body.offline-player{overflow:hidden}.offline-player .slide{display:none;margin:0 auto}
-.offline-player .slide[aria-hidden="false"]{display:block}
-#offline-controls{position:fixed;z-index:2147483647;right:20px;bottom:20px;display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:12px;background:#111827e8;color:#fff;font:14px system-ui;box-shadow:0 4px 18px #0006}
+.offline-player .slide[aria-hidden="false"]{display:block;position:fixed;left:50%;top:var(--offline-center-y,50%);margin:0;transform:translate(-50%,-50%) scale(var(--offline-scale,1));transform-origin:center}
+#offline-controls{position:fixed;z-index:2147483647;left:50%;right:auto;bottom:max(12px,env(safe-area-inset-bottom));transform:translateX(-50%);display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:12px;background:#111827e8;color:#fff;font:14px system-ui;box-shadow:0 4px 18px #0006}
 #offline-controls button{min-width:44px;min-height:44px;border:1px solid #ffffff55;border-radius:8px;background:#ffffff18;color:#fff;font:inherit;cursor:pointer}
 #offline-controls button:disabled{opacity:.35;cursor:not-allowed}#offline-page{min-width:64px;text-align:center}
 </style>"""
     body = """<nav id="offline-controls" aria-label="幻灯片导航"><button id="offline-prev" type="button" aria-label="上一页">&#8592;</button><output id="offline-page" aria-live="polite"></output><button id="offline-next" type="button" aria-label="下一页">&#8594;</button></nav>
-<script src="assets/offline-player.js"></script>
-<script type="module" src="assets/motion.min.js"></script>"""
+<script src="assets/motion.min.js"></script>
+<script src="assets/offline-player.js"></script>"""
     lower = deck_html.lower()
     position = lower.rfind("</head>")
     deck_html = deck_html[:position] + head + deck_html[position:] if position >= 0 else deck_html.replace("<body", head + "<body", 1)

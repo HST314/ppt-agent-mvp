@@ -377,19 +377,17 @@
 
 ### 加载方式
 
-`assets/template.html` 底部的 module script 会先尝试**本地** `assets/motion.min.js`,失败则回落到 **jsdelivr CDN**,两者都失败则强制把所有带 `data-anim` 的元素设为 `opacity:1`—— 内容永远可读,演示不依赖网络。
+`assets/template.html` 底部用**经典脚本** `<script src="./assets/motion.min.js"></script>` 加载 UMD 版 Motion One,加载后挂 `window.Motion`;`file://` 直接双击打开也能工作(ES 模块在 `file://` 下会被 CORS 拦截,因此不要用 `type="module"` 或动态 `import()` 加载本地 motion)。Motion 缺失时强制把所有带 `data-anim` 的元素设为 `opacity:1`—— 内容永远可读,演示不依赖网络。
 
 ```js
 // template 里的核心加载器(不用改)
-let motion;
-try { motion = await import('./assets/motion.min.js'); }
-catch(e1) {
-  try { motion = await import('https://cdn.jsdelivr.net/npm/motion@11.11.17/+esm'); }
-  catch(e2) {
-    document.querySelectorAll('[data-anim]').forEach(el=>{el.style.opacity='1';el.style.transform='none'});
-  }
+const motion = window.Motion || null;
+if(!motion) {
+  document.querySelectorAll('[data-anim]').forEach(el=>{el.style.opacity='1';el.style.transform='none'});
 }
 ```
+
+⚠️ 不要在生成的 deck 里引用 `https://` 远程脚本(如 jsdelivr/unpkg 的 motion 或 lucide):交付 ZIP 的离线校验会拒绝任何外链,`file://` 断网打开也会报错。
 
 ### 数据属性驱动
 
