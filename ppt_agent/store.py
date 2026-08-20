@@ -154,12 +154,6 @@ class WorkspaceStore:
             return self.branches(task_id)
     def _mirror_active_locked(self,task_id,branch_root,state):
         task=self._task(task_id); self.atomic_json(task/"checkpoint.json",state); self.atomic_bytes(task/"events.jsonl",(branch_root/"events.jsonl").read_bytes())
-    def runtime_settings(self):
-        path=self.root/"runtime-settings.json"
-        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    def save_runtime_settings(self,value):
-        with self._guard: self.atomic_json(self.root/"runtime-settings.json",value)
-        return value
     def resource_root(self,task_id):
         p=self._task(task_id)
         if not p.exists(): raise NotFoundError("任务不存在")

@@ -33,15 +33,13 @@ class StageAConfigTests(unittest.TestCase):
         self.assertEqual(cfg.mode, "fake")
 
     def test_repository_default_config_loads_with_referenced_environment(self):
-        # The shipped default flips between fake (acceptance) and agent (live
-        # use); either way it must load cleanly once its referenced secrets
-        # exist, and its public snapshot must not leak them.
+        # The shipped default is the live Agent runtime and must load cleanly
+        # once its referenced secrets exist without exposing them publicly.
         env={"MODEL_API_KEY":"secret","MODEL_BASE_URL":"https://provider.example/v1"}
         with patch.dict(os.environ,env,clear=True), patch("ppt_agent.config.load_dotenv"):
             cfg = load_config(ROOT / "config/ppt-agent.yaml")
-        self.assertIn(cfg.mode, {"fake", "agent"})
-        if cfg.mode == "agent":
-            self.assertEqual(cfg.generation.structured_output, "auto")
+        self.assertEqual(cfg.mode, "agent")
+        self.assertEqual(cfg.generation.structured_output, "auto")
         self.assertNotIn("secret", str(cfg.public()))
 
         with patch.dict(os.environ,env,clear=True), patch("ppt_agent.config.load_dotenv"):
@@ -96,6 +94,37 @@ class StageAConfigTests(unittest.TestCase):
                 self.config(base+invalid,env)
         fake=self.config("gateway: {mode: fake}\nclarification: {style: minimal, max_rounds: 1}\n",{})
         self.assertEqual((fake.clarification.style,fake.clarification.max_rounds),("minimal",1))
+
+    def test_global_job_and_review_settings_are_validated_and_carried(self):
+        cfg=self.config(
+            "gateway: {mode: fake}\n"
+            "jobs: {generation_timeout_seconds: 91, inspection_timeout_seconds: 92, delivery_timeout_seconds: 93}\n"
+            "review: {default_max_rounds: 4}\n",
+            {},
+        )
+        self.assertEqual(cfg.jobs.generation_timeout_seconds,91)
+        self.assertEqual(cfg.jobs.inspection_timeout_seconds,92)
+        self.assertEqual(cfg.jobs.delivery_timeout_seconds,93)
+        self.assertEqual(cfg.review.default_max_rounds,4)
+        for invalid in (
+            "jobs: {generation_timeout_seconds: 29}\n",
+            "jobs: {unknown: 30}\n",
+            "review: {default_max_rounds: 11}\n",
+            "review: {unknown: 1}\n",
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(ValidationError):
+                self.config("gateway: {mode: fake}\n"+invalid,{})
+
+    def test_inherited_crlf_environment_values_are_normalized(self):
+        env={"GEN_KEY":"secret\r","GEN_URL":"https://gen.example/v1\r"}
+        cfg=self.config(
+            "gateway: {mode: agent}\nmodels:\n"
+            "  generation: {provider: openai_responses, model: gen, api_key_env: GEN_KEY, base_url_env: GEN_URL}\n"
+            "  inspection: {fallback_to_generation: true}\n",
+            env,
+        )
+        self.assertEqual(cfg.generation.api_key,"secret")
+        self.assertEqual(cfg.generation.base_url,"https://gen.example/v1")
 
     def test_structured_output_mode_is_validated(self):
         env={"GEN_KEY":"secret","GEN_URL":"https://gen.example/v1"}

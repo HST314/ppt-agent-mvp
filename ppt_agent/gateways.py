@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 from .errors import GatewayError, GatewayUnknownResult, ValidationError
-from .agent_runtime import AgentRuntime, STAGE_OUTPUT_SCHEMAS, STAGE_PROVIDER_SCHEMAS, _extract_json_object
+from .agent_runtime import AgentRuntime, STAGE_OUTPUT_SCHEMAS, STAGE_PROVIDER_SCHEMAS, _extract_json_object, normalize_rendering_output
 from .audit import current_agent_audit_context
 from .skill_runtime import SkillRuntime
 
@@ -296,49 +296,11 @@ class AgentGateway:
         stage = "deck" if action == "inspection" else action
         expected = list(context.get("slide_ids") or [])
         value = self._run(stage, {"outline": outline, **context})
-        slides = value.get("slides")
-        if not isinstance(slides, list) or [item.get("slide_id") for item in slides if isinstance(item, dict)] != expected:
-            raise ValidationError("模型页面片段与请求页面不一致")
+        slides = normalize_rendering_output(value, expected)["slides"]
         
         fragments = []
         for item in slides:
-            fragment = item.get("html")
-            if not isinstance(fragment, str) or not fragment.strip():
-                raise ValidationError("模型页面片段契约无效")
-            
-            fragment = fragment.strip()
-            # 兼容模型偶尔包裹的代码围栏
-            if fragment.startswith("```"):
-                fragment = re.sub(r"^```[a-zA-Z]*\s*", "", fragment)
-                fragment = re.sub(r"\s*```$", "", fragment).strip()
-
-            sid = item["slide_id"]
-            # 校验是否为以 <section ...> 开始并以 </section> 结束的独立片段
-            tag_match = re.match(r'^<section\b(?P<attrs>[^>]*)>[\s\S]*</section>$', fragment, re.I)
-            if not tag_match:
-                raise ValidationError("模型页面片段契约无效")
-
-            attrs_str = tag_match.group("attrs")
-            id_match = re.search(r'\bid=["\']([A-Za-z0-9_-]+)["\']', attrs_str, re.I)
-            data_id_match = re.search(r'\bdata-slide-id=["\']([A-Za-z0-9_-]+)["\']', attrs_str, re.I)
-            class_match = re.search(r'\bclass=["\']([^"\']*)["\']', attrs_str, re.I)
-
-            # 检查 class 必须包含 slide
-            if not class_match or "slide" not in class_match.group(1).split():
-                raise ValidationError("模型页面片段契约无效")
-
-            # 校验 id / data-slide-id 是否与请求的 slide_id 匹配
-            extracted_id = (id_match.group(1) if id_match else None) or (data_id_match.group(1) if data_id_match else None)
-            if extracted_id is not None and extracted_id != sid:
-                raise ValidationError("模型页面片段契约无效")
-
-            # 确保同时具备标准的 id 和 data-slide-id 属性
-            if not id_match:
-                fragment = re.sub(r'^<section\b', f'<section id="{sid}"', fragment, count=1, flags=re.I)
-            if not data_id_match:
-                fragment = re.sub(r'^<section\b', f'<section data-slide-id="{sid}"', fragment, count=1, flags=re.I)
-
-            fragments.append(fragment)
+            fragments.append(item["html"])
 
         rules = " · ".join(html.escape(str(x)) for x in context.get("rules", []))
         return (

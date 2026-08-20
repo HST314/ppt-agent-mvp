@@ -1,10 +1,10 @@
-import { api, ApiError } from "./api.js?v=2026.08.19.081751755538";
-import { JobTracker } from "./job-tracker.js?v=2026.08.19.081751755538";
-import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.19.081751755538";
-import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.19.081751755538";
-import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.19.081751755538";
-import { inlineError, setBusy } from "./components/index.js?v=2026.08.19.081751755538";
-import { renderStage } from "./stages/index.js?v=2026.08.19.081751755538";
+import { api, ApiError } from "./api.js?v=2026.08.20.114142303041";
+import { JobTracker } from "./job-tracker.js?v=2026.08.20.114142303041";
+import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.20.114142303041";
+import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.20.114142303041";
+import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.20.114142303041";
+import { inlineError, setBusy } from "./components/index.js?v=2026.08.20.114142303041";
+import { renderStage } from "./stages/index.js?v=2026.08.20.114142303041";
 
 const app = document.getElementById("app");
 const APP_BUILD = document.querySelector('meta[name="app-build"]')?.content || "unknown";
@@ -1060,11 +1060,11 @@ function settingsGroup(title,settings,group) {
   const save=button("保存并立即生效",{kind:"primary",mutates:true,onClick:async()=>{
     const payload={}; payload[group]=Object.fromEntries(Object.entries(controls).map(([key,control])=>[key,schema[key].type==="integer" ? Number(control.value) : control.value]));
     setBusy(save,true,"正在保存…"); message.replaceChildren();
-    try { await api.updateSettings(payload); message.append(element("p",{className:"success-message",text:"设置已保存；新 Job 将立即采用。"})); }
+    try { await api.updateSettings(payload); message.append(element("p",{className:"success-message",text:"全局设置已保存；新 Job 将立即采用。"})); }
     catch (error) { message.replaceChildren(inlineError(describeError(error),error?.diagnosticId)); }
     finally { setBusy(save,false); }
   }});
-  return element("section",{className:"card settings-panel"},[element("div",{className:"card__header"},[element("div",{},[element("h2",{text:title}),element("p",{className:"muted",text:"保存采用原子更新；当前运行不会被中途改写。"})])]),...fields,save,message]);
+  return element("section",{className:"card settings-panel"},[element("div",{className:"card__header"},[element("div",{},[element("h2",{text:title}),element("p",{className:"muted",text:"保存会原子更新应用级全局 YAML；当前运行不会被中途改写。"})])]),...fields,save,message]);
 }
 
 function modelSettings(models) {

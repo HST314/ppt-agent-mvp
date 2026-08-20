@@ -9,7 +9,7 @@
 
 ## 启动与配置
 
-默认离线/fake 启动无需 `.env`：
+默认配置使用真实 Responses 模型。先在仓库根目录准备只包含 `MODEL_API_KEY` 与 `MODEL_BASE_URL` 的 `.env`，再启动：
 
 ```bash
 python -m uvicorn main_front:app --host 127.0.0.1 --port 8000
@@ -29,7 +29,7 @@ python -m uvicorn main_front:app --host 127.0.0.1 --port 8000
 - 活动 Job 不清理。MVP 终态 Job 至少保留 7 天；当前版本由运维在备份后按 `finished_at` 清理任务目录内的终态 `jobs/*.json` 及同名事件文件，不得清理活动状态。
 - SSE 事件与 Job 错误只包含步骤、诊断 ID、`agent_audit_id` 和业务版本引用，不能写入完整 Prompt、客户资料、密钥或模型推理。按任务导出脱敏审计使用 `GET /v1/tasks/{task_id}/agent-audits`，可用 `job_id` 查询参数收窄；按 Job 导出使用 `GET /v1/jobs/{job_id}/agent-audits`。关联审计同时镜像到任务目录的 `agent-audit.jsonl`，因此任务目录归档会自带该任务审计。工具错误码区分 `invalid_arguments`、`path_not_in_lock`、`quota_exceeded`、`unauthorized_tool` 与其余校验错误。
 
-仓库默认 `config/ppt-agent.yaml` 为无需凭证的 fake 模式。真实 API 应复制 `config/ppt-agent.agent.example.yaml` 为本地配置，并用 `PPT_AGENT_CONFIG` 指向它；配置 `provider: openai_responses`、模型与保存环境变量名称的 `api_key_env`/`base_url_env`，秘密值只放 `.env`。`request_timeout_seconds` 必须小于 `run_timeout_seconds`，`job_timeout_seconds` 又必须严格大于 Agent 运行预算。规划阶段使用全局 30 步、40 次只读工具和 8 次 provider 请求；样品独立使用 8 步/4 工具/6 provider、最多 2 轮探索并预留最后 2 次请求；全稿独立使用 12 步/8 工具/10 provider、最多 3 轮探索并预留最后 2 次请求。样品/全稿只读取版本化 `references/design-pack-v1.md`。检查模型未配置时只有显式 `fallback_to_generation: true` 才允许回退。
+仓库默认 `config/ppt-agent.yaml` 使用真实 `openai_responses` Gateway；配置只保存模型名与环境变量名称，秘密值只放 `.env`。设置页保存会原子更新该全局 YAML 的 `clarification`、`jobs` 与 `review`，不会在 `PPT_AGENT_DATA` 下创建设置文件。`request_timeout_seconds` 必须小于 `run_timeout_seconds`，`job_timeout_seconds` 又必须严格大于 Agent 运行预算。规划阶段使用全局 30 步、40 次只读工具和 8 次 provider 请求；样品独立使用 8 步/4 工具/6 provider、最多 2 轮探索并预留最后 2 次请求；全稿独立使用 12 步/8 工具/10 provider、最多 3 轮探索并预留最后 2 次请求。样品/全稿只读取版本化 `references/design-pack-v1.md`。检查模型未配置时只有显式 `fallback_to_generation: true` 才允许回退。
 
 任务分支通过 `branches.json` 和分支检查点/事件头保存，版本与资源继续使用共享的内容寻址存储。Job 创建时绑定 `branch_id + head_revision + parent_hash`；存在活动 Job 时禁止切换分支。历史阶段只读，继续编辑应从顶部创作进度节点派生新分支。
 

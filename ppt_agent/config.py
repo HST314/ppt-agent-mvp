@@ -73,12 +73,32 @@ class ClarificationConfig:
 
 
 @dataclass(frozen=True)
+class JobSettingsConfig:
+    generation_timeout_seconds: int = 630
+    inspection_timeout_seconds: int = 630
+    delivery_timeout_seconds: int = 180
+
+    def public(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ReviewSettingsConfig:
+    default_max_rounds: int = 2
+
+    def public(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     mode: str
     generation: ModelConfig | None = None
     inspection: ModelConfig | None = None
     inspection_fallback: bool = False
     clarification: ClarificationConfig = ClarificationConfig()
+    jobs: JobSettingsConfig = JobSettingsConfig()
+    review: ReviewSettingsConfig = ReviewSettingsConfig()
 
     def public(self) -> dict:
         return {
@@ -89,10 +109,12 @@ class RuntimeConfig:
                 "inspection_fallback": self.inspection_fallback,
             },
             "clarification": self.clarification.public(),
+            "jobs": self.jobs.public(),
+            "review": self.review.public(),
         }
 
 
-_ROOT_KEYS = {"gateway", "models", "skills", "capabilities", "clarification"}
+_ROOT_KEYS = {"gateway", "models", "skills", "capabilities", "clarification", "jobs", "review"}
 _MODEL_KEYS = {
     "provider", "model", "api_key_env", "base_url_env", "timeout_seconds",
     "request_timeout_seconds", "run_timeout_seconds", "job_timeout_seconds",
@@ -106,6 +128,8 @@ _STAGE_BUDGET_KEYS = {
 _STRUCTURED_OUTPUT_MODES = {"auto", "json_schema", "prompt"}
 _CLARIFICATION_KEYS = {"max_questions_per_round", "max_rounds", "style"}
 _CLARIFICATION_STYLES = {"minimal", "comprehensive"}
+_JOB_KEYS = {"generation_timeout_seconds", "inspection_timeout_seconds", "delivery_timeout_seconds"}
+_REVIEW_KEYS = {"default_max_rounds"}
 
 
 def _mapping(value, name: str) -> dict:
@@ -129,7 +153,11 @@ def _model(value: dict, name: str, *, required: bool) -> ModelConfig | None:
     base_url_env = value.get("base_url_env")
     if not all(isinstance(item, str) and item.strip() for item in (model, api_key_env, base_url_env)):
         raise ValidationError(f"models.{name} 缺少模型或环境变量名称")
-    api_key, base_url = os.getenv(api_key_env, ""), os.getenv(base_url_env, "")
+    # Values inherited from a CRLF dotenv file sourced by a shell can retain a
+    # trailing carriage return. Normalize their surrounding whitespace before
+    # URL parsing and SDK construction so a valid endpoint is not rejected.
+    api_key = os.getenv(api_key_env, "").strip()
+    base_url = os.getenv(base_url_env, "").strip()
     if not api_key or not base_url:
         raise ValidationError(f"models.{name} 引用的环境变量未配置")
     try:
@@ -239,6 +267,33 @@ def _clarification(value) -> ClarificationConfig:
     return ClarificationConfig(max_questions, max_rounds, style)
 
 
+def _jobs(value, *, generation_default: int, inspection_default: int) -> JobSettingsConfig:
+    value = _mapping(value, "jobs")
+    unknown = set(value) - _JOB_KEYS
+    if unknown:
+        raise ValidationError(f"jobs 包含未知字段：{', '.join(sorted(unknown))}")
+    settings = JobSettingsConfig(
+        generation_timeout_seconds=value.get("generation_timeout_seconds", generation_default),
+        inspection_timeout_seconds=value.get("inspection_timeout_seconds", inspection_default),
+        delivery_timeout_seconds=value.get("delivery_timeout_seconds", 180),
+    )
+    for label, item in settings.public().items():
+        if isinstance(item, bool) or not isinstance(item, int) or not 30 <= item <= 3660:
+            raise ValidationError(f"jobs.{label} 超出范围")
+    return settings
+
+
+def _review(value) -> ReviewSettingsConfig:
+    value = _mapping(value, "review")
+    unknown = set(value) - _REVIEW_KEYS
+    if unknown:
+        raise ValidationError(f"review 包含未知字段：{', '.join(sorted(unknown))}")
+    rounds = value.get("default_max_rounds", 2)
+    if isinstance(rounds, bool) or not isinstance(rounds, int) or not 0 <= rounds <= 10:
+        raise ValidationError("review.default_max_rounds 超出范围")
+    return ReviewSettingsConfig(rounds)
+
+
 def load_config(path: str | Path | None = None, *, env_file: str | Path | None = None) -> RuntimeConfig:
     load_dotenv(env_file, override=False) if env_file is not None else load_dotenv(override=False)
     config_path = Path(path or os.getenv("PPT_AGENT_CONFIG", "config/ppt-agent.yaml"))
@@ -266,8 +321,10 @@ def load_config(path: str | Path | None = None, *, env_file: str | Path | None =
     if any(capabilities.values()):
         raise ValidationError("阶段 A 不允许启用网络或图片能力")
     clarification = _clarification(raw.get("clarification", {}))
+    review = _review(raw.get("review", {}))
     if mode == "fake":
-        return RuntimeConfig(mode="fake", clarification=clarification)
+        jobs = _jobs(raw.get("jobs", {}), generation_default=630, inspection_default=630)
+        return RuntimeConfig(mode="fake", clarification=clarification, jobs=jobs, review=review)
     models = _mapping(raw.get("models"), "models")
     if set(models) - {"generation", "inspection"}:
         raise ValidationError("models 包含未知字段")
@@ -284,4 +341,17 @@ def load_config(path: str | Path | None = None, *, env_file: str | Path | None =
         if not fallback:
             raise ValidationError("缺少检查模型且未启用生成模型回退")
         inspection = generation
-    return RuntimeConfig("agent", generation, inspection, fallback, clarification)
+    jobs = _jobs(
+        raw.get("jobs", {}),
+        generation_default=int(generation.job_timeout_seconds),
+        inspection_default=int(inspection.job_timeout_seconds),
+    )
+    return RuntimeConfig(
+        mode="agent",
+        generation=generation,
+        inspection=inspection,
+        inspection_fallback=fallback,
+        clarification=clarification,
+        jobs=jobs,
+        review=review,
+    )

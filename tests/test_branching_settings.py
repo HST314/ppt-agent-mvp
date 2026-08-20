@@ -2,11 +2,15 @@ import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
+import yaml
+
 from ppt_agent.service import TaskService
+from ppt_agent.global_settings import GlobalSettingsStore
 from ppt_agent.store import WorkspaceStore
-from ppt_agent.errors import ConflictError
+from ppt_agent.errors import ConflictError, ValidationError
 from ppt_agent.web.jobs import JobService
 
 
@@ -51,10 +55,19 @@ class BranchingAndSettingsTests(unittest.TestCase):
 
     def test_settings_persist_and_new_jobs_read_updated_timeouts(self):
         with tempfile.TemporaryDirectory() as root:
-            service=TaskService(WorkspaceStore(root)); service.create("task"); service.command("task","to-clarification","advance"); service.command("task","to-narrative","advance")
+            config_path=Path(root)/"ppt-agent.yaml"
+            config_path.write_text("gateway: {mode: fake}\n",encoding="utf-8")
+            settings_store=GlobalSettingsStore(config_path)
+            service=TaskService(WorkspaceStore(root),settings_store=settings_store); service.create("task"); service.command("task","to-clarification","advance"); service.command("task","to-narrative","advance")
             saved=service.update_settings({"workflow":{"max_rounds":4},"jobs":{"generation_timeout_seconds":91},"review":{"default_max_rounds":3}})
             self.assertEqual(saved["values"]["workflow"]["max_rounds"],4)
-            recovered=TaskService(WorkspaceStore(root))
+            self.assertEqual(saved["scope"],"global")
+            self.assertRegex(saved["config_revision"],r"^[0-9a-f]{64}$")
+            self.assertFalse((Path(root)/"runtime-settings.json").exists())
+            persisted=yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["clarification"]["max_rounds"],4)
+            self.assertEqual(persisted["jobs"]["generation_timeout_seconds"],91)
+            recovered=TaskService(WorkspaceStore(root),settings_store=GlobalSettingsStore(config_path))
             self.assertEqual(recovered.settings_view()["values"]["review"]["default_max_rounds"],3)
             jobs=JobService(recovered,executor=DeferredExecutor())
             created,_=jobs.create("task","narrative.generate",{},"settings-timeout")
@@ -65,6 +78,18 @@ class BranchingAndSettingsTests(unittest.TestCase):
                 jobs._invoke("inspection.run","task",{})
                 inspection.assert_called_once_with("task",3,None)
             jobs.close()
+
+    def test_invalid_global_settings_do_not_change_yaml_or_memory(self):
+        with tempfile.TemporaryDirectory() as root:
+            config_path=Path(root)/"ppt-agent.yaml"
+            config_path.write_text("gateway: {mode: fake}\n",encoding="utf-8")
+            service=TaskService(WorkspaceStore(root),settings_store=GlobalSettingsStore(config_path))
+            before_file=config_path.read_bytes()
+            before_view=service.settings_view()
+            with self.assertRaises(ValidationError):
+                service.update_settings({"jobs":{"generation_timeout_seconds":29}})
+            self.assertEqual(config_path.read_bytes(),before_file)
+            self.assertEqual(service.settings_view(),before_view)
 
     def test_running_job_rejects_result_when_same_branch_head_moves(self):
         with tempfile.TemporaryDirectory() as root:

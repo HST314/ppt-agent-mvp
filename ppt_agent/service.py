@@ -42,8 +42,9 @@ def _clarification_directive(config: ClarificationConfig, round_number: int) -> 
     )
 
 class TaskService:
-    def __init__(self,store,generator=None,inspector=None,skills=None,builder=None,clarifier=None,clarification_config=None):
+    def __init__(self,store,generator=None,inspector=None,skills=None,builder=None,clarifier=None,clarification_config=None,settings_store=None):
         self.store=store; self.generator=generator or FakeGenerationGateway(); self.inspector=inspector or FakeInspectionGateway(); self.skills=skills or FakeSkillLoader(); self.builder=builder or FakeHtmlBuilder(); self.clarifier=clarifier
+        self._settings_store=settings_store
         self._clarification_config=clarification_config or ClarificationConfig()
         self._runtime_capabilities={"checked":False,"ready":True,"status":"not_required","models":[]}
         self._runtime_guard=threading.RLock()
@@ -52,10 +53,13 @@ class TaskService:
             if hasattr(gateway,"set_audit_sink"): gateway.set_audit_sink(self.store.append_agent_audit)
         if self._runtime_gateways():
             self._runtime_capabilities={"checked":False,"ready":False,"status":"not_checked","models":[]}
-        saved=self.store.runtime_settings()
-        workflow=saved.get("workflow",{}) if isinstance(saved,dict) else {}
         generation_timeout=max((getattr(gateway,"job_timeout_seconds",0) for gateway in (self.clarifier,self.generator,self.builder) if gateway is not None),default=0) or 630
         inspection_timeout=getattr(self.inspector,"job_timeout_seconds",0) or 630
+        snapshot=self._settings_store.read() if self._settings_store is not None else {"values":{},"config_revision":None,"scope":"memory"}
+        saved=snapshot["values"]
+        workflow=saved.get("workflow",{}) if isinstance(saved,dict) else {}
+        self._settings_revision=snapshot.get("config_revision")
+        self._settings_scope=snapshot.get("scope","global" if self._settings_store is not None else "memory")
         self._clarification_config=ClarificationConfig(
             workflow.get("max_questions_per_round",self._clarification_config.max_questions_per_round),
             workflow.get("max_rounds",self._clarification_config.max_rounds),
@@ -151,6 +155,8 @@ class TaskService:
             values=json.loads(json.dumps(self._runtime_settings))
         return {
             "values":values,
+            "scope":self._settings_scope,
+            "config_revision":self._settings_revision,
             "models":self.runtime_config_summary(),
             "schema":{
                 "workflow":{
@@ -169,22 +175,26 @@ class TaskService:
     def update_settings(self,value):
         if not isinstance(value,dict) or set(value)-{"workflow","jobs","review"}: raise ValidationError("设置分组无效")
         with self._runtime_guard:
-            merged=json.loads(json.dumps(self._runtime_settings))
-            for group,patch in value.items():
-                if not isinstance(patch,dict) or set(patch)-set(merged[group]): raise ValidationError(f"{group} 设置字段无效")
-                merged[group].update(patch)
+            if self._settings_store is not None:
+                snapshot=self._settings_store.update(value)
+                merged=snapshot["values"]
+                self._settings_revision=snapshot["config_revision"]
+                self._settings_scope=snapshot["scope"]
+            else:
+                merged=json.loads(json.dumps(self._runtime_settings))
+                for group,patch in value.items():
+                    if not isinstance(patch,dict) or set(patch)-set(merged[group]): raise ValidationError(f"{group} 设置字段无效")
+                    merged[group].update(patch)
+                workflow=merged["workflow"]
+                for key,minimum,maximum in (("max_questions_per_round",1,10),("max_rounds",1,5)):
+                    item=workflow[key]
+                    if isinstance(item,bool) or not isinstance(item,int) or not minimum<=item<=maximum: raise ValidationError(f"workflow.{key} 超出范围")
+                if workflow["style"] not in {"minimal","comprehensive"}: raise ValidationError("workflow.style 无效")
+                for key,item in merged["jobs"].items():
+                    if isinstance(item,bool) or not isinstance(item,int) or not 30<=item<=3660: raise ValidationError(f"jobs.{key} 超出范围")
+                rounds=merged["review"]["default_max_rounds"]
+                if isinstance(rounds,bool) or not isinstance(rounds,int) or not 0<=rounds<=10: raise ValidationError("review.default_max_rounds 超出范围")
             workflow=merged["workflow"]
-            for key,minimum,maximum in (("max_questions_per_round",1,10),("max_rounds",1,5)):
-                item=workflow[key]
-                if isinstance(item,bool) or not isinstance(item,int) or not minimum<=item<=maximum: raise ValidationError(f"workflow.{key} 超出范围")
-            if workflow["style"] not in {"minimal","comprehensive"}: raise ValidationError("workflow.style 无效")
-            for key,item in merged["jobs"].items():
-                if isinstance(item,bool) or not isinstance(item,int) or not 30<=item<=3660: raise ValidationError(f"jobs.{key} 超出范围")
-            rounds=merged["review"]["default_max_rounds"]
-            if isinstance(rounds,bool) or not isinstance(rounds,int) or not 0<=rounds<=10: raise ValidationError("review.default_max_rounds 超出范围")
-            # Publish the durable snapshot before swapping the in-memory view;
-            # a failed write therefore cannot partially activate new settings.
-            self.store.save_runtime_settings(merged)
             self._clarification_config=ClarificationConfig(workflow["max_questions_per_round"],workflow["max_rounds"],workflow["style"])
             self._runtime_settings=merged
         return self.settings_view()

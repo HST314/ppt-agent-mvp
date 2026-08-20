@@ -4,11 +4,11 @@
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
-[![Offline first](https://img.shields.io/badge/runtime-local%20%26%20offline-7C3AED)](#两种运行模式)
+[![Local first](https://img.shields.io/badge/runtime-local%20first-7C3AED)](#真实模型与测试替身)
 
 PPT Agent MVP 把演示稿生成拆成 8 个可追踪阶段。每次生成、编辑、确认和检查都会保存为不可静默覆盖的版本；长任务可以刷新恢复；最终结果可打包成不依赖 CDN 的离线文件。
 
-当前仓库是可运行的 MVP，默认使用确定性的 fake 模式演示完整流程，不需要 API Key，也不会访问外部模型。
+当前仓库是可运行的 MVP，默认使用真实 Responses 模型执行生成、结构化输出、工具调用和独立检查；确定性的 fake Gateway 仅用于自动化测试与离线开发。
 
 ## 目录
 
@@ -16,7 +16,7 @@ PPT Agent MVP 把演示稿生成拆成 8 个可追踪阶段。每次生成、编
 - [5 分钟启动](#5-分钟启动)
 - [第一次创建 PPT](#第一次创建-ppt)
 - [如何准备图片资源](#如何准备图片资源)
-- [两种运行模式](#两种运行模式)
+- [真实模型与测试替身](#真实模型与测试替身)
 - [工作流与架构](#工作流与架构)
 - [测试](#测试)
 - [常见问题](#常见问题)
@@ -101,7 +101,7 @@ Web 存活端点会先开放，历史 Job 恢复和真实模型能力探测在�
 
 如需快速出稿，可选择“快速生成”，明确填写最终页数。系统只追问阻断项，随后保留并自动保存叙事结构与逐页大纲，推进到样品确认；样品确认、阻断问题处置和最终交付仍由人工完成。
 
-默认 fake 模式生成的是用于验证工作流、版本和门禁的确定性内容，不代表真实模型的设计质量。要生成真实内容，请参见[真实 Agent 模式](#真实-agent-模式)。
+默认真实 Agent 模式会生成可交付内容；自动化测试仍通过注入 fake Gateway 验证工作流、版本和门禁。
 
 ## 如何准备图片资源
 
@@ -154,33 +154,9 @@ Web 存活端点会先开放，历史 Job 恢复和真实模型能力探测在�
 
 当前 MVP 不提供浏览器上传控件，资源需要通过本地文件系统放入上述目录。
 
-## 两种运行模式
+## 真实模型与测试替身
 
-### 默认 fake 模式
-
-仓库默认配置为：
-
-```yaml
-gateway:
-  mode: fake
-```
-
-特点：
-
-- 无需 `.env` 或 API Key
-- 不访问网络
-- 输出确定、便于测试和复现
-- 适合体验产品流程、开发前端和运行回归测试
-
-### 真实 Agent 模式
-
-先复制一份本地配置，避免直接修改仓库默认值：
-
-```bash
-cp config/ppt-agent.agent.example.yaml config/ppt-agent.local.yaml
-```
-
-检查 `config/ppt-agent.local.yaml` 中生成/检查模型的 `model`、`api_key_env`、`base_url_env`、超时和最大步骤数。
+仓库默认 `config/ppt-agent.yaml` 是真实 Agent 配置。启动前检查生成/检查模型的 `model`、`api_key_env`、`base_url_env`、超时和最大步骤数。
 
 然后在仓库根目录创建 `.env`。变量名必须与 YAML 中的 `api_key_env` 和 `base_url_env` 一致，例如：
 
@@ -189,19 +165,18 @@ MODEL_API_KEY=your-api-key
 MODEL_BASE_URL=https://your-provider.example/v1
 ```
 
-`.env` 和 `config/*.local.yaml` 已被 Git 忽略。不要把密钥写入 YAML、Issue、日志或提交记录。
+`.env` 已被 Git 忽略。不要把密钥写入 YAML、Issue、日志或提交记录。
 
 启动：
 
 ```bash
-PPT_AGENT_CONFIG=config/ppt-agent.local.yaml \
 PPT_AGENT_DATA=.ppt-agent-data \
 python -m uvicorn main_front:app --host 127.0.0.1 --port 8000
 ```
 
 真实模式要求兼容 Responses API 的模型端点。Base URL 必须使用 HTTPS，本机回环调试地址除外。生成与检查推荐使用独立模型配置；如果检查模型回退到生成模型，必须在配置中显式开启。
 
-启动后用 `/livez` 检查 Web 进程存活，用 `/readyz` 检查真实模型运行契约；模型认证、模型名、限流、上游故障或能力探测失败时 `/readyz` 返回 503，依赖模型的 Job 不会入队。修复配置或等待上游恢复后，可从工作台“设置 → 系统与显示”执行一次显式重新检测。`/healthz` 保留兼容用途，并与 readiness 使用相同的 200/503 语义。
+启动后用 `/livez` 检查 Web 进程存活，用 `/readyz` 检查真实模型运行契约；模型认证、模型名、限流、上游故障或能力探测失败时 `/readyz` 返回 503，依赖模型的 Job 不会入队。修复配置或等待上游恢复后，可从工作台“设置 → 系统与显示”执行一次显式重新检测。设置页保存的工作流、Job 与自检默认值会原子更新当前全局 YAML，不会写入任务数据目录。`/healthz` 保留兼容用途，并与 readiness 使用相同的 200/503 语义。
 
 ## 工作流与架构
 

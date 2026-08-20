@@ -134,6 +134,43 @@ def _extract_json_object(text: str) -> Any:
     return json.loads(stripped)
 
 
+def normalize_rendering_output(value: dict, expected_slide_ids: list[str]) -> dict:
+    """Validate and normalize the HTML fragment contract for sample/deck output."""
+    slides = value.get("slides")
+    if not expected_slide_ids or len(set(expected_slide_ids)) != len(expected_slide_ids):
+        raise GatewayError("渲染请求的页面 ID 无效")
+    if not isinstance(slides, list) or [item.get("slide_id") for item in slides if isinstance(item, dict)] != expected_slide_ids:
+        raise GatewayError("模型页面片段与请求页面不一致")
+    normalized = []
+    for index, item in enumerate(slides):
+        fragment = item.get("html")
+        if not isinstance(fragment, str) or not fragment.strip():
+            raise GatewayError(f"output.slides[{index}].html 不能为空")
+        fragment = fragment.strip()
+        if fragment.startswith("```"):
+            fragment = re.sub(r"^```[a-zA-Z]*\s*", "", fragment)
+            fragment = re.sub(r"\s*```$", "", fragment).strip()
+        tag_match = re.fullmatch(r'<section\b(?P<attrs>[^>]*)>[\s\S]*</section>', fragment, re.I)
+        if not tag_match:
+            raise GatewayError(f"output.slides[{index}].html 必须是单个完整 section 片段")
+        attributes = tag_match.group("attrs")
+        id_match = re.search(r'\bid=["\']([A-Za-z0-9_-]+)["\']', attributes, re.I)
+        data_id_match = re.search(r'\bdata-slide-id=["\']([A-Za-z0-9_-]+)["\']', attributes, re.I)
+        class_match = re.search(r'\bclass=["\']([^"\']*)["\']', attributes, re.I)
+        if not class_match or "slide" not in class_match.group(1).split():
+            raise GatewayError(f"output.slides[{index}].html 的 section 必须包含 slide class")
+        slide_id = item["slide_id"]
+        declared_ids = [match.group(1) for match in (id_match, data_id_match) if match is not None]
+        if any(declared != slide_id for declared in declared_ids):
+            raise GatewayError(f"output.slides[{index}].html 的页面 ID 与 slide_id 不一致")
+        if not id_match:
+            fragment = re.sub(r'^<section\b', f'<section id="{slide_id}"', fragment, count=1, flags=re.I)
+        if not data_id_match:
+            fragment = re.sub(r'^<section\b', f'<section data-slide-id="{slide_id}"', fragment, count=1, flags=re.I)
+        normalized.append({**item, "html": fragment})
+    return {**value, "slides": normalized}
+
+
 def _list_skill_files_tool() -> dict:
     return {"type": "function", "name": "list_skill_files", "description": "列出当前阶段可读取的标准 Skill 文件", "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}
 
@@ -535,6 +572,25 @@ class AgentRuntime:
                     force_final_output = True
                     continue
                 fail(exc.message, "invalid_output", exc)
+            if stage in RENDERING_STAGES and payload.get("slide_ids"):
+                try:
+                    value = normalize_rendering_output(value, list(payload.get("slide_ids") or []))
+                except GatewayError as exc:
+                    if schema_corrections < self.max_schema_corrections:
+                        schema_corrections += 1
+                        audit.append({"step": step, "event": "semantic_correction", "reason": "html_fragment_contract", "attempt": schema_corrections})
+                        conversation.extend([
+                            {"role": "assistant", "content": turn.text or ""},
+                            {"role": "user", "content": (
+                                f"semantic_correction：{exc.message}。请重新提交完整 slides；"
+                                "每项 html 必须且只能是对应页面的单个 <section class=\"slide\" "
+                                "id=\"给定ID\" data-slide-id=\"给定ID\">...</section> 片段，"
+                                "不得包含 html/body 外壳、额外页面或解释文字。"
+                            )},
+                        ])
+                        force_final_output = True
+                        continue
+                    fail(exc.message, "invalid_output", exc)
             if capability_probe and stage != "clarification" and not any(item.get("event") == "tool" for item in audit):
                 fail("模型未完成工具能力探测", "capability_probe_failed")
             audit.append({"event": "terminal", "reason": "success", "tool_calls": tool_count, "provider_calls": provider_call_budget.claimed, "exploration_rounds": exploration_rounds, "cumulative_skill_bytes": skill_bytes, "unique_skill_files": len(successful_read_paths), "repeated_skill_reads": repeated_read_count})

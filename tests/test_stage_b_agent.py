@@ -458,6 +458,23 @@ class StageBAgentTests(unittest.TestCase):
         self.assertEqual(caught.exception.audit[-1]["reason"], "invalid_output")
         self.assertEqual(len(exhausted.inputs), 2)
 
+    def test_rendering_fragment_failure_gets_one_bounded_semantic_correction(self):
+        bad=json.dumps({"slides":[{"slide_id":"slide-1","html":"<html><body>wrong shell</body></html>"}]})
+        fixed=json.dumps({"slides":[{"slide_id":"slide-1","html":"```html\n<section class=\"slide\"><h1>ok</h1></section>\n```"}]})
+        client=ScriptedClient([ModelTurn(bad,"bad"),ModelTurn(fixed,"fixed")])
+        result=AgentRuntime(client,SkillRuntime.builtin()).run("sample",{"slide_ids":["slide-1"]})
+        fragment=result.value["slides"][0]["html"]
+        self.assertTrue(fragment.startswith('<section data-slide-id="slide-1" id="slide-1" class="slide">'))
+        self.assertEqual(sum(item.get("event")=="semantic_correction" for item in result.audit),1)
+        self.assertIn("semantic_correction",str(client.inputs[1]["input"]))
+        self.assertEqual(client.inputs[1]["tool_choice"],"none")
+
+        exhausted=ScriptedClient([ModelTurn(bad,"bad-1"),ModelTurn(bad,"bad-2")])
+        with self.assertRaises(GatewayError) as caught:
+            AgentRuntime(exhausted,SkillRuntime.builtin()).run("deck",{"slide_ids":["slide-1"]})
+        self.assertEqual(caught.exception.code,"agent_invalid_output")
+        self.assertEqual(caught.exception.audit[-1]["reason"],"invalid_output")
+
     def test_lock_is_closed_and_rechecked_on_every_read(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); make_skill(root, {"SKILL.md": b"ok"})

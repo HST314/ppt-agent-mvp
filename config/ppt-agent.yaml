@@ -58,6 +58,15 @@ clarification:
   # 提问风格：minimal=只问阻断交付的关键问题；comprehensive=积极全面追问（偏好类问题可跳过）
   style: minimal
 
+# 应用级全局设置。设置页保存时原子更新本 YAML；不会写入任务数据目录。
+jobs:
+  generation_timeout_seconds: 630
+  inspection_timeout_seconds: 630
+  delivery_timeout_seconds: 180
+
+review:
+  default_max_rounds: 2
+
 skills:
   active: guizang-ppt-skill
 
