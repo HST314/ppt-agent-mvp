@@ -1,4 +1,4 @@
-import { badge, button, element, icon } from "../shell.js?v=2026.08.20.141243404257";
+import { badge, button, element, icon } from "../shell.js?v=2026.08.20.152614537731";
 
 export { badge, button, element, icon };
 
@@ -129,7 +129,8 @@ export function setBusy(buttonNode, busy, busyLabel = "正在提交…") {
     buttonNode.disabled = true;
   } else {
     buttonNode.textContent = buttonNode.dataset.label || buttonNode.textContent;
-    buttonNode.disabled = false;
+    // 独立的版本阻断状态优先：忙碌恢复不得解除版本门禁的禁用。
+    buttonNode.disabled = buttonNode.dataset.versionDisabled === "true";
     delete buttonNode.dataset.label;
   }
 }

@@ -1,6 +1,6 @@
-import { api } from "../api.js?v=2026.08.20.141243404257";
-import { badge, button, confirmationDialog, element, field, formatTime, metadataList, shortHash } from "../components/index.js?v=2026.08.20.141243404257";
-import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.20.141243404257";
+import { api } from "../api.js?v=2026.08.20.152614537731";
+import { badge, button, confirmationDialog, element, field, formatTime, metadataList, shortHash } from "../components/index.js?v=2026.08.20.152614537731";
+import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.20.152614537731";
 
 export async function render(context) {
   const [view, deckView] = await Promise.all([
@@ -21,6 +21,7 @@ function deliveryStage(view, deck, context) {
     disabled: completed || !deck || !finalization,
     reason: "请先在全稿或自检与修改页确定终稿",
     mutates: true,
+    requiresVersionMatch: true,
   });
   confirm.addEventListener("click", () => confirmationDialog({
     title: "写入不可变离线包",

@@ -1,6 +1,6 @@
-import { api } from "../api.js?v=2026.08.20.141243404257";
-import { badge, button, confirmationDialog, element, field, metadataList, shortHash } from "../components/index.js?v=2026.08.20.141243404257";
-import { actionMessage, invalidationNotice, runAction, section, stageGrid } from "./shared.js?v=2026.08.20.141243404257";
+import { api } from "../api.js?v=2026.08.20.152614537731";
+import { badge, button, confirmationDialog, element, field, metadataList, shortHash } from "../components/index.js?v=2026.08.20.152614537731";
+import { actionMessage, invalidationNotice, runAction, section, stageGrid } from "./shared.js?v=2026.08.20.152614537731";
 
 const FIELD_LABELS = { goal: "演示目标", audience: "主要受众", topic: "核心主题" };
 const WARNING_LABELS = {
@@ -108,6 +108,9 @@ function inputStage(view, context) {
     message,
   ]);
   updateGate();
+  // 版本阻断解除后按当前输入重新评估业务闸；版本阻断状态由 app.js 独立打标，
+  // enable() 已检查 data-version-disabled，mismatch 期间不会被本闸重新启用。
+  document.addEventListener("versiongatechange", updateGate, { signal: context.controller.signal });
 
   const primary = [section(view.snapshot ? "更新任务资料" : "创建 / 导入任务卡", form, {
     description: view.snapshot ? "已有快照不会被静默覆盖；重建会明确失效下游内容。" : "填写目标、受众和主题，系统会扫描任务授权资源。",

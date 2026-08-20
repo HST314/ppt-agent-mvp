@@ -168,11 +168,24 @@ class FrontendAssetTests(unittest.TestCase):
         shared = js("stages/shared.js")
         sample = js("stages/sample.js")
         input_stage = js("stages/input.js")
-        # 派发前二次校验 mismatch：所有 Job 创建入口先过版本门禁，再过运行态门禁。
+        delivery = js("stages/delivery.js")
+        # 派发前二次校验 mismatch：所有 Job 创建入口（含 requiresRuntime=false 的
+        # delivery.publish）无条件先过版本门禁，模型就绪校验仅限运行时操作。
         self.assertIn("ensureVersionMatchAllowed", app)
         self.assertIn("await ensureVersionMatchAllowed();", app.split("async function ensureRuntimeActionAllowed", 1)[1])
-        self.assertIn("if (requiresRuntime) await ensureRuntimeActionAllowed();", app)
+        tracked = app.split("async function startTrackedJob", 1)[1].split("const job = await create();", 1)[0]
+        self.assertIn("await ensureVersionMatchAllowed();", tracked)
+        self.assertIn("if (requiresRuntime) assertRuntimeReady();", tracked)
+        self.assertNotIn("if (requiresRuntime) await ensureRuntimeActionAllowed();", tracked)
         self.assertIn("runtimeVersionMismatch()", app.split("async function ensureVersionMatchAllowed", 1)[1])
+        # 版本阻断状态独立于 disabled 当前值：mismatch 期间始终打标，
+        # 解除时只恢复版本门禁自己禁用的控件，不误改业务禁用态。
+        version_gate = app.split("querySelectorAll('[data-requires-version-match", 1)[1]
+        self.assertIn('control.dataset.versionDisabled = "true"', version_gate)
+        self.assertNotIn('if (!control.disabled) control.dataset.versionDisabled = "true"', version_gate)
+        self.assertIn("versionPrevEnabled", version_gate)
+        self.assertIn('document.dispatchEvent(new CustomEvent("versiongatechange"))', app)
+        self.assertIn('document.addEventListener("versiongatechange", updateGate', input_stage)
         # runAction 自动入队入口经统一版本守卫二次校验；按钮层用独立的版本门禁，
         # 模型不可用但版本一致时不得误伤（后端对该场景有降级路径）。
         self.assertIn("setVersionMatchGuard", app + shared)
@@ -191,6 +204,12 @@ class FrontendAssetTests(unittest.TestCase):
         self.assertIn('"提交答案并继续", { kind: "primary", type: "submit", mutates: true, requiresVersionMatch: true }', input_stage)
         answers_action = input_stage.split("api.answerClarifications", 1)[1].split("});", 1)[0]
         self.assertIn("requiresVersionMatch: true", answers_action)
+        # 交付发布（delivery.publish）：按钮层补版本门禁。
+        publish_block = delivery.split("将离线包写入工程文件夹", 1)[1].split("});", 1)[0]
+        self.assertIn("requiresVersionMatch: true", publish_block)
+        # 忙碌恢复不得解除版本门禁的独立阻断状态。
+        components = js("components/index.js")
+        self.assertIn('buttonNode.disabled = buttonNode.dataset.versionDisabled === "true";', components)
 
 
 if __name__ == "__main__":

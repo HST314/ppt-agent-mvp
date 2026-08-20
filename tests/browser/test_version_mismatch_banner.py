@@ -5,6 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import uvicorn
@@ -183,4 +184,76 @@ class VersionMismatchBannerTests(unittest.TestCase):
         self.force_click(submit)
         self.assert_blocked_dispatch(posts, "/clarifications/answers")
         self.assertEqual(self.svc.input_view("task")["clarification"]["answers"], {})
+        self.assertEqual(self.svc.get("task")["stage"], "clarification")
+
+    def drive_to_delivery(self):
+        self.svc.create("task")
+        self.svc.import_input("task", {"goal": "发布", "audience": "客户", "topic": "方案", "页数": 3})
+        self.svc.generate_narrative("task")
+        self.svc.confirm_narrative("task")
+        self.svc.generate_outline("task")
+        self.svc.confirm_outline("task")
+        self.svc.generate_sample("task")
+        self.svc.confirm_sample("task")
+        self.svc.generate_deck("task")
+        deck = self.svc.deck_view("task")["deck"]
+        self.svc.finalize_deck("task", deck["hash"], "deck")
+
+    def test_mismatch_blocks_delivery_publish(self):
+        # delivery.publish 不需要模型，但版本门禁必须无条件先行：
+        # 按钮层禁用 + startTrackedJob 派发前二次校验，全程零副作用。
+        self.drive_to_delivery()
+        base = self.serve(stale=True)
+        posts = self.track_posts()
+        self.page.goto(base + "/tasks/task?stage=delivery")
+        self.page.locator("[data-version-mismatch-banner]").wait_for(timeout=15000)
+        publish = self.page.get_by_role("button", name="将离线包写入工程文件夹")
+        publish.wait_for()
+        self.assertTrue(publish.is_disabled())
+        self.assertIn("重启", publish.get_attribute("title") or "")
+        self.force_click(publish)
+        dialog = self.page.locator("dialog[open]")
+        dialog.wait_for()
+        dialog.get_by_role("button", name="开始写入并校验").click()
+        self.assert_blocked_dispatch(posts, "/jobs")
+        self.assertTrue(publish.is_disabled())
+        view = self.svc.delivery_view("task")
+        self.assertEqual(view["deliveries"], [])
+        self.assertEqual(view["state"]["stage"], "delivery")
+        self.assertNotEqual(view["state"]["status"], "completed")
+        self.assertEqual(self.svc.versions("task", "delivery"), [])
+        self.assertFalse((Path(self.tmp.name) / "task" / "deliveries").exists())
+
+    def test_mismatch_blocks_rebuild_after_business_gate_would_enable(self):
+        # 已有快照→修改→勾选重建：业务闸本会将按钮重新启用，
+        # 独立的版本阻断状态必须保持禁用，且派发前二次校验仍拦截。
+        self.svc.create("task")
+        self.svc.import_input("task", {"goal": "发布", "audience": "客户", "topic": "方案", "页数": 3})
+        snapshot_before = self.svc.input_view("task")["snapshot_hash"]
+        base = self.serve(stale=True)
+        posts = self.track_posts()
+        self.page.goto(base + "/tasks/task?stage=created")
+        self.page.locator("[data-version-mismatch-banner]").wait_for(timeout=15000)
+        # 无图片资源时会自动打开资源提醒对话框；留在“任务/资料”阶段关闭它。
+        reminder = self.page.locator("dialog[open]")
+        reminder.wait_for()
+        reminder.get_by_role("button", name="返回准备资源").click()
+        self.page.locator("dialog[open]").wait_for(state="detached")
+        submit = self.page.get_by_role("button", name="重建资料快照")
+        submit.wait_for()
+        self.assertTrue(submit.is_disabled())
+        self.page.locator("#task-card-source").fill("演示目标：改版发布\n受众：客户\n核心主题：全新方案")
+        self.page.locator("#rebuild-input").check()
+        # 动态业务闸不得覆盖版本阻断：按钮保持禁用并持续提示重启。
+        self.assertTrue(submit.is_disabled())
+        self.assertIn("重启", submit.get_attribute("title") or "")
+        self.force_click(submit)
+        dialog = self.page.locator("dialog[open]")
+        dialog.wait_for()
+        dialog.get_by_role("button", name="确认重建").click()
+        self.assert_blocked_dispatch(posts, "/input")
+        self.assertTrue(submit.is_disabled())
+        after = self.svc.input_view("task")
+        self.assertEqual(after["snapshot_hash"], snapshot_before)
+        self.assertEqual(len(self.svc.versions("task", "input-snapshot")), 1)
         self.assertEqual(self.svc.get("task")["stage"], "clarification")

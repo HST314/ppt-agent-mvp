@@ -1,11 +1,11 @@
-import { api, ApiError } from "./api.js?v=2026.08.20.141243404257";
-import { JobTracker } from "./job-tracker.js?v=2026.08.20.141243404257";
-import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.20.141243404257";
-import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.20.141243404257";
-import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.20.141243404257";
-import { inlineError, setBusy } from "./components/index.js?v=2026.08.20.141243404257";
-import { renderStage } from "./stages/index.js?v=2026.08.20.141243404257";
-import { setVersionMatchGuard } from "./stages/shared.js?v=2026.08.20.141243404257";
+import { api, ApiError } from "./api.js?v=2026.08.20.152614537731";
+import { JobTracker } from "./job-tracker.js?v=2026.08.20.152614537731";
+import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.20.152614537731";
+import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.20.152614537731";
+import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.20.152614537731";
+import { inlineError, setBusy } from "./components/index.js?v=2026.08.20.152614537731";
+import { renderStage } from "./stages/index.js?v=2026.08.20.152614537731";
+import { setVersionMatchGuard } from "./stages/shared.js?v=2026.08.20.152614537731";
 
 const app = document.getElementById("app");
 const APP_BUILD = document.querySelector('meta[name="app-build"]')?.content || "unknown";
@@ -250,22 +250,34 @@ function updateRuntimeUI() {
     control.title = reason;
     control.setAttribute("aria-description", reason);
   });
+  // 版本阻断状态（data-version-disabled）独立于 disabled 当前值：mismatch 期间
+  // 始终打标，动态业务闸据此保持禁用；仅记录版本门禁自己禁用的控件
+  // （data-version-prev-enabled），解除时只恢复这些控件，不误改业务禁用态。
+  let versionGateReleased = false;
   document.querySelectorAll('[data-requires-version-match="true"]').forEach((control) => {
     if (!versionMismatch) {
       if (control.dataset.versionDisabled === "true") {
-        control.disabled = false;
         delete control.dataset.versionDisabled;
-        control.removeAttribute("aria-description");
-        control.title = "";
+        versionGateReleased = true;
+        if (control.dataset.versionPrevEnabled === "true") {
+          delete control.dataset.versionPrevEnabled;
+          control.disabled = false;
+          control.removeAttribute("aria-description");
+          control.title = "";
+        }
       }
       return;
     }
-    if (!control.disabled) control.dataset.versionDisabled = "true";
+    if (control.dataset.versionDisabled !== "true") {
+      control.dataset.versionDisabled = "true";
+      if (!control.disabled) control.dataset.versionPrevEnabled = "true";
+    }
     control.disabled = true;
     const reason = "前端与后端版本不一致，请先重启后端服务";
     control.title = reason;
     control.setAttribute("aria-description", reason);
   });
+  if (versionGateReleased) document.dispatchEvent(new CustomEvent("versiongatechange"));
   syncVersionBanner();
 }
 
@@ -276,11 +288,15 @@ async function ensureVersionMatchAllowed() {
   }
 }
 
-async function ensureRuntimeActionAllowed() {
-  await ensureVersionMatchAllowed();
+function assertRuntimeReady() {
   if (!runtimeState.runtimeReady) {
     throw new ApiError("模型运行时不可用，请先在连接状态中重新检测", { code: "runtime_unavailable", status: 503 });
   }
+}
+
+async function ensureRuntimeActionAllowed() {
+  await ensureVersionMatchAllowed();
+  assertRuntimeReady();
 }
 
 function syncVersionBanner() {
@@ -892,7 +908,10 @@ async function startTrackedJob({ taskId, route, buttonNode, region, intent, crea
   region?.replaceChildren();
   setBusy(buttonNode, true, busyLabel);
   try {
-    if (requiresRuntime) await ensureRuntimeActionAllowed();
+    // 版本门禁无条件先行：包括 delivery.publish 在内的所有 Job 创建路径，
+    // 在派发前都必须通过前后端版本一致性校验；模型就绪校验仅限运行时操作。
+    await ensureVersionMatchAllowed();
+    if (requiresRuntime) assertRuntimeReady();
     const job = await create();
     bindJobIntent(job, intent.storageKey);
     let activeRegion = document.getElementById("active-job-region");
