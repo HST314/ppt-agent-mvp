@@ -18,7 +18,7 @@ from .schema import ClarificationSet, ResourceManifest, TaskCard, TaskInputSnaps
 from .schema import NarrativeDocument, SlideOutline, SampleSelection, DeckArtifact
 from .p3 import changed_slide_ids, narrative_markdown, normalize_outline_markdown, outline_markdown, parse_outline, requested_slide_count, structured_outline_markdown
 from .p4 import apply_design_contract, controlled_assets, infer_scope, recommend, render, validate_html
-from .render_gate import canonical_post_render_evidence, enforce_post_render_gate, post_render_evidence_hash, run_post_render_gate
+from .render_gate import canonical_post_render_evidence, post_render_evidence_hash, run_post_render_gate
 from .offline import localize_delivery_html, offline_assets, offline_performance, offline_player, verify_delivery
 from .overflow_autofit import GEOMETRIC_CODES, fit_deck_html
 
@@ -829,7 +829,7 @@ class TaskService:
                     "rules":fitted["rules"],"rounds":fitted["rounds"],
                     "converged":fitted["converged"],"remaining":fitted["remaining"],
                 }
-        evidence=enforce_post_render_gate(
+        evidence=run_post_render_gate(
             html_text,
             expected_slide_ids=slide_ids,
             contract=contract_value,
@@ -839,14 +839,21 @@ class TaskService:
             browser_inspector=browser,
             overflow_autofit=autofit,
         )
+        # Persist pass AND failure evidence.  Failed diagnostics carry the
+        # slide / selector / scroll-client geometry of every blocker and must
+        # stay auditable after the run aborts, not vanish with the exception.
         evidence_hash=self.store.put_version(task_id,"post-render-gate-evidence",canonical_post_render_evidence(evidence),{
             "design_contract_hash":contract_hash,
             "claim_ledger_hash":ledger_hash,
             "rendered_html_hash":evidence["rendered_html_hash"],
+            "passed":evidence["passed"],
             "immutable":True,
         })
         if evidence_hash!=evidence["evidence_hash"]:
             raise ConflictError("渲染后门禁 evidence 内容寻址持久化失败")
+        if evidence["blockers"]:
+            summary="；".join(f"{item.get('code')}:{item.get('evidence','')}" for item in evidence["blockers"][:5])
+            raise ValidationError(f"渲染后硬门禁未通过（evidence {evidence_hash[:12]}）：{summary}")
         return html_text,evidence
     def planning_view(self,task_id):
         state=self.get(task_id); result={"state":state,"narrative":None,"outline":None,"versions":self.versions(task_id)}

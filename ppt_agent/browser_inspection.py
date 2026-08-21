@@ -15,9 +15,9 @@ VISUAL_CAPTURE_MEDIA_TYPE = "image/webp"
 VISUAL_CAPTURE_QUALITY = 72
 
 
-def _issue(code: str, message: str, *, severity: str = "blocker", slide_id: str = "", element_id: str = "", evidence: str, suggestion: str) -> dict:
+def _issue(code: str, message: str, *, severity: str = "blocker", slide_id: str = "", element_id: str = "", evidence: str, suggestion: str, selector: str = "", geometry: dict | None = None) -> dict:
     stable = hashlib.sha256(f"{code}\0{slide_id}\0{element_id}\0{evidence}".encode()).hexdigest()[:12]
-    return {
+    issue = {
         "issue_id": f"browser-{code}-{stable}",
         "severity": severity,
         "level": "element" if element_id else "slide" if slide_id else "deck",
@@ -28,6 +28,11 @@ def _issue(code: str, message: str, *, severity: str = "blocker", slide_id: str 
         "evidence": evidence,
         "suggestion": suggestion,
     }
+    if selector:
+        issue["selector"] = selector
+    if geometry:
+        issue["geometry"] = geometry
+    return issue
 
 
 def _visual_quality(slides: list[dict]) -> tuple[dict, list[dict]]:
@@ -224,6 +229,24 @@ class ChromiumDeckInspector:
                             const label = (element, index) =>
                                 element.getAttribute('data-element-id') || element.id ||
                                 `${element.tagName.toLowerCase()}-${index + 1}`;
+                            const safeId = value => /^[A-Za-z0-9_-]+$/.test(value || '');
+                            const selectorFor = element => {
+                                const slideId = slide.getAttribute('data-slide-id') || slide.id;
+                                const scope = safeId(slideId) ? `.slide[data-slide-id="${slideId}"]` : `.slide:nth-of-type(${slideIndex + 1})`;
+                                const elementId = element.getAttribute('data-element-id');
+                                if (safeId(elementId) && slide.querySelectorAll(`[data-element-id="${elementId}"]`).length === 1) {
+                                    return `${scope} [data-element-id="${elementId}"]`;
+                                }
+                                const parts = [];
+                                let node = element;
+                                while (node && node !== slide) {
+                                    const parent = node.parentElement;
+                                    const siblings = [...parent.children].filter(child => child.tagName === node.tagName);
+                                    parts.unshift(`${node.tagName.toLowerCase()}:nth-of-type(${siblings.indexOf(node) + 1})`);
+                                    node = parent;
+                                }
+                                return `${scope} > ${parts.join(' > ')}`;
+                            };
                             const descendants = [...slide.querySelectorAll('*')].filter(visible);
                             const overflowRoots = new Map();
                             const overflowSuppressed = [];
@@ -251,7 +274,10 @@ class ChromiumDeckInspector:
                                     else overflowRoots.set(element, {element_id: elementId, tag: element.tagName.toLowerCase(), suppressed: [], ...delta});
                                 }
                             });
-                            const overflows = [...overflowRoots.values()];
+                            const overflows = [...overflowRoots.entries()].map(([element, value]) => ({
+                                selector: selectorFor(element),
+                                ...value,
+                            }));
                             descendants.forEach((element, index) => {
                                 if (element.clientWidth > 0 && element.clientHeight > 0 &&
                                     (element.scrollWidth > element.clientWidth + 1 || element.scrollHeight > element.clientHeight + 1)) {
@@ -264,6 +290,7 @@ class ChromiumDeckInspector:
                                     scrolling.push({
                                         element_id: label(element, index),
                                         tag: element.tagName.toLowerCase(),
+                                        selector: selectorFor(element),
                                         client_width: element.clientWidth,
                                         client_height: element.clientHeight,
                                         scroll_width: element.scrollWidth,
@@ -509,6 +536,11 @@ class ChromiumDeckInspector:
                     element_id=str(item.get("element_id") or item.get("tag") or "element"),
                     evidence=evidence,
                     suggestion="收紧内容、间距或改用容量更合适的布局；同源子元素会随根因修复一并消除",
+                    selector=str(item.get("selector") or ""),
+                    geometry={
+                        "overflow_px": round(overflow, 2),
+                        "delta": {key: round(float(item.get(key) or 0), 2) for key in ("left", "top", "right", "bottom")},
+                    },
                 ))
             for item in slide.get("scrolling") or []:
                 if item.get("covered_by"):
@@ -523,6 +555,13 @@ class ChromiumDeckInspector:
                         f"scroll={item.get('scroll_width')}x{item.get('scroll_height')}px"
                     ),
                     suggestion="精简文字、调整布局或扩大内容容器",
+                    selector=str(item.get("selector") or ""),
+                    geometry={
+                        "client_width": item.get("client_width"),
+                        "client_height": item.get("client_height"),
+                        "scroll_width": item.get("scroll_width"),
+                        "scroll_height": item.get("scroll_height"),
+                    },
                 ))
             for item in slide.get("small_text") or []:
                 size = float(item.get("font_size") or 0)

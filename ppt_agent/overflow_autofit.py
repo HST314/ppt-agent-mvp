@@ -21,6 +21,11 @@ Zoom semantics exploited here (Chromium applies ``zoom`` to used values):
   content size measured against the clamped target box
   (``min(box, available) / scroll``), which satisfies the scroll and the
   bounds constraint simultaneously; separate per-kind rules oscillate.
+* a small leaf with pure scroll overflow and measured slack next to it is
+  NOT zoomed: the needed factor (e.g. 52px -> 61px content) sits under
+  ``MIN_ZOOM`` and would also scale computed font sizes below the hard
+  ``text_too_small`` gate.  The box is grown into the slack with an
+  explicit compensated size instead, which changes no font metrics.
 
 All declarations carry ``!important``: real decks size offending elements
 through inline ``style=`` attributes, which otherwise silently win over the
@@ -41,6 +46,7 @@ TOLERANCE_PX = 1.0
 SAFETY = 0.99
 MIN_ZOOM = 0.85
 MAX_RULES = 24
+GROW_MARGIN_PX = 1.0
 
 GEOMETRIC_CODES = ("content_out_of_bounds", "element_scroll_overflow")
 
@@ -122,6 +128,27 @@ _MEASURE_JS = r"""slides => slides.map((slide, slideIndex) => {
             if (!covered) scrollRoots.add(element);
         }
     });
+    // Room a box can grow into without overlapping the next visible element
+    // stacked against it (horizontal overlap for downward growth, vertical
+    // overlap for rightward growth).  Falls back to the slide edge.
+    const clearanceFor = element => {
+        const box = element.getBoundingClientRect();
+        let below = rect.bottom - box.bottom;
+        let right = rect.right - box.right;
+        descendants.forEach(other => {
+            if (other === element || element.contains(other) || other.contains(element)) return;
+            const otherBox = other.getBoundingClientRect();
+            const horizontalOverlap = Math.min(box.right, otherBox.right) - Math.max(box.left, otherBox.left);
+            if (horizontalOverlap > 1 && otherBox.top >= box.bottom - 1) {
+                below = Math.min(below, otherBox.top - box.bottom);
+            }
+            const verticalOverlap = Math.min(box.bottom, otherBox.bottom) - Math.max(box.top, otherBox.top);
+            if (verticalOverlap > 1 && otherBox.left >= box.right - 1) {
+                right = Math.min(right, otherBox.left - box.right);
+            }
+        });
+        return { below: Math.max(0, below), right: Math.max(0, right) };
+    };
     const targets = [];
     oobRoots.forEach((value, element) => targets.push({
         kind: 'oob',
@@ -135,6 +162,7 @@ _MEASURE_JS = r"""slides => slides.map((slide, slideIndex) => {
         box: (box => ({ left: box.left, top: box.top, width: box.width, height: box.height }))(element.getBoundingClientRect()),
         client: { width: element.clientWidth, height: element.clientHeight },
         scroll: { width: element.scrollWidth, height: element.scrollHeight },
+        clear: clearanceFor(element),
     }));
     return {
         slide_id: slide.getAttribute('data-slide-id') || slide.id || '',
@@ -160,6 +188,35 @@ def _slide_scope(slide: dict) -> str:
     if _SAFE_ID.fullmatch(slide_id):
         return f'.slide[data-slide-id="{slide_id}"]'
     return f'.slide:nth-of-type({slide["index"] + 1})'
+
+
+def _grow_declarations(target: dict) -> str | None:
+    """Grow a pure scroll-overflow leaf into its measured slack.
+
+    Small text leaves (a 52px label holding 61px of content is the typical
+    real case) cannot be zoomed: the factor (~0.84) sits under ``MIN_ZOOM``
+    and would also shrink computed font sizes below the hard
+    ``text_too_small`` gate.  When the measured clearance shows the content
+    fits by simply enlarging the box, pin explicit compensated sizes so no
+    font metric changes.  Returns ``None`` when the slack is insufficient —
+    the caller then falls back to the zoom path, keeping fail-closed
+    behaviour for genuinely oversized content.
+    """
+    box = target["box"]
+    content = target["scroll"]
+    clear = target.get("clear") or {}
+    grow_w = box["width"] + max(0.0, float(clear.get("right") or 0.0))
+    grow_h = box["height"] + max(0.0, float(clear.get("below") or 0.0))
+    if content["width"] + GROW_MARGIN_PX > grow_w or content["height"] + GROW_MARGIN_PX > grow_h:
+        return None
+    declarations = ["box-sizing: border-box !important", "flex: none !important"]
+    if content["width"] > box["width"] + TOLERANCE_PX:
+        declarations.append(f"width: {content['width'] + GROW_MARGIN_PX:.2f}px !important")
+    if content["height"] > box["height"] + TOLERANCE_PX:
+        declarations.append(f"height: {content['height'] + GROW_MARGIN_PX:.2f}px !important")
+    if len(declarations) == 2:
+        return None
+    return "; ".join(declarations) + ";"
 
 
 def _rules_for(measured: list[dict], known: dict[str, str]) -> tuple[dict[str, str], list[dict]]:
@@ -230,6 +287,14 @@ def _rules_for(measured: list[dict], known: dict[str, str]) -> tuple[dict[str, s
             if oob and (oob["delta"]["left"] > TOLERANCE_PX or oob["delta"]["top"] > TOLERANCE_PX):
                 unfixable.append({**describe, "reason": "negative_anchor"})
                 continue
+            if scroll and not oob:
+                grown = _grow_declarations(scroll)
+                if grown is not None:
+                    if not claim(selector):
+                        unfixable.append({**describe, "reason": "rule_budget_exhausted"})
+                    else:
+                        rules[selector] = grown
+                    continue
             box = (scroll or oob)["box"]
             available_h = slide["rect"]["height"] - max(0.0, box["top"] - slide["rect"]["top"])
             available_w = slide["rect"]["width"] - max(0.0, box["left"] - slide["rect"]["left"])

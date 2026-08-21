@@ -8,7 +8,7 @@ from ppt_agent.claim_ledger import assert_claims_bound, audit_claims, audit_html
 from ppt_agent.design_contract import TemplateRegistry
 from ppt_agent.errors import ConflictError, ValidationError
 from ppt_agent.p2 import canonical, digest, now
-from ppt_agent.render_gate import canonical_post_render_evidence
+from ppt_agent.render_gate import canonical_post_render_evidence, post_render_evidence_hash
 from ppt_agent.service import TaskService
 from ppt_agent.store import WorkspaceStore
 
@@ -270,6 +270,28 @@ class ContractLedgerGateTests(unittest.TestCase):
                 service.generate_sample("task")
 
             self.assertFalse(service.versions("task", "sample"))
+
+    def test_failed_gate_persists_evidence_with_blocker_diagnostics(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root, OverflowGenerationBrowser())
+            self._to_outline(service)
+            service.select_samples("task", ["slide-1"])
+
+            with self.assertRaisesRegex(ValidationError, "渲染后硬门禁未通过（evidence [0-9a-f]{12}）"):
+                service.generate_sample("task")
+
+            self.assertFalse(service.versions("task", "sample"))
+            records = service.versions("task", "post-render-gate-evidence")
+            self.assertEqual(len(records), 1)
+            self.assertIs(records[0]["metadata"]["passed"], False)
+            self.assertEqual(records[0]["metadata"]["immutable"], True)
+            evidence = json.loads(service.version("task", records[0]["hash"]))
+            self.assertFalse(evidence["passed"])
+            self.assertEqual(evidence["geometry"]["overflow_count"], 1)
+            blocker = next(item for item in evidence["blockers"] if item["code"] == "content_out_of_bounds")
+            self.assertEqual(blocker["slide_id"], "slide-1")
+            self.assertEqual(blocker["element_id"], "body")
+            self.assertEqual(post_render_evidence_hash(evidence), records[0]["hash"])
 
 
 if __name__ == "__main__":

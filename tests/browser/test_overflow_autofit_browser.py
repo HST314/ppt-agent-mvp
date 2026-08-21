@@ -43,6 +43,18 @@ def overflowing_deck():
     return assemble_locked_template([clean, oob, scroll])
 
 
+def leaf_label_deck(top=200):
+    # 复刻真实复验中的典型 leaf 溢出：52px 小标签盒容纳 61px 内容。
+    # 该缺陷 zoom 因子 0.844 低于 MIN_ZOOM，且缩字会触发 text_too_small
+    # 硬门禁，确定性修复只能让盒体向空闲区域增长。
+    return assemble_locked_template([_slide(
+        "slide-1",
+        _TITLE % "标签页"
+        + f'<div data-element-id="kpi-label" style="position:absolute;left:77px;top:{top}px;width:400px;height:52px;overflow:hidden;font-size:16px;line-height:1.4">'
+        '<div style="height:61px">一个会在 52px 盒子里溢出到 61px 的小标签内容</div></div>',
+    )])
+
+
 class OverflowAutofitBrowserGate(unittest.TestCase):
     def test_autofit_clears_geometric_blockers_and_reinspects_green(self):
         html = overflowing_deck()
@@ -81,6 +93,53 @@ class OverflowAutofitBrowserGate(unittest.TestCase):
         self.assertEqual(second["html"], first["html"])
         self.assertTrue(second["converged"])
         self.assertEqual(second["remaining"], [])
+
+    def test_leaf_label_overflow_grows_into_slack_and_converges(self):
+        html = leaf_label_deck()
+        validate_html(html, ["slide-1"])
+        inspector = ChromiumDeckInspector()
+        before = inspector.inspect(html, ["slide-1"])
+        self.assertTrue(before["available"])
+        self.assertFalse(before["passed"])
+        issue = next(item for item in before["issues"] if item["code"] == "element_scroll_overflow")
+        # 失败诊断必须携带 slide、selector 与 scroll/client 几何。
+        self.assertEqual(issue["slide_id"], "slide-1")
+        self.assertIn('[data-element-id="kpi-label"]', issue["selector"])
+        self.assertEqual(issue["geometry"]["client_height"], 52)
+        self.assertEqual(issue["geometry"]["scroll_height"], 61)
+
+        result = fit_deck_html(html, max_rounds=2)
+
+        self.assertTrue(result["available"])
+        self.assertTrue(result["converged"], result["remaining"])
+        self.assertEqual(result["remaining"], [])
+        rule = result["rules"][issue["selector"]]
+        # leaf 修复必须是盒体增长，绝不缩放字号。
+        self.assertIn("height: 62.00px !important", rule)
+        self.assertNotIn("zoom", rule)
+        validate_html(result["html"], ["slide-1"])
+        after = inspector.inspect(result["html"], ["slide-1"])
+        self.assertTrue(after["passed"], after["issues"])
+        self.assertEqual(after["issues"], [])
+
+        # 幂等：剥离后从原始测量确定性重建同一规则集与同一份 HTML。
+        second = fit_deck_html(result["html"], max_rounds=2)
+        self.assertEqual(second["rules"], result["rules"])
+        self.assertEqual(second["html"], result["html"])
+        self.assertTrue(second["converged"])
+
+    def test_leaf_overflow_without_slack_stays_unfixable(self):
+        # 贴底元素向下没有增长空间（top 668 + 52 == 720），zoom 又低于下限：
+        # 确定性路径必须拒绝硬修，保持 fail-closed 交给 LLM/人工修复。
+        html = leaf_label_deck(top=668)
+        validate_html(html, ["slide-1"])
+
+        result = fit_deck_html(html, max_rounds=2)
+
+        self.assertTrue(result["available"])
+        self.assertFalse(result["converged"])
+        self.assertIn("zoom_below_floor", {item["reason"] for item in result["remaining"]})
+        self.assertFalse(ChromiumDeckInspector().inspect(result["html"], ["slide-1"])["passed"])
 
     def test_unfixable_overflow_stays_on_the_remaining_list(self):
         # 需要缩放到 0.5 以下才能放行的目标低于 MIN_ZOOM 下限，确定性路径
