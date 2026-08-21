@@ -1,5 +1,5 @@
-import { ApiError } from "../api.js?v=2026.08.21.105223646308";
-import { button, element, inlineError, setBusy } from "../components/index.js?v=2026.08.21.105223646308";
+import { ApiError } from "../api.js?v=2026.08.21.115749201866";
+import { button, element, inlineError, setBusy } from "../components/index.js?v=2026.08.21.115749201866";
 
 export function stageGrid(primary, aside, className = "") {
   return element("div", { className: `stage-grid ${className}`.trim() }, [

@@ -23,6 +23,7 @@ class PassingInspector:
 
 VIEWPORTS = (
     {"width": 375, "height": 667},
+    {"width": 667, "height": 375},
     {"width": 1024, "height": 768},
     {"width": 1280, "height": 720},
     {"width": 1366, "height": 768},
@@ -118,6 +119,9 @@ class OfflinePlayerViewportGate(unittest.TestCase):
                     self.assertEqual(page.locator("#offline-page").text_content(), "3 / 3")
                     page.keyboard.press("Home")
                     self.assertEqual(page.locator("#offline-page").text_content(), "1 / 3")
+                    metrics = page.evaluate("window.__offlinePlayerMetrics")
+                    self.assertGreaterEqual(metrics["navigationCount"], 4)
+                    self.assertLessEqual(metrics["slideStateMutations"], metrics["navigationCount"] * 2)
                     self.assertEqual(console_errors, [])
                     self.assertEqual(page_errors, [])
                     self.assertEqual(failed, [])

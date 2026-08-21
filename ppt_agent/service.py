@@ -19,7 +19,7 @@ from .schema import NarrativeDocument, SlideOutline, SampleSelection, DeckArtifa
 from .p3 import changed_slide_ids, narrative_markdown, normalize_outline_markdown, outline_markdown, parse_outline, requested_slide_count, structured_outline_markdown
 from .p4 import apply_design_contract, controlled_assets, infer_scope, recommend, render, validate_html
 from .render_gate import canonical_post_render_evidence, enforce_post_render_gate, post_render_evidence_hash, run_post_render_gate
-from .offline import localize_delivery_html, offline_assets, offline_player, verify_delivery
+from .offline import localize_delivery_html, offline_assets, offline_performance, offline_player, verify_delivery
 from .overflow_autofit import GEOMETRIC_CODES, fit_deck_html
 
 def utcnow(): return datetime.now(timezone.utc).isoformat()
@@ -1289,7 +1289,7 @@ class TaskService:
     def inspection_view(self,task_id):
         deck=self.deck_view(task_id)["deck"]
         projection=self._inspection_projection(task_id); current=projection["report"]
-        evidence_trace={"valid":False,"reference_count":0,"artifact_hashes":[],"errors":["尚无当前检查报告"]}
+        evidence_trace={"valid":False,"reference_count":0,"artifact_hashes":[],"screenshot_hashes":[],"errors":["尚无当前检查报告"]}
         if current and not current["stale"]:
             evidence_trace=self._assert_inspection_evidence(task_id,current,fail_closed=False)
         state=self.get(task_id)
@@ -1316,7 +1316,7 @@ class TaskService:
         return normalized
 
     def _assert_inspection_evidence(self,task_id,report,fail_closed=True):
-        errors=[]; artifact_hashes=[]; reference_count=0; cache={}; report_value=None
+        errors=[]; artifact_hashes=[]; screenshot_hashes=[]; reference_count=0; cache={}; report_value=None
         report_hash=report.get("hash") if isinstance(report,dict) else None
         try:
             report_records={item["hash"]:item for item in self.versions(task_id,"inspection")}
@@ -1415,7 +1415,46 @@ class TaskService:
             expected_origins={item["issue_id"]:list(item["source_issues"]) for item in expected_issues}
             if metadata.get("issue_sources")!=expected_sources or metadata.get("issue_origins")!=expected_origins:
                 errors.append("检查报告 issue 来源元数据绑定不一致")
-        result={"valid":not errors,"reference_count":reference_count,"artifact_hashes":sorted(set(artifact_hashes)),"errors":list(dict.fromkeys(errors))}
+        visual_quality=None
+        browser_document=documents.get("technical_browser")
+        if browser_document is not None:
+            candidate=browser_document["payload"].get("visual_quality")
+            if candidate is not None:
+                visual_quality=candidate
+                screenshots=candidate.get("screenshots") if isinstance(candidate,dict) else None
+                if not isinstance(screenshots,list):
+                    errors.append("视觉质量截图清单无效")
+                    screenshots=[]
+                try:
+                    screenshot_records={item["hash"]:item for item in self.versions(task_id,"inspection-screenshot")}
+                except NotFoundError:
+                    screenshot_records={}
+                declared_slides=[str(item.get("slide_id") or "") for item in browser_document["payload"].get("slides",[]) if isinstance(item,dict)]
+                seen_slides=[]
+                for item in screenshots:
+                    if not isinstance(item,dict):
+                        errors.append("视觉质量截图引用无效")
+                        continue
+                    screenshot_hash=str(item.get("sha256") or "")
+                    evidence_ref=str(item.get("evidence_ref") or "")
+                    slide_id=str(item.get("slide_id") or "")
+                    record=screenshot_records.get(screenshot_hash)
+                    try:
+                        raw=self.version(task_id,screenshot_hash)
+                    except (NotFoundError,ValidationError):
+                        raw=None
+                    if (not re.fullmatch(r"[0-9a-f]{64}",screenshot_hash)
+                        or evidence_ref!=f"inspection-screenshot://{screenshot_hash}"
+                        or item.get("media_type")!="image/webp" or item.get("width")!=1280 or item.get("height")!=720
+                        or raw is None or digest(raw)!=screenshot_hash or len(raw)!=item.get("byte_size")
+                        or not raw.startswith(b"RIFF") or raw[8:12]!=b"WEBP"
+                        or record is None or record["metadata"]!={"deck_hash":(report_value or report).get("deck_hash"),"slide_id":slide_id,"media_type":"image/webp","immutable":True}):
+                        errors.append(f"视觉质量截图哈希或绑定不一致:{slide_id or 'unknown'}")
+                        continue
+                    screenshot_hashes.append(screenshot_hash); seen_slides.append(slide_id); reference_count+=1
+                if screenshots and seen_slides!=declared_slides:
+                    errors.append("视觉质量截图与 Chromium 页面顺序不一致")
+        result={"valid":not errors,"reference_count":reference_count,"artifact_hashes":sorted(set(artifact_hashes)),"screenshot_hashes":sorted(set(screenshot_hashes)),"visual_quality":visual_quality,"errors":list(dict.fromkeys(errors))}
         if errors and fail_closed:
             raise ConflictError("检查报告与 evidence 溯源失败："+"；".join(errors[:3]))
         return result
@@ -1427,6 +1466,14 @@ class TaskService:
             item.kind==inspect.Parameter.VAR_KEYWORD for item in parameters.values()
         )
         return method(outline,html_text,browser_evidence=browser_evidence) if accepts_evidence else method(outline,html_text)
+
+    def _call_browser_inspector(self,html_text,slide_ids,*,visual_quality=False):
+        method=self.browser_inspector.inspect
+        parameters=inspect.signature(method).parameters
+        supports_visual="visual_quality" in parameters or any(
+            item.kind==inspect.Parameter.VAR_KEYWORD for item in parameters.values()
+        )
+        return method(html_text,slide_ids,visual_quality=True) if visual_quality and supports_visual else method(html_text,slide_ids)
 
     def _prepare_inspection_result(self,task_id,deck):
         outline=json.loads(self.version(task_id,deck["outline_hash"]))["markdown"]
@@ -1461,8 +1508,11 @@ class TaskService:
             "unbound_claim_count":ledger_evidence["unbound_count"],
         })
         browser_evidence=None
+        visual_screenshots=[]
         if self.browser_inspector is not None:
-            browser_evidence=self.browser_inspector.inspect(deck["html"],list(deck["metadata"]["page_hashes"]))
+            browser_evidence=self._call_browser_inspector(deck["html"],list(deck["metadata"]["page_hashes"]),visual_quality=True)
+            if isinstance(browser_evidence,dict):
+                visual_screenshots=browser_evidence.pop("_visual_screenshots",[])
         raw=self._call_inspector(outline,deck["html"],browser_evidence)
         if not isinstance(raw,dict): raise ValidationError("检查响应契约无效")
         model_issues=raw.get("issues",[])
@@ -1480,7 +1530,7 @@ class TaskService:
         checks={
             "semantic_deterministic":{"available":True,"passed":bool(content_evidence.get("passed")),"issue_count":merged_counts["semantic_deterministic"],"raw_issue_count":len(content_issues),"evidence_hash":fingerprint(content_evidence)},
             "semantic_model":{"available":True,"passed":bool(raw.get("passed",not model_issues)),"issue_count":merged_counts["semantic_model"],"raw_issue_count":len(model_issues),"model":raw.get("model","unknown")},
-            "technical_browser":{"available":browser_evidence is not None and bool(browser_evidence.get("available")),"passed":browser_passed,"issue_count":merged_counts["technical_browser"],"raw_issue_count":len(browser_issues)},
+            "technical_browser":{"available":browser_evidence is not None and bool(browser_evidence.get("available")),"passed":browser_passed,"issue_count":merged_counts["technical_browser"],"raw_issue_count":len(browser_issues),**({"visual_quality":{"score":browser_evidence["visual_quality"].get("score"),"grade":browser_evidence["visual_quality"].get("grade"),"screenshot_count":len(browser_evidence["visual_quality"].get("screenshots",[]))}} if isinstance(browser_evidence,dict) and isinstance(browser_evidence.get("visual_quality"),dict) else {})},
         }
         evidence_documents=[
             {"schema_version":"1.0","source":"semantic_deterministic","deck_hash":deck["hash"],"payload":content_evidence},
@@ -1495,6 +1545,7 @@ class TaskService:
             "content_evidence":content_evidence,
             "quality_checks":checks,
             "evidence_documents":evidence_documents,
+            "_visual_screenshots":visual_screenshots,
             **({"browser_evidence":browser_evidence} if browser_evidence is not None else {}),
         }
 
@@ -1503,9 +1554,30 @@ class TaskService:
         if not deck: raise ConflictError("尚未生成全稿")
         # Deliberately pass only the original outline, review HTML and local
         # Chromium measurements. Generation dialogue, model self-description,
-        # resources and screenshots never cross this boundary.
+        # resources and screenshot pixels never cross this boundary.
         skill=self.skills.load("inspection")
         raw=prepared_raw if prepared_raw is not None else self._prepare_inspection_result(task_id,deck)
+        visual_screenshots=raw.pop("_visual_screenshots",[])
+        browser_payload=raw.get("browser_evidence")
+        if visual_screenshots:
+            if not isinstance(browser_payload,dict) or not isinstance(browser_payload.get("visual_quality"),dict):
+                raise ValidationError("视觉质量截图缺少 Chromium 评分绑定")
+            declared={item.get("slide_id"):item for item in browser_payload["visual_quality"].get("screenshots",[]) if isinstance(item,dict)}
+            references=[]
+            for item in visual_screenshots:
+                if not isinstance(item,dict) or not isinstance(item.get("content"),(bytes,bytearray)):
+                    raise ValidationError("视觉质量截图内容无效")
+                slide_id=str(item.get("slide_id") or ""); content=bytes(item["content"]); expected=declared.get(slide_id)
+                if (not slide_id or slide_id not in deck["metadata"]["page_hashes"] or expected is None
+                    or expected.get("media_type")!="image/webp" or expected.get("width")!=1280 or expected.get("height")!=720
+                    or expected.get("sha256")!=digest(content) or expected.get("byte_size")!=len(content)
+                    or not content.startswith(b"RIFF") or content[8:12]!=b"WEBP"):
+                    raise ValidationError("视觉质量截图哈希、格式或候选绑定无效")
+                screenshot_hash=self.store.put_version(task_id,"inspection-screenshot",content,{"deck_hash":deck["hash"],"slide_id":slide_id,"media_type":"image/webp","immutable":True})
+                references.append({**expected,"evidence_ref":f"inspection-screenshot://{screenshot_hash}"})
+            if [item["slide_id"] for item in references]!=list(deck["metadata"]["page_hashes"]):
+                raise ValidationError("视觉质量截图没有完整覆盖候选页面顺序")
+            browser_payload["visual_quality"]["screenshots"]=references
         documents=raw.get("evidence_documents")
         if not isinstance(documents,list):
             model_issues=raw.get("issues",[])
@@ -1547,6 +1619,7 @@ class TaskService:
             "viewport":browser.get("viewport"),
             "issue_count":len(browser.get("issues",[])),
             "evidence_hash":fingerprint(browser),
+            **({"visual_quality":{"score":browser["visual_quality"].get("score"),"grade":browser["visual_quality"].get("grade"),"composition_score":browser["visual_quality"].get("composition_score"),"layout_diversity_score":browser["visual_quality"].get("layout_diversity_score"),"theme_rhythm_score":browser["visual_quality"].get("theme_rhythm_score"),"screenshot_count":len(browser["visual_quality"].get("screenshots",[])),"screenshot_hashes":[item.get("sha256") for item in browser["visual_quality"].get("screenshots",[])]}} if isinstance(browser.get("visual_quality"),dict) else {}),
         }
         content_meta=None if not isinstance(content,dict) else {
             "available":bool(content.get("available")),
@@ -1559,7 +1632,7 @@ class TaskService:
             "unbound_claim_count":content.get("unbound_claim_count",0),
             "evidence_hash":fingerprint(content),
         }
-        metadata={"deck_hash":deck["hash"],"scope":scope,"affected_slide_ids":affected,"includes_deck_consistency":True,"includes_content_quality":content_meta is not None,"includes_browser_render":browser_meta is not None,"content_evidence":content_meta,"browser_evidence":browser_meta,"quality_checks":raw.get("quality_checks",{}),"issue_sources":{item["issue_id"]:list(item["sources"]) for item in issues},"issue_origins":{item["issue_id"]:list(item["source_issues"]) for item in issues},"evidence_artifacts":evidence_artifacts,"round":round_number,"model":raw.get("model","unknown"),"skill":{"action":"inspection","version":skill["version"],"hash":digest(skill["content"].encode()),"files":skill.get("files",[])},"input_fields":["original_outline","html","frozen_source_binding","design_contract","claim_ledger",*(["browser_evidence"] if browser_meta is not None else [])],"excluded_fields":["generation_context","self_description","images","screenshots"],"design_contract_hash":deck["metadata"].get("design_contract_hash"),"claim_ledger_hash":deck["metadata"].get("claim_ledger_hash"),"post_render_gate":deck["metadata"].get("post_render_gate")}
+        metadata={"deck_hash":deck["hash"],"scope":scope,"affected_slide_ids":affected,"includes_deck_consistency":True,"includes_content_quality":content_meta is not None,"includes_browser_render":browser_meta is not None,"content_evidence":content_meta,"browser_evidence":browser_meta,"quality_checks":raw.get("quality_checks",{}),"issue_sources":{item["issue_id"]:list(item["sources"]) for item in issues},"issue_origins":{item["issue_id"]:list(item["source_issues"]) for item in issues},"evidence_artifacts":evidence_artifacts,"round":round_number,"model":raw.get("model","unknown"),"skill":{"action":"inspection","version":skill["version"],"hash":digest(skill["content"].encode()),"files":skill.get("files",[])},"input_fields":["original_outline","html","frozen_source_binding","design_contract","claim_ledger",*(["browser_evidence"] if browser_meta is not None else [])],"excluded_fields":["generation_context","self_description","source_images","screenshot_pixels"],"design_contract_hash":deck["metadata"].get("design_contract_hash"),"claim_ledger_hash":deck["metadata"].get("claim_ledger_hash"),"post_render_gate":deck["metadata"].get("post_render_gate")}
         h=self.store.put_version(task_id,"inspection",canonical(report.to_dict()),metadata)
         return {**report.to_dict(),"hash":h,"metadata":metadata}
 
@@ -1887,6 +1960,8 @@ class TaskService:
             delivery_gate=self.assert_delivery_gate(task_id)
         inspection_report=None if delivery_gate is None else delivery_gate["inspection_report"]
         inspection_evidence_hashes=[] if delivery_gate is None else delivery_gate["inspection_evidence"]["artifact_hashes"]
+        visual_screenshot_hashes=[] if delivery_gate is None else delivery_gate["inspection_evidence"].get("screenshot_hashes",[])
+        visual_quality=None if delivery_gate is None else delivery_gate["inspection_evidence"].get("visual_quality")
 
         # A delivery fact is the domain idempotency boundary.  Replays for the
         # same finalized deck return that immutable fact even when the caller
@@ -1942,12 +2017,23 @@ class TaskService:
                 raise ConflictError("已发布离线包的检查报告缺失或不一致")
             packaged_result=json.loads((published_root/"result.json").read_text(encoding="utf-8"))
             if (packaged_result.get("inspection_report_hash")!=inspection_report["hash"]
-                or packaged_result.get("inspection_evidence_hashes")!=inspection_evidence_hashes):
+                or packaged_result.get("inspection_evidence_hashes")!=inspection_evidence_hashes
+                or packaged_result.get("visual_screenshot_hashes",[])!=visual_screenshot_hashes):
                 raise ConflictError("已发布离线包的检查报告绑定不一致")
             for evidence_hash in inspection_evidence_hashes:
                 packaged_inspection_evidence=published_root/"inspection-evidence"/f"{evidence_hash}.json"
                 if not packaged_inspection_evidence.is_file() or packaged_inspection_evidence.read_bytes()!=self.version(task_id,evidence_hash):
                     raise ConflictError("已发布离线包的检查 evidence 缺失或不一致")
+            for screenshot_hash in visual_screenshot_hashes:
+                packaged_screenshot=published_root/"visual-screenshots"/f"{screenshot_hash}.webp"
+                if not packaged_screenshot.is_file() or packaged_screenshot.read_bytes()!=self.version(task_id,screenshot_hash):
+                    raise ConflictError("已发布离线包的视觉质量截图缺失或不一致")
+            packaged_visual=json.loads((published_root/"visual-quality.json").read_text(encoding="utf-8"))
+            if packaged_visual!=visual_quality:
+                raise ConflictError("已发布离线包的视觉质量评分绑定不一致")
+            packaged_performance=json.loads((published_root/"offline-performance.json").read_text(encoding="utf-8"))
+            if not packaged_performance.get("passed") or packaged_result.get("offline_performance")!=packaged_performance:
+                raise ConflictError("已发布离线包的性能预算证据缺失或不一致")
             hashes["manifest.json"]=digest((published_root/"manifest.json").read_bytes())
             localized=json.loads((published_root/"localized-resources.json").read_text(encoding="utf-8")).get("resources",[])
             if existing_delivery:
@@ -1961,7 +2047,10 @@ class TaskService:
         resource_root=self.store.resource_root(task_id)
         localized_html,localized_resources,localization_records=localize_delivery_html(current["html"],snapshot["manifest"],resource_root)
         result_summary={"version":delivery_id,"status":{"stage":"delivery","status":"completed"},"description":"用户确定的终稿已写入工程文件夹并通过离线校验"}
-        files={"deck.html":localized_html.encode(),"index.html":offline_player(localized_html).encode(),"narrative.md":json.loads(self.version(task_id,narrative_hash))["markdown"].encode(),"outline.md":json.loads(self.version(task_id,outline_hash))["markdown"].encode(),"design-contract.json":self.version(task_id,design_contract_hash),"claim-ledger.json":self.version(task_id,claim_ledger_hash),"post-render-gate-evidence.json":post_render_gate_evidence,"inspection-report.json":self.version(task_id,inspection_report["hash"]),**{f"inspection-evidence/{evidence_hash}.json":self.version(task_id,evidence_hash) for evidence_hash in inspection_evidence_hashes},"resource-manifest.json":canonical(snapshot["manifest"]),"localized-resources.json":canonical({"resources":localization_records}),"result.json":canonical({"task_id":task_id,"deck_hash":deck_hash,"finalization_hash":finalization["hash"],"design_contract_hash":design_contract_hash,"claim_ledger_hash":claim_ledger_hash,"post_render_gate_hash":post_render_gate_hash,"inspection_report_hash":inspection_report["hash"],"inspection_evidence_hashes":inspection_evidence_hashes,"inspection_status":finalization["inspection_status"],"finalization_mode":finalization_mode,"warnings":warnings,"confirmed_at":confirmed_at,**result_summary}),**offline_assets(),**localized_resources}
+        index_html=offline_player(localized_html); runtime_assets=offline_assets(); performance=offline_performance(index_html,runtime_assets)
+        if not performance["passed"]:
+            raise ConflictError("离线播放器性能预算未通过")
+        files={"deck.html":localized_html.encode(),"index.html":index_html.encode(),"narrative.md":json.loads(self.version(task_id,narrative_hash))["markdown"].encode(),"outline.md":json.loads(self.version(task_id,outline_hash))["markdown"].encode(),"design-contract.json":self.version(task_id,design_contract_hash),"claim-ledger.json":self.version(task_id,claim_ledger_hash),"post-render-gate-evidence.json":post_render_gate_evidence,"inspection-report.json":self.version(task_id,inspection_report["hash"]),**{f"inspection-evidence/{evidence_hash}.json":self.version(task_id,evidence_hash) for evidence_hash in inspection_evidence_hashes},**{f"visual-screenshots/{screenshot_hash}.webp":self.version(task_id,screenshot_hash) for screenshot_hash in visual_screenshot_hashes},"visual-quality.json":canonical(visual_quality),"offline-performance.json":canonical(performance),"resource-manifest.json":canonical(snapshot["manifest"]),"localized-resources.json":canonical({"resources":localization_records}),"result.json":canonical({"task_id":task_id,"deck_hash":deck_hash,"finalization_hash":finalization["hash"],"design_contract_hash":design_contract_hash,"claim_ledger_hash":claim_ledger_hash,"post_render_gate_hash":post_render_gate_hash,"inspection_report_hash":inspection_report["hash"],"inspection_evidence_hashes":inspection_evidence_hashes,"visual_screenshot_hashes":visual_screenshot_hashes,"visual_quality":None if visual_quality is None else {key:visual_quality.get(key) for key in ("score","grade","composition_score","layout_diversity_score","theme_rhythm_score")},"offline_performance":performance,"inspection_status":finalization["inspection_status"],"finalization_mode":finalization_mode,"warnings":warnings,"confirmed_at":confirmed_at,**result_summary}),**runtime_assets,**localized_resources}
         for item in snapshot["manifest"].get("resources",[]):
             relative=Path(item["uri"].removeprefix("resources://"))
             source=resource_root/relative

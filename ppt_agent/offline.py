@@ -424,13 +424,14 @@ def offline_player(deck_html: str) -> str:
     head = """<style id="offline-player-style">
 body.offline-player{overflow:hidden}.offline-player .slide{display:none;margin:0 auto}
 .offline-player .slide[aria-hidden="false"]{display:block;position:fixed;left:50%;top:var(--offline-center-y,50%);margin:0;transform:translate(-50%,-50%) scale(var(--offline-scale,1));transform-origin:center}
-#offline-controls{position:fixed;z-index:2147483647;left:50%;right:auto;bottom:max(12px,env(safe-area-inset-bottom));transform:translateX(-50%);display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:12px;background:#111827e8;color:#fff;font:14px system-ui;box-shadow:0 4px 18px #0006}
-#offline-controls button{min-width:44px;min-height:44px;border:1px solid #ffffff55;border-radius:8px;background:#ffffff18;color:#fff;font:inherit;cursor:pointer}
+#offline-controls{position:fixed;z-index:1000;left:50%;right:auto;bottom:max(12px,env(safe-area-inset-bottom));transform:translateX(-50%);display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:12px;background:#111827e8;color:#fff;font:14px system-ui;box-shadow:0 4px 18px #0006}
+#offline-controls button{min-width:44px;min-height:44px;border:1px solid #ffffff55;border-radius:8px;background:#ffffff18;color:#fff;font:inherit;cursor:pointer;touch-action:manipulation}
+#offline-controls button:active{background:#ffffff2e}#offline-controls button:focus-visible{outline:3px solid #fff;outline-offset:2px}
 #offline-controls button:disabled{opacity:.35;cursor:not-allowed}#offline-page{min-width:64px;text-align:center}
 </style>"""
+    motion = "" if re.search(r"<script\b[^>]*\bsrc\s*=\s*(['\"])(?:\./)?assets/motion\.min\.js\1", deck_html, re.I) else '<script src="assets/motion.min.js"></script>\n'
     body = """<nav id="offline-controls" aria-label="幻灯片导航"><button id="offline-prev" type="button" aria-label="上一页">&#8592;</button><output id="offline-page" aria-live="polite"></output><button id="offline-next" type="button" aria-label="下一页">&#8594;</button></nav>
-<script src="assets/motion.min.js"></script>
-<script src="assets/offline-player.js"></script>"""
+%s<script src="assets/offline-player.js"></script>""" % motion
     lower = deck_html.lower()
     position = lower.rfind("</head>")
     deck_html = deck_html[:position] + head + deck_html[position:] if position >= 0 else deck_html.replace("<body", head + "<body", 1)
@@ -441,3 +442,46 @@ body.offline-player{overflow:hidden}.offline-player .slide{display:none;margin:0
 def offline_assets() -> dict[str, bytes]:
     names = ("offline-player.js", "motion.min.js", "THIRD_PARTY_NOTICES.txt")
     return {f"assets/{name}": (ASSET_ROOT / name).read_bytes() for name in names}
+
+
+def offline_performance(index_html: str, assets: dict[str, bytes]) -> dict:
+    """Return reproducible delivery-time budgets for the local player shell."""
+    motion_references = len(re.findall(r"<script\b[^>]*\bsrc\s*=\s*['\"](?:\./)?assets/motion\.min\.js['\"]", index_html, re.I))
+    player_references = len(re.findall(r"<script\b[^>]*\bsrc\s*=\s*['\"](?:\./)?assets/offline-player\.js['\"]", index_html, re.I))
+    player_bytes = len(assets.get("assets/offline-player.js", b""))
+    javascript_bytes = sum(len(content) for name,content in assets.items() if name.endswith((".js",".mjs")))
+    runtime_shell_bytes = len(index_html.encode()) + javascript_bytes
+    budgets = {
+        "motion_script_references_max": 1,
+        "player_script_references": 1,
+        "player_javascript_bytes_max": 4096,
+        "runtime_javascript_bytes_max": 70 * 1024,
+        "runtime_shell_bytes_max": 256 * 1024,
+    }
+    measurements = {
+        "motion_script_references": motion_references,
+        "player_script_references": player_references,
+        "player_javascript_bytes": player_bytes,
+        "runtime_javascript_bytes": javascript_bytes,
+        "runtime_shell_bytes": runtime_shell_bytes,
+    }
+    checks = {
+        "single_motion_runtime": motion_references <= budgets["motion_script_references_max"],
+        "single_player_runtime": player_references == budgets["player_script_references"],
+        "player_bundle_budget": player_bytes <= budgets["player_javascript_bytes_max"],
+        "javascript_budget": javascript_bytes <= budgets["runtime_javascript_bytes_max"],
+        "runtime_shell_budget": runtime_shell_bytes <= budgets["runtime_shell_bytes_max"],
+    }
+    return {
+        "schema_version":"1.0",
+        "passed":all(checks.values()),
+        "measurements":measurements,
+        "budgets":budgets,
+        "checks":checks,
+        "optimizations":{
+            "slide_state_updates":"O(1) previous/current mutation",
+            "resize_fitting":"requestAnimationFrame coalesced",
+            "dimension_reads":"cached per slide",
+            "motion_loading":"single runtime reference",
+        },
+    }

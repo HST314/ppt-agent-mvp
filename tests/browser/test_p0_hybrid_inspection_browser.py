@@ -87,6 +87,39 @@ class P0HybridInspectionBrowserGate(unittest.TestCase):
         self.assertIn("role=meta", small["footnote"]["evidence"])
         self.assertIn("minimum=12", small["footnote"]["evidence"])
 
+    def test_visual_quality_captures_stable_webp_and_scores_composition_advisories(self):
+        slides = "".join(
+            f'<section class="slide light" data-slide-id="slide-{index}" data-layout="same">'
+            f'<h1 data-element-id="title">Page {index}</h1><p data-element-id="body">tiny content</p></section>'
+            for index in range(1, 5)
+        )
+        html = (
+            '<!doctype html><html><head><style>*{box-sizing:border-box}body{margin:0}'
+            '.slide{width:1280px;height:720px;position:relative;background:#fff;overflow:hidden}'
+            'h1{position:absolute;left:40px;top:32px;font-size:40px}'
+            'p{position:absolute;left:40px;top:100px;font-size:18px}'
+            f'</style></head><body>{slides}</body></html>'
+        )
+
+        evidence = ChromiumDeckInspector().inspect(
+            html,
+            [f"slide-{index}" for index in range(1, 5)],
+            visual_quality=True,
+        )
+
+        self.assertTrue(evidence["available"])
+        self.assertLess(evidence["visual_quality"]["score"], 70)
+        self.assertEqual(len(evidence["visual_quality"]["screenshots"]), 4)
+        self.assertEqual(len(evidence["_visual_screenshots"]), 4)
+        for declared, payload in zip(evidence["visual_quality"]["screenshots"], evidence["_visual_screenshots"]):
+            self.assertEqual(declared["media_type"], "image/webp")
+            self.assertEqual(declared["byte_size"], len(payload["content"]))
+            self.assertEqual(payload["content"][:4], b"RIFF")
+            self.assertEqual(payload["content"][8:12], b"WEBP")
+        codes = {item["code"] for item in evidence["issues"]}
+        self.assertTrue({"excessive_whitespace", "visual_imbalance", "repetitive_layout", "flat_theme_rhythm"}.issubset(codes))
+        self.assertTrue(all(item["severity"] == "warning" for item in evidence["issues"]))
+
 
 if __name__ == "__main__":
     unittest.main()

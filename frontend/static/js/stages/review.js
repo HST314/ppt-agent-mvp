@@ -1,7 +1,7 @@
-import { api } from "../api.js?v=2026.08.21.105223646308";
-import { badge, button, confirmationDialog, element, field, metadataList, shortHash, versionTimeline } from "../components/index.js?v=2026.08.21.105223646308";
-import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.21.105223646308";
-import { comparePanel, deckPreview, modificationPanel } from "./deck.js?v=2026.08.21.105223646308";
+import { api } from "../api.js?v=2026.08.21.115749201866";
+import { badge, button, confirmationDialog, element, field, metadataList, shortHash, versionTimeline } from "../components/index.js?v=2026.08.21.115749201866";
+import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.21.115749201866";
+import { comparePanel, deckPreview, modificationPanel } from "./deck.js?v=2026.08.21.115749201866";
 
 export async function render(context) {
   const [view, deckView, settings] = await Promise.all([api.inspection(context.taskId, context.controller), api.deck(context.taskId, context.controller), api.settings(context.controller)]);
@@ -38,9 +38,28 @@ function reviewStage(view, deckView, defaultRounds, context) {
       badge(report.stale ? "报告过期" : report.passed ? "检查通过" : "需要处置", report.stale ? "warning" : report.passed ? "success" : "danger"),
       metadataList([["报告 hash", shortHash(report.hash)], ["候选 hash", shortHash(report.deck_hash)], ["检查范围", report.metadata?.scope || "full"], ["修复轮次", report.metadata?.round ?? 0], ["问题总数", issues.length], ["未处置", view.unresolved?.length || 0], ["证据溯源", view.evidence_trace?.valid ? `完整 · ${view.evidence_trace.reference_count} 条引用` : "缺失或失配"]]),
     ] : [badge("尚未检查", "warning"), element("p", { className: "muted", text: "生成全稿后执行独立检查。" })]),
+    visualQualitySummary(report),
     section("终稿策略", [badge("发布前强制预检", "primary"), element("p", { className: "muted", text: "存在未处置阻断问题时禁止默认定稿，只能显式选择带风险定稿并留痕；未检查、报告过期或仅剩警告时仍可确定终稿并记录状态；发布离线包始终要求新鲜报告且阻断清零。" })]),
     section("全稿版本", [history, historyMessage]),
     section("检查历史", reportHistory(view)),
+  ]);
+}
+
+function visualQualitySummary(report) {
+  const quality = report?.metadata?.browser_evidence?.visual_quality;
+  if (!quality) {
+    return section("视觉质量评分", [badge("暂无截图评分", "warning"), element("p", { className: "muted", text: "重新执行支持 Chromium 截图的独立检查后，将展示构图、布局多样性与主题节奏评分。" })]);
+  }
+  const tone = quality.score >= 90 ? "success" : quality.score >= 70 ? "warning" : "danger";
+  return section("视觉质量评分", [
+    badge(`${Number(quality.score).toFixed(1)} / 100 · ${quality.grade}`, tone),
+    metadataList([
+      ["逐页构图", `${Number(quality.composition_score).toFixed(1)} / 100`],
+      ["布局多样性", `${Number(quality.layout_diversity_score).toFixed(1)} / 100`],
+      ["主题节奏", `${Number(quality.theme_rhythm_score).toFixed(1)} / 100`],
+      ["稳定截图", `${quality.screenshot_count || 0} 页`],
+    ]),
+    element("p", { className: "muted", text: "评分是可复算的辅助 QA；DesignContract、事实与几何门禁仍是发布硬约束。" }),
   ]);
 }
 
