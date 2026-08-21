@@ -176,6 +176,40 @@ def build_design_contract(
     }
 
 
+def scope_design_contract(
+    contract: dict[str, Any],
+    slide_ids: list[str],
+    registry: TemplateRegistry | None = None,
+) -> dict[str, Any]:
+    """Derive a self-consistent contract for one bounded generation batch.
+
+    The persisted contract remains the deck-wide source of truth.  A real HTML
+    builder still needs a smaller contract containing only the requested pages,
+    but ``contract_id`` is content-addressed and therefore must be recomputed
+    after that projection.  The separate artifact hash passed to the builder is
+    intentionally left deck-wide so generated fragments remain bound to the
+    persisted contract used by the final render gate.
+    """
+    registry = registry or TemplateRegistry()
+    validate_design_contract(contract, registry)
+    if not slide_ids or len(slide_ids) != len(set(slide_ids)):
+        raise ValidationError("DesignContract 批次页面范围无效")
+    by_id = {item["slide_id"]: item for item in contract["slide_contracts"]}
+    if any(slide_id not in by_id for slide_id in slide_ids):
+        raise ValidationError("DesignContract 批次包含未登记页面")
+    scoped = {
+        **contract,
+        "slide_contracts": [dict(by_id[slide_id]) for slide_id in slide_ids],
+    }
+    seed = {key: scoped[key] for key in (
+        "task_id", "input_snapshot_hash", "outline_hash", "style_id", "template_id",
+        "template_hash", "theme_id", "registry_version", "registry_hash",
+        "allowed_layouts", "slide_contracts",
+    )}
+    scoped["contract_id"] = f"design-{hashlib.sha256(_canonical(seed)).hexdigest()[:20]}"
+    return validate_design_contract(scoped, registry)
+
+
 def validate_design_contract(contract: dict[str, Any], registry: TemplateRegistry | None = None) -> dict[str, Any]:
     registry = registry or TemplateRegistry()
     required = {

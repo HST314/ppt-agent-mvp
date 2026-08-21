@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from ppt_agent.claim_ledger import assert_claims_bound, audit_claims, build_claim_ledger
+from ppt_agent.claim_ledger import assert_claims_bound, audit_claims, audit_html_claims, build_claim_ledger
 from ppt_agent.design_contract import TemplateRegistry
 from ppt_agent.errors import ConflictError, ValidationError
 from ppt_agent.p2 import canonical, digest, now
@@ -118,6 +118,36 @@ class ContractLedgerGateTests(unittest.TestCase):
         self.assertTrue(any(item["status"] == "derived" and item["value"].replace(" ", "") == "20万元" for item in bound["bindings"]))
         with self.assertRaises(ValidationError):
             assert_claims_bound("预计 7 个月回本。", ledger, "叙事")
+
+    def test_standard_head_meta_and_body_void_tags_do_not_hide_claim_text(self):
+        ledger = build_claim_ledger(
+            task_id="task",
+            input_snapshot_hash="a" * 64,
+            source_binding={"known_facts": ["软件 36 万元", "服务 24 万元", "实施 12 万元", "培训 8 万元"]},
+            created_at=now(),
+        )
+        html = """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>预算方案</title>
+  <style>.slide { color: black; }</style>
+</head>
+<body>
+  <section class="slide" data-slide-id="slide-1">
+    <p>软件 36 万元<br>服务 24 万元</p>
+    <p>实施 12 万元，培训 8 万元，另报 80 万元</p>
+  </section>
+</body>
+</html>"""
+
+        result = audit_html_claims(html, ledger)
+
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["binding_count"], 4)
+        self.assertEqual(result["unbound_count"], 1)
+        self.assertEqual(result["unbound"][0]["normalized_value"], "80万元")
 
     def test_contract_and_ledger_hashes_survive_every_delivery_stage(self):
         with tempfile.TemporaryDirectory() as root:

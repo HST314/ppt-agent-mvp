@@ -6,6 +6,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 
 from ppt_agent.agent_runtime import AgentRuntime
+from ppt_agent.design_contract import validate_design_contract
 from ppt_agent.errors import GatewayError
 from ppt_agent.gateways import AgentGateway
 from ppt_agent.model_clients import ModelToolCall, ModelTurn
@@ -140,6 +141,53 @@ class P0GenerationRefactorTests(unittest.TestCase):
             self.assertTrue(all(len(call["slide_ids"]) <= 3 for call in builder.calls))
             self.assertEqual(candidate["metadata"]["inspection_status"],"pending")
             self.assertFalse(svc.versions("task","inspection"))
+
+    def test_production_agent_builder_receives_valid_scoped_contract_per_batch(self):
+        class ContractAwareClient:
+            def __init__(self):
+                self.contracts=[]
+                self.contract_hashes=[]
+
+            def create(self, **kwargs):
+                payload=json.loads(kwargs["input"][1]["content"])
+                contract=validate_design_contract(payload["design_contract"])
+                self.assert_batch(payload["slide_ids"],contract)
+                if kwargs.get("tool_choice") != "none":
+                    return ModelTurn(None,"skill",(
+                        ModelToolCall("read_skill_file",'{"path":"references/design-pack-v1.md"}',f"skill-{len(self.contracts)}"),
+                    ))
+                self.contracts.append(contract)
+                self.contract_hashes.append(payload["design_contract_hash"])
+                slides=[{
+                    "slide_id":slide_id,
+                    "html":f'<section class="slide" id="{slide_id}" data-slide-id="{slide_id}"><h1>{slide_id}</h1><p>已生成内容</p></section>',
+                } for slide_id in payload["slide_ids"]]
+                return ModelTurn(json.dumps({"slides":slides},ensure_ascii=False),f"deck-{len(self.contracts)}")
+
+            @staticmethod
+            def assert_batch(slide_ids, contract):
+                if [item["slide_id"] for item in contract["slide_contracts"]] != slide_ids:
+                    raise AssertionError("batch DesignContract did not match requested slides")
+
+        with tempfile.TemporaryDirectory() as root:
+            svc=TaskService(WorkspaceStore(root)); svc.create("task","manual")
+            svc.import_input("task",{"goal":"发布","audience":"客户","topic":"方案","页数":8})
+            svc.generate_narrative("task"); svc.confirm_narrative("task")
+            svc.generate_outline("task"); svc.confirm_outline("task")
+            svc.select_samples("task",["slide-2","slide-7"]); svc.generate_sample("task"); svc.confirm_sample("task")
+            full_contract=svc.design_contract_view("task")
+            client=ContractAwareClient()
+            svc.builder=AgentGateway(client,skill=SkillRuntime.builtin(),max_steps=4,max_tool_calls=4,max_provider_calls=4)
+
+            deck=svc.generate_deck("task")["deck"]
+
+            self.assertEqual(
+                [[item["slide_id"] for item in contract["slide_contracts"]] for contract in client.contracts],
+                [["slide-1","slide-3","slide-4"],["slide-5","slide-6","slide-8"]],
+            )
+            self.assertTrue(all(contract["contract_id"] != full_contract["contract_id"] for contract in client.contracts))
+            self.assertEqual(client.contract_hashes,[full_contract["hash"],full_contract["hash"]])
+            self.assertEqual(list(deck["metadata"]["page_hashes"]),[f"slide-{index}" for index in range(1,9)])
 
     def test_html_generation_jobs_have_ten_minute_budget_plus_save_tail(self):
         self.assertEqual(OPERATION_BUDGET_SECONDS["samples.generate"],630)

@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from .config import ClarificationConfig
 from .claim_ledger import assert_claims_bound, audit_html_claims, build_claim_ledger, validate_claim_ledger
 from .content_inspection import inspect_content_quality
-from .design_contract import build_design_contract, validate_design_contract
+from .design_contract import build_design_contract, scope_design_contract, validate_design_contract
 from .diagnostics import log_exception_chain
 from .errors import ConflictError, GatewayError, NotFoundError, RuntimeUnavailableError, ValidationError
 from .fsm import TaskState, transition
@@ -1223,7 +1223,8 @@ class TaskService:
             for index in range(0,len(unconfirmed),3):
                 checkpoint(); batch=unconfirmed[index:index+3]
                 progress("generating_batch",f"生成未确认页面 {index+1}-{index+len(batch)} / {len(unconfirmed)}")
-                partial=self.builder.build(data["markdown"],action="deck",slide_ids=batch,rules=meta.get("global_rules",[]),exceptions=meta.get("local_exceptions",{}),assets=assets,design_contract={**contract_value,"slide_contracts":[item for item in contract_value["slide_contracts"] if item["slide_id"] in batch]},design_contract_hash=contract["hash"],claim_ledger=ledger_value,claim_ledger_hash=ledger["hash"])
+                batch_contract=scope_design_contract(contract_value,batch)
+                partial=self.builder.build(data["markdown"],action="deck",slide_ids=batch,rules=meta.get("global_rules",[]),exceptions=meta.get("local_exceptions",{}),assets=assets,design_contract=batch_contract,design_contract_hash=contract["hash"],claim_ledger=ledger_value,claim_ledger_hash=ledger["hash"])
                 generated.update(self._slide_fragments(validate_html(partial,batch,assets)))
             ordered={**generated,**sample_fragments}
             shell=render(data["markdown"],ids,meta.get("global_rules",[]),meta.get("local_exceptions",{}),assets,contract_value,contract["hash"])

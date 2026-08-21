@@ -175,27 +175,36 @@ def audit_claims(text: str, ledger: dict[str, Any]) -> dict[str, Any]:
 
 class _VisibleText(HTMLParser):
     _SKIP = {"head", "style", "script", "template", "noscript", "title"}
+    _VOID = {
+        "area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+        "meta", "param", "source", "track", "wbr",
+    }
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
-        self.stack: list[bool] = []
+        self.stack: list[tuple[str, bool]] = []
         self.text: list[str] = []
 
     def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
         values = {name.lower(): value or "" for name, value in attrs}
-        hidden = (self.stack[-1] if self.stack else False) or tag.lower() in self._SKIP or "hidden" in values or values.get("aria-hidden", "").lower() == "true"
-        self.stack.append(hidden)
+        hidden = (self.stack[-1][1] if self.stack else False) or tag in self._SKIP or "hidden" in values or values.get("aria-hidden", "").lower() == "true"
+        if tag not in self._VOID:
+            self.stack.append((tag, hidden))
 
     def handle_startendtag(self, tag, attrs):
         self.handle_starttag(tag, attrs)
         self.handle_endtag(tag)
 
-    def handle_endtag(self, _tag):
-        if self.stack:
-            self.stack.pop()
+    def handle_endtag(self, tag):
+        target = tag.lower()
+        for index in range(len(self.stack) - 1, -1, -1):
+            if self.stack[index][0] == target:
+                del self.stack[index:]
+                return
 
     def handle_data(self, data):
-        if self.stack and not self.stack[-1] and data.strip():
+        if self.stack and not self.stack[-1][1] and data.strip():
             self.text.append(re.sub(r"\s+", " ", data).strip())
 
 
