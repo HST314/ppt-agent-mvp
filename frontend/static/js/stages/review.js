@@ -1,7 +1,7 @@
-import { api } from "../api.js?v=2026.08.21.042435702251";
-import { badge, button, confirmationDialog, element, field, metadataList, shortHash, versionTimeline } from "../components/index.js?v=2026.08.21.042435702251";
-import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.21.042435702251";
-import { comparePanel, deckPreview, modificationPanel } from "./deck.js?v=2026.08.21.042435702251";
+import { api } from "../api.js?v=2026.08.21.045824180656";
+import { badge, button, confirmationDialog, element, field, metadataList, shortHash, versionTimeline } from "../components/index.js?v=2026.08.21.045824180656";
+import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.21.045824180656";
+import { comparePanel, deckPreview, modificationPanel } from "./deck.js?v=2026.08.21.045824180656";
 
 export async function render(context) {
   const [view, deckView, settings] = await Promise.all([api.inspection(context.taskId, context.controller), api.deck(context.taskId, context.controller), api.settings(context.controller)]);
@@ -105,7 +105,24 @@ function groupIssues(issues) {
 function groupDomKey(group) {
   const partition = group.severity === "blocker" ? "blocker" : "warning";
   const sanitize = (value) => String(value ?? "").replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "deck";
-  return `${partition}-${sanitize(group.slide)}-${sanitize(group.code)}`;
+  // 可读前缀只做定位锚点，清洗不是一一映射（如 "text overflow" 与 "text/overflow" 同形）；
+  // 唯一性由未清洗原始 (severity, slide_id, code) 的稳定摘要保证。
+  const digest = stableDigest([partition, String(group.slide ?? ""), String(group.code ?? "")]);
+  return `${partition}-${sanitize(group.slide)}-${sanitize(group.code)}-${digest}`;
+}
+
+function stableDigest(parts) {
+  const text = JSON.stringify(parts);
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text.charCodeAt(index);
+    h1 = Math.imul(h1 ^ char, 2654435761);
+    h2 = Math.imul(h2 ^ char, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return `${(h2 >>> 0).toString(36)}-${(h1 >>> 0).toString(36)}`;
 }
 
 function issueGroupCard(group, active, context, preview, location, index) {
