@@ -155,6 +155,24 @@ def run_post_render_gate(
         *[{"source": "chromium", **item} for item in browser_blockers],
     ]
     overflow = [item for item in browser_blockers if item.get("code") in _OVERFLOW_CODES]
+    autofit = None if overflow_autofit is None else dict(overflow_autofit)
+    if autofit is not None:
+        # The final post-render Chromium inspection is the authoritative
+        # terminal state.  The bounded autofit loop can apply its last rule
+        # at the round limit and return before its bookkeeping observes the
+        # now-green document.  Promote that exact green state only when no
+        # deterministic target remains; a real residual overflow always
+        # stays fail-closed.
+        terminal_geometry_green = (
+            isinstance(browser, dict)
+            and bool(browser.get("available"))
+            and bool(browser.get("passed"))
+            and not browser_blockers
+        )
+        if terminal_geometry_green and autofit.get("remaining") == []:
+            autofit["converged"] = True
+        elif overflow:
+            autofit["converged"] = False
     evidence = {
         "passed": not blockers,
         "blocker_count": len(blockers),
@@ -178,7 +196,7 @@ def run_post_render_gate(
             "engine_version": None if browser is None else browser.get("engine_version"),
             "viewport": None if browser is None else browser.get("viewport"),
         },
-        "overflow_autofit": overflow_autofit,
+        "overflow_autofit": autofit,
     }
     return seal_post_render_evidence(evidence)
 

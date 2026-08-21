@@ -190,7 +190,7 @@ class ContractLedgerGateTests(unittest.TestCase):
             self.assertEqual(packaged_evidence, canonical_post_render_evidence(gate))
             self.assertEqual(digest(packaged_evidence), gate["evidence_hash"])
 
-    def test_autofit_is_part_of_the_hashed_persisted_evidence(self):
+    def test_terminal_green_geometry_reconciles_autofit_convergence_in_hashed_evidence(self):
         with tempfile.TemporaryDirectory() as root:
             browser = AutofitGenerationBrowser()
             service = self._service(root, browser)
@@ -200,8 +200,8 @@ class ContractLedgerGateTests(unittest.TestCase):
                 "available": True,
                 "html": None,
                 "rules": [{"slide_id": "slide-1", "element_id": "body", "font_size": 18}],
-                "rounds": 1,
-                "converged": True,
+                "rounds": MAX_CASCADE_ROUNDS,
+                "converged": False,
                 "remaining": [],
             }
 
@@ -213,10 +213,50 @@ class ContractLedgerGateTests(unittest.TestCase):
                 sample = service.generate_sample("task")["sample"]
 
             gate = sample["metadata"]["post_render_gate"]
-            self.assertEqual(gate["overflow_autofit"], {key: value for key, value in fitted.items() if key not in {"available", "html"}})
+            self.assertTrue(gate["geometry"]["passed"])
+            self.assertEqual(gate["geometry"]["overflow_count"], 0)
+            self.assertEqual(gate["overflow_autofit"]["remaining"], [])
+            self.assertTrue(gate["overflow_autofit"]["converged"])
+            self.assertEqual(gate["overflow_autofit"]["rules"], fitted["rules"])
+            self.assertEqual(gate["overflow_autofit"]["rounds"], MAX_CASCADE_ROUNDS)
             raw = canonical_post_render_evidence(gate)
             self.assertEqual(digest(raw), gate["evidence_hash"])
             self.assertEqual(service.version("task", gate["evidence_hash"]), raw)
+
+    def test_terminal_overflow_keeps_autofit_fail_closed_for_regeneration(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root, OverflowGenerationBrowser())
+            self._to_outline(service)
+            service.select_samples("task", ["slide-1"])
+            remaining = [{
+                "slide_id": "slide-1",
+                "kind": "oob",
+                "selector": '.slide[data-slide-id="slide-1"] [data-element-id="body"]',
+            }]
+
+            def fit(html_text, max_rounds):
+                self.assertEqual(max_rounds, MAX_CASCADE_ROUNDS)
+                return {
+                    "available": True,
+                    "html": html_text,
+                    "rules": {remaining[0]["selector"]: "height: 564.00px !important;"},
+                    "rounds": MAX_CASCADE_ROUNDS,
+                    "converged": False,
+                    "remaining": remaining,
+                }
+
+            with patch("ppt_agent.service.fit_deck_html", side_effect=fit):
+                with self.assertRaisesRegex(ValidationError, "渲染后硬门禁未通过"):
+                    service.generate_sample("task")
+
+            records = service.versions("task", "post-render-gate-evidence")
+            self.assertEqual(len(records), 1)
+            evidence = json.loads(service.version("task", records[0]["hash"]))
+            self.assertFalse(evidence["geometry"]["passed"])
+            self.assertEqual(evidence["geometry"]["overflow_count"], 1)
+            self.assertFalse(evidence["overflow_autofit"]["converged"])
+            self.assertEqual(evidence["overflow_autofit"]["remaining"], remaining)
+            self.assertFalse(service.versions("task", "sample"))
 
     def test_finalize_rejects_tampered_gate_evidence_without_saving_a_fact(self):
         with tempfile.TemporaryDirectory() as root:
