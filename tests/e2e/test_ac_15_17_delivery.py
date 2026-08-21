@@ -28,6 +28,56 @@ class BlockingBuilder:
         return render(outline,context["slide_ids"],context.get("rules"),context.get("exceptions"),context.get("assets"))
 
 
+class WarningInspector:
+    def inspect(self, outline, html):
+        return {"passed":False,"issues":[{"issue_id":"small-text","severity":"warning","level":"element","code":"text_too_small","message":"正文字号偏小","slide_id":"slide-1","element_id":"body","evidence":"computed font-size=12.0px","suggestion":"调大到至少 16px"}],"model":"fixture"}
+
+
+class DeliveryGateTests(unittest.TestCase):
+    """发布门禁：无新鲜报告或阻断问题未清零时禁止首次写包；重放保持幂等。"""
+
+    def _drive_to_deck(self, inspector):
+        tmp=tempfile.TemporaryDirectory(); store=WorkspaceStore(tmp.name); svc=TaskService(store,inspector=inspector)
+        self.addCleanup(tmp.cleanup)
+        svc.create("task","manual")
+        svc.import_input("task",{"goal":"发布","audience":"客户","topic":"方案","页数":3})
+        svc.generate_narrative("task"); svc.confirm_narrative("task"); svc.generate_outline("task"); svc.confirm_outline("task")
+        svc.generate_sample("task"); svc.confirm_sample("task"); svc.generate_deck("task")
+        return svc
+
+    def test_publish_blocked_without_inspection_report(self):
+        svc=self._drive_to_deck(PassingInspector())
+        deck=svc.deck_view("task")["deck"]; svc.finalize_deck("task",deck["hash"],"deck")
+        with self.assertRaises(ConflictError): svc.publish_delivery("task")
+        self.assertEqual(svc.versions("task","delivery"),[])
+
+    def test_publish_blocked_with_unresolved_blocker_then_allowed_after_disposition(self):
+        svc=self._drive_to_deck(BlockingInspector())
+        svc.run_inspection("task",0)
+        with self.assertRaises(ConflictError): svc.assert_delivery_gate("task")
+        issue=svc.inspection_view("task")["blocking_issues"][0]
+        svc.dispose_issue("task",issue["issue_id"],"waive","演示口径接受该越界",actor="user")
+        deck=svc.deck_view("task")["deck"]; svc.finalize_deck("task",deck["hash"],"review")
+        result=svc.publish_delivery("task")
+        self.assertEqual(result["state"]["status"],"completed")
+
+    def test_warnings_do_not_block_publish(self):
+        svc=self._drive_to_deck(WarningInspector())
+        svc.run_inspection("task",0)
+        self.assertEqual(svc.inspection_view("task")["unresolved"][0]["severity"],"warning")
+        deck=svc.deck_view("task")["deck"]; svc.finalize_deck("task",deck["hash"],"review")
+        result=svc.publish_delivery("task")
+        self.assertEqual(result["state"]["status"],"completed")
+
+    def test_replay_after_gate_pass_stays_idempotent(self):
+        svc=self._drive_to_deck(PassingInspector())
+        svc.run_inspection("task",0)
+        deck=svc.deck_view("task")["deck"]; svc.finalize_deck("task",deck["hash"],"review")
+        first=svc.publish_delivery("task"); second=svc.publish_delivery("task")
+        self.assertEqual(second["delivery"]["hash"],first["delivery"]["hash"])
+        self.assertEqual(len(svc.versions("task","delivery")),1)
+
+
 class DeliveryJourney(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory(); self.store=WorkspaceStore(self.tmp.name); self.svc=TaskService(self.store,inspector=PassingInspector()); self.svc.create("task","manual")
@@ -58,13 +108,21 @@ class DeliveryJourney(unittest.TestCase):
         self.assertEqual(result["status"],{"stage":"delivery","status":"completed"})
         self.assertTrue(result["description"])
 
-    def test_ac17_delivery_is_immutable_and_new_candidate_can_use_fast_path(self):
+    def test_ac17_delivery_is_immutable_and_new_candidate_requires_fresh_precheck(self):
         deck=self.svc.deck_view("task")["deck"]; delivered=self.svc.confirm_delivery("task",deck["hash"])["delivery"]; root=self.store.delivery_root("task",delivered["delivery_id"]); before=(root/"deck.html").read_bytes()
         candidate=self.svc.derive_from_delivery("task",delivered["hash"],"统一使用蓝色主题")["deck"]
         self.assertNotEqual(candidate["hash"],deck["hash"]); self.assertEqual((root/"deck.html").read_bytes(),before); self.assertEqual(self.svc.get("task")["status"],"ready")
-        result=self.svc.confirm_delivery("task",candidate["hash"])
+        # 派生候选使既有报告过期：发布门禁必须阻断，而不是沿用旧证据。
+        with self.assertRaises(ConflictError): self.svc.confirm_delivery("task",candidate["hash"])
+        self.assertEqual(len(self.svc.versions("task","delivery")),1)
+        # 逃生通道：返回自检重新预检、重新确定终稿后放行。
+        self.svc.reopen_review("task")
+        self.svc.run_inspection("task",0)
+        refinalized=self.svc.finalize_deck("task",candidate["hash"],"review")["finalization"]
+        self.assertEqual(refinalized["inspection_status"],"passed")
+        result=self.svc.publish_delivery("task")
         self.assertEqual(result["state"]["status"],"completed")
-        self.assertEqual(self.svc.finalization_view("task")["current"]["inspection_status"],"stale")
+        self.assertEqual(self.svc.finalization_view("task")["current"]["inspection_status"],"passed")
 
     def test_finalization_is_distinct_from_offline_publish(self):
         deck=self.svc.deck_view("task")["deck"]
@@ -213,7 +271,7 @@ class DeliveryFaultTests(unittest.TestCase):
             store=WorkspaceStore(tmp,fault=fault); svc=TaskService(store,inspector=PassingInspector()); svc.create("task","manual")
             svc.import_input("task",{"goal":"发布","audience":"客户","topic":"方案","页数":2})
             svc.generate_narrative("task"); svc.confirm_narrative("task"); svc.generate_outline("task"); svc.confirm_outline("task")
-            svc.generate_sample("task"); svc.confirm_sample("task"); svc.generate_deck("task")
+            svc.generate_sample("task"); svc.confirm_sample("task"); svc.generate_deck("task"); svc.run_inspection("task",0)
             deck_hash=svc.deck_view("task")["deck"]["hash"]
             localized_calls=[]
             def localized(html,_manifest,_root):

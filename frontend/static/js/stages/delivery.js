@@ -1,25 +1,36 @@
-import { api } from "../api.js?v=2026.08.20.172432606707";
-import { badge, button, confirmationDialog, element, field, formatTime, metadataList, shortHash } from "../components/index.js?v=2026.08.20.172432606707";
-import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.20.172432606707";
+import { api } from "../api.js?v=2026.08.21.035240047774";
+import { badge, button, confirmationDialog, element, field, formatTime, metadataList, shortHash } from "../components/index.js?v=2026.08.21.035240047774";
+import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.21.035240047774";
 
 export async function render(context) {
-  const [view, deckView] = await Promise.all([
+  const [view, deckView, inspection] = await Promise.all([
     api.delivery(context.taskId, context.controller),
     api.deck(context.taskId, context.controller),
+    api.inspection(context.taskId, context.controller),
   ]);
   context.assertCurrent();
-  return deliveryStage(view, deckView.deck, context);
+  return deliveryStage(view, deckView.deck, inspection, context);
 }
 
-function deliveryStage(view, deck, context) {
+function deliveryStage(view, deck, inspection, context) {
   const latest = view.latest;
   const finalization = view.finalization;
   const completed = view.state.status === "completed";
+  const blockingCount = inspection?.blocking_issues?.length || 0;
+  const reportFresh = Boolean(inspection?.report && !inspection.report.stale);
+  const precheckOk = reportFresh && blockingCount === 0;
+  const gateReason = !inspection?.report
+    ? "发布前须先在自检与修改页完成 Chromium 渲染预检"
+    : inspection.report.stale
+      ? "检查报告对应旧版本，请返回自检与修改页重新执行预检"
+      : blockingCount
+        ? `仍有 ${blockingCount} 项未处置的阻断问题，须修复或豁免后方可发布`
+        : "";
   const confirmMessage = actionMessage();
   const confirm = button(completed ? "离线包已写入" : "将离线包写入工程文件夹", {
     kind: "primary",
-    disabled: completed || !deck || !finalization,
-    reason: "请先在全稿或自检与修改页确定终稿",
+    disabled: completed || !deck || !finalization || !precheckOk,
+    reason: (!deck || !finalization) ? "请先在全稿或自检与修改页确定终稿" : gateReason,
     mutates: true,
     requiresVersionMatch: true,
   });
@@ -38,11 +49,16 @@ function deliveryStage(view, deck, context) {
       ]),
       element("div", { className: "gate-grid" }, [
         gateItem("终稿冻结", Boolean(finalization), finalization ? "已绑定精确 deck hash" : "待确定"),
-        gateItem("检查状态", Boolean(finalization), inspectionStatus(finalization?.inspection_status)),
+        gateItem("渲染预检", precheckOk, precheckOk ? "Chromium 预检通过，blocker 已清零" : gateReason),
         gateItem("资源本地化", completed, completed ? "已校验" : "写包时执行"),
         gateItem("工程写入", completed, completed ? "已完成" : "等待用户"),
       ]),
-      finalization?.unresolved_issue_count ? element("div", { className: "notice notice--warning" }, [element("strong", { text: `终稿带有 ${finalization.unresolved_issue_count} 项遗留问题` }), element("p", { text: "该事实会写入结果摘要，但不会阻止离线交付。" })]) : null,
+      finalization && !precheckOk && !completed ? element("div", { className: "notice notice--danger" }, [
+        element("strong", { text: "渲染预检未通过，已禁止发布" }),
+        element("p", { text: `${gateReason}。` }),
+        reopenAction(context),
+      ]) : null,
+      precheckOk && finalization?.unresolved_issue_count ? element("div", { className: "notice notice--warning" }, [element("strong", { text: `终稿带有 ${finalization.unresolved_issue_count} 项遗留警告` }), element("p", { text: "该事实会写入结果摘要；阻断问题已清零，可以发布。" })]) : null,
       confirm,
       confirmMessage,
     ], { description: "写入使用后台 Job、临时目录与原子发布；刷新页面可恢复进度，同一终稿重复执行保持幂等。" }),
@@ -62,6 +78,20 @@ function deliveryStage(view, deck, context) {
 
 function inspectionStatus(status) {
   return ({ unchecked: "未执行检查", stale: "检查报告对应旧版本", passed: "检查通过", issues_disposed: "问题已全部处置", issues_remaining: "带遗留问题确认" })[status] || "未记录";
+}
+
+function reopenAction(context) {
+  const message = actionMessage();
+  const reopen = button("返回自检与修改", { kind: "secondary", mutates: true, requiresVersionMatch: true });
+  reopen.addEventListener("click", () => runAction({
+    buttonNode: reopen,
+    region: message,
+    busyLabel: "正在返回自检…",
+    action: () => api.reopenReview(context.taskId),
+    success: "已返回自检与修改，可重新执行预检并处置问题。",
+    refresh: () => context.goTo("review"),
+  }).catch(() => {}));
+  return element("div", { className: "button-row" }, [reopen, message]);
 }
 
 function derivePanel(latest, context) {

@@ -14,7 +14,7 @@
 .button:disabled, .icon-button:disabled, [aria-disabled="true"] { cursor: not-allowed; opacity: 0.48; }
 .button--block { width: 100%; }
 
-.icon-button { width: 2.75rem; display: inline-grid; place-items: center; padding: 0; color: var(--color-foreground); background: var(--color-muted); border-color: var(--color-border); }
+.icon-button { width: 2.75rem; min-width: 2.75rem; flex-shrink: 0; display: inline-grid; place-items: center; padding: 0; color: var(--color-foreground); background: var(--color-muted); border-color: var(--color-border); }
 .icon { width: 1.25rem; height: 1.25rem; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 
 .card { padding: clamp(1rem, 2vw, 1.4rem); border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-surface); box-shadow: var(--shadow-sm); }

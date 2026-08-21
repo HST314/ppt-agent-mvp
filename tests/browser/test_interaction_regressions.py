@@ -120,12 +120,32 @@ class InteractionRegressionGate(unittest.TestCase):
         try:
             page.goto(f"{self.base}/tasks/touch-targets?stage=narrative")
             page.get_by_role("heading", name="叙事结构", exact=True).wait_for()
-            brand = page.locator(".topbar__brand").bounding_box()
-            self.assertGreaterEqual(brand["height"], 44, "品牌首页链接触控高度不足 44px")
+            brand = page.locator(".topbar__brand")
+            box = brand.bounding_box()
+            self.assertGreaterEqual(box["height"], 44, "品牌首页链接触控高度不足 44px")
+            self.assertGreaterEqual(box["width"], 44, "品牌首页链接触控宽度不足 44px")
+            # 移动端 .topbar__title 被隐藏后，链接仍必须有非空可访问名称。
+            self.assertEqual(brand.get_attribute("aria-label"), "返回任务首页")
+            self.assertEqual(page.get_by_role("link", name="返回任务首页").count(), 1, "品牌首页链接缺少可访问名称")
             preview = page.locator(".version-item .button", has_text="预览").first
             preview.wait_for()
             box = preview.bounding_box()
             self.assertGreaterEqual(box["height"], 44, "版本时间线按钮触控高度不足 44px")
+        finally:
+            page.close()
+
+    def test_icon_buttons_keep_44px_width_in_flex_layout(self):
+        self._complete_task("icon-width")
+        page = self.browser.new_page(viewport={"width": 1024, "height": 800})
+        try:
+            page.goto(f"{self.base}/tasks/icon-width?stage=narrative")
+            page.get_by_role("heading", name="叙事结构", exact=True).wait_for()
+            buttons = page.locator(".topbar .icon-button:visible").all()
+            self.assertTrue(buttons, "顶栏应至少有一个可见图标按钮")
+            for button in buttons:
+                box = button.bounding_box()
+                self.assertGreaterEqual(box["width"], 44, "图标按钮触控宽度不足 44px")
+                self.assertGreaterEqual(box["height"], 44, "图标按钮触控高度不足 44px")
         finally:
             page.close()
 

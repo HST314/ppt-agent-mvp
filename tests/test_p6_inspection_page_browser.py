@@ -72,17 +72,27 @@ class InspectionPageBrowserTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_locate_highlights_preview_and_batch_keeps_same_code(self):
-        blocker = self.page.locator(".issue-card").filter(has_text="slide-1 / title")
-        blocker.get_by_role("button", name="定位").click()
+        group = self.page.locator(".issue-group").filter(has_text="slide-1 · overflow")
+        group.get_by_role("button", name="定位").click()
         frame = self.page.frame_locator("#deck-preview-frame")
         self.assertEqual(frame.locator('[data-element-id="title"]').first.get_attribute("data-inspection-highlight"), "true")
         self.assertIn("slide-1 / title", self.page.get_by_role("status").filter(has_text="已定位").inner_text())
-        blocker.get_by_label("处置动作").select_option("defer")
-        blocker.get_by_label("处置依据").fill("同类处理")
+        group.get_by_label("处置动作").select_option("defer")
+        group.get_by_label("处置依据").fill("同类处理")
         with self.page.expect_request(lambda request: request.url.endswith("/issues/dispositions/batch")) as captured:
-            blocker.get_by_role("button", name="处置同 code 问题").click()
+            group.get_by_role("button", name="处置本组 1 项").click()
         body = json.loads(captured.value.post_data)
         self.assertEqual(body["issue_ids"], ["overflow-1"])
+
+    def test_issues_are_grouped_by_slide_and_code(self):
+        groups = self.page.locator(".issue-group")
+        groups.first.wait_for()
+        self.assertEqual(groups.count(), 3)
+        self.assertEqual(self.page.locator(".issue-group", has_text="slide-2 · overflow").count(), 1)
+        self.assertEqual(self.page.locator(".issue-group", has_text="slide-2 · density").count(), 1)
+        # 每个分组的处置表单是一份，而不是每卡片一份。
+        first = groups.first
+        self.assertEqual(first.get_by_label("处置动作").count(), 1)
 
 
 if __name__ == "__main__":

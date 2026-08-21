@@ -57,6 +57,12 @@ def transition(s: TaskState, action: str, *, actor: str="system") -> TaskState:
     if action == "confirm_delivery":
         if s.stage != Stage.DELIVERY or actor != "user": raise GateError("须由用户在交付阶段确认写入")
         return replace(s,delivery_confirmed=True,status=RunStatus.COMPLETED,waiting_reason=None,required_action=None,revision=s.revision+1)
+    if action == "reopen_review":
+        # Escape hatch from the publish gate: a finalized-but-unpublished task
+        # may return to review so a stale report can be refreshed and blocking
+        # issues disposed.  Completed deliveries stay immutable (line above).
+        if s.stage != Stage.DELIVERY or actor != "user": raise GateError("须由用户在交付阶段返回自检")
+        return replace(s,stage=Stage.REVIEW,status=RunStatus.WAITING_FOR_USER,waiting_reason="publish_gate",required_action="review_issues",revision=s.revision+1)
     if action == "advance":
         if s.status == RunStatus.PAUSED: raise GateError("任务已暂停")
         if s.stage == Stage.SAMPLE and not s.sample_confirmed: raise GateError("请先确认样品")

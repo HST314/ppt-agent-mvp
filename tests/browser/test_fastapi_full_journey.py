@@ -99,10 +99,11 @@ class FastAPIFullJourneyGate(unittest.TestCase):
         page.get_by_role("heading", name="自检与修改", exact=True).wait_for()
         page.get_by_text("尚未检查", exact=True).wait_for()
         page.get_by_role("button", name="执行独立检查", exact=True).click()
-        page.get_by_role("button", name="保存处置").wait_for()
+        page.get_by_role("button", name="处置本组 1 项").wait_for()
         page.get_by_label("处置动作").select_option("waive")
         page.get_by_label("处置依据").fill("已人工核对，接受当前版式")
-        page.get_by_role("button", name="保存处置").click()
+        page.get_by_role("button", name="处置本组 1 项").click()
+        page.get_by_text("已处置：waive", exact=False).first.wait_for()
         page.get_by_role("button", name="确定终稿", exact=True).click()
         with page.expect_response(lambda response: response.url.endswith("/deck/finalize")) as finalized:
             page.get_by_role("dialog").get_by_role("button", name="确定终稿并前往交付").click()

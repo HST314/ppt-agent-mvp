@@ -44,6 +44,49 @@ class P0HybridInspectionBrowserGate(unittest.TestCase):
         self.assertFalse(evidence["passed"])
         self.assertEqual(evidence["issues"][0]["code"], "render_unavailable")
 
+    def test_nested_overflow_is_deduped_to_root_cause(self):
+        fragment = (
+            '<section class="slide light" id="slide-1" data-slide-id="slide-1">'
+            '<h1 data-element-id="title">嵌套越界</h1>'
+            '<div data-element-id="root-box" style="position:absolute;left:1100px;top:80px;width:400px;height:560px">'
+            '<div data-element-id="child-list" style="width:380px;height:520px">'
+            '<p data-element-id="child-item">子项内容</p>'
+            '</div></div>'
+            '</section>'
+        )
+        html = assemble_locked_template([fragment])
+        validate_html(html, ["slide-1"])
+
+        evidence = ChromiumDeckInspector().inspect(html, ["slide-1"])
+
+        issues = [item for item in evidence["issues"] if item["code"] == "content_out_of_bounds"]
+        self.assertEqual(len(issues), 1, evidence["issues"])
+        self.assertEqual(issues[0]["element_id"], "root-box")
+        self.assertIn("child-list", issues[0]["evidence"])
+        self.assertIn("child-item", issues[0]["evidence"])
+
+    def test_meta_role_text_has_independent_threshold(self):
+        fragment = (
+            '<section class="slide light" id="slide-1" data-slide-id="slide-1">'
+            '<h1 data-element-id="title">角色阈值</h1>'
+            '<p data-element-id="kicker" style="font-size:13px">装饰性 KICKER</p>'
+            '<p data-element-id="body-copy" style="font-size:13px">正文十三像素</p>'
+            '<small data-element-id="footnote" style="font-size:10px">脚注说明文字</small>'
+            '</section>'
+        )
+        html = assemble_locked_template([fragment])
+        validate_html(html, ["slide-1"])
+
+        evidence = ChromiumDeckInspector().inspect(html, ["slide-1"])
+
+        small = {item["element_id"]: item for item in evidence["issues"] if item["code"] == "text_too_small"}
+        self.assertIn("body-copy", small)
+        self.assertIn("minimum=16", small["body-copy"]["evidence"])
+        self.assertNotIn("kicker", small)
+        self.assertIn("footnote", small)
+        self.assertIn("role=meta", small["footnote"]["evidence"])
+        self.assertIn("minimum=12", small["footnote"]["evidence"])
+
 
 if __name__ == "__main__":
     unittest.main()

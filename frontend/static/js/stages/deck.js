@@ -1,6 +1,6 @@
-import { api } from "../api.js?v=2026.08.20.172432606707";
-import { badge, button, confirmationDialog, element, field, metadataList, previewFrame, previewUrl, shortHash } from "../components/index.js?v=2026.08.20.172432606707";
-import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.20.172432606707";
+import { api } from "../api.js?v=2026.08.21.035240047774";
+import { badge, button, confirmationDialog, element, field, metadataList, previewFrame, previewUrl, shortHash } from "../components/index.js?v=2026.08.21.035240047774";
+import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.21.035240047774";
 
 export async function render(context) {
   const view = await api.deck(context.taskId, context.controller);
@@ -41,7 +41,7 @@ function deckStage(view, context) {
     ]) : null,
     section("全稿预览", [deck ? fullScreenAction(previewRegion) : null, previewRegion], { description: deck ? `当前候选 v${deck.version} · ${Object.keys(deck.metadata?.page_hashes || {}).length} 页` : "生成完成后将在此显示大幅 16:9 预览" }),
     deck && !frozen ? section("选择下一步", [
-      element("p", { text: "可直接确定终稿，也可进入自检与修改；两条路径都不会强制要求检查通过。" }),
+      element("p", { text: "可直接确定终稿，也可进入自检与修改；但发布前必须通过 Chromium 渲染预检且阻断问题清零。" }),
       element("div", { className: "button-row" }, [finalize, button("前往自检与修改", { href: `/tasks/${encodeURIComponent(context.taskId)}?stage=review`, kind: "secondary" })]),
       finalizeMessage,
     ], { className: "finalize-actions" }) : null,

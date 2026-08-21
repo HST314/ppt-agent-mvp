@@ -90,6 +90,7 @@ export const api = {
   confirmDelivery: (taskId, payload) => post(`${taskPath(taskId)}/delivery/confirm`, payload),
   publishDelivery: (taskId) => post(`${taskPath(taskId)}/delivery/publish`, {}),
   deriveDelivery: (taskId, payload) => post(`${taskPath(taskId)}/delivery/derive`, payload),
+  reopenReview: (taskId) => post(`${taskPath(taskId)}/delivery/reopen-review`, {}),
   versions: (taskId, controller) => request(`${taskPath(taskId)}/versions`, { controller }),
   version: (taskId, hash, controller) => request(`${taskPath(taskId)}/versions/${encodeURIComponent(hash)}`, { controller }),
   compareVersions: (taskId, payload) => post(`${taskPath(taskId)}/versions/compare`, payload),

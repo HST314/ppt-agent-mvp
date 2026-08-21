@@ -9,6 +9,7 @@ VIEWPORT = {"width": 1280, "height": 720}
 TOLERANCE_PX = 1.0
 MIN_TITLE_PX = 32.0
 MIN_BODY_PX = 16.0
+MIN_META_PX = 12.0
 
 
 def _issue(code: str, message: str, *, severity: str = "blocker", slide_id: str = "", element_id: str = "", evidence: str, suggestion: str) -> dict:
@@ -95,8 +96,12 @@ class ChromiumDeckInspector:
                                 element.getAttribute('data-element-id') || element.id ||
                                 `${element.tagName.toLowerCase()}-${index + 1}`;
                             const descendants = [...slide.querySelectorAll('*')].filter(visible);
-                            const overflows = [];
+                            const overflowRoots = new Map();
+                            const overflowSuppressed = [];
                             const scrolling = [];
+                            // Root-cause dedup: when an ancestor already exceeds the slide
+                            // bounds, descendant flags share that root cause.  Keep the
+                            // outermost element and fold children into its evidence.
                             descendants.forEach((element, index) => {
                                 const box = element.getBoundingClientRect();
                                 const elementId = label(element, index);
@@ -107,17 +112,34 @@ class ChromiumDeckInspector:
                                     bottom: box.bottom - rect.bottom,
                                 };
                                 if (Math.max(delta.left, delta.top, delta.right, delta.bottom) > 1) {
-                                    overflows.push({element_id: elementId, tag: element.tagName.toLowerCase(), ...delta});
+                                    let ancestor = element.parentElement;
+                                    let root = null;
+                                    while (ancestor && ancestor !== slide) {
+                                        if (overflowRoots.has(ancestor)) { root = overflowRoots.get(ancestor); break; }
+                                        ancestor = ancestor.parentElement;
+                                    }
+                                    if (root) root.suppressed.push(elementId);
+                                    else overflowRoots.set(element, {element_id: elementId, tag: element.tagName.toLowerCase(), suppressed: [], ...delta});
                                 }
+                            });
+                            const overflows = [...overflowRoots.values()];
+                            descendants.forEach((element, index) => {
                                 if (element.clientWidth > 0 && element.clientHeight > 0 &&
                                     (element.scrollWidth > element.clientWidth + 1 || element.scrollHeight > element.clientHeight + 1)) {
+                                    let coveredBy = '';
+                                    let node = element;
+                                    while (node && node !== slide) {
+                                        if (overflowRoots.has(node)) { coveredBy = overflowRoots.get(node).element_id; break; }
+                                        node = node.parentElement;
+                                    }
                                     scrolling.push({
-                                        element_id: elementId,
+                                        element_id: label(element, index),
                                         tag: element.tagName.toLowerCase(),
                                         client_width: element.clientWidth,
                                         client_height: element.clientHeight,
                                         scroll_width: element.scrollWidth,
                                         scroll_height: element.scrollHeight,
+                                        covered_by: coveredBy,
                                     });
                                 }
                             });
@@ -127,14 +149,36 @@ class ChromiumDeckInspector:
                                 font_size: Number.parseFloat(getComputedStyle(titleElement).fontSize),
                                 text: (titleElement.innerText || '').trim().slice(0, 160),
                             } : null;
+                            // Role-based thresholds: body/list text stays >=16px; kickers,
+                            // footers, page numbers and similar chrome get their own floor.
+                            const metaPattern = /kicker|eyebrow|caption|foot|note|page|index|number|chrome|badge|label|source|meta|tag/i;
+                            const smallTextRoots = new Set();
                             const smallText = [...slide.querySelectorAll('p,li,td,th,small,figcaption,[data-element-id]')]
                                 .filter(element => visible(element) && (element.innerText || '').trim())
-                                .map((element, index) => ({
-                                    element_id: label(element, descendants.indexOf(element) >= 0 ? descendants.indexOf(element) : index),
-                                    font_size: Number.parseFloat(getComputedStyle(element).fontSize),
-                                    text: (element.innerText || '').trim().slice(0, 120),
-                                }))
-                                .filter(item => item.font_size < 16)
+                                .map((element, index) => {
+                                    const role = (element.matches('small,figcaption') ||
+                                        metaPattern.test(element.getAttribute('data-element-id') || '') ||
+                                        metaPattern.test(element.className || '')) ? 'meta' : 'body';
+                                    return {
+                                        element,
+                                        element_id: label(element, descendants.indexOf(element) >= 0 ? descendants.indexOf(element) : index),
+                                        font_size: Number.parseFloat(getComputedStyle(element).fontSize),
+                                        text: (element.innerText || '').trim().slice(0, 120),
+                                        role,
+                                        minimum: role === 'meta' ? 12 : 16,
+                                    };
+                                })
+                                .filter(item => {
+                                    if (item.font_size >= item.minimum) return false;
+                                    let ancestor = item.element.parentElement;
+                                    while (ancestor && ancestor !== slide) {
+                                        if (smallTextRoots.has(ancestor)) return false;
+                                        ancestor = ancestor.parentElement;
+                                    }
+                                    smallTextRoots.add(item.element);
+                                    return true;
+                                })
+                                .map(({element, ...rest}) => rest)
                                 .slice(0, 8);
                             const brokenImages = [...slide.querySelectorAll('img')]
                                 .filter(image => !image.complete || image.naturalWidth === 0)
@@ -226,17 +270,27 @@ class ChromiumDeckInspector:
                     evidence=f"computed font-size={size:.1f}px; minimum={MIN_TITLE_PX:.0f}px",
                     suggestion="使用锁定模板标题类或将标题字号提高到至少 32px",
                 ))
+            covered_scroll = [item for item in slide.get("scrolling") or [] if item.get("covered_by")]
             for item in slide.get("overflows") or []:
                 overflow = max(float(item.get(key) or 0) for key in ("left", "top", "right", "bottom"))
+                evidence = f"DOM geometry exceeds slide by {overflow:.1f}px"
+                suppressed = [str(name) for name in item.get("suppressed") or []]
+                if suppressed:
+                    evidence += f"；同根因受影响元素 {len(suppressed)} 个: {', '.join(suppressed[:8])}"
+                linked = [entry for entry in covered_scroll if str(entry.get("covered_by")) == str(item.get("element_id") or item.get("tag") or "element")]
+                if linked:
+                    evidence += f"；其中 {len(linked)} 个元素伴随内部滚动溢出"
                 issues.append(_issue(
                     "content_out_of_bounds",
                     "元素超出页面安全边界",
                     slide_id=slide_id,
                     element_id=str(item.get("element_id") or item.get("tag") or "element"),
-                    evidence=f"DOM geometry exceeds slide by {overflow:.1f}px",
-                    suggestion="收紧内容、间距或改用容量更合适的布局",
+                    evidence=evidence,
+                    suggestion="收紧内容、间距或改用容量更合适的布局；同源子元素会随根因修复一并消除",
                 ))
             for item in slide.get("scrolling") or []:
+                if item.get("covered_by"):
+                    continue
                 issues.append(_issue(
                     "element_scroll_overflow",
                     "元素内容发生滚动溢出",
@@ -250,14 +304,16 @@ class ChromiumDeckInspector:
                 ))
             for item in slide.get("small_text") or []:
                 size = float(item.get("font_size") or 0)
+                minimum = float(item.get("minimum") or MIN_BODY_PX)
+                role = str(item.get("role") or "body")
                 issues.append(_issue(
                     "text_too_small",
-                    "正文或辅助文字投屏字号过小",
+                    "元信息文字投屏字号过小" if role == "meta" else "正文或辅助文字投屏字号过小",
                     severity="warning",
                     slide_id=slide_id,
                     element_id=str(item.get("element_id") or "text"),
-                    evidence=f"computed font-size={size:.1f}px; minimum={MIN_BODY_PX:.0f}px",
-                    suggestion="精简内容并把文字字号提高到至少 16px",
+                    evidence=f"computed font-size={size:.1f}px; role={role}; minimum={minimum:.0f}px",
+                    suggestion=f"精简内容并把文字字号提高到至少 {minimum:.0f}px" if role != "meta" else f"弱化展示或提高到至少 {minimum:.0f}px，并核对对比度",
                 ))
             for element_id in slide.get("broken_images") or []:
                 issues.append(_issue(

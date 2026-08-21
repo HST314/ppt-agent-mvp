@@ -14,7 +14,7 @@
   backdrop-filter: blur(16px);
 }
 
-.topbar__brand { display: flex; align-items: center; gap: var(--space-3); min-width: 0; min-height: 2.75rem; color: var(--color-foreground); text-decoration: none; }
+.topbar__brand { display: flex; align-items: center; gap: var(--space-3); min-width: 2.75rem; min-height: 2.75rem; flex: 0 0 auto; color: var(--color-foreground); text-decoration: none; }
 .topbar__brand .brand-mark { width: 1.75rem; height: 1.75rem; flex: 0 0 auto; }
 .topbar__title { font: 650 1rem/1.2 var(--font-display); white-space: nowrap; }
 .topbar__context { min-width: 0; display: flex; align-items: center; gap: var(--space-2); color: var(--color-muted-foreground); }

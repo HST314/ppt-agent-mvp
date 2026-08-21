@@ -1,11 +1,11 @@
-import { api, ApiError } from "./api.js?v=2026.08.20.172432606707";
-import { JobTracker } from "./job-tracker.js?v=2026.08.20.172432606707";
-import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.20.172432606707";
-import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.20.172432606707";
-import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.20.172432606707";
-import { inlineError, setBusy } from "./components/index.js?v=2026.08.20.172432606707";
-import { renderStage } from "./stages/index.js?v=2026.08.20.172432606707";
-import { setVersionMatchGuard } from "./stages/shared.js?v=2026.08.20.172432606707";
+import { api, ApiError } from "./api.js?v=2026.08.21.035240047774";
+import { JobTracker } from "./job-tracker.js?v=2026.08.21.035240047774";
+import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.21.035240047774";
+import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.21.035240047774";
+import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.21.035240047774";
+import { inlineError, setBusy } from "./components/index.js?v=2026.08.21.035240047774";
+import { renderStage } from "./stages/index.js?v=2026.08.21.035240047774";
+import { setVersionMatchGuard } from "./stages/shared.js?v=2026.08.21.035240047774";
 
 const app = document.getElementById("app");
 const APP_BUILD = document.querySelector('meta[name="app-build"]')?.content || "unknown";
@@ -112,7 +112,7 @@ function topbar(context = {}) {
     themeButton.setAttribute("aria-label", label);
     themeButton.title = label;
   });
-  const home = element("a", { className: "topbar__brand", href: "/", onClick: intercept }, [
+  const home = element("a", { className: "topbar__brand", href: "/", "aria-label": "返回任务首页", onClick: intercept }, [
     brandMark(),
     element("span", { className: "topbar__title", text: "PPT Agent" }),
   ]);

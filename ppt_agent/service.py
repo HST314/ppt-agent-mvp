@@ -1234,9 +1234,6 @@ class TaskService:
             state=TaskState.parse(self.get(task_id)); deck=self.deck_view(task_id)["deck"]
             if state.stage not in {state.stage.DECK,state.stage.REVIEW}: raise ConflictError("只能在全稿或自检与修改阶段确定终稿")
             if not deck or deck["hash"]!=deck_hash: raise ConflictError("终稿必须绑定当前候选 HTML 版本")
-            existing=self.finalization_view(task_id)["current"]
-            if existing:
-                return {"state":self.get(task_id),"finalization":existing}
             inspection=self.inspection_view(task_id); report=inspection["report"]
             if not report or report["stale"]:
                 inspection_status="unchecked" if not report else "stale"
@@ -1246,6 +1243,9 @@ class TaskService:
                 inspection_status="issues_disposed"
             else:
                 inspection_status="issues_remaining"
+            existing=self.finalization_view(task_id)["current"]
+            if existing and existing["inspection_status"]==inspection_status and existing["unresolved_issue_count"]==len(inspection["unresolved"]) and existing["blocking_issue_count"]==len(inspection["blocking_issues"]):
+                return {"state":self.get(task_id),"finalization":existing}
             finalized_at=utcnow()
             payload={"finalization_id":f"final-{deck_hash[:16]}","task_id":task_id,"deck_hash":deck_hash,"finalized_by":"user","finalized_at":finalized_at,"source":source if source in {"deck","review"} else "deck","inspection_status":inspection_status,"inspection_report_hash":None if not report or report["stale"] else report["hash"],"unresolved_issue_count":len(inspection["unresolved"]),"blocking_issue_count":len(inspection["blocking_issues"]),"schema_version":"1.0"}
             final_hash=self.store.put_version(task_id,"final-deck",canonical(payload),{"deck_hash":deck_hash,"source":payload["source"],"inspection_status":inspection_status})
@@ -1288,6 +1288,13 @@ class TaskService:
         snapshot=self.input_view(task_id)
         existing_delivery=next((r for r in self.versions(task_id,"delivery") if json.loads(self.version(task_id,r["hash"]))["deck_hash"]==deck_hash),None)
         delivery_id=(json.loads(self.version(task_id,existing_delivery["hash"]))["delivery_id"] if existing_delivery else f"delivery-{len(self.versions(task_id,'delivery'))+1}-{deck_hash[:12]}")
+
+        # First-time publishes must pass the Chromium-backed delivery gate:
+        # a fresh inspection report bound to the current deck with zero
+        # unresolved blockers.  Replays of an already-recorded delivery fact
+        # stay idempotent and never re-evaluate the gate.
+        if not existing_delivery:
+            self.assert_delivery_gate(task_id)
 
         # A delivery fact is the domain idempotency boundary.  Replays for the
         # same finalized deck return that immutable fact even when the caller
@@ -1362,6 +1369,19 @@ class TaskService:
         if not self.finalization_view(task_id)["current"]:
             self.finalize_deck(task_id,deck_hash,"review" if self.get(task_id)["stage"]=="review" else "deck",actor)
         return self.publish_delivery(task_id,actor)
+
+    def reopen_review(self,task_id):
+        """Return a finalized-but-unpublished task to the review stage.
+
+        The publish gate blocks first-time writes when the inspection report is
+        missing/stale or unresolved blockers remain; without a way back the task
+        would be wedged, since inspection and disposition require a mutable
+        candidate.  Completed deliveries stay immutable (derive instead)."""
+        state=TaskState.parse(self.get(task_id))
+        if state.stage!=state.stage.DELIVERY: raise ConflictError("只有交付阶段可以返回自检与修改")
+        if not self.finalization_view(task_id)["current"]: raise ConflictError("当前没有已冻结的终稿")
+        self.command(task_id,f"reopen-review-{state.revision}","reopen_review","user")
+        return self.inspection_view(task_id)
 
     def derive_from_delivery(self,task_id,delivery_hash,prompt,slide_ids=None):
         with self.store.transaction(task_id):

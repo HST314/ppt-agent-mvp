@@ -329,6 +329,9 @@ async def change_delivery(task_id: str, action: str, request: Request, service: 
     if action == "derive":
         exact(body, {"delivery_hash", "prompt", "slide_ids"}, {"delivery_hash", "prompt"})
         return service.derive_from_delivery(task_id, body["delivery_hash"], body["prompt"], body.get("slide_ids"))
+    if action == "reopen-review":
+        exact(body, set())
+        return service.reopen_review(task_id)
     raise NotFoundError("接口不存在")
 
 

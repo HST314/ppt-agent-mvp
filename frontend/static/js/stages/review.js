@@ -1,7 +1,7 @@
-import { api } from "../api.js?v=2026.08.20.172432606707";
-import { badge, button, confirmationDialog, element, field, metadataList, shortHash, versionTimeline } from "../components/index.js?v=2026.08.20.172432606707";
-import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.20.172432606707";
-import { comparePanel, deckPreview, modificationPanel } from "./deck.js?v=2026.08.20.172432606707";
+import { api } from "../api.js?v=2026.08.21.035240047774";
+import { badge, button, confirmationDialog, element, field, metadataList, shortHash, versionTimeline } from "../components/index.js?v=2026.08.21.035240047774";
+import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.21.035240047774";
+import { comparePanel, deckPreview, modificationPanel } from "./deck.js?v=2026.08.21.035240047774";
 
 export async function render(context) {
   const [view, deckView, settings] = await Promise.all([api.inspection(context.taskId, context.controller), api.deck(context.taskId, context.controller), api.settings(context.controller)]);
@@ -30,15 +30,15 @@ function reviewStage(view, deckView, defaultRounds, context) {
     mutable ? inspectionControls(view, defaultRounds, context) : null,
     mutable && view.deck ? modificationPanel(view.deck, context) : null,
     report?.stale ? section("检查报告已过期", element("div", { className: "notice notice--warning" }, [element("strong", { text: "当前全稿已变化" }), element("p", { text: "旧报告仍可追溯，若需最新质量结论请重新检查；也可以带该状态直接确定终稿。" })])) : null,
-    report ? section("阻断问题", mutable ? issueGroup(blockers, active, context, preview, location) : readOnlyIssueGroup(blockers, active, preview, location), { description: mutable ? `${blockers.length} 项；可以修复、记录处置或带遗留问题确定终稿。` : `${blockers.length} 项；终稿冻结后仅供追溯。` }) : null,
-    report ? section("普通警告", mutable ? issueGroup(warnings, active, context, preview, location) : readOnlyIssueGroup(warnings, active, preview, location), { description: mutable ? `${warnings.length} 项；处置可追溯，但不阻断终稿确认。` : `${warnings.length} 项；终稿冻结后仅供追溯。` }) : null,
+    report ? section("阻断问题", mutable ? issueGroup(blockers, active, context, preview, location) : readOnlyIssueGroup(blockers, active, preview, location), { description: mutable ? `${blockers.length} 项 · 按页面与根因分组；修复、记录处置或带遗留问题确定终稿。` : `${blockers.length} 项；终稿冻结后仅供追溯。` }) : null,
+    report ? section("普通警告", mutable ? issueGroup(warnings, active, context, preview, location) : readOnlyIssueGroup(warnings, active, preview, location), { description: mutable ? `${warnings.length} 项 · 按页面与根因分组；处置可追溯，但不阻断终稿确认。` : `${warnings.length} 项；终稿冻结后仅供追溯。` }) : null,
     view.deck ? comparePanel(deckView, context) : null,
   ], [
     section("检查摘要", report ? [
       badge(report.stale ? "报告过期" : report.passed ? "检查通过" : "需要处置", report.stale ? "warning" : report.passed ? "success" : "danger"),
       metadataList([["报告 hash", shortHash(report.hash)], ["候选 hash", shortHash(report.deck_hash)], ["检查范围", report.metadata?.scope || "full"], ["修复轮次", report.metadata?.round ?? 0], ["问题总数", issues.length], ["未处置", view.unresolved?.length || 0]]),
     ] : [badge("尚未检查", "warning"), element("p", { className: "muted", text: "生成全稿后执行独立检查。" })]),
-    section("终稿策略", [badge("检查可跳过", "primary"), element("p", { className: "muted", text: "未检查、报告过期或仍有遗留问题时，确认框会明确记录状态，但不会阻断确定终稿。" })]),
+    section("终稿策略", [badge("发布前强制预检", "primary"), element("p", { className: "muted", text: "未检查或仍有遗留问题时仍可确定终稿并记录状态；但存在未处置阻断问题或报告过期时，交付页将禁止发布。" })]),
     section("全稿版本", [history, historyMessage]),
     section("检查历史", reportHistory(view)),
   ]);
@@ -89,59 +89,82 @@ function inspectionControls(view, defaultRounds, context) {
 
 function issueGroup(issues, active, context, preview, location) {
   if (!issues.length) return element("div", { className: "empty-state empty-state--compact" }, [element("p", { text: "本组暂无问题。" })]);
-  return element("div", { className: "issue-list" }, issues.map((issue) => issueCard(issue, active.get(issue.issue_id), context, preview, location, issues)));
+  return element("div", { className: "issue-list" }, groupIssues(issues).map((group, index) => issueGroupCard(group, active, context, preview, location, index)));
+}
+
+function groupIssues(issues) {
+  const groups = new Map();
+  issues.forEach((issue) => {
+    const key = `${issue.slide_id || ""}::${issue.code}`;
+    if (!groups.has(key)) groups.set(key, { slide: issue.slide_id, code: issue.code, severity: issue.severity, items: [] });
+    groups.get(key).items.push(issue);
+  });
+  return [...groups.values()];
+}
+
+function issueGroupCard(group, active, context, preview, location, index) {
+  const message = actionMessage();
+  const disposed = group.items.filter((issue) => ["manual", "waive", "resolve"].includes(active.get(issue.issue_id)?.action));
+  const action = element("select", { className: "select", id: `group-action-${index}` }, [
+    element("option", { value: "manual", text: "手工已处理" }),
+    element("option", { value: "waive", text: "接受 / 豁免" }),
+    element("option", { value: "defer", text: "暂不处理" }),
+  ]);
+  const rationale = element("input", { className: "input", id: `group-rationale-${index}`, placeholder: "说明处置依据（豁免时必填）" });
+  const save = button(`处置本组 ${group.items.length} 项`, { kind: "secondary", mutates: true });
+  save.addEventListener("click", () => {
+    runAction({ buttonNode: save, region: message, action: () => api.disposeIssues(context.taskId, { issue_ids: group.items.map((item) => item.issue_id), action: action.value, rationale: rationale.value }), success: `已处置 ${group.items.length} 个同类问题。`, refresh: context.refresh }).catch(() => {});
+  });
+  const summary = element("summary", { className: "issue-group__summary" }, [
+    badge(group.severity === "blocker" ? "阻断" : "警告", group.severity === "blocker" ? "danger" : "warning"),
+    element("strong", { text: `${group.slide || "整稿"} · ${group.code}` }),
+    element("span", { className: "muted", text: `${group.items.length} 项${disposed.length ? ` · 已处置 ${disposed.length}` : ""}` }),
+  ]);
+  return element("details", { className: "issue-group", open: index === 0 ? "open" : null }, [
+    summary,
+    element("div", { className: "issue-group__items" }, group.items.map((issue) => issueCard(issue, active.get(issue.issue_id), context, preview, location))),
+    element("div", { className: "form-grid" }, [field("处置动作", action), field("处置依据", rationale)]),
+    element("div", { className: "button-row" }, [save]),
+    message,
+  ]);
 }
 
 function readOnlyIssueGroup(issues, active, preview, location) {
   if (!issues.length) return element("div", { className: "empty-state empty-state--compact" }, [element("p", { text: "本组暂无问题。" })]);
-  return element("div", { className: "issue-list" }, issues.map((issue) => {
-    const disposition = active.get(issue.issue_id);
-    return element("article", { className: `issue-card issue-card--${issue.severity}` }, [
-      element("div", { className: "issue-card__header" }, [
-        element("div", {}, [badge(issue.severity === "blocker" ? "阻断" : "警告", issue.severity === "blocker" ? "danger" : "warning"), element("strong", { text: issue.message })]),
-        button("定位", { kind: "ghost", onClick: () => locateIssue(issue, preview, location) }),
-      ]),
-      metadataList([["级别", issue.level], ["位置", issue.slide_id ? `${issue.slide_id}${issue.element_id ? ` / ${issue.element_id}` : ""}` : "整稿"], ["问题 code", issue.code], ["证据", issue.evidence], ["建议", issue.suggestion]]),
-      disposition ? element("div", { className: "notice" }, [element("strong", { text: `已处置：${disposition.action}` }), element("p", { text: disposition.rationale })]) : element("p", { className: "muted", text: "终稿确认时未记录处置。" }),
-    ]);
-  }));
+  return element("div", { className: "issue-list" }, groupIssues(issues).map((group, index) => element("details", { className: "issue-group", open: index === 0 ? "open" : null }, [
+    element("summary", { className: "issue-group__summary" }, [
+      badge(group.severity === "blocker" ? "阻断" : "警告", group.severity === "blocker" ? "danger" : "warning"),
+      element("strong", { text: `${group.slide || "整稿"} · ${group.code}` }),
+      element("span", { className: "muted", text: `${group.items.length} 项` }),
+    ]),
+    element("div", { className: "issue-group__items" }, group.items.map((issue) => {
+      const disposition = active.get(issue.issue_id);
+      return element("article", { className: `issue-card issue-card--${issue.severity}` }, [
+        element("div", { className: "issue-card__header" }, [
+          element("div", {}, [element("strong", { text: issue.message })]),
+          button("定位", { kind: "ghost", onClick: () => locateIssue(issue, preview, location) }),
+        ]),
+        metadataList([["级别", issue.level], ["位置", issue.slide_id ? `${issue.slide_id}${issue.element_id ? ` / ${issue.element_id}` : ""}` : "整稿"], ["证据", issue.evidence], ["建议", issue.suggestion]]),
+        disposition ? element("div", { className: "notice" }, [element("strong", { text: `已处置：${disposition.action}` }), element("p", { text: disposition.rationale })]) : element("p", { className: "muted", text: "终稿确认时未记录处置。" }),
+      ]);
+    })),
+  ])));
 }
 
-function issueCard(issue, disposition, context, preview, location, group) {
+function issueCard(issue, disposition, context, preview, location) {
   const message = actionMessage();
-  const action = element("select", { className: "select", id: `issue-${issue.issue_id}-action` }, [
-    element("option", { value: "agent_fix", text: "Agent 修复", selected: disposition?.action === "agent_fix" }),
-    element("option", { value: "manual", text: "手工已处理", selected: disposition?.action === "manual" }),
-    element("option", { value: "waive", text: "接受 / 豁免", selected: disposition?.action === "waive" }),
-    element("option", { value: "defer", text: "暂不处理", selected: disposition?.action === "defer" }),
-  ]);
-  const rationale = element("input", { className: "input", id: `issue-${issue.issue_id}-rationale`, value: disposition?.rationale || "", placeholder: "说明处置依据（豁免时必填）" });
-  const save = button("保存处置", { kind: "secondary", mutates: true });
-  save.addEventListener("click", () => {
-    if (action.value === "agent_fix") {
-      context.startJob("inspection.fix", { issue_id: issue.issue_id, rationale: rationale.value }, { buttonNode: save, region: message });
-      return;
-    }
-    runAction({ buttonNode: save, region: message, action: () => api.disposeIssue(context.taskId, issue.issue_id, { action: action.value, rationale: rationale.value, actor: "user" }), success: "问题处置已记录。", refresh: context.refresh }).catch(() => {});
-  });
-  const batch = button("处置同 code 问题", { kind: "ghost", mutates: true });
-  const updateBatch = () => { batch.disabled = action.value === "agent_fix"; batch.title = batch.disabled ? "Agent 修复需逐项执行" : ""; };
-  action.addEventListener("change", updateBatch);
-  updateBatch();
-  batch.addEventListener("click", () => {
-    const ids = group.filter((item) => item.code === issue.code).map((item) => item.issue_id);
-    runAction({ buttonNode: batch, region: message, action: () => api.disposeIssues(context.taskId, { issue_ids: ids, action: action.value, rationale: rationale.value }), success: `已处置 ${ids.length} 个同类问题。`, refresh: context.refresh }).catch(() => {});
+  const fix = button("Agent 修复", { kind: "ghost", mutates: true });
+  fix.addEventListener("click", () => {
+    context.startJob("inspection.fix", { issue_id: issue.issue_id, rationale: disposition?.rationale || "" }, { buttonNode: fix, region: message });
   });
   const locate = button("定位", { kind: "ghost", onClick: () => locateIssue(issue, preview, location) });
   return element("article", { className: `issue-card issue-card--${issue.severity}` }, [
     element("div", { className: "issue-card__header" }, [
-      element("div", {}, [badge(issue.severity === "blocker" ? "阻断" : "警告", issue.severity === "blocker" ? "danger" : "warning"), element("strong", { text: issue.message })]),
-      locate,
+      element("div", {}, [element("strong", { text: issue.message })]),
+      element("div", { className: "button-row" }, [locate, fix]),
     ]),
-    metadataList([["级别", issue.level], ["位置", issue.slide_id ? `${issue.slide_id}${issue.element_id ? ` / ${issue.element_id}` : ""}` : "整稿"], ["问题 code", issue.code], ["证据", issue.evidence], ["建议", issue.suggestion]]),
+    metadataList([["级别", issue.level], ["位置", issue.slide_id ? `${issue.slide_id}${issue.element_id ? ` / ${issue.element_id}` : ""}` : "整稿"], ["证据", issue.evidence], ["建议", issue.suggestion]]),
     disposition ? element("div", { className: "notice" }, [element("strong", { text: `已处置：${disposition.action}` }), element("p", { text: disposition.rationale })]) : null,
-    element("div", { className: "form-grid" }, [field("处置动作", action), field("处置依据", rationale)]),
-    element("div", { className: "button-row" }, [save, batch]),
     message,
   ]);
 }
