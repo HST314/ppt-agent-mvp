@@ -28,6 +28,10 @@ def fingerprint(value): return hashlib.sha256(json.dumps(value,sort_keys=True,se
 INSPECTION_SOURCES=frozenset({"semantic_model","semantic_deterministic","technical_browser"})
 INSPECTION_SOURCE_PRIORITY={"semantic_model":0,"semantic_deterministic":1,"technical_browser":2}
 
+def inspection_hard_gate_passed(issues):
+    """Warnings remain reviewable findings without failing the hard gate."""
+    return not any(isinstance(item,dict) and item.get("severity")=="blocker" for item in issues)
+
 def inspection_semantic_identity(issue):
     """Return the server-owned identity for a finding, independent of source IDs."""
     level=issue.get("level") or ("element" if issue.get("element_id") else "slide" if issue.get("slide_id") else "deck")
@@ -1408,7 +1412,7 @@ class TaskService:
         if report_value is not None:
             if report_value.get("issues")!=expected_issues:
                 errors.append("检查报告 issue 集与 evidence payload 双向绑定不一致")
-            expected_passed=not expected_issues and all(bool(document["payload"].get("passed",not document["payload"].get("issues",[]))) for document in documents.values())
+            expected_passed=inspection_hard_gate_passed(expected_issues) and all(bool(document["payload"].get("passed",inspection_hard_gate_passed(document["payload"].get("issues",[])))) for document in documents.values())
             if report_value.get("passed") is not expected_passed:
                 errors.append("检查报告 passed 与 evidence payload 不一致")
             expected_sources={item["issue_id"]:list(item["sources"]) for item in expected_issues}
@@ -1425,13 +1429,21 @@ class TaskService:
                 if not isinstance(screenshots,list):
                     errors.append("视觉质量截图清单无效")
                     screenshots=[]
+                deck_hash=(report_value or report).get("deck_hash")
+                try:
+                    deck_record=next(item for item in self.versions(task_id,"deck") if item["hash"]==deck_hash)
+                    page_hashes=deck_record["metadata"].get("page_hashes")
+                    if not isinstance(page_hashes,dict) or not page_hashes: raise ValueError("deck page order is unavailable")
+                    expected_slides=list(page_hashes)
+                except (NotFoundError,StopIteration,TypeError,ValueError):
+                    errors.append("视觉质量截图缺少可验证的 deck 页面顺序")
+                    expected_slides=[]
                 try:
                     screenshot_records={item["hash"]:item for item in self.versions(task_id,"inspection-screenshot")}
                 except NotFoundError:
                     screenshot_records={}
-                declared_slides=[str(item.get("slide_id") or "") for item in browser_document["payload"].get("slides",[]) if isinstance(item,dict)]
                 seen_slides=[]
-                for item in screenshots:
+                for slide_index,item in enumerate(screenshots):
                     if not isinstance(item,dict):
                         errors.append("视觉质量截图引用无效")
                         continue
@@ -1445,15 +1457,18 @@ class TaskService:
                         raw=None
                     if (not re.fullmatch(r"[0-9a-f]{64}",screenshot_hash)
                         or evidence_ref!=f"inspection-screenshot://{screenshot_hash}"
+                        or item.get("deck_hash")!=deck_hash or item.get("slide_index")!=slide_index
                         or item.get("media_type")!="image/webp" or item.get("width")!=1280 or item.get("height")!=720
                         or raw is None or digest(raw)!=screenshot_hash or len(raw)!=item.get("byte_size")
                         or not raw.startswith(b"RIFF") or raw[8:12]!=b"WEBP"
-                        or record is None or record["metadata"]!={"deck_hash":(report_value or report).get("deck_hash"),"slide_id":slide_id,"media_type":"image/webp","immutable":True}):
+                        or record is None or record["metadata"]!={"media_type":"image/webp","immutable":True}):
                         errors.append(f"视觉质量截图哈希或绑定不一致:{slide_id or 'unknown'}")
                         continue
                     screenshot_hashes.append(screenshot_hash); seen_slides.append(slide_id); reference_count+=1
-                if screenshots and seen_slides!=declared_slides:
-                    errors.append("视觉质量截图与 Chromium 页面顺序不一致")
+                measured_slides=[str(item.get("slide_id") or "") for item in browser_document["payload"].get("slides",[]) if isinstance(item,dict)]
+                scored_slides=[str(item.get("slide_id") or "") for item in candidate.get("slides",[]) if isinstance(item,dict)] if isinstance(candidate,dict) else []
+                if seen_slides!=expected_slides or measured_slides!=expected_slides or scored_slides!=expected_slides:
+                    errors.append("视觉质量截图没有完整覆盖 deck 页面顺序")
         result={"valid":not errors,"reference_count":reference_count,"artifact_hashes":sorted(set(artifact_hashes)),"screenshot_hashes":sorted(set(screenshot_hashes)),"visual_quality":visual_quality,"errors":list(dict.fromkeys(errors))}
         if errors and fail_closed:
             raise ConflictError("检查报告与 evidence 溯源失败："+"；".join(errors[:3]))
@@ -1526,7 +1541,12 @@ class TaskService:
         )
         combined=merge_inspection_source_issues(sources)
         merged_counts={source:sum(source in item["sources"] for item in combined) for source,_ in sources}
-        browser_passed=True if browser_evidence is None else bool(browser_evidence.get("available")) and bool(browser_evidence.get("passed"))
+        browser_passed=True if browser_evidence is None else bool(browser_evidence.get("available")) and inspection_hard_gate_passed(browser_issues)
+        if isinstance(browser_evidence,dict):
+            # Reassert the server-owned hard-gate meaning even when a browser
+            # adapter reports ``passed=false`` solely because it emitted an
+            # advisory visual warning.
+            browser_evidence["passed"]=browser_passed
         checks={
             "semantic_deterministic":{"available":True,"passed":bool(content_evidence.get("passed")),"issue_count":merged_counts["semantic_deterministic"],"raw_issue_count":len(content_issues),"evidence_hash":fingerprint(content_evidence)},
             "semantic_model":{"available":True,"passed":bool(raw.get("passed",not model_issues)),"issue_count":merged_counts["semantic_model"],"raw_issue_count":len(model_issues),"model":raw.get("model","unknown")},
@@ -1541,7 +1561,7 @@ class TaskService:
         return {
             **raw,
             "issues":combined,
-            "passed":bool(raw.get("passed",not model_issues)) and bool(content_evidence.get("passed")) and browser_passed and not combined,
+            "passed":bool(raw.get("passed",not model_issues)) and bool(content_evidence.get("passed")) and browser_passed and inspection_hard_gate_passed(combined),
             "content_evidence":content_evidence,
             "quality_checks":checks,
             "evidence_documents":evidence_documents,
@@ -1559,25 +1579,38 @@ class TaskService:
         raw=prepared_raw if prepared_raw is not None else self._prepare_inspection_result(task_id,deck)
         visual_screenshots=raw.pop("_visual_screenshots",[])
         browser_payload=raw.get("browser_evidence")
-        if visual_screenshots:
-            if not isinstance(browser_payload,dict) or not isinstance(browser_payload.get("visual_quality"),dict):
+        visual_quality=browser_payload.get("visual_quality") if isinstance(browser_payload,dict) else None
+        if visual_quality is not None:
+            if not isinstance(visual_quality,dict) or not isinstance(visual_screenshots,list):
                 raise ValidationError("视觉质量截图缺少 Chromium 评分绑定")
-            declared={item.get("slide_id"):item for item in browser_payload["visual_quality"].get("screenshots",[]) if isinstance(item,dict)}
-            references=[]
-            for item in visual_screenshots:
-                if not isinstance(item,dict) or not isinstance(item.get("content"),(bytes,bytearray)):
+            declared=visual_quality.get("screenshots")
+            page_order=list(deck["metadata"]["page_hashes"])
+            if (not isinstance(declared,list) or len(declared)!=len(page_order)
+                or len(visual_screenshots)!=len(page_order)):
+                raise ValidationError("视觉质量截图没有完整覆盖候选页面顺序")
+            candidates=[]
+            for slide_index,(expected,item) in enumerate(zip(declared,visual_screenshots)):
+                slide_id=page_order[slide_index]
+                if (not isinstance(expected,dict) or not isinstance(item,dict)
+                    or not isinstance(item.get("content"),(bytes,bytearray))):
                     raise ValidationError("视觉质量截图内容无效")
-                slide_id=str(item.get("slide_id") or ""); content=bytes(item["content"]); expected=declared.get(slide_id)
-                if (not slide_id or slide_id not in deck["metadata"]["page_hashes"] or expected is None
+                content=bytes(item["content"])
+                if (str(expected.get("slide_id") or "")!=slide_id or str(item.get("slide_id") or "")!=slide_id
                     or expected.get("media_type")!="image/webp" or expected.get("width")!=1280 or expected.get("height")!=720
                     or expected.get("sha256")!=digest(content) or expected.get("byte_size")!=len(content)
                     or not content.startswith(b"RIFF") or content[8:12]!=b"WEBP"):
                     raise ValidationError("视觉质量截图哈希、格式或候选绑定无效")
-                screenshot_hash=self.store.put_version(task_id,"inspection-screenshot",content,{"deck_hash":deck["hash"],"slide_id":slide_id,"media_type":"image/webp","immutable":True})
-                references.append({**expected,"evidence_ref":f"inspection-screenshot://{screenshot_hash}"})
-            if [item["slide_id"] for item in references]!=list(deck["metadata"]["page_hashes"]):
-                raise ValidationError("视觉质量截图没有完整覆盖候选页面顺序")
-            browser_payload["visual_quality"]["screenshots"]=references
+                candidates.append((slide_index,slide_id,expected,content))
+            references=[]
+            for slide_index,slide_id,expected,content in candidates:
+                # The artifact metadata describes the bytes only.  Deck/page
+                # identity belongs to the immutable reference in the evidence
+                # document so identical screenshots can be shared by pages.
+                screenshot_hash=self.store.put_version(task_id,"inspection-screenshot",content,{"media_type":"image/webp","immutable":True})
+                references.append({**expected,"deck_hash":deck["hash"],"slide_index":slide_index,"evidence_ref":f"inspection-screenshot://{screenshot_hash}"})
+            visual_quality["screenshots"]=references
+        elif visual_screenshots:
+            raise ValidationError("视觉质量截图缺少 Chromium 评分绑定")
         documents=raw.get("evidence_documents")
         if not isinstance(documents,list):
             model_issues=raw.get("issues",[])
@@ -1605,7 +1638,7 @@ class TaskService:
             source_issues=[{**origin,"evidence_ref":evidence_refs[origin["source"]]} for origin in origins]
             enriched.append({**item,"sources":sources,"evidence_refs":list(dict.fromkeys(origin["evidence_ref"] for origin in source_issues)),"source_issues":source_issues})
         issues=self._normalize_inspection_issues(enriched)
-        passed=not issues and all(bool(document["payload"].get("passed",not document["payload"].get("issues",[]))) for document in documents)
+        passed=inspection_hard_gate_passed(issues) and all(bool(document["payload"].get("passed",inspection_hard_gate_passed(document["payload"].get("issues",[])))) for document in documents)
         evidence_artifacts={source:ref.removeprefix("inspection-evidence://") for source,ref in evidence_refs.items()}
         created=utcnow(); seed=canonical({"deck_hash":deck["hash"],"issues":issues,"evidence_artifacts":evidence_artifacts,"created_at":created})
         report=InspectionReport.parse({"report_id":f"report-{digest(seed)[:16]}","task_id":task_id,"deck_hash":deck["hash"],"issues":issues,"passed":passed,"created_at":created,"evidence_artifacts":evidence_artifacts,"schema_version":"1.0"})

@@ -4,6 +4,7 @@ import hashlib
 import http.client
 import ipaddress
 import json
+import posixpath
 import re
 import socket
 import ssl
@@ -11,7 +12,7 @@ import stat
 import zipfile
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit
 
 from .errors import ValidationError
 from .p4 import CSS_URL, IMAGE_MEDIA_TYPES, _valid_image_bytes, validate_image_url
@@ -141,6 +142,41 @@ class _ImageReferences(HTMLParser):
     def handle_data(self, data):
         if self.in_style:
             self.urls.extend(_css_image_urls(data))
+
+
+class _ScriptSources(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.sources: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != "script":
+            return
+        values = {str(name).lower(): value or "" for name, value in attrs}
+        if values.get("src"):
+            self.sources.append(values["src"].strip())
+
+    handle_startendtag = handle_starttag
+
+
+def _normalized_local_script_path(value: str) -> str | None:
+    """Normalize a browser-local script URL while ignoring query/fragment."""
+    candidate=value.strip()
+    try:
+        parsed=urlsplit(candidate)
+    except ValueError:
+        return None
+    if not candidate or parsed.scheme or parsed.netloc or candidate.startswith("//"):
+        return None
+    path=unquote(parsed.path).replace("\\","/")
+    if path.startswith("/"):
+        return None
+    return posixpath.normpath(path)
+
+
+def _script_reference_count(html_text: str, asset_path: str) -> int:
+    parser=_ScriptSources(); parser.feed(html_text); parser.close()
+    return sum(_normalized_local_script_path(value)==asset_path for value in parser.sources)
 
 
 def _css_image_urls(source: str) -> list[str]:
@@ -429,7 +465,7 @@ body.offline-player{overflow:hidden}.offline-player .slide{display:none;margin:0
 #offline-controls button:active{background:#ffffff2e}#offline-controls button:focus-visible{outline:3px solid #fff;outline-offset:2px}
 #offline-controls button:disabled{opacity:.35;cursor:not-allowed}#offline-page{min-width:64px;text-align:center}
 </style>"""
-    motion = "" if re.search(r"<script\b[^>]*\bsrc\s*=\s*(['\"])(?:\./)?assets/motion\.min\.js\1", deck_html, re.I) else '<script src="assets/motion.min.js"></script>\n'
+    motion = "" if _script_reference_count(deck_html,"assets/motion.min.js") else '<script src="assets/motion.min.js"></script>\n'
     body = """<nav id="offline-controls" aria-label="幻灯片导航"><button id="offline-prev" type="button" aria-label="上一页">&#8592;</button><output id="offline-page" aria-live="polite"></output><button id="offline-next" type="button" aria-label="下一页">&#8594;</button></nav>
 %s<script src="assets/offline-player.js"></script>""" % motion
     lower = deck_html.lower()
@@ -446,8 +482,8 @@ def offline_assets() -> dict[str, bytes]:
 
 def offline_performance(index_html: str, assets: dict[str, bytes]) -> dict:
     """Return reproducible delivery-time budgets for the local player shell."""
-    motion_references = len(re.findall(r"<script\b[^>]*\bsrc\s*=\s*['\"](?:\./)?assets/motion\.min\.js['\"]", index_html, re.I))
-    player_references = len(re.findall(r"<script\b[^>]*\bsrc\s*=\s*['\"](?:\./)?assets/offline-player\.js['\"]", index_html, re.I))
+    motion_references = _script_reference_count(index_html,"assets/motion.min.js")
+    player_references = _script_reference_count(index_html,"assets/offline-player.js")
     player_bytes = len(assets.get("assets/offline-player.js", b""))
     javascript_bytes = sum(len(content) for name,content in assets.items() if name.endswith((".js",".mjs")))
     runtime_shell_bytes = len(index_html.encode()) + javascript_bytes

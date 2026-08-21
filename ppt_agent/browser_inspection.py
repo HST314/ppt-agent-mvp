@@ -180,7 +180,10 @@ class ChromiumDeckInspector:
             visual["screenshots"] = screenshots
         result = {
             "available": True,
-            "passed": not issues,
+            # Visual-quality findings are advisory.  Keep them in ``issues``
+            # for review, but do not let a warning rewrite the technical hard
+            # gate's pass/fail result.
+            "passed": not any(item.get("severity") == "blocker" for item in issues),
             "engine": "chromium",
             "engine_version": raw["engine_version"],
             "viewport": dict(VIEWPORT),

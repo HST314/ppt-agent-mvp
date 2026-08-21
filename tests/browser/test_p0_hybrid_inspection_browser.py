@@ -119,6 +119,7 @@ class P0HybridInspectionBrowserGate(unittest.TestCase):
         codes = {item["code"] for item in evidence["issues"]}
         self.assertTrue({"excessive_whitespace", "visual_imbalance", "repetitive_layout", "flat_theme_rhythm"}.issubset(codes))
         self.assertTrue(all(item["severity"] == "warning" for item in evidence["issues"]))
+        self.assertTrue(evidence["passed"], "advisory warnings must not fail the technical hard gate")
 
 
 if __name__ == "__main__":
