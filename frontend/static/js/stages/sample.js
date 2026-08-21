@@ -1,6 +1,6 @@
-import { api } from "../api.js?v=2026.08.21.075744095363";
-import { badge, button, element, field, metadataList, previewFrame, previewUrl, shortHash, versionTimeline } from "../components/index.js?v=2026.08.21.075744095363";
-import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.21.075744095363";
+import { api } from "../api.js?v=2026.08.21.105223646308";
+import { badge, button, element, field, metadataList, previewFrame, previewUrl, shortHash, versionTimeline } from "../components/index.js?v=2026.08.21.105223646308";
+import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.21.105223646308";
 
 export async function render(context) {
   const [view, planning] = await Promise.all([

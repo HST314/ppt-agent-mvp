@@ -510,14 +510,80 @@ class _SafeHtmlParser(HTMLParser):
             self.slide_ids.append(values["data-slide-id"])
 
 
-def recommend(markdown: str, count: int = 2):
+def recommend(markdown: str, count: int = 2, slide_contracts: list[dict] | None = None):
+    """Choose a representative, diverse sample instead of the longest pages.
+
+    A two-page automatic sample always contains the visual cover/hero and the
+    strongest information-bearing non-cover page.  Additional slots are filled
+    greedily for layout, role and resource diversity.  The score is deliberately
+    deterministic so a frozen outline and DesignContract always produce the same
+    selection and auditable reasons.
+    """
     slides = [(m.group(1), m.group(2)) for m in SLIDE.finditer(markdown)]
     if not slides:
         raise ValidationError("逐页大纲不包含有效页面")
     count = max(1, min(count, len(slides)))
-    ranked = sorted(enumerate(slides), key=lambda x: (-(len(x[1]) + 40 * ("resources://" in x[1])), -x[0]))
-    chosen = sorted(ranked[:count], key=lambda x: x[0])
-    return [x[1][0] for x in chosen], {x[1][0]: "覆盖主要内容与资源版式" for x in chosen}
+    contracts = {item.get("slide_id"): item for item in (slide_contracts or []) if isinstance(item, dict)}
+    if slide_contracts is not None and (len(contracts) != len(slides) or set(contracts) != {sid for sid, _ in slides}):
+        raise ValidationError("样品推荐所用 DesignContract 页面范围不完整或重复")
+
+    candidates = []
+    for index, (slide_id, body) in enumerate(slides):
+        contract = contracts.get(slide_id, {})
+        role = str(contract.get("visual_role") or ("cover" if index == 0 else "closing" if index == len(slides) - 1 else "body"))
+        layout = str(contract.get("layout_id") or "unregistered")
+        resource_count = len(re.findall(r"resources://[A-Za-z0-9_.\-/]+", body))
+        structural_count = len(re.findall(r"(?m)^\s*(?:[-*+]\s|\d+[.)]\s|\|)", body))
+        numeric_count = len(re.findall(r"(?<![A-Za-z])\d+(?:\.\d+)?%?", body))
+        decision_count = len(re.findall(r"风险|决策|取舍|预算|指标|里程碑|流程|架构|数据", body, re.I))
+        visible_length = len(re.sub(r"\s+", "", body))
+        density = visible_length + structural_count * 24 + numeric_count * 18 + decision_count * 32 + resource_count * 48
+        candidates.append({
+            "index": index,
+            "slide_id": slide_id,
+            "role": role,
+            "layout": layout,
+            "density": density,
+            "resource_count": resource_count,
+            "decision_count": decision_count,
+        })
+
+    cover = next((item for item in candidates if item["role"] in {"cover", "hero"}), candidates[0])
+    selected = [cover]
+    while len(selected) < count:
+        selected_ids = {item["slide_id"] for item in selected}
+        selected_layouts = {item["layout"] for item in selected}
+        selected_roles = {item["role"] for item in selected}
+        selected_resource_roles = {bool(item["resource_count"]) for item in selected}
+        remaining = [item for item in candidates if item["slide_id"] not in selected_ids]
+        if not remaining:
+            break
+        ranked = sorted(
+            remaining,
+            key=lambda item: (
+                -(item["density"]
+                  + (180 if item["layout"] not in selected_layouts else 0)
+                  + (140 if item["role"] not in selected_roles else 0)
+                  + (100 if bool(item["resource_count"]) not in selected_resource_roles else 0)
+                  + (80 if item["decision_count"] else 0)
+                  - (120 if item["role"] == "closing" and len(selected) == 1 else 0)),
+                item["index"],
+            ),
+        )
+        selected.append(ranked[0])
+
+    chosen = sorted(selected, key=lambda item: item["index"])
+    reasons = {}
+    for item in chosen:
+        if item["slide_id"] == cover["slide_id"]:
+            reasons[item["slide_id"]] = f"代表封面/hero；visual_role={item['role']}；layout_id={item['layout']}"
+        else:
+            resource_role = "有资源" if item["resource_count"] else "无资源"
+            reasons[item["slide_id"]] = (
+                f"高信息与版式多样性；visual_role={item['role']}；layout_id={item['layout']}；"
+                f"density={item['density']}；resource_role={resource_role}"
+            )
+    return [item["slide_id"] for item in chosen], reasons
 
 
 def controlled_assets(manifest: dict, resource_root):

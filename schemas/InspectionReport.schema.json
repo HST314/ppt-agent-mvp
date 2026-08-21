@@ -80,6 +80,30 @@
             "type": "string",
             "minLength": 1,
             "pattern": "^[\\s\\S]*\\S[\\s\\S]*$"
+          },
+          "source": {
+            "title": "source",
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[\\s\\S]*\\S[\\s\\S]*$"
+          },
+          "sources": {
+            "title": "sources",
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[\\s\\S]*\\S[\\s\\S]*$"
+            }
+          },
+          "evidence_refs": {
+            "title": "evidence_refs",
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[\\s\\S]*\\S[\\s\\S]*$"
+            }
           }
         },
         "required": [

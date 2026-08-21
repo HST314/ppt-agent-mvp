@@ -100,6 +100,13 @@ class InspectionPageBrowserTests(InspectionPageBrowserBase):
         first = groups.first
         self.assertEqual(first.get_by_label("处置动作").count(), 1)
 
+    def test_issue_sources_and_content_addressed_evidence_are_visible(self):
+        summary = self.page.get_by_role("heading", name="检查摘要", exact=True).locator("xpath=../../..").first
+        self.assertIn("完整", summary.inner_text())
+        issue = self.page.locator(".issue-card").first
+        self.assertIn("semantic_model", issue.inner_text())
+        self.assertNotIn("证据引用\n缺失", issue.inner_text())
+
     def test_mixed_severity_group_form_ids_unique_and_labels_resolve(self):
         groups = self.page.locator(".issue-group")
         groups.first.wait_for()

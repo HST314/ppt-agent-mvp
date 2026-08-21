@@ -1,7 +1,7 @@
-import { api } from "../api.js?v=2026.08.21.075744095363";
-import { badge, button, confirmationDialog, element, field, metadataList, shortHash, versionTimeline } from "../components/index.js?v=2026.08.21.075744095363";
-import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.21.075744095363";
-import { comparePanel, deckPreview, modificationPanel } from "./deck.js?v=2026.08.21.075744095363";
+import { api } from "../api.js?v=2026.08.21.105223646308";
+import { badge, button, confirmationDialog, element, field, metadataList, shortHash, versionTimeline } from "../components/index.js?v=2026.08.21.105223646308";
+import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.21.105223646308";
+import { comparePanel, deckPreview, modificationPanel } from "./deck.js?v=2026.08.21.105223646308";
 
 export async function render(context) {
   const [view, deckView, settings] = await Promise.all([api.inspection(context.taskId, context.controller), api.deck(context.taskId, context.controller), api.settings(context.controller)]);
@@ -36,7 +36,7 @@ function reviewStage(view, deckView, defaultRounds, context) {
   ], [
     section("检查摘要", report ? [
       badge(report.stale ? "报告过期" : report.passed ? "检查通过" : "需要处置", report.stale ? "warning" : report.passed ? "success" : "danger"),
-      metadataList([["报告 hash", shortHash(report.hash)], ["候选 hash", shortHash(report.deck_hash)], ["检查范围", report.metadata?.scope || "full"], ["修复轮次", report.metadata?.round ?? 0], ["问题总数", issues.length], ["未处置", view.unresolved?.length || 0]]),
+      metadataList([["报告 hash", shortHash(report.hash)], ["候选 hash", shortHash(report.deck_hash)], ["检查范围", report.metadata?.scope || "full"], ["修复轮次", report.metadata?.round ?? 0], ["问题总数", issues.length], ["未处置", view.unresolved?.length || 0], ["证据溯源", view.evidence_trace?.valid ? `完整 · ${view.evidence_trace.reference_count} 条引用` : "缺失或失配"]]),
     ] : [badge("尚未检查", "warning"), element("p", { className: "muted", text: "生成全稿后执行独立检查。" })]),
     section("终稿策略", [badge("发布前强制预检", "primary"), element("p", { className: "muted", text: "存在未处置阻断问题时禁止默认定稿，只能显式选择带风险定稿并留痕；未检查、报告过期或仅剩警告时仍可确定终稿并记录状态；发布离线包始终要求新鲜报告且阻断清零。" })]),
     section("全稿版本", [history, historyMessage]),
@@ -208,7 +208,7 @@ function readOnlyIssueGroup(issues, active, preview, location) {
           element("div", {}, [element("strong", { text: issue.message })]),
           button("定位", { kind: "ghost", onClick: () => locateIssue(issue, preview, location) }),
         ]),
-        metadataList([["级别", issue.level], ["位置", issue.slide_id ? `${issue.slide_id}${issue.element_id ? ` / ${issue.element_id}` : ""}` : "整稿"], ["证据", issue.evidence], ["建议", issue.suggestion]]),
+        metadataList(issueMetadata(issue)),
         disposition ? element("div", { className: "notice" }, [element("strong", { text: `已处置：${disposition.action}` }), element("p", { text: disposition.rationale })]) : element("p", { className: "muted", text: "终稿确认时未记录处置。" }),
       ]);
     })),
@@ -227,10 +227,16 @@ function issueCard(issue, disposition, context, preview, location) {
       element("div", {}, [element("strong", { text: issue.message })]),
       element("div", { className: "button-row" }, [locate, fix]),
     ]),
-    metadataList([["级别", issue.level], ["位置", issue.slide_id ? `${issue.slide_id}${issue.element_id ? ` / ${issue.element_id}` : ""}` : "整稿"], ["证据", issue.evidence], ["建议", issue.suggestion]]),
+    metadataList(issueMetadata(issue)),
     disposition ? element("div", { className: "notice" }, [element("strong", { text: `已处置：${disposition.action}` }), element("p", { text: disposition.rationale })]) : null,
     message,
   ]);
+}
+
+function issueMetadata(issue) {
+  const sources = issue.sources?.length ? issue.sources : [issue.source || "semantic_model"];
+  const references = (issue.evidence_refs || []).map((ref) => shortHash(ref.split("//").pop())).join(", ") || "缺失";
+  return [["级别", issue.level], ["位置", issue.slide_id ? `${issue.slide_id}${issue.element_id ? ` / ${issue.element_id}` : ""}` : "整稿"], ["来源", sources.join(" + ")], ["证据", issue.evidence], ["证据引用", references], ["建议", issue.suggestion]];
 }
 
 function locateIssue(issue, wrapper, location) {

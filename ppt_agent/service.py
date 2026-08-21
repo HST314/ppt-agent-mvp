@@ -312,7 +312,16 @@ class TaskService:
                 style="minimal",
             )
         return self._clarification_config
-    def get(self,task_id): return self.store.checkpoint(task_id)
+    def get(self,task_id):
+        state=self.store.checkpoint(task_id)
+        # ``blockers_resolved`` is a compatibility field, not an independent
+        # mutable truth.  Once inspection exists it is projected exclusively
+        # from the current deck/report/disposition lineage, so every API view
+        # agrees even after a deck edit makes the prior report stale.
+        projection=self._inspection_projection(task_id)
+        if projection["has_reports"]:
+            state={**state,"blockers_resolved":projection["blockers_resolved"]}
+        return state
     def _require_actionable(self,task_id):
         status=self.get(task_id)["status"]
         if status in {"paused","cancelled","failed","completed"}: raise ConflictError(f"任务状态 {status} 不允许启动新动作")
@@ -322,6 +331,32 @@ class TaskService:
         if state.stage not in {state.stage.DECK,state.stage.REVIEW}:
             raise ConflictError("当前阶段的候选全稿不可修改；如需调整，请从已交付版本显式派生新候选")
         return state
+
+    def _inspection_projection(self,task_id):
+        deck_hash=self._current_version(task_id,"deck")
+        reports=self.versions(task_id,"inspection")
+        current=None
+        if reports:
+            record=max(reports,key=lambda item:json.loads(self.version(task_id,item["hash"]))["created_at"])
+            value=json.loads(self.version(task_id,record["hash"]))
+            current={**value,"hash":record["hash"],"metadata":record["metadata"],"stale":not deck_hash or value["deck_hash"]!=deck_hash}
+        dispositions=[]
+        for record in self.versions(task_id,"issue-disposition"):
+            value=json.loads(self.version(task_id,record["hash"]))
+            dispositions.append({**value,"hash":record["hash"],"metadata":record["metadata"],"stale":not deck_hash or value["target_deck_hash"]!=deck_hash})
+        active={}
+        for disposition in sorted((item for item in dispositions if not item["stale"]),key=lambda item:(item["metadata"].get("sequence",0),item["created_at"],item["hash"])):
+            active[disposition["issue_id"]]=disposition
+        unresolved=[] if not current or current["stale"] else [
+            issue for issue in current["issues"]
+            if active.get(issue["issue_id"],{}).get("action") not in {"resolve","manual","waive"}
+        ]
+        blockers=[issue for issue in unresolved if issue["severity"]=="blocker"]
+        return {
+            "has_reports":bool(reports),"report":current,"reports":reports,
+            "dispositions":dispositions,"unresolved":unresolved,"blocking_issues":blockers,
+            "blockers_resolved":bool(current and not current["stale"] and not blockers),
+        }
     def _candidate_write_token(self,task_id,allowed_stages=None):
         """Capture the state which a prepared deck candidate is allowed to replace."""
         with self.store.lock(task_id):
@@ -934,18 +969,20 @@ class TaskService:
         if self._confirmed_outline_hash(task_id) != outline: raise ConflictError("须先确认当前版本逐页大纲")
         data=json.loads(self.version(task_id,outline)); valid=list(data["slide_ids"])
         contract,ledger=self._generation_contracts(task_id,outline)
-        if slide_ids is None: slide_ids,reasons=recommend(data["markdown"],count)
+        automatic_selection=slide_ids is None
+        if automatic_selection: slide_ids,reasons=recommend(data["markdown"],count,contract["slide_contracts"])
         else:
             if not isinstance(slide_ids,list) or not slide_ids or len(slide_ids)>len(valid) or len(set(slide_ids))!=len(slide_ids) or any(x not in valid for x in slide_ids): raise ValidationError("样品页面选择无效或重复")
             reasons={sid:"用户选择" for sid in slide_ids}
         seed=canonical({"outline_hash":outline,"slide_ids":slide_ids}); model=SampleSelection.parse({"selection_id":f"selection-{digest(seed)[:16]}","task_id":task_id,"outline_hash":outline,"slide_ids":slide_ids,"confirmed":False,"schema_version":"1.0"})
-        h=self.store.put_version(task_id,"sample-selection",canonical(model.to_dict()),{"reasons":reasons,"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"]})
+        selection_metadata={"reasons":reasons,"strategy":"representative-diversity-v1" if automatic_selection else "user-selected","design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"]}
+        h=self.store.put_version(task_id,"sample-selection",canonical(model.to_dict()),selection_metadata)
         state=TaskState.parse(self.get(task_id))
         new=(TaskState(**{**state.__dict__,"sample_confirmed":False,"status":state.status.WAITING_FOR_USER,"waiting_reason":"manual_gate","required_action":"confirm_sample","revision":state.revision+1})
              if state.sample_confirmed else TaskState(**{**state.__dict__,"revision":state.revision+1}))
-        event={"event_id":hashlib.sha256(f"{task_id}:select-samples:{h}:{state.revision}".encode()).hexdigest()[:24],"command_id":f"select-samples-{h[:16]}-{state.revision}","action":"select_samples","actor":"user" if slide_ids is not None else "system","request_hash":h,"at":utcnow(),"from":state.to_dict(),"to":new.to_dict(),"result":{"hash":h,"invalidated":["sample_confirmation","deck"] if state.sample_confirmed else []}}
+        event={"event_id":hashlib.sha256(f"{task_id}:select-samples:{h}:{state.revision}".encode()).hexdigest()[:24],"command_id":f"select-samples-{h[:16]}-{state.revision}","action":"select_samples","actor":"system" if automatic_selection else "user","request_hash":h,"at":utcnow(),"from":state.to_dict(),"to":new.to_dict(),"result":{"hash":h,"invalidated":["sample_confirmation","deck"] if state.sample_confirmed else []}}
         self.store.commit(task_id,new.to_dict(),event)
-        return {**self.sample_view(task_id),"selection":{**model.to_dict(),"hash":h,"metadata":{"reasons":reasons,"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"]}}}
+        return {**self.sample_view(task_id),"selection":{**model.to_dict(),"hash":h,"metadata":selection_metadata}}
     def generate_sample(self,task_id,prompt=None):
         from .execution import progress
         self._require_actionable(task_id)
@@ -1173,21 +1210,19 @@ class TaskService:
         return self._commit_candidate_deck(task_id,meta["html"],target["outline_hash"],{"parent":token["parent_deck_hash"],"rollback_from":target_hash,"summary":f"回退自 {target_hash[:12]}","scope":"global","affected":list(meta["page_hashes"]),"outline_consistent":not inconsistent,"regenerate_required":list(meta["page_hashes"]) if inconsistent else [],"global_rules":meta.get("global_rules",[]),"local_exceptions":meta.get("local_exceptions",{}),"design_contract_hash":meta.get("design_contract_hash"),"claim_ledger_hash":meta.get("claim_ledger_hash"),"post_render_gate":meta.get("post_render_gate")},"deck_rollback",token,"user")
 
     def inspection_view(self,task_id):
-        deck=self.deck_view(task_id)["deck"]; reports=self.versions(task_id,"inspection")
-        current=None
-        if reports:
-            record=max(reports,key=lambda r:json.loads(self.version(task_id,r["hash"]))["created_at"]); model=json.loads(self.version(task_id,record["hash"]))
-            current={**model,"hash":record["hash"],"metadata":record["metadata"],"stale":not deck or model["deck_hash"]!=deck["hash"]}
-        dispositions=[]
-        for record in self.versions(task_id,"issue-disposition"):
-            value=json.loads(self.version(task_id,record["hash"]))
-            dispositions.append({**value,"hash":record["hash"],"metadata":record["metadata"],"stale":not deck or value["target_deck_hash"]!=deck["hash"]})
-        active={}
-        for disposition in sorted((d for d in dispositions if not d["stale"]),key=lambda d:(d["metadata"].get("sequence",0),d["created_at"],d["hash"])):
-            active[disposition["issue_id"]]=disposition
-        unresolved=[] if not current or current["stale"] else [i for i in current["issues"] if active.get(i["issue_id"],{}).get("action") not in {"resolve","manual","waive"}]
-        blockers=[i for i in unresolved if i["severity"]=="blocker"]
-        return {"state":self.get(task_id),"deck":deck,"report":current,"reports":reports,"dispositions":dispositions,"unresolved":unresolved,"blocking_issues":blockers,"delivery_allowed":bool(current and not current["stale"] and not blockers),"waiting_reason":self.get(task_id).get("waiting_reason")}
+        deck=self.deck_view(task_id)["deck"]
+        projection=self._inspection_projection(task_id); current=projection["report"]
+        evidence_trace={"valid":False,"reference_count":0,"artifact_hashes":[],"errors":["尚无当前检查报告"]}
+        if current and not current["stale"]:
+            evidence_trace=self._assert_inspection_evidence(task_id,current,fail_closed=False)
+        state=self.get(task_id)
+        return {
+            "state":state,"deck":deck,"report":current,"reports":projection["reports"],
+            "dispositions":projection["dispositions"],"unresolved":projection["unresolved"],
+            "blocking_issues":projection["blocking_issues"],
+            "delivery_allowed":bool(current and not current["stale"] and not projection["blocking_issues"] and evidence_trace["valid"]),
+            "evidence_trace":evidence_trace,"waiting_reason":state.get("waiting_reason"),
+        }
 
     @staticmethod
     def _normalize_inspection_issues(items):
@@ -1195,8 +1230,68 @@ class TaskService:
         for index,item in enumerate(items):
             if not isinstance(item,dict): raise ValidationError("检查报告 issue 必须是对象")
             level=item.get("level") or ("element" if item.get("element_id") else "slide" if item.get("slide_id") else "deck")
-            normalized.append({"issue_id":item.get("issue_id") or f"issue-{index+1}","severity":item.get("severity","warning"),"level":level,"code":item.get("code","quality_issue"),"message":item.get("message","发现质量问题"),"slide_id":item.get("slide_id","") or "","element_id":item.get("element_id","") or "","evidence":item.get("evidence",item.get("message","发现质量问题")),"suggestion":item.get("suggestion","请人工检查并修复"),"source":item.get("source","semantic_model")})
+            source=item.get("source","semantic_model")
+            sources=list(dict.fromkeys(item.get("sources") or [source]))
+            evidence_refs=list(dict.fromkeys(item.get("evidence_refs") or []))
+            normalized.append({"issue_id":item.get("issue_id") or f"issue-{index+1}","severity":item.get("severity","warning"),"level":level,"code":item.get("code","quality_issue"),"message":item.get("message","发现质量问题"),"slide_id":item.get("slide_id","") or "","element_id":item.get("element_id","") or "","evidence":item.get("evidence",item.get("message","发现质量问题")),"suggestion":item.get("suggestion","请人工检查并修复"),"source":source,"sources":sources,"evidence_refs":evidence_refs})
         return normalized
+
+    def _assert_inspection_evidence(self,task_id,report,fail_closed=True):
+        errors=[]; artifact_hashes=[]; reference_count=0; cache={}
+        try:
+            records={item["hash"]:item for item in self.versions(task_id,"inspection-evidence")}
+        except NotFoundError:
+            records={}
+        def resolve(evidence_hash,label):
+            if evidence_hash in cache: return cache[evidence_hash]
+            record=records.get(evidence_hash)
+            try:
+                raw=self.version(task_id,evidence_hash); value=json.loads(raw)
+            except (NotFoundError,json.JSONDecodeError,UnicodeDecodeError):
+                errors.append(f"{label}:evidence 工件缺失或无效"); cache[evidence_hash]=None; return None
+            source=value.get("source")
+            if (record is None or digest(raw)!=evidence_hash or raw!=canonical(value)
+                or value.get("schema_version")!="1.0" or value.get("deck_hash")!=report.get("deck_hash")
+                or source not in {"semantic_model","semantic_deterministic","technical_browser"}
+                or record["metadata"].get("source")!=source or record["metadata"].get("deck_hash")!=report.get("deck_hash")):
+                errors.append(f"{label}:evidence 哈希或绑定不一致"); cache[evidence_hash]=None; return None
+            cache[evidence_hash]=source; return source
+
+        declared=report.get("metadata",{}).get("evidence_artifacts")
+        if not isinstance(declared,dict) or not declared:
+            errors.append("报告缺少 evidence_artifacts 清单")
+            declared={}
+        for source,evidence_hash in declared.items():
+            if source not in {"semantic_model","semantic_deterministic","technical_browser"} or not re.fullmatch(r"[0-9a-f]{64}",str(evidence_hash)):
+                errors.append("报告 evidence_artifacts 清单格式无效")
+                continue
+            artifact_hashes.append(evidence_hash)
+            if resolve(evidence_hash,"报告")!=source:
+                errors.append(f"报告:{source} evidence 绑定不一致")
+        for issue in report.get("issues",[]):
+            sources=list(issue.get("sources") or [issue.get("source","semantic_model")])
+            refs=list(issue.get("evidence_refs") or [])
+            resolved_sources=set()
+            if not refs:
+                errors.append(f"{issue.get('issue_id','unknown')}:缺少 evidence_refs")
+            for ref in refs:
+                reference_count+=1
+                match=re.fullmatch(r"inspection-evidence://([0-9a-f]{64})",str(ref))
+                if not match:
+                    errors.append(f"{issue.get('issue_id','unknown')}:evidence 引用格式无效")
+                    continue
+                evidence_hash=match.group(1); artifact_hashes.append(evidence_hash)
+                source=resolve(evidence_hash,issue.get("issue_id","unknown"))
+                if source: resolved_sources.add(source)
+                if declared.get(source)!=evidence_hash:
+                    errors.append(f"{issue.get('issue_id','unknown')}:evidence 未登记在报告清单")
+            missing=set(sources)-resolved_sources
+            if missing:
+                errors.append(f"{issue.get('issue_id','unknown')}:来源缺少 evidence：{','.join(sorted(missing))}")
+        result={"valid":not errors,"reference_count":reference_count,"artifact_hashes":sorted(set(artifact_hashes)),"errors":list(dict.fromkeys(errors))}
+        if errors and fail_closed:
+            raise ConflictError("检查问题 evidence 溯源失败："+"；".join(errors[:3]))
+        return result
 
     def _call_inspector(self,outline,html_text,browser_evidence):
         method=self.inspector.inspect
@@ -1247,7 +1342,7 @@ class TaskService:
         if not isinstance(model_issues,list): raise ValidationError("检查响应 issues 必须是数组")
         browser_issues=(browser_evidence or {}).get("issues",[])
         content_issues=content_evidence.get("issues",[])
-        combined=[]; seen=set()
+        combined=[]; by_identity={}
         sources=(
             ("semantic_deterministic",content_issues),
             ("semantic_model",model_issues),
@@ -1259,20 +1354,36 @@ class TaskService:
                 if not isinstance(original,dict): raise ValidationError("检查报告 issue 必须是对象")
                 item={**original,"source":source}
                 identity=item.get("issue_id") or fingerprint(item)
-                if identity in seen: continue
-                seen.add(identity); combined.append(item)
+                if identity in by_identity:
+                    existing=by_identity[identity]
+                    existing["sources"]=list(dict.fromkeys([*(existing.get("sources") or [existing["source"]]),source]))
+                    # A deterministic/browser measurement is the least
+                    # ambiguous compatibility source when the model repeats
+                    # the same issue after reading technical evidence.
+                    priority={"semantic_model":0,"semantic_deterministic":1,"technical_browser":2}
+                    existing["source"]=max(existing["sources"],key=lambda value:priority[value])
+                    continue
+                item["sources"]=[source]
+                by_identity[identity]=item; combined.append(item)
         browser_passed=True if browser_evidence is None else bool(browser_evidence.get("available")) and bool(browser_evidence.get("passed"))
         checks={
             "semantic_deterministic":{"available":True,"passed":bool(content_evidence.get("passed")),"issue_count":len(content_issues),"evidence_hash":fingerprint(content_evidence)},
             "semantic_model":{"available":True,"passed":bool(raw.get("passed",not model_issues)),"issue_count":len(model_issues),"model":raw.get("model","unknown")},
             "technical_browser":{"available":browser_evidence is not None and bool(browser_evidence.get("available")),"passed":browser_passed,"issue_count":len(browser_issues)},
         }
+        evidence_documents=[
+            {"schema_version":"1.0","source":"semantic_deterministic","deck_hash":deck["hash"],"payload":content_evidence},
+            {"schema_version":"1.0","source":"semantic_model","deck_hash":deck["hash"],"payload":{"model":raw.get("model","unknown"),"passed":bool(raw.get("passed",not model_issues)),"issues":model_issues}},
+        ]
+        if browser_evidence is not None:
+            evidence_documents.append({"schema_version":"1.0","source":"technical_browser","deck_hash":deck["hash"],"payload":browser_evidence})
         return {
             **raw,
             "issues":combined,
             "passed":bool(raw.get("passed",not model_issues)) and bool(content_evidence.get("passed")) and browser_passed and not combined,
             "content_evidence":content_evidence,
             "quality_checks":checks,
+            "evidence_documents":evidence_documents,
             **({"browser_evidence":browser_evidence} if browser_evidence is not None else {}),
         }
 
@@ -1284,7 +1395,29 @@ class TaskService:
         # resources and screenshots never cross this boundary.
         skill=self.skills.load("inspection")
         raw=prepared_raw if prepared_raw is not None else self._prepare_inspection_result(task_id,deck)
-        issues=self._normalize_inspection_issues(raw.get("issues",[])); passed=bool(raw.get("passed",not issues)) and not issues
+        documents=raw.get("evidence_documents")
+        if not isinstance(documents,list):
+            model_issues=raw.get("issues",[])
+            documents=[{"schema_version":"1.0","source":"semantic_model","deck_hash":deck["hash"],"payload":{"model":raw.get("model","unknown"),"passed":bool(raw.get("passed",not model_issues)),"issues":model_issues}}]
+        evidence_refs={}
+        for document in documents:
+            if (not isinstance(document,dict) or set(document)!={"schema_version","source","deck_hash","payload"}
+                or document.get("schema_version")!="1.0" or document.get("deck_hash")!=deck["hash"]
+                or document.get("source") not in {"semantic_model","semantic_deterministic","technical_browser"}
+                or not isinstance(document.get("payload"),dict)):
+                raise ValidationError("检查 evidence 工件结构或候选绑定无效")
+            raw_evidence=canonical(document)
+            evidence_hash=self.store.put_version(task_id,"inspection-evidence",raw_evidence,{"source":document["source"],"deck_hash":deck["hash"],"immutable":True})
+            if evidence_hash!=digest(raw_evidence): raise ConflictError("检查 evidence 内容寻址持久化失败")
+            evidence_refs[document["source"]]=f"inspection-evidence://{evidence_hash}"
+        enriched=[]
+        for item in raw.get("issues",[]):
+            if not isinstance(item,dict): raise ValidationError("检查报告 issue 必须是对象")
+            sources=list(dict.fromkeys(item.get("sources") or [item.get("source","semantic_model")]))
+            missing=[source for source in sources if source not in evidence_refs]
+            if missing: raise ValidationError("检查问题来源缺少可解析 evidence 工件")
+            enriched.append({**item,"sources":sources,"evidence_refs":[evidence_refs[source] for source in sources]})
+        issues=self._normalize_inspection_issues(enriched); passed=bool(raw.get("passed",not issues)) and not issues
         created=utcnow(); seed=canonical({"deck_hash":deck["hash"],"issues":issues,"created_at":created})
         report=InspectionReport.parse({"report_id":f"report-{digest(seed)[:16]}","task_id":task_id,"deck_hash":deck["hash"],"issues":issues,"passed":passed,"created_at":created,"schema_version":"1.0"})
         browser=raw.get("browser_evidence")
@@ -1309,7 +1442,7 @@ class TaskService:
             "unbound_claim_count":content.get("unbound_claim_count",0),
             "evidence_hash":fingerprint(content),
         }
-        metadata={"deck_hash":deck["hash"],"scope":scope,"affected_slide_ids":affected,"includes_deck_consistency":True,"includes_content_quality":content_meta is not None,"includes_browser_render":browser_meta is not None,"content_evidence":content_meta,"browser_evidence":browser_meta,"quality_checks":raw.get("quality_checks",{}),"issue_sources":{item["issue_id"]:item["source"] for item in issues},"round":round_number,"model":raw.get("model","unknown"),"skill":{"action":"inspection","version":skill["version"],"hash":digest(skill["content"].encode()),"files":skill.get("files",[])},"input_fields":["original_outline","html","frozen_source_binding","design_contract","claim_ledger",*(["browser_evidence"] if browser_meta is not None else [])],"excluded_fields":["generation_context","self_description","images","screenshots"],"design_contract_hash":deck["metadata"].get("design_contract_hash"),"claim_ledger_hash":deck["metadata"].get("claim_ledger_hash"),"post_render_gate":deck["metadata"].get("post_render_gate")}
+        metadata={"deck_hash":deck["hash"],"scope":scope,"affected_slide_ids":affected,"includes_deck_consistency":True,"includes_content_quality":content_meta is not None,"includes_browser_render":browser_meta is not None,"content_evidence":content_meta,"browser_evidence":browser_meta,"quality_checks":raw.get("quality_checks",{}),"issue_sources":{item["issue_id"]:list(item["sources"]) for item in issues},"evidence_artifacts":{source:ref.removeprefix("inspection-evidence://") for source,ref in evidence_refs.items()},"round":round_number,"model":raw.get("model","unknown"),"skill":{"action":"inspection","version":skill["version"],"hash":digest(skill["content"].encode()),"files":skill.get("files",[])},"input_fields":["original_outline","html","frozen_source_binding","design_contract","claim_ledger",*(["browser_evidence"] if browser_meta is not None else [])],"excluded_fields":["generation_context","self_description","images","screenshots"],"design_contract_hash":deck["metadata"].get("design_contract_hash"),"claim_ledger_hash":deck["metadata"].get("claim_ledger_hash"),"post_render_gate":deck["metadata"].get("post_render_gate")}
         h=self.store.put_version(task_id,"inspection",canonical(report.to_dict()),metadata)
         return {**report.to_dict(),"hash":h,"metadata":metadata}
 
@@ -1432,6 +1565,7 @@ class TaskService:
         self._require_candidate_mutable(task_id)
         view=self.inspection_view(task_id); report=view["report"]
         if not report or report["stale"]: raise ConflictError("当前 HTML 版本没有有效检查报告")
+        self._assert_inspection_evidence(task_id,report)
         issue=next((x for x in report["issues"] if x["issue_id"]==issue_id),None)
         if not issue: raise ValidationError("检查问题不存在")
         if action not in {"agent_fix","manual","waive","defer"}: raise ValidationError("问题处置动作无效")
@@ -1444,7 +1578,7 @@ class TaskService:
         created=utcnow(); payload={"task_id":task_id,"issue_id":issue_id,"action":action,"actor":actor,"target_deck_hash":report["deck_hash"],"rationale":(rationale or "按当前处置执行").strip(),"created_at":created,"schema_version":"1.0"}
         model=IssueDisposition.parse({"disposition_id":f"disposition-{digest(canonical(payload))[:16]}",**payload})
         def record_disposition():
-            return self.store.put_version(task_id,"issue-disposition",canonical(model.to_dict()),{"report_hash":report["hash"],"severity":issue["severity"],"code":issue["code"],"sequence":len(self.versions(task_id,"issue-disposition"))+1})
+            return self.store.put_version(task_id,"issue-disposition",canonical(model.to_dict()),{"report_hash":report["hash"],"severity":issue["severity"],"code":issue["code"],"sources":list(issue.get("sources") or [issue.get("source","semantic_model")]),"evidence_refs":list(issue.get("evidence_refs") or []),"sequence":len(self.versions(task_id,"issue-disposition"))+1})
         if action=="agent_fix":
             html_text,outline_hash,metadata,token=prepared_fix
             with self.store.transaction(task_id):
@@ -1516,7 +1650,8 @@ class TaskService:
         view=self.inspection_view(task_id)
         if view["blocking_issues"]: raise ConflictError("仍有未解决且未豁免的阻断问题，禁止交付")
         if not view["report"] or view["report"]["stale"]: raise ConflictError("当前 HTML 版本须先完成检查")
-        return {"delivery_allowed":True,"warnings":[x for x in view["unresolved"] if x["severity"]=="warning"],**generation}
+        evidence_trace=self._assert_inspection_evidence(task_id,view["report"])
+        return {"delivery_allowed":True,"warnings":[x for x in view["unresolved"] if x["severity"]=="warning"],"inspection_report":view["report"],"inspection_evidence":evidence_trace,**generation}
 
     def finalization_view(self,task_id):
         deck=self.deck_view(task_id)["deck"]
@@ -1540,6 +1675,8 @@ class TaskService:
             if not deck or deck["hash"]!=deck_hash: raise ConflictError("终稿必须绑定当前候选 HTML 版本")
             generation=self._assert_current_post_render_gate(task_id)
             inspection=self.inspection_view(task_id); report=inspection["report"]
+            if report and not report["stale"]:
+                self._assert_inspection_evidence(task_id,report)
             if not report or report["stale"]:
                 inspection_status="unchecked" if not report else "stale"
             elif report["passed"]:
@@ -1618,8 +1755,9 @@ class TaskService:
         # a fresh inspection report bound to the current deck with zero
         # unresolved blockers.  Replays of an already-recorded delivery fact
         # stay idempotent and never re-evaluate the gate.
+        delivery_gate=None
         if not existing_delivery:
-            self.assert_delivery_gate(task_id)
+            delivery_gate=self.assert_delivery_gate(task_id)
 
         # A delivery fact is the domain idempotency boundary.  Replays for the
         # same finalized deck return that immutable fact even when the caller
@@ -1683,7 +1821,9 @@ class TaskService:
         resource_root=self.store.resource_root(task_id)
         localized_html,localized_resources,localization_records=localize_delivery_html(current["html"],snapshot["manifest"],resource_root)
         result_summary={"version":delivery_id,"status":{"stage":"delivery","status":"completed"},"description":"用户确定的终稿已写入工程文件夹并通过离线校验"}
-        files={"deck.html":localized_html.encode(),"index.html":offline_player(localized_html).encode(),"narrative.md":json.loads(self.version(task_id,narrative_hash))["markdown"].encode(),"outline.md":json.loads(self.version(task_id,outline_hash))["markdown"].encode(),"design-contract.json":self.version(task_id,design_contract_hash),"claim-ledger.json":self.version(task_id,claim_ledger_hash),"post-render-gate-evidence.json":post_render_gate_evidence,"resource-manifest.json":canonical(snapshot["manifest"]),"localized-resources.json":canonical({"resources":localization_records}),"result.json":canonical({"task_id":task_id,"deck_hash":deck_hash,"finalization_hash":finalization["hash"],"design_contract_hash":design_contract_hash,"claim_ledger_hash":claim_ledger_hash,"post_render_gate_hash":post_render_gate_hash,"inspection_status":finalization["inspection_status"],"finalization_mode":finalization_mode,"warnings":warnings,"confirmed_at":confirmed_at,**result_summary}),**offline_assets(),**localized_resources}
+        inspection_report=delivery_gate["inspection_report"]
+        inspection_evidence_hashes=delivery_gate["inspection_evidence"]["artifact_hashes"]
+        files={"deck.html":localized_html.encode(),"index.html":offline_player(localized_html).encode(),"narrative.md":json.loads(self.version(task_id,narrative_hash))["markdown"].encode(),"outline.md":json.loads(self.version(task_id,outline_hash))["markdown"].encode(),"design-contract.json":self.version(task_id,design_contract_hash),"claim-ledger.json":self.version(task_id,claim_ledger_hash),"post-render-gate-evidence.json":post_render_gate_evidence,"inspection-report.json":self.version(task_id,inspection_report["hash"]),**{f"inspection-evidence/{evidence_hash}.json":self.version(task_id,evidence_hash) for evidence_hash in inspection_evidence_hashes},"resource-manifest.json":canonical(snapshot["manifest"]),"localized-resources.json":canonical({"resources":localization_records}),"result.json":canonical({"task_id":task_id,"deck_hash":deck_hash,"finalization_hash":finalization["hash"],"design_contract_hash":design_contract_hash,"claim_ledger_hash":claim_ledger_hash,"post_render_gate_hash":post_render_gate_hash,"inspection_report_hash":inspection_report["hash"],"inspection_evidence_hashes":inspection_evidence_hashes,"inspection_status":finalization["inspection_status"],"finalization_mode":finalization_mode,"warnings":warnings,"confirmed_at":confirmed_at,**result_summary}),**offline_assets(),**localized_resources}
         for item in snapshot["manifest"].get("resources",[]):
             relative=Path(item["uri"].removeprefix("resources://"))
             source=resource_root/relative
