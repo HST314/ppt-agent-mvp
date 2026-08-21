@@ -40,6 +40,37 @@ class BlockingBrowserInspector:
         }
 
 
+class PassingBrowserInspector:
+    def inspect(self, html, expected_slide_ids):
+        return {
+            "available": True,
+            "passed": True,
+            "engine": "chromium",
+            "engine_version": "test-browser",
+            "viewport": {"width": 1280, "height": 720},
+            "issues": [],
+            "slides": [],
+        }
+
+
+class PlaceholderBuilder:
+    def build(self, outline, **context):
+        from ppt_agent.p4 import render
+
+        html = render(
+            outline,
+            context["slide_ids"],
+            context.get("rules"),
+            context.get("exceptions"),
+            context.get("assets"),
+        )
+        return html.replace(
+            "</section>",
+            '<p data-element-id="unbound-kpi">覆盖 XX 条业务线，日均处理 XXX 次对话</p></section>',
+            1,
+        )
+
+
 class ScriptedClient:
     def __init__(self, turns):
         self.turns = list(turns)
@@ -110,6 +141,35 @@ class P0HybridInspectionTests(unittest.TestCase):
             self.assertTrue(metadata["includes_browser_render"])
             self.assertFalse(metadata["browser_evidence"]["passed"])
             self.assertEqual(metadata["browser_evidence"]["issue_count"], 1)
+
+    def test_deterministic_semantic_gate_merges_with_model_and_browser_checks(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = TaskService(
+                WorkspaceStore(root),
+                inspector=PassingModelInspector(),
+                browser_inspector=PassingBrowserInspector(),
+                builder=PlaceholderBuilder(),
+            )
+            service.create("content-gate", "manual")
+            service.import_input("content-gate", {"goal":"发布", "audience":"管理层", "topic":"试点复盘", "页数":3})
+            service.generate_narrative("content-gate"); service.confirm_narrative("content-gate")
+            service.generate_outline("content-gate"); service.confirm_outline("content-gate")
+            service.generate_sample("content-gate"); service.confirm_sample("content-gate")
+            service.generate_deck("content-gate")
+
+            result = service.run_inspection("content-gate", 0)
+
+            placeholders = [item for item in result["report"]["issues"] if item["code"] == "placeholder_token"]
+            self.assertGreaterEqual(len(placeholders), 2)
+            self.assertTrue(all(item["severity"] == "blocker" for item in placeholders))
+            self.assertTrue(all(item["source"] == "semantic_deterministic" for item in placeholders))
+            self.assertFalse(result["delivery_allowed"])
+            metadata = result["report"]["metadata"]
+            self.assertTrue(metadata["includes_content_quality"])
+            self.assertTrue(metadata["includes_browser_render"])
+            self.assertEqual(metadata["quality_checks"]["semantic_deterministic"]["issue_count"], len(placeholders))
+            self.assertEqual(metadata["quality_checks"]["semantic_model"]["issue_count"], 0)
+            self.assertEqual(metadata["quality_checks"]["technical_browser"]["issue_count"], 0)
 
 
 if __name__ == "__main__":

@@ -19,7 +19,7 @@ REQUIRED_STAGE_FILES = {
     "deck": frozenset({"references/design-pack-v1.md"}),
     "inspection": frozenset({"references/checklist.md"}),
 }
-MAX_PLANNING_FILE_READS = 2
+MAX_PLANNING_FILE_READS = 1
 DATA_IMAGE = "data:image/"
 STAGE_PROMPTS = {
     "clarification": (
@@ -28,7 +28,7 @@ STAGE_PROMPTS = {
         "helper_text、0 个或多个带 value/label/description 的 options、allow_other 与 blocking。"
         "本阶段不提供也不需要任何 Skill 工具，禁止请求工具。"
     ),
-    "narrative": "根据任务卡生成叙事结构 Markdown；不要生成逐页 HTML。按需最多读取 1 到 2 个当前阶段已列出的 Skill 文件，不要重复读取。",
+    "narrative": "根据任务卡生成叙事结构 Markdown；不要生成逐页 HTML。按需最多读取 1 个当前阶段已列出的规划摘要，不要重复读取。",
     "outline": (
         "根据已确认叙事生成结构化逐页大纲；不要自行编写页面 ID，也不要返回 markdown 字段。"
         "每页必须只包含 title、purpose、content_markdown、resource_uris；resource_uris 只能选自输入的冻结资源清单，"
@@ -36,7 +36,7 @@ STAGE_PROMPTS = {
         "例如：{\"slides\":[{\"title\":\"开场与目标\",\"purpose\":\"建立共同目标\","
         "\"content_markdown\":\"- 背景\\n- 目标\",\"resource_uris\":[]}]}}。"
         "若输入包含 semantic_correction，须依据其中的具体错误修正并重新提交完整 slides。"
-        "按需最多读取 1 到 2 个当前阶段已列出的 Skill 文件，禁止尝试读取布局、主题、图片或 HTML 模板文件；"
+        "按需最多读取 1 个当前阶段已列出的规划摘要，禁止尝试读取布局、主题、图片或 HTML 模板文件；"
         "读取后立即提交大纲 JSON，不要重复读取。"
     ),
     "sample": "仅为外层状态机指定的样品页生成 section 片段，不得生成公共模板或扩展到全稿；优先直接使用输入和轻量 design pack 清单，最多进行两轮必要探索；每项 html 必须严格以 <section class=\"slide\" id=\"给定ID\" data-slide-id=\"给定ID\"> 开始并以 </section> 结束。",
@@ -373,7 +373,7 @@ class AgentRuntime:
                 elif (
                     force_final_output
                     or provider_call_budget.claimed >= self.max_provider_calls - self.reserved_final_calls
-                    or (stage in RENDERING_STAGES and (
+                    or (stage in (RENDERING_STAGES | PLANNING_STAGES) and not recovery_active and (
                         exploration_rounds >= self.max_exploration_rounds
                         or successful_read_count >= self.max_unique_files
                         or skill_bytes >= self.max_skill_bytes
@@ -504,15 +504,16 @@ class AgentRuntime:
                         if not isinstance(args, dict): raise ValidationError("工具参数必须为 object")
                     except (json.JSONDecodeError, ValidationError) as exc:
                         args, error = {}, {"ok": False, "error": {"code": "invalid_arguments", "message": str(exc)}}
-                    if error is None and call.name not in request_tool_names:
-                        error = {"ok": False, "error": {"code": "unauthorized_tool", "message": "当前轮次未授权该工具；请使用已提供的工具或直接提交最终 JSON"}}
                     requested_path = args.get("path") if isinstance(args, dict) else None
                     normalized_path = self.skill.normalize_tool_path(requested_path) if isinstance(requested_path, str) else None
                     repeated = call.name == "read_skill_file" and normalized_path in successful_read_paths
                     read_limit = MAX_PLANNING_FILE_READS if stage in PLANNING_STAGES else self.max_unique_files
                     if error is None and repeated:
                         repeated_read_count += 1
-                        result = {"ok": False, "error": {"code": "already_read", "message": "该文件已读取；未重复返回正文，请直接使用已有上下文"}, "path": normalized_path, "already_read": True, "bytes": 0, "sha256": successful_read_digests.get(normalized_path)}
+                        result = {"ok": True, "path": normalized_path, "already_read": True, "cached": True, "bytes": 0, "sha256": successful_read_digests.get(normalized_path), "message": "该文件已读取；请复用已有上下文并直接提交最终 JSON"}
+                        force_final_output = True
+                    elif error is None and call.name not in request_tool_names:
+                        result = {"ok": False, "error": {"code": "unauthorized_tool", "message": "当前轮次未授权该工具；请使用已提供的工具或直接提交最终 JSON"}}
                     elif error is None and call.name == "read_skill_file" and successful_read_count >= read_limit:
                         result = {"ok": False, "error": {"code": "quota_exceeded", "message": f"当前阶段最多读取 {read_limit} 个 Skill 文件；请直接提交最终 JSON"}}
                     else:
@@ -570,6 +571,9 @@ class AgentRuntime:
                     )
                     conversation.append({"role": "user", "content": instruction})
                     audit.append({"step": step, "event": "tool_recovery_instruction", "attempt": tool_error_corrections})
+                elif required_files.issubset(successful_read_paths) and successful_read_paths:
+                    conversation.append({"role": "user", "content": "当前阶段必需或选定的 Skill 文件已读取完成。请复用已有上下文，不要重复读取；下一轮直接提交符合 Schema 的最终 JSON。"})
+                    force_final_output = True
                 continue
             if capability_probe and stage != "clarification" and tool_count == 0:
                 fail("模型忽略了强制工具调用要求", "capability_probe_failed")

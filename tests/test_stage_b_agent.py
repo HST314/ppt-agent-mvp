@@ -108,16 +108,17 @@ class StageBAgentTests(unittest.TestCase):
         self.assertEqual([tool["name"] for tool in client.inputs[1]["tools"]], ["read_skill_file"])
         self.assertEqual(
             client.inputs[1]["tools"][0]["parameters"]["properties"]["path"]["enum"],
-            ["SKILL.md", "references/checklist.md"],
+            ["references/planning-summary.md"],
         )
 
     def test_tool_audit_records_requested_path_hash_and_normalized_path(self):
-        calls = [ModelToolCall("read_skill_file", '{"path":"guizang-ppt/SKILL.md"}', "c1")]
+        requested = "guizang-ppt/references/planning-summary.md"
+        calls = [ModelToolCall("read_skill_file", json.dumps({"path":requested}), "c1")]
         client = ScriptedClient([ModelTurn(None, "r1", calls), ModelTurn('{"markdown":"ok"}', "r2")])
         result = AgentRuntime(client, SkillRuntime.builtin()).run("narrative", {})
         tool_event = next(e for e in result.audit if e.get("event") == "tool")
-        self.assertEqual(tool_event["requested_path_sha256"], hashlib.sha256("guizang-ppt/SKILL.md".encode()).hexdigest())
-        self.assertEqual(tool_event["path"], "SKILL.md")
+        self.assertEqual(tool_event["requested_path_sha256"], hashlib.sha256(requested.encode()).hexdigest())
+        self.assertEqual(tool_event["path"], "references/planning-summary.md")
 
     def test_clarification_has_no_tools_and_rejects_unsolicited_tool_calls(self):
         client=ScriptedClient([ModelTurn('{"questions":[]}',"r")])
@@ -164,7 +165,7 @@ class StageBAgentTests(unittest.TestCase):
         self.assertEqual(client.inputs[1]["tools"],[])
         self.assertEqual(client.inputs[1]["response_schema"],STAGE_PROVIDER_SCHEMAS["outline"])
         self.assertEqual([tool["name"] for tool in client.inputs[2]["tools"]],["list_skill_files","read_skill_file"])
-        self.assertEqual(client.inputs[2]["tools"][1]["parameters"]["properties"]["path"]["enum"],["SKILL.md","references/checklist.md"])
+        self.assertEqual(client.inputs[2]["tools"][1]["parameters"]["properties"]["path"]["enum"],["references/planning-summary.md"])
         self.assertEqual(client.inputs[2]["tool_choice"],{"type":"function","name":"list_skill_files"})
         self.assertIsNone(client.inputs[2]["response_schema"])
         self.assertEqual(client.inputs[3]["tool_choice"],"none")
@@ -303,7 +304,7 @@ class StageBAgentTests(unittest.TestCase):
         self.assertEqual(AgentRuntime._tool_error_code("read_skill_file","Skill 累计读取超过上限"),"quota_exceeded")
     def test_tool_loop_schema_and_secret_free_audit(self):
         client = ScriptedClient([
-            ModelTurn(None, "r1", (ModelToolCall("read_skill_file", json.dumps({"path": "SKILL.md"}), "c1"),)),
+            ModelTurn(None, "r1", (ModelToolCall("read_skill_file", json.dumps({"path": "references/planning-summary.md"}), "c1"),)),
             ModelTurn('{"text":"done"}', "r2"),
         ])
         client.turns[-1] = ModelTurn(OUTLINE_JSON, "r2")
@@ -324,7 +325,7 @@ class StageBAgentTests(unittest.TestCase):
         }
         for stage, final in finals.items():
             with self.subTest(stage=stage):
-                path = "references/checklist.md" if stage == "inspection" else "SKILL.md"
+                path = "references/checklist.md" if stage == "inspection" else "references/planning-summary.md"
                 client = ScriptedClient([
                     ModelTurn(None, "tool", (ModelToolCall("read_skill_file", json.dumps({"path":path}), "call"),)),
                     ModelTurn(final, "final"),
@@ -336,18 +337,16 @@ class StageBAgentTests(unittest.TestCase):
                 self.assertNotIn("get_asset_info", [tool["name"] for tool in tools])
                 self.assertEqual(
                     tools[-1]["parameters"]["properties"]["path"]["enum"],
-                    ["references/checklist.md"] if stage == "inspection" else ["SKILL.md", "references/checklist.md"],
+                    ["references/checklist.md"] if stage == "inspection" else ["references/planning-summary.md"],
                 )
                 system = client.inputs[0]["input"][0]["content"]
-                self.assertIn("SKILL.md", system)
-                self.assertIn("references/checklist.md", system)
-                self.assertIn("最多成功读取 2 个文件", system)
+                self.assertIn(path, system)
+                self.assertIn("最多成功读取 1 个文件", system)
 
-    def test_planning_stage_enforces_two_successful_file_reads(self):
+    def test_planning_stage_reads_one_summary_and_idempotently_deduplicates_it(self):
         calls = (
-            ModelToolCall("read_skill_file", '{"path":"SKILL.md"}', "one"),
-            ModelToolCall("read_skill_file", '{"path":"references/checklist.md"}', "two"),
-            ModelToolCall("read_skill_file", '{"path":"SKILL.md"}', "three"),
+            ModelToolCall("read_skill_file", '{"path":"references/planning-summary.md"}', "one"),
+            ModelToolCall("read_skill_file", '{"path":"references/planning-summary.md"}', "two"),
         )
         client = ScriptedClient([ModelTurn(None, "tools", calls), ModelTurn(OUTLINE_JSON, "final")])
 
@@ -355,8 +354,9 @@ class StageBAgentTests(unittest.TestCase):
 
         self.assertEqual(result.value, OUTLINE_VALUE)
         self.assertEqual(sum(item.get("event") == "tool" for item in result.audit), 2)
-        quota = [item for item in result.audit if item.get("event") == "tool_error"]
-        self.assertEqual([item["error_code"] for item in quota], ["already_read"])
+        cached = [item for item in result.audit if item.get("event") == "tool" and item.get("repeated")]
+        self.assertEqual(len(cached), 1)
+        self.assertFalse(any(item.get("event") == "tool_error" for item in result.audit))
         self.assertEqual(client.inputs[1]["tools"], [])
         self.assertEqual(client.inputs[1]["tool_choice"], "none")
 
@@ -375,13 +375,10 @@ class StageBAgentTests(unittest.TestCase):
 
     def test_mixed_tool_batch_recovery_uses_one_remaining_path_contract(self):
         first_batch = (
-            ModelToolCall("read_skill_file", '{"path":"SKILL.md"}', "initial-read"),
+            ModelToolCall("read_skill_file", '{"path":"references/planning-summary.md"}', "initial-read"),
             ModelToolCall("get_asset_info", '{"path":"assets/template.html"}', "hidden-tool"),
         )
-        recovery_batch = (
-            ModelToolCall("read_skill_file", '{"path":"SKILL.md"}', "duplicate-read"),
-            ModelToolCall("read_skill_file", '{"path":"references/checklist.md"}', "remaining-read"),
-        )
+        recovery_batch = (ModelToolCall("read_skill_file", '{"path":"references/planning-summary.md"}', "duplicate-read"),)
         client = ScriptedClient([
             ModelTurn(None, "mixed", first_batch),
             ModelTurn(None, "recovery", recovery_batch),
@@ -391,22 +388,18 @@ class StageBAgentTests(unittest.TestCase):
         result = AgentRuntime(client, SkillRuntime.builtin()).run("outline", {})
 
         recovery_tools = client.inputs[1]["tools"]
-        self.assertEqual([tool["name"] for tool in recovery_tools], ["read_skill_file"])
-        self.assertEqual(
-            recovery_tools[0]["parameters"]["properties"]["path"]["enum"],
-            ["references/checklist.md"],
-        )
+        self.assertEqual(recovery_tools, [])
+        self.assertEqual(client.inputs[1]["tool_choice"], "none")
         recovery_prompts = [
             item["content"] for item in client.inputs[1]["input"]
             if item.get("role") == "user" and "受限恢复轮" in item.get("content", "")
         ]
         recovery_prompt = recovery_prompts[0]
-        self.assertNotIn("SKILL.md", recovery_prompt)
-        self.assertIn("references/checklist.md", recovery_prompt)
+        self.assertIn("已无剩余合法读取路径", recovery_prompt)
         second_round = [item for item in result.audit if item.get("step") == 2 and item.get("event") in {"tool", "tool_error"}]
         self.assertEqual(
             [(item["event"], item.get("error_code"), item.get("path")) for item in second_round],
-            [("tool_error", "already_read", "SKILL.md"), ("tool", None, "references/checklist.md")],
+            [("tool", None, "references/planning-summary.md")],
         )
         self.assertEqual(client.inputs[2]["tools"], [])
         self.assertEqual(client.inputs[2]["tool_choice"], "none")
@@ -432,13 +425,13 @@ class StageBAgentTests(unittest.TestCase):
         for request in client.inputs[1:]:
             self.assertEqual(
                 request["tools"][0]["parameters"]["properties"]["path"]["enum"],
-                ["references/checklist.md"],
+                ["references/planning-summary.md"],
             )
         recovery_errors = [
             item for item in caught.exception.audit
             if item.get("step") in {2, 3} and item.get("event") == "tool_error"
         ]
-        self.assertEqual([item["error_code"] for item in recovery_errors], ["already_read", "already_read"])
+        self.assertEqual([item["error_code"] for item in recovery_errors], ["path_not_in_lock"])
 
     def test_image_content_is_removed_from_every_nested_model_input(self):
         client = ScriptedClient([
@@ -689,7 +682,7 @@ class StageBAgentTests(unittest.TestCase):
     def test_outline_skill_view_hides_rendering_only_references(self):
         skill = SkillRuntime.builtin()
         allowed = skill.files_for_stage("outline")
-        self.assertEqual(skill.list_skill_files(allowed_files=allowed)["files"], ["SKILL.md", "references/checklist.md"])
+        self.assertEqual(skill.list_skill_files(allowed_files=allowed)["files"], ["references/planning-summary.md"])
         with self.assertRaises(ValidationError):
             skill.dispatch("read_skill_file", {"path": "references/themes.md"}, allowed_files=allowed)
         self.assertEqual(skill.files_for_stage("deck"),frozenset({"references/design-pack-v1.md"}))

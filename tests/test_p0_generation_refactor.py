@@ -93,6 +93,27 @@ class P0GenerationRefactorTests(unittest.TestCase):
         self.assertTrue(html.startswith("<!doctype html>"))
         self.assertIn(fragment,html)
 
+    def test_sample_cross_round_duplicate_is_cached_without_error_recovery(self):
+        fragment='<section class="slide" id="slide-1" data-slide-id="slide-1"><h1>样品</h1></section>'
+        client=RecordingClient([
+            ModelTurn(None,"r1",(ModelToolCall("read_skill_file",'{"path":"references/design-pack-v1.md"}',"c1"),)),
+            ModelTurn(None,"r2",(ModelToolCall("read_skill_file",'{"path":"references/design-pack-v1.md"}',"c2"),)),
+            ModelTurn(json.dumps({"slides":[{"slide_id":"slide-1","html":fragment}]}),"r3"),
+        ])
+        gateway=AgentGateway(client,skill=SkillRuntime.builtin(),max_steps=30,max_tool_calls=40,max_provider_calls=8)
+
+        html=gateway.build("## [slide-1] 样品",action="sample",slide_ids=["slide-1"])
+
+        self.assertTrue(html.startswith("<!doctype html>"))
+        self.assertEqual(client.inputs[1]["tool_choice"],"none")
+        cached_outputs=[
+            item for item in client.inputs[2]["input"]
+            if item.get("type")=="function_call_output" and '"cached": true' in item.get("output","")
+        ]
+        self.assertEqual(len(cached_outputs),1)
+        self.assertFalse(any(item.get("event")=="tool_error" for item in gateway.runtime.last_audit))
+        self.assertEqual(gateway.runtime.last_audit[-1]["repeated_skill_reads"],1)
+
     def test_deck_generates_only_unconfirmed_pages_in_bounded_batches(self):
         with tempfile.TemporaryDirectory() as root:
             svc=TaskService(WorkspaceStore(root)); svc.create("task","manual")

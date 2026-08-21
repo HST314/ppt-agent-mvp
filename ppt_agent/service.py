@@ -5,6 +5,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 from .config import ClarificationConfig
+from .content_inspection import inspect_content_quality
 from .diagnostics import log_exception_chain
 from .errors import ConflictError, GatewayError, NotFoundError, RuntimeUnavailableError, ValidationError
 from .fsm import TaskState, transition
@@ -1014,7 +1015,7 @@ class TaskService:
         for index,item in enumerate(items):
             if not isinstance(item,dict): raise ValidationError("检查报告 issue 必须是对象")
             level=item.get("level") or ("element" if item.get("element_id") else "slide" if item.get("slide_id") else "deck")
-            normalized.append({"issue_id":item.get("issue_id") or f"issue-{index+1}","severity":item.get("severity","warning"),"level":level,"code":item.get("code","quality_issue"),"message":item.get("message","发现质量问题"),"slide_id":item.get("slide_id","") or "","element_id":item.get("element_id","") or "","evidence":item.get("evidence",item.get("message","发现质量问题")),"suggestion":item.get("suggestion","请人工检查并修复")})
+            normalized.append({"issue_id":item.get("issue_id") or f"issue-{index+1}","severity":item.get("severity","warning"),"level":level,"code":item.get("code","quality_issue"),"message":item.get("message","发现质量问题"),"slide_id":item.get("slide_id","") or "","element_id":item.get("element_id","") or "","evidence":item.get("evidence",item.get("message","发现质量问题")),"suggestion":item.get("suggestion","请人工检查并修复"),"source":item.get("source","semantic_model")})
         return normalized
 
     def _call_inspector(self,outline,html_text,browser_evidence):
@@ -1027,6 +1028,11 @@ class TaskService:
 
     def _prepare_inspection_result(self,task_id,deck):
         outline=json.loads(self.version(task_id,deck["outline_hash"]))["markdown"]
+        input_view=self.input_view(task_id)
+        content_evidence=inspect_content_quality(deck["html"],{
+            "source":input_view.get("source"),
+            "task_card":input_view.get("task_card"),
+        })
         browser_evidence=None
         if self.browser_inspector is not None:
             browser_evidence=self.browser_inspector.inspect(deck["html"],list(deck["metadata"]["page_hashes"]))
@@ -1035,17 +1041,33 @@ class TaskService:
         model_issues=raw.get("issues",[])
         if not isinstance(model_issues,list): raise ValidationError("检查响应 issues 必须是数组")
         browser_issues=(browser_evidence or {}).get("issues",[])
+        content_issues=content_evidence.get("issues",[])
         combined=[]; seen=set()
-        for item in [*model_issues,*browser_issues]:
-            if not isinstance(item,dict): raise ValidationError("检查报告 issue 必须是对象")
-            identity=item.get("issue_id") or fingerprint(item)
-            if identity in seen: continue
-            seen.add(identity); combined.append(item)
+        sources=(
+            ("semantic_deterministic",content_issues),
+            ("semantic_model",model_issues),
+            ("technical_browser",browser_issues),
+        )
+        for source,items in sources:
+            if not isinstance(items,list): raise ValidationError("检查报告 issues 必须是数组")
+            for original in items:
+                if not isinstance(original,dict): raise ValidationError("检查报告 issue 必须是对象")
+                item={**original,"source":source}
+                identity=item.get("issue_id") or fingerprint(item)
+                if identity in seen: continue
+                seen.add(identity); combined.append(item)
         browser_passed=True if browser_evidence is None else bool(browser_evidence.get("available")) and bool(browser_evidence.get("passed"))
+        checks={
+            "semantic_deterministic":{"available":True,"passed":bool(content_evidence.get("passed")),"issue_count":len(content_issues),"evidence_hash":fingerprint(content_evidence)},
+            "semantic_model":{"available":True,"passed":bool(raw.get("passed",not model_issues)),"issue_count":len(model_issues),"model":raw.get("model","unknown")},
+            "technical_browser":{"available":browser_evidence is not None and bool(browser_evidence.get("available")),"passed":browser_passed,"issue_count":len(browser_issues)},
+        }
         return {
             **raw,
             "issues":combined,
-            "passed":bool(raw.get("passed",not model_issues)) and browser_passed and not combined,
+            "passed":bool(raw.get("passed",not model_issues)) and bool(content_evidence.get("passed")) and browser_passed and not combined,
+            "content_evidence":content_evidence,
+            "quality_checks":checks,
             **({"browser_evidence":browser_evidence} if browser_evidence is not None else {}),
         }
 
@@ -1061,6 +1083,7 @@ class TaskService:
         created=utcnow(); seed=canonical({"deck_hash":deck["hash"],"issues":issues,"created_at":created})
         report=InspectionReport.parse({"report_id":f"report-{digest(seed)[:16]}","task_id":task_id,"deck_hash":deck["hash"],"issues":issues,"passed":passed,"created_at":created,"schema_version":"1.0"})
         browser=raw.get("browser_evidence")
+        content=raw.get("content_evidence")
         browser_meta=None if not isinstance(browser,dict) else {
             "available":bool(browser.get("available")),
             "passed":bool(browser.get("passed")),
@@ -1070,7 +1093,15 @@ class TaskService:
             "issue_count":len(browser.get("issues",[])),
             "evidence_hash":fingerprint(browser),
         }
-        metadata={"deck_hash":deck["hash"],"scope":scope,"affected_slide_ids":affected,"includes_deck_consistency":True,"includes_browser_render":browser_meta is not None,"browser_evidence":browser_meta,"round":round_number,"model":raw.get("model","unknown"),"skill":{"action":"inspection","version":skill["version"],"hash":digest(skill["content"].encode()),"files":skill.get("files",[])},"input_fields":["original_outline","html",*(["browser_evidence"] if browser_meta is not None else [])],"excluded_fields":["generation_context","self_description","images","screenshots"]}
+        content_meta=None if not isinstance(content,dict) else {
+            "available":bool(content.get("available")),
+            "passed":bool(content.get("passed")),
+            "issue_count":len(content.get("issues",[])),
+            "visible_text_hash":content.get("visible_text_hash"),
+            "source_binding_hash":content.get("source_binding_hash"),
+            "evidence_hash":fingerprint(content),
+        }
+        metadata={"deck_hash":deck["hash"],"scope":scope,"affected_slide_ids":affected,"includes_deck_consistency":True,"includes_content_quality":content_meta is not None,"includes_browser_render":browser_meta is not None,"content_evidence":content_meta,"browser_evidence":browser_meta,"quality_checks":raw.get("quality_checks",{}),"issue_sources":{item["issue_id"]:item["source"] for item in issues},"round":round_number,"model":raw.get("model","unknown"),"skill":{"action":"inspection","version":skill["version"],"hash":digest(skill["content"].encode()),"files":skill.get("files",[])},"input_fields":["original_outline","html","frozen_source_binding",*(["browser_evidence"] if browser_meta is not None else [])],"excluded_fields":["generation_context","self_description","images","screenshots"]}
         h=self.store.put_version(task_id,"inspection",canonical(report.to_dict()),metadata)
         return {**report.to_dict(),"hash":h,"metadata":metadata}
 

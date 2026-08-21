@@ -102,7 +102,7 @@ class StrictModel:
         if not isinstance(value, dict): raise ValidationError(f"{cls.__name__} 必须是对象")
         allowed = {f.name for f in fields(cls)}
         if set(value) - allowed: raise ValidationError(f"{cls.__name__} 包含未知字段")
-        optional_compat={"level","element_id","evidence","suggestion","target_deck_hash","rationale"}
+        optional_compat={"level","element_id","evidence","suggestion","source","target_deck_hash","rationale"}
         required = {f.name for f in fields(cls) if f.name != "schema_version" and f.name not in optional_compat}
         if required - set(value): raise ValidationError(f"{cls.__name__} 缺少必填字段")
         hints=get_type_hints(cls)
@@ -117,7 +117,7 @@ class StrictModel:
         hints = get_type_hints(cls)
         props = {f.name:_property_schema(f.name,hints[f.name]) for f in fields(cls)}
         props["schema_version"]["const"] = "1.0"
-        optional_compat={"level","element_id","evidence","suggestion","target_deck_hash","rationale"}
+        optional_compat={"level","element_id","evidence","suggestion","source","target_deck_hash","rationale"}
         return {"$schema":"https://json-schema.org/draft/2020-12/schema","title":cls.__name__,"type":"object","additionalProperties":False,"properties":props,"required":[f.name for f in fields(cls) if f.name != "schema_version" and f.name not in optional_compat]}
 
 @dataclass(frozen=True)
@@ -158,8 +158,10 @@ class DeckArtifact(StrictModel):
 class InspectionIssue:
     issue_id:str; severity:str; code:str; message:str; slide_id:str
     level:str="slide"; element_id:str=""; evidence:str="未提供独立证据"; suggestion:str="请人工检查并修复"
+    source:str="semantic_model"
     def validate(self):
         if (not ID.fullmatch(self.issue_id) or self.severity not in {"warning","blocker"} or self.level not in {"element","slide","deck"}
+            or self.source not in {"semantic_model","semantic_deterministic","technical_browser"}
             or not self.code.strip() or not self.message.strip() or not self.evidence.strip() or not self.suggestion.strip()): raise ValidationError("issue 字段语义无效")
         if self.slide_id and not ID.fullmatch(self.slide_id): raise ValidationError("issue 页面范围无效")
         if self.element_id and not ID.fullmatch(self.element_id): raise ValidationError("issue 元素范围无效")

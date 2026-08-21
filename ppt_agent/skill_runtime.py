@@ -13,8 +13,8 @@ class SkillRuntime:
 
     TEXT_SUFFIXES = {".md", ".html", ".js", ".css", ".json", ".txt"}
     STAGE_FILES = {
-        "narrative": frozenset({"SKILL.md", "references/checklist.md"}),
-        "outline": frozenset({"SKILL.md", "references/checklist.md"}),
+        "narrative": frozenset({"references/planning-summary.md"}),
+        "outline": frozenset({"references/planning-summary.md"}),
         "sample": frozenset({"references/design-pack-v1.md"}),
         "deck": frozenset({"references/design-pack-v1.md"}),
         "inspection": frozenset({"SKILL.md", "references/checklist.md"}),
