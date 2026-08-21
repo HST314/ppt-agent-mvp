@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import tempfile
@@ -13,14 +14,21 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from ppt_agent.browser_inspection import ChromiumDeckInspector  # noqa: E402
+from ppt_agent.render_gate import canonical_post_render_evidence  # noqa: E402
 from ppt_agent.service import TaskService  # noqa: E402
 from ppt_agent.store import WorkspaceStore  # noqa: E402
+
+
+class PassingInspector:
+    def inspect(self, _outline, _html, *, browser_evidence=None):
+        return {"passed": True, "issues": [], "model": "p0-verifier"}
 
 
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="ppt-p0-gate-") as data_root:
         service = TaskService(
             WorkspaceStore(data_root),
+            inspector=PassingInspector(),
             browser_inspector=ChromiumDeckInspector(),
         )
         task_id = "p0-generation-gate"
@@ -43,6 +51,11 @@ def main() -> int:
         deck = service.generate_deck(task_id)["deck"]
         contract = service.design_contract_view(task_id)
         gate = deck["metadata"]["post_render_gate"]
+        evidence = service.version(task_id, gate["evidence_hash"])
+        service.run_inspection(task_id, 0)
+        finalization = service.finalize_deck(task_id, deck["hash"], "review")["finalization"]
+        delivery = service.publish_delivery(task_id)["delivery"]
+        packaged_evidence = (service.store.delivery_root(task_id, delivery["delivery_id"]) / "post-render-gate-evidence.json").read_bytes()
         result = {
             "sample_gate_passed": sample["metadata"]["post_render_gate"]["passed"],
             "deck_gate_passed": gate["passed"],
@@ -58,6 +71,12 @@ def main() -> int:
             "design_contract_hash": gate["design_contract_hash"],
             "claim_ledger_hash": gate["claim_ledger_hash"],
             "evidence_hash": gate["evidence_hash"],
+            "evidence_recomputed": hashlib.sha256(canonical_post_render_evidence(gate)).hexdigest() == gate["evidence_hash"],
+            "evidence_artifact_persisted": evidence == canonical_post_render_evidence(gate),
+            "autofit_evidence_present": "overflow_autofit" in json.loads(evidence),
+            "finalization_evidence_hash_verified": finalization["post_render_gate_hash"] == gate["evidence_hash"],
+            "delivery_evidence_included": packaged_evidence == evidence,
+            "delivery_evidence_hash_verified": hashlib.sha256(packaged_evidence).hexdigest() == gate["evidence_hash"],
         }
         expected = {
             "sample_gate_passed": True,
@@ -69,6 +88,12 @@ def main() -> int:
             "browser_available": True,
             "browser_engine": "chromium",
             "style_id": "swiss",
+            "evidence_recomputed": True,
+            "evidence_artifact_persisted": True,
+            "autofit_evidence_present": True,
+            "finalization_evidence_hash_verified": True,
+            "delivery_evidence_included": True,
+            "delivery_evidence_hash_verified": True,
         }
         failures = {name: {"expected": value, "actual": result.get(name)} for name, value in expected.items() if result.get(name) != value}
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))

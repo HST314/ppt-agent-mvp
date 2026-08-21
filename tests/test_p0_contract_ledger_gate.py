@@ -1,11 +1,14 @@
 import json
 import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from ppt_agent.claim_ledger import assert_claims_bound, audit_claims, build_claim_ledger
 from ppt_agent.design_contract import TemplateRegistry
-from ppt_agent.errors import ValidationError
-from ppt_agent.p2 import now
+from ppt_agent.errors import ConflictError, ValidationError
+from ppt_agent.p2 import canonical, digest, now
+from ppt_agent.render_gate import canonical_post_render_evidence
 from ppt_agent.service import TaskService
 from ppt_agent.store import WorkspaceStore
 
@@ -52,6 +55,17 @@ class OverflowGenerationBrowser(PassingGenerationBrowser):
         return result
 
 
+class AutofitGenerationBrowser(OverflowGenerationBrowser):
+    def __init__(self):
+        self.calls = 0
+
+    def inspect(self, _html, expected_slide_ids):
+        self.calls += 1
+        if self.calls == 1:
+            return super().inspect(_html, expected_slide_ids)
+        return PassingGenerationBrowser.inspect(self, _html, expected_slide_ids)
+
+
 class ContractLedgerGateTests(unittest.TestCase):
     def _service(self, root, browser=None):
         return TaskService(
@@ -74,6 +88,13 @@ class ContractLedgerGateTests(unittest.TestCase):
         service.confirm_narrative(task_id)
         service.generate_outline(task_id)
         service.confirm_outline(task_id)
+
+    def _to_deck(self, service, task_id="task"):
+        self._to_outline(service, task_id)
+        service.select_samples(task_id, ["slide-1", "slide-3"])
+        service.generate_sample(task_id)
+        service.confirm_sample(task_id)
+        return service.generate_deck(task_id)["deck"]
 
     def test_real_registry_selects_hash_locked_swiss_template(self):
         registry = TemplateRegistry()
@@ -117,6 +138,8 @@ class ContractLedgerGateTests(unittest.TestCase):
             self.assertEqual(gate["geometry"]["overflow_count"], 0)
             self.assertEqual(gate["layout"]["layout_registration_percent"], 100)
             self.assertEqual(gate["claims"]["unbound_count"], 0)
+            self.assertEqual(canonical_post_render_evidence(gate), service.version("task", gate["evidence_hash"]))
+            self.assertIn(gate["evidence_hash"], {item["hash"] for item in service.versions("task", "post-render-gate-evidence")})
 
             inspection = service.run_inspection("task", 0)["report"]
             self.assertEqual(inspection["metadata"]["design_contract_hash"], contract["hash"])
@@ -130,6 +153,69 @@ class ContractLedgerGateTests(unittest.TestCase):
             self.assertEqual(delivery_record["metadata"]["claim_ledger_hash"], ledger["hash"])
             self.assertIn("design-contract.json", delivery["files"])
             self.assertIn("claim-ledger.json", delivery["files"])
+            self.assertIn("post-render-gate-evidence.json", delivery["files"])
+            delivery_root = service.store.delivery_root("task", delivery["delivery_id"])
+            packaged_evidence = (delivery_root / "post-render-gate-evidence.json").read_bytes()
+            self.assertEqual(packaged_evidence, canonical_post_render_evidence(gate))
+            self.assertEqual(digest(packaged_evidence), gate["evidence_hash"])
+
+    def test_autofit_is_part_of_the_hashed_persisted_evidence(self):
+        with tempfile.TemporaryDirectory() as root:
+            browser = AutofitGenerationBrowser()
+            service = self._service(root, browser)
+            self._to_outline(service)
+            service.select_samples("task", ["slide-1"])
+            fitted = {
+                "available": True,
+                "html": None,
+                "rules": [{"slide_id": "slide-1", "element_id": "body", "font_size": 18}],
+                "rounds": 1,
+                "converged": True,
+                "remaining": [],
+            }
+
+            def fit(html_text, max_rounds):
+                self.assertEqual(max_rounds, 2)
+                return {**fitted, "html": html_text}
+
+            with patch("ppt_agent.service.fit_deck_html", side_effect=fit):
+                sample = service.generate_sample("task")["sample"]
+
+            gate = sample["metadata"]["post_render_gate"]
+            self.assertEqual(gate["overflow_autofit"], {key: value for key, value in fitted.items() if key not in {"available", "html"}})
+            raw = canonical_post_render_evidence(gate)
+            self.assertEqual(digest(raw), gate["evidence_hash"])
+            self.assertEqual(service.version("task", gate["evidence_hash"]), raw)
+
+    def test_finalize_rejects_tampered_gate_evidence_without_saving_a_fact(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root)
+            deck = self._to_deck(service)
+            service.run_inspection("task", 0)
+            evidence_hash = deck["metadata"]["post_render_gate"]["evidence_hash"]
+            evidence_path = Path(root) / "task" / "artifacts" / evidence_hash
+            tampered = json.loads(evidence_path.read_bytes())
+            tampered["blocker_count"] = 1
+            evidence_path.write_bytes(canonical(tampered))
+
+            with self.assertRaisesRegex(ConflictError, "evidence 哈希重算不一致"):
+                service.finalize_deck("task", deck["hash"], "review")
+
+            self.assertFalse(service.versions("task", "final-deck"))
+
+    def test_delivery_rejects_missing_gate_evidence_without_writing_a_package(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root)
+            deck = self._to_deck(service)
+            service.run_inspection("task", 0)
+            service.finalize_deck("task", deck["hash"], "review")
+            evidence_hash = deck["metadata"]["post_render_gate"]["evidence_hash"]
+            (Path(root) / "task" / "artifacts" / evidence_hash).unlink()
+
+            with self.assertRaisesRegex(ConflictError, "evidence 工件缺失"):
+                service.publish_delivery("task")
+
+            self.assertFalse(service.versions("task", "delivery"))
 
     def test_unbound_narrative_is_rejected_before_a_new_artifact_is_saved(self):
         with tempfile.TemporaryDirectory() as root:

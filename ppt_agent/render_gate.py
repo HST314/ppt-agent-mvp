@@ -15,6 +15,23 @@ _OVERFLOW_CODES = {"content_out_of_bounds", "element_scroll_overflow", "canvas_s
 _HARD_BROWSER_CODES = _OVERFLOW_CODES | {"render_unavailable", "invalid_measurement", "empty_slide", "broken_image", "missing_title", "title_too_small", "text_too_small"}
 
 
+def canonical_post_render_evidence(evidence: dict[str, Any]) -> bytes:
+    """Serialize the complete evidence body without its self-reference."""
+    if not isinstance(evidence, dict):
+        raise ValidationError("渲染后门禁 evidence 格式无效")
+    body = {key: value for key, value in evidence.items() if key != "evidence_hash"}
+    return json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+
+
+def post_render_evidence_hash(evidence: dict[str, Any]) -> str:
+    return hashlib.sha256(canonical_post_render_evidence(evidence)).hexdigest()
+
+
+def seal_post_render_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
+    body = {key: value for key, value in evidence.items() if key != "evidence_hash"}
+    return {**body, "evidence_hash": post_render_evidence_hash(body)}
+
+
 class _ContractParser(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
@@ -113,6 +130,7 @@ def run_post_render_gate(
     claim_ledger: dict[str, Any],
     claim_ledger_hash: str,
     browser_inspector=None,
+    overflow_autofit: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     validate_claim_ledger(claim_ledger)
     structure = inspect_contract(html_text, expected_slide_ids, contract, contract_hash)
@@ -143,6 +161,7 @@ def run_post_render_gate(
         "blockers": blockers,
         "design_contract_hash": contract_hash,
         "claim_ledger_hash": claim_ledger_hash,
+        "rendered_html_hash": hashlib.sha256(html_text.encode()).hexdigest(),
         "layout": structure,
         "claims": {
             "binding_count": claims["binding_count"],
@@ -159,9 +178,9 @@ def run_post_render_gate(
             "engine_version": None if browser is None else browser.get("engine_version"),
             "viewport": None if browser is None else browser.get("viewport"),
         },
+        "overflow_autofit": overflow_autofit,
     }
-    evidence["evidence_hash"] = hashlib.sha256(json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    return evidence
+    return seal_post_render_evidence(evidence)
 
 
 def enforce_post_render_gate(*args, **kwargs) -> dict[str, Any]:

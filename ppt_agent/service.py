@@ -18,7 +18,7 @@ from .schema import ClarificationSet, ResourceManifest, TaskCard, TaskInputSnaps
 from .schema import NarrativeDocument, SlideOutline, SampleSelection, DeckArtifact
 from .p3 import changed_slide_ids, narrative_markdown, normalize_outline_markdown, outline_markdown, parse_outline, requested_slide_count, structured_outline_markdown
 from .p4 import apply_design_contract, controlled_assets, infer_scope, recommend, render, validate_html
-from .render_gate import enforce_post_render_gate, run_post_render_gate
+from .render_gate import canonical_post_render_evidence, enforce_post_render_gate, post_render_evidence_hash, run_post_render_gate
 from .offline import localize_delivery_html, offline_assets, offline_player, verify_delivery
 from .overflow_autofit import GEOMETRIC_CODES, fit_deck_html
 
@@ -721,8 +721,16 @@ class TaskService:
             claim_ledger=ledger_value,
             claim_ledger_hash=ledger_hash,
             browser_inspector=browser,
+            overflow_autofit=autofit,
         )
-        evidence["overflow_autofit"]=autofit
+        evidence_hash=self.store.put_version(task_id,"post-render-gate-evidence",canonical_post_render_evidence(evidence),{
+            "design_contract_hash":contract_hash,
+            "claim_ledger_hash":ledger_hash,
+            "rendered_html_hash":evidence["rendered_html_hash"],
+            "immutable":True,
+        })
+        if evidence_hash!=evidence["evidence_hash"]:
+            raise ConflictError("渲染后门禁 evidence 内容寻址持久化失败")
         return html_text,evidence
     def planning_view(self,task_id):
         state=self.get(task_id); result={"state":state,"narrative":None,"outline":None,"versions":self.versions(task_id)}
@@ -1467,6 +1475,30 @@ class TaskService:
         if not deck: raise ConflictError("尚未生成全稿")
         contract,ledger=self._bound_deck_contracts(task_id,deck)
         gate=deck["metadata"].get("post_render_gate") or {}
+        evidence_hash=gate.get("evidence_hash")
+        try:
+            evidence_records=self.versions(task_id,"post-render-gate-evidence")
+        except NotFoundError as exc:
+            raise ConflictError("当前全稿的渲染后门禁 evidence 工件缺失") from exc
+        record=next((item for item in evidence_records if item["hash"]==evidence_hash),None)
+        if not evidence_hash or record is None:
+            raise ConflictError("当前全稿的渲染后门禁 evidence 工件缺失")
+        try:
+            persisted=self.version(task_id,evidence_hash)
+            persisted_value=json.loads(persisted)
+        except (NotFoundError,json.JSONDecodeError,UnicodeDecodeError) as exc:
+            raise ConflictError("当前全稿的渲染后门禁 evidence 工件缺失或无效") from exc
+        if (not isinstance(persisted_value,dict)
+            or digest(persisted)!=evidence_hash
+            or persisted!=canonical_post_render_evidence(persisted_value)
+            or canonical_post_render_evidence(gate)!=persisted
+            or post_render_evidence_hash(gate)!=evidence_hash):
+            raise ConflictError("当前全稿的渲染后门禁 evidence 哈希重算不一致")
+        if (gate.get("rendered_html_hash")!=digest(deck["html"].encode())
+            or record["metadata"].get("rendered_html_hash")!=gate.get("rendered_html_hash")
+            or record["metadata"].get("design_contract_hash")!=contract["hash"]
+            or record["metadata"].get("claim_ledger_hash")!=ledger["hash"]):
+            raise ConflictError("当前全稿与渲染后门禁 evidence 绑定不一致")
         valid=(
             deck["metadata"].get("design_contract_hash")==contract["hash"]
             and deck["metadata"].get("claim_ledger_hash")==ledger["hash"]
@@ -1567,11 +1599,15 @@ class TaskService:
         finalization=self.finalization_view(task_id)["current"]
         if not current or not finalization or finalization["deck_hash"]!=current["hash"]: raise ConflictError("请先将当前候选确定为终稿")
         deck_hash=current["hash"]
+        generation=self._assert_current_post_render_gate(task_id)
         design_contract_hash=finalization.get("design_contract_hash")
         claim_ledger_hash=finalization.get("claim_ledger_hash")
+        post_render_gate_hash=finalization.get("post_render_gate_hash")
         if (design_contract_hash!=current["metadata"].get("design_contract_hash")
-            or claim_ledger_hash!=current["metadata"].get("claim_ledger_hash")):
-            raise ConflictError("终稿与当前 DesignContract 或 Claim Ledger 不一致")
+            or claim_ledger_hash!=current["metadata"].get("claim_ledger_hash")
+            or post_render_gate_hash!=generation["post_render_gate"].get("evidence_hash")):
+            raise ConflictError("终稿与当前 DesignContract、Claim Ledger 或渲染后门禁 evidence 不一致")
+        post_render_gate_evidence=self.version(task_id,post_render_gate_hash)
         if state.stage!=state.stage.DELIVERY: raise ConflictError("当前阶段不能交付")
         narrative_hash=self._current_version(task_id,"narrative"); outline_hash=current["outline_hash"]
         snapshot=self.input_view(task_id)
@@ -1631,6 +1667,9 @@ class TaskService:
             hashes={name:digest((published_root/name).read_bytes()) for name in package.get("files",{})}
             if hashes!=package.get("files"):
                 raise ConflictError("已发布离线包 manifest 不一致")
+            packaged_evidence=published_root/"post-render-gate-evidence.json"
+            if not packaged_evidence.is_file() or packaged_evidence.read_bytes()!=post_render_gate_evidence:
+                raise ConflictError("已发布离线包的渲染后门禁 evidence 缺失或不一致")
             hashes["manifest.json"]=digest((published_root/"manifest.json").read_bytes())
             localized=json.loads((published_root/"localized-resources.json").read_text(encoding="utf-8")).get("resources",[])
             if existing_delivery:
@@ -1644,7 +1683,7 @@ class TaskService:
         resource_root=self.store.resource_root(task_id)
         localized_html,localized_resources,localization_records=localize_delivery_html(current["html"],snapshot["manifest"],resource_root)
         result_summary={"version":delivery_id,"status":{"stage":"delivery","status":"completed"},"description":"用户确定的终稿已写入工程文件夹并通过离线校验"}
-        files={"deck.html":localized_html.encode(),"index.html":offline_player(localized_html).encode(),"narrative.md":json.loads(self.version(task_id,narrative_hash))["markdown"].encode(),"outline.md":json.loads(self.version(task_id,outline_hash))["markdown"].encode(),"design-contract.json":self.version(task_id,design_contract_hash),"claim-ledger.json":self.version(task_id,claim_ledger_hash),"resource-manifest.json":canonical(snapshot["manifest"]),"localized-resources.json":canonical({"resources":localization_records}),"result.json":canonical({"task_id":task_id,"deck_hash":deck_hash,"finalization_hash":finalization["hash"],"design_contract_hash":design_contract_hash,"claim_ledger_hash":claim_ledger_hash,"post_render_gate_hash":finalization.get("post_render_gate_hash"),"inspection_status":finalization["inspection_status"],"finalization_mode":finalization_mode,"warnings":warnings,"confirmed_at":confirmed_at,**result_summary}),**offline_assets(),**localized_resources}
+        files={"deck.html":localized_html.encode(),"index.html":offline_player(localized_html).encode(),"narrative.md":json.loads(self.version(task_id,narrative_hash))["markdown"].encode(),"outline.md":json.loads(self.version(task_id,outline_hash))["markdown"].encode(),"design-contract.json":self.version(task_id,design_contract_hash),"claim-ledger.json":self.version(task_id,claim_ledger_hash),"post-render-gate-evidence.json":post_render_gate_evidence,"resource-manifest.json":canonical(snapshot["manifest"]),"localized-resources.json":canonical({"resources":localization_records}),"result.json":canonical({"task_id":task_id,"deck_hash":deck_hash,"finalization_hash":finalization["hash"],"design_contract_hash":design_contract_hash,"claim_ledger_hash":claim_ledger_hash,"post_render_gate_hash":post_render_gate_hash,"inspection_status":finalization["inspection_status"],"finalization_mode":finalization_mode,"warnings":warnings,"confirmed_at":confirmed_at,**result_summary}),**offline_assets(),**localized_resources}
         for item in snapshot["manifest"].get("resources",[]):
             relative=Path(item["uri"].removeprefix("resources://"))
             source=resource_root/relative
