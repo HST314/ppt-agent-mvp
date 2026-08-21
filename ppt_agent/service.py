@@ -17,6 +17,7 @@ from .schema import NarrativeDocument, SlideOutline, SampleSelection, DeckArtifa
 from .p3 import changed_slide_ids, narrative_markdown, normalize_outline_markdown, outline_markdown, parse_outline, requested_slide_count, structured_outline_markdown
 from .p4 import controlled_assets, infer_scope, recommend, render, validate_html
 from .offline import localize_delivery_html, offline_assets, offline_player, verify_delivery
+from .overflow_autofit import GEOMETRIC_CODES, fit_deck_html
 
 def utcnow(): return datetime.now(timezone.utc).isoformat()
 def fingerprint(value): return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(",",":")).encode()).hexdigest()
@@ -1134,6 +1135,44 @@ class TaskService:
         html_text,outline_hash,metadata,token=prepared or self._prepare_auto_fix(task_id,report,round_number)
         return self._commit_candidate_deck(task_id,html_text,outline_hash,metadata,"deck_auto_fix",token,"system")["deck"]
 
+    def _try_overflow_autofit(self,task_id,report):
+        """Deterministic geometric repair ahead of any LLM fix round.
+
+        Returns the fresh post-repair inspection report when geometric
+        blockers existed and at least one rule was committed; ``None`` when
+        there was nothing for the deterministic path to do.
+        """
+        if self.browser_inspector is None: return None
+        geometric=[item for item in report["issues"] if item["severity"]=="blocker" and item["code"] in GEOMETRIC_CODES]
+        if not geometric: return None
+        with self.store.lock(task_id):
+            token=self._candidate_write_token(task_id)
+            deck=self.deck_view(task_id)["deck"]
+        result=fit_deck_html(deck["html"],max_rounds=2)
+        if not result["available"] or not result["rules"]: return None
+        metadata={"parent":deck["hash"],"summary":f"确定性溢出修复 {len(result['rules'])} 处（{result['rounds']} 轮）","scope":"global","affected":list(deck["metadata"]["page_hashes"]),"outline_consistent":True,"overflow_autofit":{"rules":result["rules"],"rounds":result["rounds"],"converged":result["converged"],"remaining":result["remaining"]},"global_rules":deck["metadata"].get("global_rules",[]),"local_exceptions":deck["metadata"].get("local_exceptions",{})}
+        self._commit_candidate_deck(task_id,result["html"],deck["outline_hash"],metadata,"deck_overflow_autofit",token,"system")
+        return self._inspect_once(task_id,"full",list(deck["metadata"]["page_hashes"]),0)
+
+    def autofit_overflow(self,task_id,max_rounds=2):
+        """User-triggered deterministic overflow repair from the review page."""
+        state=self._require_candidate_mutable(task_id)
+        if isinstance(max_rounds,bool) or not isinstance(max_rounds,int) or max_rounds<1 or max_rounds>5: raise ValidationError("max_rounds 必须为 1 到 5 的整数")
+        deck=self.deck_view(task_id)["deck"]
+        if not deck: raise ConflictError("尚未生成全稿")
+        if state.stage==state.stage.DECK: self.command(task_id,f"to-review-{self._current_version(task_id,'deck')[:12]}","advance","system")
+        with self.store.lock(task_id):
+            token=self._candidate_write_token(task_id)
+            deck=self.deck_view(task_id)["deck"]
+        result=fit_deck_html(deck["html"],max_rounds=max_rounds)
+        if not result["available"]: raise ConflictError("Chromium 渲染不可用，无法执行确定性溢出修复")
+        if not result["rules"]:
+            return {**self.inspection_view(task_id),"autofit":{"applied":0,"rounds":0,"converged":result["converged"],"remaining":result["remaining"]}}
+        metadata={"parent":deck["hash"],"summary":f"确定性溢出修复 {len(result['rules'])} 处（{result['rounds']} 轮）","scope":"global","affected":list(deck["metadata"]["page_hashes"]),"outline_consistent":True,"overflow_autofit":{"rules":result["rules"],"rounds":result["rounds"],"converged":result["converged"],"remaining":result["remaining"]},"global_rules":deck["metadata"].get("global_rules",[]),"local_exceptions":deck["metadata"].get("local_exceptions",{})}
+        self._commit_candidate_deck(task_id,result["html"],deck["outline_hash"],metadata,"deck_overflow_autofit",token,"system")
+        report=self._inspect_once(task_id,"full",list(deck["metadata"]["page_hashes"]),0)
+        return {**self.inspection_view(task_id),"autofit":{"applied":len(result["rules"]),"rounds":result["rounds"],"converged":result["converged"],"remaining":result["remaining"],"report_hash":report["hash"]}}
+
     def run_inspection(self,task_id,max_rounds=2,affected_slide_ids=None,_prepared_raw=None):
         metric_started=time.monotonic()
         state=self._require_candidate_mutable(task_id)
@@ -1151,6 +1190,11 @@ class TaskService:
             if state.stage==state.stage.DECK: self.command(task_id,f"to-review-{self._current_version(task_id,'deck')[:12]}","advance","system"); state=TaskState.parse(self.get(task_id))
             if state.stage!=state.stage.REVIEW: raise ConflictError("当前阶段不能执行检查")
             report=self._inspect_once(task_id,scope,affected,0,_prepared_raw); rounds=0
+            if state.mode in {"auto","quick"} and max_rounds>=1 and not report["passed"]:
+                # 纯几何溢出先做确定性自适应，不消耗模型修复轮次；修复成功
+                # 则直接进入人工确认，残留问题再走既有 LLM 有界修复。
+                fitted=self._try_overflow_autofit(task_id,report)
+                if fitted is not None: report=fitted
             if state.mode in {"auto","quick"}:
                 while not report["passed"] and rounds<max_rounds:
                     rounds+=1; self._auto_fix(task_id,report,rounds); report=self._inspect_once(task_id,"incremental",affected,rounds)
@@ -1227,8 +1271,10 @@ class TaskService:
         current=next((item for item in reversed(finalizations) if not item["stale"]),None)
         return {"current":current,"history":finalizations}
 
-    def finalize_deck(self,task_id,deck_hash,source="deck",actor="user"):
+    def finalize_deck(self,task_id,deck_hash,source="deck",actor="user",allow_risk=False,risk_rationale=""):
         if actor!="user": raise ValidationError("终稿必须由用户明确确认")
+        if not isinstance(allow_risk,bool): raise ValidationError("allow_risk 必须是布尔值")
+        if not isinstance(risk_rationale,str): raise ValidationError("带风险定稿依据必须是字符串")
         with self.store.transaction(task_id):
             self._require_actionable(task_id)
             state=TaskState.parse(self.get(task_id)); deck=self.deck_view(task_id)["deck"]
@@ -1243,14 +1289,23 @@ class TaskService:
                 inspection_status="issues_disposed"
             else:
                 inspection_status="issues_remaining"
+            blockers=list(inspection["blocking_issues"])
+            # 阻断问题未清零时禁止默认定稿；用户仍可显式选择带风险定稿，
+            # 但必须留下可追溯依据，且终稿事实与交付元数据明确标注“带风险终稿”。
+            if blockers and not allow_risk:
+                raise ConflictError(f"仍有 {len(blockers)} 项未处置的阻断问题，禁止默认定稿；请先修复、处置，或显式选择带风险定稿并填写依据")
+            finalization_mode="standard"
+            if blockers and allow_risk:
+                if not risk_rationale.strip(): raise ValidationError("带风险定稿必须填写可追溯的风险依据")
+                finalization_mode="risk_accepted"
             existing=self.finalization_view(task_id)["current"]
-            if existing and existing["inspection_status"]==inspection_status and existing["unresolved_issue_count"]==len(inspection["unresolved"]) and existing["blocking_issue_count"]==len(inspection["blocking_issues"]):
+            if existing and existing["inspection_status"]==inspection_status and existing["unresolved_issue_count"]==len(inspection["unresolved"]) and existing["blocking_issue_count"]==len(inspection["blocking_issues"]) and existing.get("finalization_mode","standard")==finalization_mode:
                 return {"state":self.get(task_id),"finalization":existing}
             finalized_at=utcnow()
-            payload={"finalization_id":f"final-{deck_hash[:16]}","task_id":task_id,"deck_hash":deck_hash,"finalized_by":"user","finalized_at":finalized_at,"source":source if source in {"deck","review"} else "deck","inspection_status":inspection_status,"inspection_report_hash":None if not report or report["stale"] else report["hash"],"unresolved_issue_count":len(inspection["unresolved"]),"blocking_issue_count":len(inspection["blocking_issues"]),"schema_version":"1.0"}
-            final_hash=self.store.put_version(task_id,"final-deck",canonical(payload),{"deck_hash":deck_hash,"source":payload["source"],"inspection_status":inspection_status})
+            payload={"finalization_id":f"final-{deck_hash[:16]}","task_id":task_id,"deck_hash":deck_hash,"finalized_by":"user","finalized_at":finalized_at,"source":source if source in {"deck","review"} else "deck","inspection_status":inspection_status,"inspection_report_hash":None if not report or report["stale"] else report["hash"],"unresolved_issue_count":len(inspection["unresolved"]),"blocking_issue_count":len(inspection["blocking_issues"]),"finalization_mode":finalization_mode,"risk_rationale":risk_rationale.strip() if finalization_mode=="risk_accepted" else "","schema_version":"1.0"}
+            final_hash=self.store.put_version(task_id,"final-deck",canonical(payload),{"deck_hash":deck_hash,"source":payload["source"],"inspection_status":inspection_status,"finalization_mode":finalization_mode})
             new=TaskState(**{**state.__dict__,"stage":state.stage.DELIVERY,"status":state.status.READY,"waiting_reason":"final_ready","required_action":"publish_delivery","revision":state.revision+1})
-            event={"event_id":digest(f"{task_id}:finalize:{deck_hash}".encode())[:24],"command_id":f"finalize-{deck_hash[:16]}","action":"finalize_deck","actor":"user","request_hash":deck_hash,"at":finalized_at,"from":state.to_dict(),"to":new.to_dict(),"result":{"finalization_hash":final_hash,"deck_hash":deck_hash,"inspection_status":inspection_status}}
+            event={"event_id":digest(f"{task_id}:finalize:{deck_hash}".encode())[:24],"command_id":f"finalize-{deck_hash[:16]}","action":"finalize_deck","actor":"user","request_hash":deck_hash,"at":finalized_at,"from":state.to_dict(),"to":new.to_dict(),"result":{"finalization_hash":final_hash,"deck_hash":deck_hash,"inspection_status":inspection_status,"finalization_mode":finalization_mode}}
             self.store.commit(task_id,new.to_dict(),event)
         return {"state":new.to_dict(),"finalization":{**payload,"hash":final_hash,"metadata":{"deck_hash":deck_hash,"source":payload["source"],"inspection_status":inspection_status},"stale":False}}
 
@@ -1312,9 +1367,12 @@ class TaskService:
 
         intent=self.store.delivery_intent(task_id,delivery_id,{"task_id":task_id,"deck_hash":deck_hash})
         confirmed_at=intent["confirmed_at"]
+        finalization_mode=finalization.get("finalization_mode","standard")
         warnings=[]
+        if finalization_mode=="risk_accepted":
+            warnings.append({"code":"risk_accepted_finalization","label":"带风险终稿","blocking_issue_count":finalization["blocking_issue_count"],"rationale":finalization.get("risk_rationale","")})
         if finalization["unresolved_issue_count"]:
-            warnings=[{"code":"finalized_with_issues","count":finalization["unresolved_issue_count"],"inspection_status":finalization["inspection_status"]}]
+            warnings.append({"code":"finalized_with_issues","count":finalization["unresolved_issue_count"],"inspection_status":finalization["inspection_status"]})
 
         def complete(model,hashes,localized_count,delivery_hash=None):
             delivery_hash=delivery_hash or self.store.put_version(task_id,"delivery",canonical(model.to_dict()),{"file_hashes":hashes,"warnings":warnings,"issue_summary":{"unresolved":finalization["unresolved_issue_count"],"blockers":finalization["blocking_issue_count"]},"finalization_hash":finalization["hash"],"localized_resources":localized_count,"package":delivery_id})
@@ -1352,7 +1410,7 @@ class TaskService:
         resource_root=self.store.resource_root(task_id)
         localized_html,localized_resources,localization_records=localize_delivery_html(current["html"],snapshot["manifest"],resource_root)
         result_summary={"version":delivery_id,"status":{"stage":"delivery","status":"completed"},"description":"用户确定的终稿已写入工程文件夹并通过离线校验"}
-        files={"deck.html":localized_html.encode(),"index.html":offline_player(localized_html).encode(),"narrative.md":json.loads(self.version(task_id,narrative_hash))["markdown"].encode(),"outline.md":json.loads(self.version(task_id,outline_hash))["markdown"].encode(),"resource-manifest.json":canonical(snapshot["manifest"]),"localized-resources.json":canonical({"resources":localization_records}),"result.json":canonical({"task_id":task_id,"deck_hash":deck_hash,"finalization_hash":finalization["hash"],"inspection_status":finalization["inspection_status"],"warnings":warnings,"confirmed_at":confirmed_at,**result_summary}),**offline_assets(),**localized_resources}
+        files={"deck.html":localized_html.encode(),"index.html":offline_player(localized_html).encode(),"narrative.md":json.loads(self.version(task_id,narrative_hash))["markdown"].encode(),"outline.md":json.loads(self.version(task_id,outline_hash))["markdown"].encode(),"resource-manifest.json":canonical(snapshot["manifest"]),"localized-resources.json":canonical({"resources":localization_records}),"result.json":canonical({"task_id":task_id,"deck_hash":deck_hash,"finalization_hash":finalization["hash"],"inspection_status":finalization["inspection_status"],"finalization_mode":finalization_mode,"warnings":warnings,"confirmed_at":confirmed_at,**result_summary}),**offline_assets(),**localized_resources}
         for item in snapshot["manifest"].get("resources",[]):
             relative=Path(item["uri"].removeprefix("resources://"))
             source=resource_root/relative

@@ -1,6 +1,6 @@
-import { api } from "../api.js?v=2026.08.21.045824180656";
-import { badge, button, confirmationDialog, element, field, formatTime, metadataList, shortHash } from "../components/index.js?v=2026.08.21.045824180656";
-import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.21.045824180656";
+import { api } from "../api.js?v=2026.08.21.075744095363";
+import { badge, button, confirmationDialog, element, field, formatTime, metadataList, shortHash } from "../components/index.js?v=2026.08.21.075744095363";
+import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.21.075744095363";
 
 export async function render(context) {
   const [view, deckView, inspection] = await Promise.all([
@@ -53,6 +53,10 @@ function deliveryStage(view, deck, inspection, context) {
         gateItem("资源本地化", completed, completed ? "已校验" : "写包时执行"),
         gateItem("工程写入", completed, completed ? "已完成" : "等待用户"),
       ]),
+      finalization?.finalization_mode === "risk_accepted" ? element("div", { className: "notice notice--danger" }, [
+        element("strong", { text: "该版本为带风险终稿" }),
+        element("p", { text: `定稿时仍有 ${finalization.blocking_issue_count} 项阻断问题未处置，用户显式接受风险并留痕。依据：${finalization.risk_rationale || "未填写"}。发布离线包仍要求阻断问题清零。` }),
+      ]) : null,
       finalization && !precheckOk && !completed ? element("div", { className: "notice notice--danger" }, [
         element("strong", { text: "渲染预检未通过，已禁止发布" }),
         element("p", { text: `${gateReason}。` }),
@@ -70,8 +74,11 @@ function deliveryStage(view, deck, inspection, context) {
       metadataList([["终稿", shortHash(finalization?.deck_hash)], ["终稿记录", shortHash(finalization?.hash)], ["最近交付", shortHash(latest?.hash)], ["交付次数", view.deliveries?.length || 0], ["任务修订", view.state.revision]]),
     ]),
     section("终稿摘要", finalization ? [
-      badge(inspectionStatus(finalization.inspection_status), ["passed", "issues_disposed"].includes(finalization.inspection_status) ? "success" : "warning"),
-      metadataList([["来源页面", finalization.source === "review" ? "自检与修改" : "全稿"], ["遗留问题", finalization.unresolved_issue_count], ["其中阻断", finalization.blocking_issue_count]]),
+      element("div", { className: "button-row" }, [
+        badge(inspectionStatus(finalization.inspection_status), ["passed", "issues_disposed"].includes(finalization.inspection_status) ? "success" : "warning"),
+        finalization.finalization_mode === "risk_accepted" ? badge("带风险终稿", "danger") : null,
+      ].filter(Boolean)),
+      metadataList([["来源页面", finalization.source === "review" ? "自检与修改" : "全稿"], ["遗留问题", finalization.unresolved_issue_count], ["其中阻断", finalization.blocking_issue_count], ...(finalization.finalization_mode === "risk_accepted" ? [["风险依据", finalization.risk_rationale || "未填写"]] : [])]),
     ] : [badge("尚未确定", "warning"), button("返回全稿", { href: `/tasks/${encodeURIComponent(context.taskId)}?stage=deck`, kind: "secondary" })]),
   ]);
 }

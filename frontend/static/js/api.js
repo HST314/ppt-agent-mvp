@@ -83,6 +83,7 @@ export const api = {
   finalizeDeck: (taskId, payload) => post(`${taskPath(taskId)}/deck/finalize`, payload),
   inspection: (taskId, controller) => request(`${taskPath(taskId)}/inspection`, { controller }),
   setInspectionMode: (taskId, mode) => post(`${taskPath(taskId)}/inspection/mode`, { mode }),
+  autofitOverflow: (taskId, payload) => post(`${taskPath(taskId)}/inspection/autofit`, payload),
   checkDeliveryGate: (taskId) => post(`${taskPath(taskId)}/inspection/delivery-gate`, {}),
   disposeIssue: (taskId, issueId, payload) => post(`${taskPath(taskId)}/issues/${encodeURIComponent(issueId)}/disposition`, payload),
   disposeIssues: (taskId, payload) => post(`${taskPath(taskId)}/issues/dispositions/batch`, payload),

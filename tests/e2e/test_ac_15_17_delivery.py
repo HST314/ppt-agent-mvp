@@ -2,7 +2,7 @@ import hashlib, json, tempfile, threading, unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
-from ppt_agent.errors import ConflictError, GateError
+from ppt_agent.errors import ConflictError, GateError, ValidationError
 from ppt_agent.gateways import FakeHtmlBuilder
 from ppt_agent.offline import verify_delivery
 from ppt_agent.p4 import render
@@ -76,6 +76,87 @@ class DeliveryGateTests(unittest.TestCase):
         first=svc.publish_delivery("task"); second=svc.publish_delivery("task")
         self.assertEqual(second["delivery"]["hash"],first["delivery"]["hash"])
         self.assertEqual(len(svc.versions("task","delivery")),1)
+
+
+class FinalizeGateTests(unittest.TestCase):
+    """定稿门禁：阻断问题未清零时禁止默认定稿；带风险定稿必须显式选择、留痕，且不放松发布门禁。"""
+
+    def _drive_to_review_with_blocker(self):
+        tmp=tempfile.TemporaryDirectory(); store=WorkspaceStore(tmp.name); svc=TaskService(store,inspector=BlockingInspector())
+        self.addCleanup(tmp.cleanup)
+        svc.create("task","manual")
+        svc.import_input("task",{"goal":"发布","audience":"客户","topic":"方案","页数":3})
+        svc.generate_narrative("task"); svc.confirm_narrative("task"); svc.generate_outline("task"); svc.confirm_outline("task")
+        svc.generate_sample("task"); svc.confirm_sample("task"); svc.generate_deck("task"); svc.run_inspection("task",0)
+        return svc
+
+    def test_default_finalize_is_blocked_by_unresolved_blockers(self):
+        svc=self._drive_to_review_with_blocker()
+        deck=svc.deck_view("task")["deck"]
+        with self.assertRaisesRegex(ConflictError,"阻断问题"):
+            svc.finalize_deck("task",deck["hash"],"review")
+        self.assertEqual(svc.get("task")["stage"],"review")
+        self.assertIsNone(svc.finalization_view("task")["current"])
+        self.assertEqual(svc.versions("task","final-deck"),[])
+
+    def test_finalize_rejects_malformed_risk_parameters(self):
+        svc=self._drive_to_review_with_blocker()
+        deck=svc.deck_view("task")["deck"]
+        with self.assertRaises(ValidationError): svc.finalize_deck("task",deck["hash"],"review",allow_risk="yes")
+        with self.assertRaises(ValidationError): svc.finalize_deck("task",deck["hash"],"review",allow_risk=True,risk_rationale=123)
+
+    def test_risk_finalize_requires_a_traceable_rationale(self):
+        svc=self._drive_to_review_with_blocker()
+        deck=svc.deck_view("task")["deck"]
+        for rationale in ("","   "):
+            with self.subTest(rationale=rationale), self.assertRaises(ValidationError):
+                svc.finalize_deck("task",deck["hash"],"review",allow_risk=True,risk_rationale=rationale)
+        self.assertIsNone(svc.finalization_view("task")["current"])
+
+    def test_risk_finalize_records_mode_and_rationale_on_the_fact_and_views(self):
+        svc=self._drive_to_review_with_blocker()
+        deck=svc.deck_view("task")["deck"]
+        result=svc.finalize_deck("task",deck["hash"],"review",allow_risk=True,risk_rationale=" 客户确认接受该越界风险 ")
+        finalization=result["finalization"]
+        self.assertEqual(result["state"]["stage"],"delivery")
+        self.assertEqual(finalization["finalization_mode"],"risk_accepted")
+        self.assertEqual(finalization["risk_rationale"],"客户确认接受该越界风险")
+        self.assertEqual(finalization["blocking_issue_count"],1)
+        self.assertEqual(finalization["inspection_status"],"issues_remaining")
+        current=svc.finalization_view("task")["current"]
+        self.assertEqual(current["finalization_mode"],"risk_accepted")
+        self.assertEqual(current["risk_rationale"],"客户确认接受该越界风险")
+        # 交付视图必须携带同等标注，交付页据此展示“带风险终稿”。
+        delivery=svc.delivery_view("task")
+        self.assertEqual(delivery["finalization"]["finalization_mode"],"risk_accepted")
+        self.assertEqual(delivery["finalization"]["risk_rationale"],"客户确认接受该越界风险")
+
+    def test_risk_finalize_freezes_the_candidate_and_replay_is_rejected(self):
+        svc=self._drive_to_review_with_blocker()
+        deck=svc.deck_view("task")["deck"]
+        first=svc.finalize_deck("task",deck["hash"],"review",allow_risk=True,risk_rationale="客户确认接受")["finalization"]
+        # 终稿事实冻结、阶段进入交付后：重复定稿（无论是否带风险）都被拒绝且不产生新事实。
+        for kwargs in ({"allow_risk":True,"risk_rationale":"客户确认接受"},{}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ConflictError):
+                svc.finalize_deck("task",deck["hash"],"review",**kwargs)
+        self.assertEqual(len(svc.versions("task","final-deck")),1)
+        self.assertEqual(svc.finalization_view("task")["current"]["hash"],first["hash"])
+
+    def test_publish_stays_gated_after_risk_finalize(self):
+        svc=self._drive_to_review_with_blocker()
+        deck=svc.deck_view("task")["deck"]
+        svc.finalize_deck("task",deck["hash"],"review",allow_risk=True,risk_rationale="客户确认接受")
+        with self.assertRaises(ConflictError): svc.publish_delivery("task")
+        self.assertEqual(svc.versions("task","delivery"),[])
+
+    def test_standard_finalize_after_disposition_is_not_labeled_risk(self):
+        svc=self._drive_to_review_with_blocker()
+        svc.dispose_issue("task","overflow","waive","演示口径接受该越界")
+        deck=svc.deck_view("task")["deck"]
+        finalization=svc.finalize_deck("task",deck["hash"],"review")["finalization"]
+        self.assertEqual(finalization["finalization_mode"],"standard")
+        self.assertEqual(finalization["risk_rationale"],"")
+        self.assertEqual(finalization["inspection_status"],"issues_disposed")
 
 
 class DeliveryJourney(unittest.TestCase):

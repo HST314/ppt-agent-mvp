@@ -79,6 +79,8 @@ CSS_PROPERTIES = {
     "object-fit", "object-position", "cursor", "pointer-events", "user-select",
     "mix-blend-mode", "filter", "backdrop-filter", "-webkit-backdrop-filter",
     "-webkit-font-smoothing", "text-rendering", "will-change", "content", "animation",
+    # 确定性溢出修复使用的惰性布局缩放（不加载资源、不执行脚本）
+    "zoom",
     # SVG 样式
     "fill", "stroke", "stroke-width", "stroke-linecap", "stroke-linejoin", "stroke-dasharray", "stroke-opacity", "fill-opacity"
 }

@@ -285,10 +285,10 @@ async def change_deck(task_id: str, action: str, request: Request, service: Task
         exact(body, {"left", "right"}, {"left", "right"})
         return service.compare_decks(task_id, body["left"], body["right"])
     if action == "finalize":
-        exact(body, {"deck_hash", "source", "actor"}, {"deck_hash"})
+        exact(body, {"deck_hash", "source", "actor", "allow_risk", "risk_rationale"}, {"deck_hash"})
         if jobs.list(task_id,"active"):
             raise ConflictError("仍有生成、修改或修复 Job 运行中，请等待完成或先取消")
-        return service.finalize_deck(task_id,body["deck_hash"],body.get("source","deck"),body.get("actor","user"))
+        return service.finalize_deck(task_id,body["deck_hash"],body.get("source","deck"),body.get("actor","user"),body.get("allow_risk",False),body.get("risk_rationale",""))
     raise NotFoundError("接口不存在")
 
 
@@ -306,6 +306,9 @@ async def change_inspection(task_id: str, action: str, request: Request, service
     if action == "mode":
         exact(body, {"mode"}, {"mode"})
         return service.switch_inspection_mode(task_id, body["mode"])
+    if action == "autofit":
+        exact(body, {"max_rounds"})
+        return service.autofit_overflow(task_id, body.get("max_rounds", 2))
     if action == "delivery-gate":
         exact(body, set())
         return service.assert_delivery_gate(task_id)
