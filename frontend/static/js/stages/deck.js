@@ -1,6 +1,6 @@
-import { api } from "../api.js?v=2026.08.21.035240047774";
-import { badge, button, confirmationDialog, element, field, metadataList, previewFrame, previewUrl, shortHash } from "../components/index.js?v=2026.08.21.035240047774";
-import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.21.035240047774";
+import { api } from "../api.js?v=2026.08.21.042435702251";
+import { badge, button, confirmationDialog, element, field, metadataList, previewFrame, previewUrl, shortHash } from "../components/index.js?v=2026.08.21.042435702251";
+import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.21.042435702251";
 
 export async function render(context) {
   const view = await api.deck(context.taskId, context.controller);

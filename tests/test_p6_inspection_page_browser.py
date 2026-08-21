@@ -94,6 +94,24 @@ class InspectionPageBrowserTests(unittest.TestCase):
         first = groups.first
         self.assertEqual(first.get_by_label("处置动作").count(), 1)
 
+    def test_mixed_severity_group_form_ids_unique_and_labels_resolve(self):
+        groups = self.page.locator(".issue-group")
+        groups.first.wait_for()
+        self.assertEqual(groups.count(), 3)
+        ids = self.page.eval_on_selector_all("select[id^='group-action-'], input[id^='group-rationale-']", "nodes => nodes.map((node) => node.id)")
+        # 混合 blocker+warning：所有分组表单 ID 全局唯一，且带 blocker/warning 分区前缀。
+        self.assertEqual(len(ids), 6)
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertIn("group-action-blocker-slide-1-overflow", ids)
+        self.assertIn("group-action-warning-slide-2-overflow", ids)
+        # 每组 label 可达，且按 ID 解析回本组控件而非页面内同 ID 副本。
+        for index in range(groups.count()):
+            group = groups.nth(index)
+            for label in ("处置动作", "处置依据"):
+                control = group.get_by_label(label)
+                self.assertEqual(control.count(), 1)
+                self.assertTrue(control.evaluate("node => document.getElementById(node.id) === node"))
+
 
 if __name__ == "__main__":
     unittest.main()

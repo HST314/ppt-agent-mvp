@@ -1,7 +1,7 @@
-import { api } from "../api.js?v=2026.08.21.035240047774";
-import { badge, button, confirmationDialog, element, field, metadataList, shortHash, versionTimeline } from "../components/index.js?v=2026.08.21.035240047774";
-import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.21.035240047774";
-import { comparePanel, deckPreview, modificationPanel } from "./deck.js?v=2026.08.21.035240047774";
+import { api } from "../api.js?v=2026.08.21.042435702251";
+import { badge, button, confirmationDialog, element, field, metadataList, shortHash, versionTimeline } from "../components/index.js?v=2026.08.21.042435702251";
+import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.21.042435702251";
+import { comparePanel, deckPreview, modificationPanel } from "./deck.js?v=2026.08.21.042435702251";
 
 export async function render(context) {
   const [view, deckView, settings] = await Promise.all([api.inspection(context.taskId, context.controller), api.deck(context.taskId, context.controller), api.settings(context.controller)]);
@@ -102,15 +102,22 @@ function groupIssues(issues) {
   return [...groups.values()];
 }
 
+function groupDomKey(group) {
+  const partition = group.severity === "blocker" ? "blocker" : "warning";
+  const sanitize = (value) => String(value ?? "").replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "deck";
+  return `${partition}-${sanitize(group.slide)}-${sanitize(group.code)}`;
+}
+
 function issueGroupCard(group, active, context, preview, location, index) {
   const message = actionMessage();
   const disposed = group.items.filter((issue) => ["manual", "waive", "resolve"].includes(active.get(issue.issue_id)?.action));
-  const action = element("select", { className: "select", id: `group-action-${index}` }, [
+  const domKey = groupDomKey(group);
+  const action = element("select", { className: "select", id: `group-action-${domKey}` }, [
     element("option", { value: "manual", text: "手工已处理" }),
     element("option", { value: "waive", text: "接受 / 豁免" }),
     element("option", { value: "defer", text: "暂不处理" }),
   ]);
-  const rationale = element("input", { className: "input", id: `group-rationale-${index}`, placeholder: "说明处置依据（豁免时必填）" });
+  const rationale = element("input", { className: "input", id: `group-rationale-${domKey}`, placeholder: "说明处置依据（豁免时必填）" });
   const save = button(`处置本组 ${group.items.length} 项`, { kind: "secondary", mutates: true });
   save.addEventListener("click", () => {
     runAction({ buttonNode: save, region: message, action: () => api.disposeIssues(context.taskId, { issue_ids: group.items.map((item) => item.issue_id), action: action.value, rationale: rationale.value }), success: `已处置 ${group.items.length} 个同类问题。`, refresh: context.refresh }).catch(() => {});
