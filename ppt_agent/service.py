@@ -25,6 +25,69 @@ from .overflow_autofit import GEOMETRIC_CODES, fit_deck_html
 def utcnow(): return datetime.now(timezone.utc).isoformat()
 def fingerprint(value): return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(",",":")).encode()).hexdigest()
 
+INSPECTION_SOURCES=frozenset({"semantic_model","semantic_deterministic","technical_browser"})
+INSPECTION_SOURCE_PRIORITY={"semantic_model":0,"semantic_deterministic":1,"technical_browser":2}
+
+def inspection_semantic_identity(issue):
+    """Return the server-owned identity for a finding, independent of source IDs."""
+    level=issue.get("level") or ("element" if issue.get("element_id") else "slide" if issue.get("slide_id") else "deck")
+    if level not in {"element","slide","deck"}: level="deck"
+    slide_id="" if level=="deck" else str(issue.get("slide_id") or "").strip()
+    element_id=str(issue.get("element_id") or "").strip() if level=="element" else ""
+    return {
+        "code":re.sub(r"\s+"," ",str(issue.get("code") or "quality_issue").strip()).casefold(),
+        "level":level,
+        "slide_id":slide_id,
+        "element_id":element_id,
+    }
+
+def inspection_semantic_issue_id(issue):
+    return f"inspection-{digest(canonical(inspection_semantic_identity(issue)))[:24]}"
+
+def inspection_source_issue_id(source,issue):
+    value=str(issue.get("issue_id") or "").strip()
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}",value): return value
+    return f"{source}-{digest(canonical(issue))[:24]}"
+
+def merge_inspection_source_issues(source_items):
+    """Merge source findings by server semantics while retaining raw identities."""
+    combined=[]; by_identity={}
+    for source,items in source_items:
+        if source not in INSPECTION_SOURCES or not isinstance(items,list):
+            raise ValidationError("检查报告来源或 issues 无效")
+        for original in items:
+            if not isinstance(original,dict): raise ValidationError("检查报告 issue 必须是对象")
+            identity=inspection_semantic_identity(original)
+            key=canonical(identity)
+            raw_id=inspection_source_issue_id(source,original)
+            candidate={
+                **original,
+                "issue_id":inspection_semantic_issue_id(original),
+                "severity":original.get("severity","warning"),
+                "level":identity["level"],
+                "code":original.get("code","quality_issue"),
+                "message":original.get("message","发现质量问题"),
+                "slide_id":identity["slide_id"],
+                "element_id":identity["element_id"],
+                "evidence":original.get("evidence",original.get("message","发现质量问题")),
+                "suggestion":original.get("suggestion","请人工检查并修复"),
+                "source":source,
+                "sources":[source],
+                "source_issue_ids":[{"source":source,"issue_id":raw_id}],
+            }
+            existing=by_identity.get(key)
+            if existing is None:
+                by_identity[key]=candidate; combined.append(candidate); continue
+            origin={"source":source,"issue_id":raw_id}
+            if origin not in existing["source_issue_ids"]: existing["source_issue_ids"].append(origin)
+            existing["sources"]=list(dict.fromkeys([*existing["sources"],source]))
+            if candidate["severity"]=="blocker": existing["severity"]="blocker"
+            if INSPECTION_SOURCE_PRIORITY[source]>=INSPECTION_SOURCE_PRIORITY[existing["source"]]:
+                for field in ("code","message","evidence","suggestion"):
+                    existing[field]=candidate[field]
+                existing["source"]=source
+    return combined
+
 # 只有传输/认证/5xx 类失败才把全局运行时置为不可用；空响应、工具错误、
 # 内容校验等模型行为类失败只记录在所属任务，避免单任务的单次模型抖动
 # 劫持全局徽章并波及其他任务。
@@ -337,9 +400,22 @@ class TaskService:
         reports=self.versions(task_id,"inspection")
         current=None
         if reports:
-            record=max(reports,key=lambda item:json.loads(self.version(task_id,item["hash"]))["created_at"])
-            value=json.loads(self.version(task_id,record["hash"]))
-            current={**value,"hash":record["hash"],"metadata":record["metadata"],"stale":not deck_hash or value["deck_hash"]!=deck_hash}
+            by_hash={item["hash"]:item for item in reports}
+            current_hash=next((
+                event.get("result",{}).get("report_hash") for event in reversed(self.events(task_id))
+                if event.get("action")=="inspection_complete" and event.get("result",{}).get("report_hash") in by_hash
+            ),reports[-1]["hash"])
+            record=by_hash[current_hash]
+            try:
+                value=json.loads(self.version(task_id,current_hash))
+                if not isinstance(value,dict): raise ValueError("inspection report is not an object")
+                report_deck_hash=value.get("deck_hash")
+                current={**value,"hash":current_hash,"metadata":record["metadata"],"stale":not deck_hash or report_deck_hash!=deck_hash}
+            except (NotFoundError,json.JSONDecodeError,UnicodeDecodeError,ValueError):
+                # Keep a fail-closed placeholder instead of treating a missing
+                # current report as "unchecked", which would allow finalize.
+                report_deck_hash=record["metadata"].get("deck_hash")
+                current={"hash":current_hash,"metadata":record["metadata"],"deck_hash":report_deck_hash,"issues":[],"passed":False,"stale":not deck_hash or report_deck_hash!=deck_hash,"integrity_error":"检查报告工件缺失或无效"}
         dispositions=[]
         for record in self.versions(task_id,"issue-disposition"):
             value=json.loads(self.version(task_id,record["hash"]))
@@ -352,10 +428,11 @@ class TaskService:
             if active.get(issue["issue_id"],{}).get("action") not in {"resolve","manual","waive"}
         ]
         blockers=[issue for issue in unresolved if issue["severity"]=="blocker"]
+        integrity_valid=bool(current and not current["stale"] and self._assert_inspection_evidence(task_id,current,fail_closed=False)["valid"])
         return {
             "has_reports":bool(reports),"report":current,"reports":reports,
             "dispositions":dispositions,"unresolved":unresolved,"blocking_issues":blockers,
-            "blockers_resolved":bool(current and not current["stale"] and not blockers),
+            "blockers_resolved":bool(integrity_valid and not blockers),
         }
     def _candidate_write_token(self,task_id,allowed_stages=None):
         """Capture the state which a prepared deck candidate is allowed to replace."""
@@ -1229,15 +1306,45 @@ class TaskService:
         normalized=[]
         for index,item in enumerate(items):
             if not isinstance(item,dict): raise ValidationError("检查报告 issue 必须是对象")
-            level=item.get("level") or ("element" if item.get("element_id") else "slide" if item.get("slide_id") else "deck")
-            source=item.get("source","semantic_model")
-            sources=list(dict.fromkeys(item.get("sources") or [source]))
+            identity=inspection_semantic_identity(item); level=identity["level"]
+            sources=list(dict.fromkeys(item.get("sources") or [item.get("source","semantic_model")]))
             evidence_refs=list(dict.fromkeys(item.get("evidence_refs") or []))
-            normalized.append({"issue_id":item.get("issue_id") or f"issue-{index+1}","severity":item.get("severity","warning"),"level":level,"code":item.get("code","quality_issue"),"message":item.get("message","发现质量问题"),"slide_id":item.get("slide_id","") or "","element_id":item.get("element_id","") or "","evidence":item.get("evidence",item.get("message","发现质量问题")),"suggestion":item.get("suggestion","请人工检查并修复"),"source":source,"sources":sources,"evidence_refs":evidence_refs})
+            if any(source not in INSPECTION_SOURCES for source in sources): raise ValidationError("检查问题来源无效")
+            source=max(sources,key=lambda value:INSPECTION_SOURCE_PRIORITY[value])
+            source_issues=list(item.get("source_issues") or [])
+            normalized.append({"issue_id":inspection_semantic_issue_id(item),"severity":item.get("severity","warning"),"level":level,"code":item.get("code","quality_issue"),"message":item.get("message","发现质量问题"),"slide_id":identity["slide_id"],"element_id":identity["element_id"],"evidence":item.get("evidence",item.get("message","发现质量问题")),"suggestion":item.get("suggestion","请人工检查并修复"),"source":source,"sources":sources,"evidence_refs":evidence_refs,"source_issues":source_issues})
         return normalized
 
     def _assert_inspection_evidence(self,task_id,report,fail_closed=True):
-        errors=[]; artifact_hashes=[]; reference_count=0; cache={}
+        errors=[]; artifact_hashes=[]; reference_count=0; cache={}; report_value=None
+        report_hash=report.get("hash") if isinstance(report,dict) else None
+        try:
+            report_records={item["hash"]:item for item in self.versions(task_id,"inspection")}
+        except NotFoundError:
+            report_records={}
+        report_record=report_records.get(report_hash)
+        try:
+            report_raw=self.version(task_id,report_hash)
+            candidate=json.loads(report_raw)
+            if not isinstance(candidate,dict): raise ValueError("inspection report is not an object")
+            report_value=candidate
+        except (NotFoundError,ValidationError,json.JSONDecodeError,UnicodeDecodeError,ValueError):
+            errors.append("检查报告内容寻址工件缺失或无效")
+            report_raw=None
+        if report_value is not None:
+            try: InspectionReport.parse(report_value)
+            except ValidationError: errors.append("检查报告 schema 或字段语义无效")
+            projected={key:report.get(key) for key in report_value} if isinstance(report,dict) else {}
+            if (report_record is None or not isinstance(report_hash,str) or digest(report_raw)!=report_hash
+                or report_raw!=canonical(report_value) or projected!=report_value):
+                errors.append("检查报告哈希重算或投影不一致")
+            metadata=report.get("metadata",{}) if isinstance(report,dict) else {}
+            if (report_record is None or metadata!=report_record.get("metadata")
+                or metadata.get("deck_hash")!=report_value.get("deck_hash")
+                or report_value.get("task_id")!=task_id):
+                errors.append("检查报告任务、deck 或版本元数据绑定不一致")
+        else:
+            metadata=report.get("metadata",{}) if isinstance(report,dict) else {}
         try:
             records={item["hash"]:item for item in self.versions(task_id,"inspection-evidence")}
         except NotFoundError:
@@ -1247,50 +1354,70 @@ class TaskService:
             record=records.get(evidence_hash)
             try:
                 raw=self.version(task_id,evidence_hash); value=json.loads(raw)
-            except (NotFoundError,json.JSONDecodeError,UnicodeDecodeError):
+            except (NotFoundError,ValidationError,json.JSONDecodeError,UnicodeDecodeError):
                 errors.append(f"{label}:evidence 工件缺失或无效"); cache[evidence_hash]=None; return None
             source=value.get("source")
             if (record is None or digest(raw)!=evidence_hash or raw!=canonical(value)
-                or value.get("schema_version")!="1.0" or value.get("deck_hash")!=report.get("deck_hash")
-                or source not in {"semantic_model","semantic_deterministic","technical_browser"}
-                or record["metadata"].get("source")!=source or record["metadata"].get("deck_hash")!=report.get("deck_hash")):
+                or set(value)!={"schema_version","source","deck_hash","payload"}
+                or value.get("schema_version")!="1.0" or value.get("deck_hash")!=(report_value or report).get("deck_hash")
+                or source not in INSPECTION_SOURCES or not isinstance(value.get("payload"),dict)
+                or not isinstance(value["payload"].get("issues",[]),list)
+                or record["metadata"].get("source")!=source or record["metadata"].get("deck_hash")!=(report_value or report).get("deck_hash")
+                or record["metadata"].get("immutable") is not True):
                 errors.append(f"{label}:evidence 哈希或绑定不一致"); cache[evidence_hash]=None; return None
-            cache[evidence_hash]=source; return source
+            cache[evidence_hash]=value; return value
 
-        declared=report.get("metadata",{}).get("evidence_artifacts")
+        declared=(report_value or {}).get("evidence_artifacts") if report_value is not None else metadata.get("evidence_artifacts")
         if not isinstance(declared,dict) or not declared:
             errors.append("报告缺少 evidence_artifacts 清单")
             declared={}
+        if metadata.get("evidence_artifacts")!=declared:
+            errors.append("检查报告 evidence 清单与版本元数据不一致")
+        documents={}
         for source,evidence_hash in declared.items():
-            if source not in {"semantic_model","semantic_deterministic","technical_browser"} or not re.fullmatch(r"[0-9a-f]{64}",str(evidence_hash)):
+            if source not in INSPECTION_SOURCES or not re.fullmatch(r"[0-9a-f]{64}",str(evidence_hash)):
                 errors.append("报告 evidence_artifacts 清单格式无效")
                 continue
             artifact_hashes.append(evidence_hash)
-            if resolve(evidence_hash,"报告")!=source:
+            document=resolve(evidence_hash,"报告")
+            if not document or document.get("source")!=source:
                 errors.append(f"报告:{source} evidence 绑定不一致")
-        for issue in report.get("issues",[]):
-            sources=list(issue.get("sources") or [issue.get("source","semantic_model")])
-            refs=list(issue.get("evidence_refs") or [])
-            resolved_sources=set()
-            if not refs:
-                errors.append(f"{issue.get('issue_id','unknown')}:缺少 evidence_refs")
-            for ref in refs:
-                reference_count+=1
-                match=re.fullmatch(r"inspection-evidence://([0-9a-f]{64})",str(ref))
-                if not match:
-                    errors.append(f"{issue.get('issue_id','unknown')}:evidence 引用格式无效")
-                    continue
-                evidence_hash=match.group(1); artifact_hashes.append(evidence_hash)
-                source=resolve(evidence_hash,issue.get("issue_id","unknown"))
-                if source: resolved_sources.add(source)
-                if declared.get(source)!=evidence_hash:
-                    errors.append(f"{issue.get('issue_id','unknown')}:evidence 未登记在报告清单")
-            missing=set(sources)-resolved_sources
-            if missing:
-                errors.append(f"{issue.get('issue_id','unknown')}:来源缺少 evidence：{','.join(sorted(missing))}")
+            else:
+                documents[source]=document
+
+        expected_issues=[]
+        try:
+            source_order=("semantic_deterministic","semantic_model","technical_browser")
+            merged=merge_inspection_source_issues([
+                (source,documents[source]["payload"].get("issues",[])) for source in source_order if source in documents
+            ])
+            for item in merged:
+                origins=item.pop("source_issue_ids")
+                sources=list(dict.fromkeys(origin["source"] for origin in origins))
+                source_issues=[]
+                for origin in origins:
+                    evidence_hash=declared.get(origin["source"])
+                    ref=f"inspection-evidence://{evidence_hash}"
+                    reference_count+=1; artifact_hashes.append(evidence_hash)
+                    source_issues.append({**origin,"evidence_ref":ref})
+                expected_issues.append({**item,"sources":sources,"evidence_refs":list(dict.fromkeys(origin["evidence_ref"] for origin in source_issues)),"source_issues":source_issues})
+            expected_issues=self._normalize_inspection_issues(expected_issues)
+        except (ValidationError,TypeError):
+            errors.append("evidence payload issue 集结构无效")
+            expected_issues=[]
+        if report_value is not None:
+            if report_value.get("issues")!=expected_issues:
+                errors.append("检查报告 issue 集与 evidence payload 双向绑定不一致")
+            expected_passed=not expected_issues and all(bool(document["payload"].get("passed",not document["payload"].get("issues",[]))) for document in documents.values())
+            if report_value.get("passed") is not expected_passed:
+                errors.append("检查报告 passed 与 evidence payload 不一致")
+            expected_sources={item["issue_id"]:list(item["sources"]) for item in expected_issues}
+            expected_origins={item["issue_id"]:list(item["source_issues"]) for item in expected_issues}
+            if metadata.get("issue_sources")!=expected_sources or metadata.get("issue_origins")!=expected_origins:
+                errors.append("检查报告 issue 来源元数据绑定不一致")
         result={"valid":not errors,"reference_count":reference_count,"artifact_hashes":sorted(set(artifact_hashes)),"errors":list(dict.fromkeys(errors))}
         if errors and fail_closed:
-            raise ConflictError("检查问题 evidence 溯源失败："+"；".join(errors[:3]))
+            raise ConflictError("检查报告与 evidence 溯源失败："+"；".join(errors[:3]))
         return result
 
     def _call_inspector(self,outline,html_text,browser_evidence):
@@ -1342,34 +1469,18 @@ class TaskService:
         if not isinstance(model_issues,list): raise ValidationError("检查响应 issues 必须是数组")
         browser_issues=(browser_evidence or {}).get("issues",[])
         content_issues=content_evidence.get("issues",[])
-        combined=[]; by_identity={}
         sources=(
             ("semantic_deterministic",content_issues),
             ("semantic_model",model_issues),
             ("technical_browser",browser_issues),
         )
-        for source,items in sources:
-            if not isinstance(items,list): raise ValidationError("检查报告 issues 必须是数组")
-            for original in items:
-                if not isinstance(original,dict): raise ValidationError("检查报告 issue 必须是对象")
-                item={**original,"source":source}
-                identity=item.get("issue_id") or fingerprint(item)
-                if identity in by_identity:
-                    existing=by_identity[identity]
-                    existing["sources"]=list(dict.fromkeys([*(existing.get("sources") or [existing["source"]]),source]))
-                    # A deterministic/browser measurement is the least
-                    # ambiguous compatibility source when the model repeats
-                    # the same issue after reading technical evidence.
-                    priority={"semantic_model":0,"semantic_deterministic":1,"technical_browser":2}
-                    existing["source"]=max(existing["sources"],key=lambda value:priority[value])
-                    continue
-                item["sources"]=[source]
-                by_identity[identity]=item; combined.append(item)
+        combined=merge_inspection_source_issues(sources)
+        merged_counts={source:sum(source in item["sources"] for item in combined) for source,_ in sources}
         browser_passed=True if browser_evidence is None else bool(browser_evidence.get("available")) and bool(browser_evidence.get("passed"))
         checks={
-            "semantic_deterministic":{"available":True,"passed":bool(content_evidence.get("passed")),"issue_count":len(content_issues),"evidence_hash":fingerprint(content_evidence)},
-            "semantic_model":{"available":True,"passed":bool(raw.get("passed",not model_issues)),"issue_count":len(model_issues),"model":raw.get("model","unknown")},
-            "technical_browser":{"available":browser_evidence is not None and bool(browser_evidence.get("available")),"passed":browser_passed,"issue_count":len(browser_issues)},
+            "semantic_deterministic":{"available":True,"passed":bool(content_evidence.get("passed")),"issue_count":merged_counts["semantic_deterministic"],"raw_issue_count":len(content_issues),"evidence_hash":fingerprint(content_evidence)},
+            "semantic_model":{"available":True,"passed":bool(raw.get("passed",not model_issues)),"issue_count":merged_counts["semantic_model"],"raw_issue_count":len(model_issues),"model":raw.get("model","unknown")},
+            "technical_browser":{"available":browser_evidence is not None and bool(browser_evidence.get("available")),"passed":browser_passed,"issue_count":merged_counts["technical_browser"],"raw_issue_count":len(browser_issues)},
         }
         evidence_documents=[
             {"schema_version":"1.0","source":"semantic_deterministic","deck_hash":deck["hash"],"payload":content_evidence},
@@ -1399,27 +1510,33 @@ class TaskService:
         if not isinstance(documents,list):
             model_issues=raw.get("issues",[])
             documents=[{"schema_version":"1.0","source":"semantic_model","deck_hash":deck["hash"],"payload":{"model":raw.get("model","unknown"),"passed":bool(raw.get("passed",not model_issues)),"issues":model_issues}}]
-        evidence_refs={}
+        evidence_refs={}; source_payloads=[]
         for document in documents:
             if (not isinstance(document,dict) or set(document)!={"schema_version","source","deck_hash","payload"}
                 or document.get("schema_version")!="1.0" or document.get("deck_hash")!=deck["hash"]
-                or document.get("source") not in {"semantic_model","semantic_deterministic","technical_browser"}
+                or document.get("source") not in INSPECTION_SOURCES
                 or not isinstance(document.get("payload"),dict)):
                 raise ValidationError("检查 evidence 工件结构或候选绑定无效")
+            source=document["source"]
+            if source in evidence_refs: raise ValidationError("检查 evidence 来源重复")
+            payload_issues=document["payload"].get("issues",[])
+            if not isinstance(payload_issues,list): raise ValidationError("检查 evidence payload issues 必须是数组")
             raw_evidence=canonical(document)
-            evidence_hash=self.store.put_version(task_id,"inspection-evidence",raw_evidence,{"source":document["source"],"deck_hash":deck["hash"],"immutable":True})
+            evidence_hash=self.store.put_version(task_id,"inspection-evidence",raw_evidence,{"source":source,"deck_hash":deck["hash"],"immutable":True})
             if evidence_hash!=digest(raw_evidence): raise ConflictError("检查 evidence 内容寻址持久化失败")
-            evidence_refs[document["source"]]=f"inspection-evidence://{evidence_hash}"
+            evidence_refs[source]=f"inspection-evidence://{evidence_hash}"
+            source_payloads.append((source,payload_issues))
         enriched=[]
-        for item in raw.get("issues",[]):
-            if not isinstance(item,dict): raise ValidationError("检查报告 issue 必须是对象")
-            sources=list(dict.fromkeys(item.get("sources") or [item.get("source","semantic_model")]))
-            missing=[source for source in sources if source not in evidence_refs]
-            if missing: raise ValidationError("检查问题来源缺少可解析 evidence 工件")
-            enriched.append({**item,"sources":sources,"evidence_refs":[evidence_refs[source] for source in sources]})
-        issues=self._normalize_inspection_issues(enriched); passed=bool(raw.get("passed",not issues)) and not issues
-        created=utcnow(); seed=canonical({"deck_hash":deck["hash"],"issues":issues,"created_at":created})
-        report=InspectionReport.parse({"report_id":f"report-{digest(seed)[:16]}","task_id":task_id,"deck_hash":deck["hash"],"issues":issues,"passed":passed,"created_at":created,"schema_version":"1.0"})
+        for item in merge_inspection_source_issues(source_payloads):
+            origins=item.pop("source_issue_ids")
+            sources=list(dict.fromkeys(origin["source"] for origin in origins))
+            source_issues=[{**origin,"evidence_ref":evidence_refs[origin["source"]]} for origin in origins]
+            enriched.append({**item,"sources":sources,"evidence_refs":list(dict.fromkeys(origin["evidence_ref"] for origin in source_issues)),"source_issues":source_issues})
+        issues=self._normalize_inspection_issues(enriched)
+        passed=not issues and all(bool(document["payload"].get("passed",not document["payload"].get("issues",[]))) for document in documents)
+        evidence_artifacts={source:ref.removeprefix("inspection-evidence://") for source,ref in evidence_refs.items()}
+        created=utcnow(); seed=canonical({"deck_hash":deck["hash"],"issues":issues,"evidence_artifacts":evidence_artifacts,"created_at":created})
+        report=InspectionReport.parse({"report_id":f"report-{digest(seed)[:16]}","task_id":task_id,"deck_hash":deck["hash"],"issues":issues,"passed":passed,"created_at":created,"evidence_artifacts":evidence_artifacts,"schema_version":"1.0"})
         browser=raw.get("browser_evidence")
         content=raw.get("content_evidence")
         browser_meta=None if not isinstance(browser,dict) else {
@@ -1442,7 +1559,7 @@ class TaskService:
             "unbound_claim_count":content.get("unbound_claim_count",0),
             "evidence_hash":fingerprint(content),
         }
-        metadata={"deck_hash":deck["hash"],"scope":scope,"affected_slide_ids":affected,"includes_deck_consistency":True,"includes_content_quality":content_meta is not None,"includes_browser_render":browser_meta is not None,"content_evidence":content_meta,"browser_evidence":browser_meta,"quality_checks":raw.get("quality_checks",{}),"issue_sources":{item["issue_id"]:list(item["sources"]) for item in issues},"evidence_artifacts":{source:ref.removeprefix("inspection-evidence://") for source,ref in evidence_refs.items()},"round":round_number,"model":raw.get("model","unknown"),"skill":{"action":"inspection","version":skill["version"],"hash":digest(skill["content"].encode()),"files":skill.get("files",[])},"input_fields":["original_outline","html","frozen_source_binding","design_contract","claim_ledger",*(["browser_evidence"] if browser_meta is not None else [])],"excluded_fields":["generation_context","self_description","images","screenshots"],"design_contract_hash":deck["metadata"].get("design_contract_hash"),"claim_ledger_hash":deck["metadata"].get("claim_ledger_hash"),"post_render_gate":deck["metadata"].get("post_render_gate")}
+        metadata={"deck_hash":deck["hash"],"scope":scope,"affected_slide_ids":affected,"includes_deck_consistency":True,"includes_content_quality":content_meta is not None,"includes_browser_render":browser_meta is not None,"content_evidence":content_meta,"browser_evidence":browser_meta,"quality_checks":raw.get("quality_checks",{}),"issue_sources":{item["issue_id"]:list(item["sources"]) for item in issues},"issue_origins":{item["issue_id"]:list(item["source_issues"]) for item in issues},"evidence_artifacts":evidence_artifacts,"round":round_number,"model":raw.get("model","unknown"),"skill":{"action":"inspection","version":skill["version"],"hash":digest(skill["content"].encode()),"files":skill.get("files",[])},"input_fields":["original_outline","html","frozen_source_binding","design_contract","claim_ledger",*(["browser_evidence"] if browser_meta is not None else [])],"excluded_fields":["generation_context","self_description","images","screenshots"],"design_contract_hash":deck["metadata"].get("design_contract_hash"),"claim_ledger_hash":deck["metadata"].get("claim_ledger_hash"),"post_render_gate":deck["metadata"].get("post_render_gate")}
         h=self.store.put_version(task_id,"inspection",canonical(report.to_dict()),metadata)
         return {**report.to_dict(),"hash":h,"metadata":metadata}
 
@@ -1561,13 +1678,20 @@ class TaskService:
         self.command(task_id,f"inspection-mode-{mode}-{self.get(task_id)['revision']}",f"switch_{mode}","user")
         return self.inspection_view(task_id)
 
+    @staticmethod
+    def _inspection_issue_by_id(report,issue_id):
+        matches=[item for item in report.get("issues",[]) if item.get("issue_id")==issue_id or any(origin.get("issue_id")==issue_id for origin in item.get("source_issues",[]))]
+        if len(matches)>1: raise ValidationError("来源原始问题 ID 对应多个语义问题，请使用服务端 issue_id")
+        return matches[0] if matches else None
+
     def dispose_issue(self,task_id,issue_id,action,rationale,actor="user"):
         self._require_candidate_mutable(task_id)
         view=self.inspection_view(task_id); report=view["report"]
         if not report or report["stale"]: raise ConflictError("当前 HTML 版本没有有效检查报告")
         self._assert_inspection_evidence(task_id,report)
-        issue=next((x for x in report["issues"] if x["issue_id"]==issue_id),None)
+        issue=self._inspection_issue_by_id(report,issue_id)
         if not issue: raise ValidationError("检查问题不存在")
+        issue_id=issue["issue_id"]
         if action not in {"agent_fix","manual","waive","defer"}: raise ValidationError("问题处置动作无效")
         if action in {"manual","waive"} and actor!="user": raise ValidationError("手工处理和豁免必须由用户执行")
         if action=="waive" and (not isinstance(rationale,str) or not rationale.strip()): raise ValidationError("豁免必须填写依据")
@@ -1596,13 +1720,16 @@ class TaskService:
         if not isinstance(issue_ids,list) or not issue_ids or len(set(issue_ids))!=len(issue_ids): raise ValidationError("批量范围必须是非空且不重复的问题 ID")
         if action=="agent_fix" and len(issue_ids)>1: raise ValidationError("Agent 修复会生成新 HTML，请逐项执行并复检")
         view=self.inspection_view(task_id)
-        issues={x["issue_id"]:x for x in (view.get("report") or {}).get("issues",[])}
-        if any(x not in issues for x in issue_ids): raise ValidationError("批量范围包含未知问题")
-        if len({issues[x]["code"] for x in issue_ids})!=1: raise ValidationError("批量处置仅支持同 code 的同类问题")
+        report=view.get("report") or {}
+        resolved=[self._inspection_issue_by_id(report,issue_id) for issue_id in issue_ids]
+        if any(item is None for item in resolved): raise ValidationError("批量范围包含未知问题")
+        stable_ids=[item["issue_id"] for item in resolved]
+        if len(set(stable_ids))!=len(stable_ids): raise ValidationError("批量范围包含同一语义问题的重复 ID")
+        if len({item["code"] for item in resolved})!=1: raise ValidationError("批量处置仅支持同 code 的同类问题")
         hashes=[]
-        for issue_id in issue_ids:
+        for issue_id in stable_ids:
             result=self.dispose_issue(task_id,issue_id,action,rationale); hashes.append(result["disposition_hash"])
-        return {**self.inspection_view(task_id),"disposition_hashes":hashes,"batch_scope":issue_ids}
+        return {**self.inspection_view(task_id),"disposition_hashes":hashes,"batch_scope":stable_ids}
 
     def _assert_current_post_render_gate(self,task_id):
         deck=self.deck_view(task_id)["deck"]
@@ -1758,6 +1885,8 @@ class TaskService:
         delivery_gate=None
         if not existing_delivery:
             delivery_gate=self.assert_delivery_gate(task_id)
+        inspection_report=None if delivery_gate is None else delivery_gate["inspection_report"]
+        inspection_evidence_hashes=[] if delivery_gate is None else delivery_gate["inspection_evidence"]["artifact_hashes"]
 
         # A delivery fact is the domain idempotency boundary.  Replays for the
         # same finalized deck return that immutable fact even when the caller
@@ -1808,6 +1937,17 @@ class TaskService:
             packaged_evidence=published_root/"post-render-gate-evidence.json"
             if not packaged_evidence.is_file() or packaged_evidence.read_bytes()!=post_render_gate_evidence:
                 raise ConflictError("已发布离线包的渲染后门禁 evidence 缺失或不一致")
+            packaged_report=published_root/"inspection-report.json"
+            if not packaged_report.is_file() or packaged_report.read_bytes()!=self.version(task_id,inspection_report["hash"]):
+                raise ConflictError("已发布离线包的检查报告缺失或不一致")
+            packaged_result=json.loads((published_root/"result.json").read_text(encoding="utf-8"))
+            if (packaged_result.get("inspection_report_hash")!=inspection_report["hash"]
+                or packaged_result.get("inspection_evidence_hashes")!=inspection_evidence_hashes):
+                raise ConflictError("已发布离线包的检查报告绑定不一致")
+            for evidence_hash in inspection_evidence_hashes:
+                packaged_inspection_evidence=published_root/"inspection-evidence"/f"{evidence_hash}.json"
+                if not packaged_inspection_evidence.is_file() or packaged_inspection_evidence.read_bytes()!=self.version(task_id,evidence_hash):
+                    raise ConflictError("已发布离线包的检查 evidence 缺失或不一致")
             hashes["manifest.json"]=digest((published_root/"manifest.json").read_bytes())
             localized=json.loads((published_root/"localized-resources.json").read_text(encoding="utf-8")).get("resources",[])
             if existing_delivery:
@@ -1821,8 +1961,6 @@ class TaskService:
         resource_root=self.store.resource_root(task_id)
         localized_html,localized_resources,localization_records=localize_delivery_html(current["html"],snapshot["manifest"],resource_root)
         result_summary={"version":delivery_id,"status":{"stage":"delivery","status":"completed"},"description":"用户确定的终稿已写入工程文件夹并通过离线校验"}
-        inspection_report=delivery_gate["inspection_report"]
-        inspection_evidence_hashes=delivery_gate["inspection_evidence"]["artifact_hashes"]
         files={"deck.html":localized_html.encode(),"index.html":offline_player(localized_html).encode(),"narrative.md":json.loads(self.version(task_id,narrative_hash))["markdown"].encode(),"outline.md":json.loads(self.version(task_id,outline_hash))["markdown"].encode(),"design-contract.json":self.version(task_id,design_contract_hash),"claim-ledger.json":self.version(task_id,claim_ledger_hash),"post-render-gate-evidence.json":post_render_gate_evidence,"inspection-report.json":self.version(task_id,inspection_report["hash"]),**{f"inspection-evidence/{evidence_hash}.json":self.version(task_id,evidence_hash) for evidence_hash in inspection_evidence_hashes},"resource-manifest.json":canonical(snapshot["manifest"]),"localized-resources.json":canonical({"resources":localization_records}),"result.json":canonical({"task_id":task_id,"deck_hash":deck_hash,"finalization_hash":finalization["hash"],"design_contract_hash":design_contract_hash,"claim_ledger_hash":claim_ledger_hash,"post_render_gate_hash":post_render_gate_hash,"inspection_report_hash":inspection_report["hash"],"inspection_evidence_hashes":inspection_evidence_hashes,"inspection_status":finalization["inspection_status"],"finalization_mode":finalization_mode,"warnings":warnings,"confirmed_at":confirmed_at,**result_summary}),**offline_assets(),**localized_resources}
         for item in snapshot["manifest"].get("resources",[]):
             relative=Path(item["uri"].removeprefix("resources://"))

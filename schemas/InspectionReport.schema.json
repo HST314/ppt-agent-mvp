@@ -104,6 +104,39 @@
               "minLength": 1,
               "pattern": "^[\\s\\S]*\\S[\\s\\S]*$"
             }
+          },
+          "source_issues": {
+            "title": "source_issues",
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "source": {
+                  "title": "source",
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": "^[\\s\\S]*\\S[\\s\\S]*$"
+                },
+                "issue_id": {
+                  "title": "issue_id",
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+                },
+                "evidence_ref": {
+                  "title": "evidence_ref",
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": "^[\\s\\S]*\\S[\\s\\S]*$"
+                }
+              },
+              "required": [
+                "source",
+                "issue_id",
+                "evidence_ref"
+              ]
+            }
           }
         },
         "required": [
@@ -143,6 +176,10 @@
       "minLength": 1,
       "pattern": "^[\\s\\S]*\\S[\\s\\S]*$",
       "format": "date-time"
+    },
+    "evidence_artifacts": {
+      "title": "evidence_artifacts",
+      "type": "object"
     }
   },
   "required": [

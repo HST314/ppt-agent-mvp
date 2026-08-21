@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import MISSING, asdict, dataclass, fields, is_dataclass
+from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass
 from datetime import datetime
 from typing import Any, ClassVar, get_args, get_origin, get_type_hints
 
@@ -102,7 +102,7 @@ class StrictModel:
         if not isinstance(value, dict): raise ValidationError(f"{cls.__name__} 必须是对象")
         allowed = {f.name for f in fields(cls)}
         if set(value) - allowed: raise ValidationError(f"{cls.__name__} 包含未知字段")
-        optional_compat={"level","element_id","evidence","suggestion","source","sources","evidence_refs","target_deck_hash","rationale"}
+        optional_compat={"level","element_id","evidence","suggestion","source","sources","evidence_refs","source_issues","evidence_artifacts","target_deck_hash","rationale"}
         required = {f.name for f in fields(cls) if f.name != "schema_version" and f.name not in optional_compat}
         if required - set(value): raise ValidationError(f"{cls.__name__} 缺少必填字段")
         hints=get_type_hints(cls)
@@ -117,7 +117,7 @@ class StrictModel:
         hints = get_type_hints(cls)
         props = {f.name:_property_schema(f.name,hints[f.name]) for f in fields(cls)}
         props["schema_version"]["const"] = "1.0"
-        optional_compat={"level","element_id","evidence","suggestion","source","sources","evidence_refs","target_deck_hash","rationale"}
+        optional_compat={"level","element_id","evidence","suggestion","source","sources","evidence_refs","source_issues","evidence_artifacts","target_deck_hash","rationale"}
         return {"$schema":"https://json-schema.org/draft/2020-12/schema","title":cls.__name__,"type":"object","additionalProperties":False,"properties":props,"required":[f.name for f in fields(cls) if f.name != "schema_version" and f.name not in optional_compat]}
 
 @dataclass(frozen=True)
@@ -155,12 +155,21 @@ class DeckArtifact(StrictModel):
         super().__post_init__()
         if self.kind not in {"sample","deck"}: raise ValidationError("kind 无效")
 @dataclass(frozen=True)
+class InspectionIssueSource:
+    source:str; issue_id:str; evidence_ref:str
+    def validate(self):
+        if (self.source not in {"semantic_model","semantic_deterministic","technical_browser"}
+            or not ID.fullmatch(self.issue_id)
+            or not re.fullmatch(r"inspection-evidence://[0-9a-f]{64}",self.evidence_ref)):
+            raise ValidationError("issue 来源身份或 evidence 引用无效")
+@dataclass(frozen=True)
 class InspectionIssue:
     issue_id:str; severity:str; code:str; message:str; slide_id:str
     level:str="slide"; element_id:str=""; evidence:str="未提供独立证据"; suggestion:str="请人工检查并修复"
     source:str="semantic_model"
     sources:tuple[str,...]=()
     evidence_refs:tuple[str,...]=()
+    source_issues:tuple[InspectionIssueSource,...]=()
     def validate(self):
         allowed_sources={"semantic_model","semantic_deterministic","technical_browser"}
         effective_sources=self.sources or (self.source,)
@@ -174,8 +183,22 @@ class InspectionIssue:
             len(self.evidence_refs)!=len(set(self.evidence_refs))
             or any(not re.fullmatch(r"inspection-evidence://[0-9a-f]{64}", item) for item in self.evidence_refs)
         ): raise ValidationError("issue evidence 引用无效")
+        if self.source_issues:
+            origins={(item.source,item.issue_id,item.evidence_ref) for item in self.source_issues}
+            if (len(origins)!=len(self.source_issues)
+                or set(effective_sources)!={item.source for item in self.source_issues}
+                or set(self.evidence_refs)!={item.evidence_ref for item in self.source_issues}):
+                raise ValidationError("issue 来源身份与 evidence 引用绑定无效")
 @dataclass(frozen=True)
-class InspectionReport(StrictModel): issues:tuple[InspectionIssue,...]=(); report_id:str=""; task_id:str=""; deck_hash:str=""; passed:bool=False; created_at:str=""
+class InspectionReport(StrictModel):
+    issues:tuple[InspectionIssue,...]=(); report_id:str=""; task_id:str=""; deck_hash:str=""; passed:bool=False; created_at:str=""
+    evidence_artifacts:dict[str,str]=field(default_factory=dict)
+    def __post_init__(self):
+        super().__post_init__()
+        if self.evidence_artifacts and (
+            set(self.evidence_artifacts)-{"semantic_model","semantic_deterministic","technical_browser"}
+            or any(not HASH.fullmatch(value) for value in self.evidence_artifacts.values())
+        ): raise ValidationError("检查报告 evidence 工件清单无效")
 @dataclass(frozen=True)
 class IssueDisposition(StrictModel):
     disposition_id:str=""; task_id:str=""; issue_id:str=""; action:str=""; actor:str=""; created_at:str=""; target_deck_hash:str="0"*64; rationale:str="未记录依据"

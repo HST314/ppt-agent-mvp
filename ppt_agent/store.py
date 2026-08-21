@@ -227,7 +227,7 @@ class WorkspaceStore:
         records=[{"kind":p.parent.name,"hash":p.stem,"metadata":json.loads(p.read_text(encoding="utf-8"))} for p in files]
         def order(record):
             try: artifact=json.loads(self.artifact(task_id,record["hash"]))
-            except (json.JSONDecodeError,UnicodeDecodeError): artifact={}
+            except (NotFoundError,json.JSONDecodeError,UnicodeDecodeError): artifact={}
             return (artifact.get("version",record["metadata"].get("v",0)),artifact.get("created_at",artifact.get("confirmed_at","")),record["hash"])
         return sorted(records,key=order)
     def artifact(self,task_id,digest):

@@ -88,7 +88,8 @@ class InspectionPageBrowserTests(InspectionPageBrowserBase):
         with self.page.expect_request(lambda request: request.url.endswith("/issues/dispositions/batch")) as captured:
             group.get_by_role("button", name="处置本组 1 项").click()
         body = json.loads(captured.value.post_data)
-        self.assertEqual(body["issue_ids"], ["overflow-1"])
+        self.assertEqual(len(body["issue_ids"]), 1)
+        self.assertRegex(body["issue_ids"][0], r"^inspection-[0-9a-f]{24}$")
 
     def test_issues_are_grouped_by_slide_and_code(self):
         groups = self.page.locator(".issue-group")
