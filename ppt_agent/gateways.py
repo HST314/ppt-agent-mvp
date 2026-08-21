@@ -325,7 +325,12 @@ class AgentGateway:
         for item in slides:
             fragments.append(item["html"])
 
-        return assemble_locked_template(fragments, context.get("rules", []))
+        return assemble_locked_template(
+            fragments,
+            context.get("rules", []),
+            context.get("design_contract"),
+            context.get("design_contract_hash"),
+        )
     
     def inspect(self, original_outline, html, *, browser_evidence=None):
         value = self._run("inspection", {

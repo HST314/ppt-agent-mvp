@@ -6,6 +6,7 @@ from html.parser import HTMLParser
 from pathlib import PurePosixPath
 from urllib.parse import unquote, urlsplit
 
+from .design_contract import TemplateRegistry, validate_design_contract
 from .errors import ValidationError
 from .skill_runtime import SkillRuntime
 
@@ -78,6 +79,8 @@ CSS_PROPERTIES = {
     "transform", "transform-origin", "transition", "transition-property", "transition-duration", "transition-timing-function",
     "object-fit", "object-position", "cursor", "pointer-events", "user-select",
     "mix-blend-mode", "filter", "backdrop-filter", "-webkit-backdrop-filter",
+    "box-decoration-break", "-webkit-box-decoration-break",
+    "mask-image", "mask-repeat", "mask-size", "-webkit-mask-image", "-webkit-mask-repeat", "-webkit-mask-size",
     "-webkit-font-smoothing", "text-rendering", "will-change", "content", "animation",
     # 确定性溢出修复使用的惰性布局缩放（不加载资源、不执行脚本）
     "zoom",
@@ -120,7 +123,7 @@ MAX_IMAGE_REFERENCES = 30
 CSS_URL = re.compile(r"url\s*\(\s*(?:(['\"])(.*?)\1|([^)]*))\s*\)", re.I | re.S)
 
 LOCKED_TEMPLATE_PATH = "assets/template.html"
-LOCKED_TEMPLATE_OVERRIDES = """
+EDITORIAL_TEMPLATE_OVERRIDES = """
 html,body{width:100%;height:auto;min-height:100%;overflow:auto;background:var(--ink)}
 body{display:block;padding:24px 0}
 .slide{box-sizing:border-box;width:1280px;height:720px;min-width:1280px;min-height:720px;flex:none;margin:0 auto 24px;overflow:hidden;background:var(--paper);color:var(--ink)}
@@ -130,10 +133,22 @@ body{display:block;padding:24px 0}
 .slide p,.slide li,.slide td,.slide th{font-family:var(--sans-zh);font-size:24px;line-height:1.5}
 .slide small{font-size:16px;line-height:1.4}
 """.strip()
+SWISS_TEMPLATE_OVERRIDES = """
+html,body{width:100%;height:auto;min-height:100%;overflow:auto;background:var(--paper)}
+body{display:block;padding:24px 0}
+#deck{position:static;width:100%;height:auto;display:block;transform:none!important}
+#nav,#hint,canvas.bg{display:none!important}
+.slide{box-sizing:border-box;width:1280px;height:720px;min-width:1280px;min-height:720px;flex:none;margin:0 auto 24px;overflow:hidden}
+.slide>h1,.slide>h2,.slide [data-element-id="title"]{font-family:var(--sans),var(--sans-zh);font-size:52px;line-height:1.08;font-weight:300}
+.slide p,.slide li,.slide td,.slide th{font-family:var(--sans),var(--sans-zh);font-size:24px;line-height:1.45}
+.slide small{font-size:16px;line-height:1.4}
+""".strip()
+# Backwards-compatible constant retained for code importing the v1 name.
+LOCKED_TEMPLATE_OVERRIDES = EDITORIAL_TEMPLATE_OVERRIDES
 
 
-@lru_cache(maxsize=1)
-def locked_template() -> dict[str, str]:
+@lru_cache(maxsize=4)
+def locked_template(style_id: str = "editorial") -> dict[str, str]:
     """Load the inert style layer from the hash-locked built-in template.
 
     The active scripts, external font links and example slides in the source
@@ -141,35 +156,133 @@ def locked_template() -> dict[str, str]:
     block is used, followed by fixed 1280x720 service-owned canvas overrides.
     """
     skill = SkillRuntime.builtin()
-    source = skill.read_locked_text(LOCKED_TEMPLATE_PATH)
+    registry = TemplateRegistry(skill)
+    record = registry.resolve(style_id)
+    source = skill.read_locked_text(record.asset_path)
     blocks = re.findall(r"<style(?:\s[^>]*)?>([\s\S]*?)</style\s*>", source, re.I)
     if len(blocks) != 1 or not blocks[0].strip():
         raise ValidationError("锁定 PPT 模板必须包含唯一非空 style 块")
+    # The Swiss source uses one inline SVG mask for a decorative cross hatch.
+    # Generated HTML deliberately keeps the stricter no-SVG-data-URL boundary;
+    # omit that non-essential decoration from the inert server-owned style.
+    style = re.sub(r"(?:-webkit-)?mask-image\s*:\s*url\([\s\S]*?\)\s*;", "", blocks[0], flags=re.I)
     return {
         "skill": skill.skill_name,
         "version": skill.skill_version,
-        "path": LOCKED_TEMPLATE_PATH,
-        "sha256": skill.manifest[LOCKED_TEMPLATE_PATH],
-        "style": blocks[0].strip() + "\n" + LOCKED_TEMPLATE_OVERRIDES,
+        "template_id": record.template_id,
+        "style_id": record.style_id,
+        "path": record.asset_path,
+        "sha256": record.template_hash,
+        "style": style.strip() + "\n" + (SWISS_TEMPLATE_OVERRIDES if style_id == "swiss" else EDITORIAL_TEMPLATE_OVERRIDES),
     }
 
 
-def assemble_locked_template(sections, rules=None) -> str:
+def assemble_locked_template(sections, rules=None, design_contract=None, contract_hash=None) -> str:
     """Assemble validated slide fragments into the locked, script-free shell."""
-    template = locked_template()
+    if design_contract is not None:
+        validate_design_contract(design_contract)
+        if not isinstance(contract_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", contract_hash):
+            raise ValidationError("DesignContract hash 无效")
+    template = locked_template(design_contract["style_id"] if design_contract else "editorial")
     rule_text = " · ".join(html.escape(str(item), quote=True) for item in (rules or []))
     provenance = html.escape(
-        f"{template['skill']}@{template['version']}:{template['path']}#{template['sha256']}",
+        f"{template['skill']}@{template['version']}:{template['template_id']}:{template['path']}#{template['sha256']}",
         quote=True,
     )
-    return (
+    source = (
         '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
-        f'<meta name="ppt-template" content="{provenance}"><style>{template["style"]}</style>'
-        f'</head><body><aside hidden data-global-rules="{rule_text}" data-template="{provenance}"></aside>'
+        + (f'<meta name="design-contract" content="{contract_hash}">' if design_contract else "")
+        + f'<meta name="ppt-template" content="{provenance}"><style>{template["style"]}</style>'
+        + f'</head><body><aside hidden data-global-rules="{rule_text}" data-template="{provenance}"></aside>'
         + "".join(sections)
         + "</body></html>"
     )
+    return apply_design_contract(source, design_contract, contract_hash) if design_contract else source
+
+
+def _set_attribute(tag: str, name: str, value: str) -> str:
+    encoded = html.escape(value, quote=True)
+    pattern = re.compile(rf"\s{name}\s*=\s*(['\"])[\s\S]*?\1", re.I)
+    replacement = f' {name}="{encoded}"'
+    if pattern.search(tag):
+        return pattern.sub(replacement, tag, count=1)
+    return tag[:-1] + replacement + ">"
+
+
+def _contract_fragment(fragment: str, item: dict[str, object], contract_hash: str) -> str:
+    opening = re.match(r"<section\b[^>]*>", fragment, re.I)
+    if not opening:
+        raise ValidationError("DesignContract 页面不是 section 片段")
+    tag = opening.group(0)
+    classes_match = re.search(r"\bclass\s*=\s*(['\"])(.*?)\1", tag, re.I | re.S)
+    classes = classes_match.group(2).split() if classes_match else []
+    for name in ("slide", *str(item["theme"]).split("-")):
+        if name and name not in classes:
+            classes.append(name)
+    for name, value in (
+        ("class", " ".join(classes)),
+        ("data-layout", str(item["layout_id"])),
+        ("data-animate", str(item["animation_recipe"])),
+        ("data-contract-hash", contract_hash),
+    ):
+        tag = _set_attribute(tag, name, value)
+    fragment = tag + fragment[opening.end():]
+    marker_count = len(re.findall(r"\bdata-anim(?:\s*=|\s|>)", fragment, re.I))
+    needed = max(0, int(item["minimum_animation_markers"]) - marker_count)
+    if needed:
+        candidates = list(re.finditer(r"<(?:h1|h2|h3|p|div|ul|ol|table|svg)\b[^>]*>", fragment, re.I))
+        offset = 0
+        for index, match in enumerate(candidates[:needed]):
+            original = match.group(0)
+            if re.search(r"\bdata-anim(?:\s*=|\s|>)", original, re.I):
+                continue
+            replacement = original[:-1] + f' data-anim="contract-{index + 1}">'
+            start, end = match.start() + offset, match.end() + offset
+            fragment = fragment[:start] + replacement + fragment[end:]
+            offset += len(replacement) - len(original)
+        marker_count = len(re.findall(r"\bdata-anim(?:\s*=|\s|>)", fragment, re.I))
+        if marker_count < int(item["minimum_animation_markers"]):
+            raise ValidationError("DesignContract 页面缺少可登记的动效元素")
+    return fragment
+
+
+def apply_design_contract(html_text: str, design_contract: dict | None, contract_hash: str | None) -> str:
+    """Bind server-owned template/layout facts to every generated slide."""
+    if design_contract is None:
+        return html_text
+    validate_design_contract(design_contract)
+    if not isinstance(contract_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", contract_hash):
+        raise ValidationError("DesignContract hash 无效")
+    fragments = {}
+    # Local import avoids a dependency on TaskService's fragment helper.
+    tag_re = re.compile(r"<section\b[^>]*>|</section\s*>", re.I)
+    stack = []
+    for match in tag_re.finditer(html_text):
+        if match.group(0).lower().startswith("</"):
+            if not stack:
+                continue
+            start, slide_id = stack.pop()
+            if slide_id is not None:
+                fragments[slide_id] = (start, match.end(), html_text[start:match.end()])
+            continue
+        tag = match.group(0)
+        identifier = re.search(r"\b(?:data-slide-id|id)\s*=\s*(['\"])([A-Za-z0-9_-]+)\1", tag, re.I)
+        classes = re.search(r"\bclass\s*=\s*(['\"])(.*?)\1", tag, re.I | re.S)
+        is_slide = bool(classes and "slide" in classes.group(2).split())
+        stack.append((match.start(), identifier.group(2) if is_slide and identifier and not stack else None))
+    expected = {item["slide_id"]: item for item in design_contract["slide_contracts"]}
+    if not fragments or not set(fragments).issubset(expected):
+        raise ValidationError("DesignContract 与 HTML 页面范围不一致")
+    for slide_id, (start, end, fragment) in sorted(fragments.items(), key=lambda pair: pair[1][0], reverse=True):
+        replacement = _contract_fragment(fragment, expected[slide_id], contract_hash)
+        html_text = html_text[:start] + replacement + html_text[end:]
+    meta = f'<meta name="design-contract" content="{contract_hash}">'
+    if re.search(r'<meta\b[^>]*name=["\']design-contract["\'][^>]*>', html_text, re.I):
+        html_text = re.sub(r'<meta\b[^>]*name=["\']design-contract["\'][^>]*>', meta, html_text, count=1, flags=re.I)
+    else:
+        html_text = re.sub(r"<head\b[^>]*>", lambda match: match.group(0) + meta, html_text, count=1, flags=re.I)
+    return html_text
 
 
 def _decoded_url(value: str) -> str:
@@ -452,7 +565,7 @@ def infer_scope(prompt: str, slide_id=None, element_id=None, requested=None):
     }
 
 
-def render(markdown: str, slide_ids: list[str], rules=None, exceptions=None, assets=None):
+def render(markdown: str, slide_ids: list[str], rules=None, exceptions=None, assets=None, design_contract=None, contract_hash=None):
     blocks = {m.group(1): m.group(2).strip() for m in SLIDE.finditer(markdown)}
     rules = rules or []
     exceptions = exceptions or {}
@@ -469,7 +582,7 @@ def render(markdown: str, slide_ids: list[str], rules=None, exceptions=None, ass
                 raise ValidationError("大纲引用不属于当前冻结资源清单")
             images.append(f'<img data-element-id="resource" src="{html.escape(assets[uri], quote=True)}" alt="{html.escape(alt, quote=True)}">')
         sections.append(f'<section class="slide" id="{sid}" data-slide-id="{sid}"><h1 data-element-id="title">{title}</h1><div data-element-id="body">{body}</div>{"".join(images)}{note}</section>')
-    return assemble_locked_template(sections, rules)
+    return assemble_locked_template(sections, rules, design_contract, contract_hash)
 
 
 def validate_html(value: str, expected_ids: list[str], allowed_assets=()):

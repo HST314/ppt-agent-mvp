@@ -185,7 +185,7 @@ class P0GenerationRefactorTests(unittest.TestCase):
             svc.modify_sample("modify","标题更醒目")
             call=builder.calls[-1]
             self.assertNotIn("previous_html",call)
-            self.assertIn('<section class="slide"',call["previous_slides"])
+            self.assertIn('<section class="slide',call["previous_slides"])
             self.assertNotIn("<!doctype html>",call["previous_slides"].lower())
 
     def test_provider_request_budget_caps_empty_response_retries_at_two(self):

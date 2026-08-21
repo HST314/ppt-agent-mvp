@@ -30,6 +30,8 @@ def _issue(code: str, message: str, *, severity: str = "blocker", slide_id: str 
 class ChromiumDeckInspector:
     """Fail-closed DOM geometry checks using the production browser engine."""
 
+    enforce_on_generation = True
+
     def __init__(self, *, timeout_ms: int = 15_000):
         self.timeout_ms = timeout_ms
 

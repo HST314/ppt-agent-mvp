@@ -10,6 +10,7 @@ import uvicorn
 from playwright.sync_api import sync_playwright
 
 from ppt_agent.errors import GatewayError
+from ppt_agent.p4 import assemble_locked_template
 from ppt_agent.service import TaskService
 from ppt_agent.store import WorkspaceStore
 from ppt_agent.web import create_app
@@ -32,8 +33,16 @@ class BrowserImageBuilder:
                     '<img id="remote-image" src="https://images.example/remote.png" alt="Remote">'
                     '<div id="css-image" style="width:20px;height:20px;background-image:url(hero.png)"></div>'
                 )
-            sections.append(f'<section class="slide" id="{slide_id}" data-slide-id="{slide_id}">{images}</section>')
-        return '<!doctype html><html><head><meta charset="utf-8"></head><body>' + "".join(sections) + "</body></html>"
+            sections.append(
+                f'<section class="slide" id="{slide_id}" data-slide-id="{slide_id}">'
+                f'<h2>图片预览 {index + 1}</h2><p>验证图片资源解析。</p>{images}</section>'
+            )
+        return assemble_locked_template(
+            sections,
+            context.get("rules", []),
+            context.get("design_contract"),
+            context.get("design_contract_hash"),
+        )
 
 
 def model_question():

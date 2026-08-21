@@ -5,7 +5,9 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 from .config import ClarificationConfig
+from .claim_ledger import assert_claims_bound, audit_html_claims, build_claim_ledger, validate_claim_ledger
 from .content_inspection import inspect_content_quality
+from .design_contract import build_design_contract, validate_design_contract
 from .diagnostics import log_exception_chain
 from .errors import ConflictError, GatewayError, NotFoundError, RuntimeUnavailableError, ValidationError
 from .fsm import TaskState, transition
@@ -15,7 +17,8 @@ from .p2 import canonical, digest, now, parse_task_card, questions_for, scan_res
 from .schema import ClarificationSet, ResourceManifest, TaskCard, TaskInputSnapshot
 from .schema import NarrativeDocument, SlideOutline, SampleSelection, DeckArtifact
 from .p3 import changed_slide_ids, narrative_markdown, normalize_outline_markdown, outline_markdown, parse_outline, requested_slide_count, structured_outline_markdown
-from .p4 import controlled_assets, infer_scope, recommend, render, validate_html
+from .p4 import apply_design_contract, controlled_assets, infer_scope, recommend, render, validate_html
+from .render_gate import enforce_post_render_gate, run_post_render_gate
 from .offline import localize_delivery_html, offline_assets, offline_player, verify_delivery
 from .overflow_autofit import GEOMETRIC_CODES, fit_deck_html
 
@@ -599,7 +602,128 @@ class TaskService:
         view=self.input_view(task_id)
         if not view.get("snapshot") or not view.get("clarification",{}).get("confirmed"):
             raise ConflictError("须先冻结输入并完成阻断澄清")
+        view["claim_ledger"]=self._ensure_claim_ledger(task_id,view)
         return view
+    def _ensure_claim_ledger(self,task_id,input_view=None):
+        view=input_view or self.input_view(task_id)
+        snapshot_hash=view.get("snapshot_hash")
+        if not snapshot_hash: raise ConflictError("须先冻结输入再建立 Claim Ledger")
+        for record in reversed(self.versions(task_id,"claim-ledger")):
+            if record["metadata"].get("input_snapshot_hash")==snapshot_hash:
+                ledger=validate_claim_ledger(json.loads(self.version(task_id,record["hash"])))
+                return {**ledger,"hash":record["hash"]}
+        ledger=build_claim_ledger(
+            task_id=task_id,
+            input_snapshot_hash=snapshot_hash,
+            source_binding={"source":view.get("source"),"task_card":view.get("task_card")},
+            created_at=utcnow(),
+        )
+        ledger_hash=self.store.put_version(task_id,"claim-ledger",canonical(ledger),{
+            "input_snapshot_hash":snapshot_hash,
+            "claim_count":len(ledger["claims"]),
+            "immutable":True,
+        })
+        return {**ledger,"hash":ledger_hash}
+    def claim_ledger_view(self,task_id):
+        return self._ensure_claim_ledger(task_id)
+    def _ensure_design_contract(self,task_id,outline_hash=None):
+        outline_hash=outline_hash or self._current_version(task_id,"outline")
+        if not outline_hash: raise ConflictError("须先生成逐页大纲再建立 DesignContract")
+        view=self._p3_input(task_id)
+        for record in reversed(self.versions(task_id,"design-contract")):
+            if record["metadata"].get("outline_hash")==outline_hash and record["metadata"].get("input_snapshot_hash")==view["snapshot_hash"]:
+                contract=validate_design_contract(json.loads(self.version(task_id,record["hash"])))
+                return {**contract,"hash":record["hash"]}
+        outline=json.loads(self.version(task_id,outline_hash))
+        contract=build_design_contract(
+            task_id=task_id,
+            task_card=view["task_card"],
+            input_snapshot_hash=view["snapshot_hash"],
+            outline_hash=outline_hash,
+            slide_ids=list(outline["slide_ids"]),
+            created_at=utcnow(),
+        )
+        contract_hash=self.store.put_version(task_id,"design-contract",canonical(contract),{
+            "input_snapshot_hash":view["snapshot_hash"],
+            "outline_hash":outline_hash,
+            "style_id":contract["style_id"],
+            "template_id":contract["template_id"],
+            "immutable":True,
+        })
+        return {**contract,"hash":contract_hash}
+    def design_contract_view(self,task_id):
+        return self._ensure_design_contract(task_id)
+    def _generation_contracts(self,task_id,outline_hash=None):
+        contract=self._ensure_design_contract(task_id,outline_hash)
+        ledger=self._ensure_claim_ledger(task_id)
+        return contract,ledger
+    def _bound_deck_contracts(self,task_id,deck):
+        """Load the immutable contracts already bound to a candidate deck.
+
+        Content-only outline revisions deliberately retain the visual contract
+        selected when the candidate was designed.  Loading by the hashes on
+        the deck prevents a later registry default from silently changing that
+        contract while still requiring the Claim Ledger to match frozen input.
+        """
+        metadata=deck.get("metadata",{})
+        contract_hash=metadata.get("design_contract_hash")
+        ledger_hash=metadata.get("claim_ledger_hash")
+        if not contract_hash or not ledger_hash:
+            raise ConflictError("候选全稿未绑定 DesignContract 或 Claim Ledger")
+        try:
+            contract=validate_design_contract(json.loads(self.version(task_id,contract_hash)))
+            ledger=validate_claim_ledger(json.loads(self.version(task_id,ledger_hash)))
+        except NotFoundError as exc:
+            raise ConflictError("候选全稿绑定的 DesignContract 或 Claim Ledger 不存在") from exc
+        current_ledger=self._ensure_claim_ledger(task_id)
+        if current_ledger["hash"]!=ledger_hash:
+            raise ConflictError("候选全稿的 Claim Ledger 与当前冻结输入不一致")
+        outline=json.loads(self.version(task_id,deck["outline_hash"]))
+        expected_ids=[item["slide_id"] for item in contract["slide_contracts"]]
+        if list(outline["slide_ids"])!=expected_ids:
+            raise ConflictError("候选全稿页面范围与 DesignContract 不一致")
+        return {**contract,"hash":contract_hash},{**ledger,"hash":ledger_hash}
+    def _generation_browser_gate(self):
+        inspector=self.browser_inspector
+        if inspector is None: return None
+        enabled=getattr(inspector,"enforce_on_generation",type(inspector).__name__=="ChromiumDeckInspector")
+        return inspector if enabled else None
+    def _post_render_gate(self,task_id,html_text,slide_ids,contract,ledger,assets):
+        contract_hash=contract["hash"]; ledger_hash=ledger["hash"]
+        contract_value={key:value for key,value in contract.items() if key!="hash"}
+        ledger_value={key:value for key,value in ledger.items() if key!="hash"}
+        html_text=apply_design_contract(html_text,contract_value,contract_hash)
+        html_text=validate_html(html_text,slide_ids,assets)
+        browser=self._generation_browser_gate()
+        first=run_post_render_gate(
+            html_text,
+            expected_slide_ids=slide_ids,
+            contract=contract_value,
+            contract_hash=contract_hash,
+            claim_ledger=ledger_value,
+            claim_ledger_hash=ledger_hash,
+            browser_inspector=browser,
+        )
+        autofit=None
+        if browser is not None and first["geometry"]["overflow_count"]:
+            fitted=fit_deck_html(html_text,max_rounds=2)
+            if fitted.get("available") and fitted.get("rules"):
+                html_text=validate_html(fitted["html"],slide_ids,assets)
+                autofit={
+                    "rules":fitted["rules"],"rounds":fitted["rounds"],
+                    "converged":fitted["converged"],"remaining":fitted["remaining"],
+                }
+        evidence=enforce_post_render_gate(
+            html_text,
+            expected_slide_ids=slide_ids,
+            contract=contract_value,
+            contract_hash=contract_hash,
+            claim_ledger=ledger_value,
+            claim_ledger_hash=ledger_hash,
+            browser_inspector=browser,
+        )
+        evidence["overflow_autofit"]=autofit
+        return html_text,evidence
     def planning_view(self,task_id):
         state=self.get(task_id); result={"state":state,"narrative":None,"outline":None,"versions":self.versions(task_id)}
         for kind in ("narrative","outline"):
@@ -612,16 +736,26 @@ class TaskService:
         self._require_actionable(task_id)
         view=self._p3_input(task_id); state=TaskState.parse(view["state"])
         skill=self.skills.load("narrative"); prior=self._current_version(task_id,"narrative")
+        ledger=view["claim_ledger"]; ledger_value={key:value for key,value in ledger.items() if key!="hash"}
         if isinstance(self.generator,FakeGenerationGateway):
             text=narrative_markdown(view["task_card"])
             if prompt: text += f"\n## 修改要求\n{prompt.strip()}\n"
             model_name=self.generator.model
+            claim_bindings=assert_claims_bound(text,ledger_value,"叙事")
         else:
-            generated=self.generator.generate("narrative",{"task_id":task_id,"task_card":view["task_card"],"prompt":prompt,"scope":scope},skill=skill["content"])
-            text=generated["text"]; model_name=generated.get("model","unknown")
+            payload={"task_id":task_id,"task_card":view["task_card"],"prompt":prompt,"scope":scope,"claim_ledger":ledger_value}
+            for attempt in range(1,3):
+                generated=self.generator.generate("narrative",payload,skill=skill["content"])
+                text=generated["text"]; model_name=generated.get("model","unknown")
+                try:
+                    claim_bindings=assert_claims_bound(text,ledger_value,"叙事")
+                    break
+                except ValidationError as exc:
+                    if attempt==2: raise
+                    payload={**payload,"semantic_correction":{"attempt":attempt,"error":exc.message,"rule":"只允许 Claim Ledger 已绑定事实；无来源内容必须标记为假设/建议/待确认"}}
         version=len(self.versions(task_id,"narrative"))+1; content_hash=digest(text.encode())
         model=NarrativeDocument.parse({"document_id":f"narrative-{content_hash[:16]}","task_id":task_id,"version":version,"markdown":text,"content_hash":content_hash,"created_at":now(),"schema_version":"1.0"})
-        metadata={"parent":prior,"action":"generate" if not prior else "regenerate","scope":scope,"summary":"生成整稿叙事结构","model":model_name,"skill":{"action":"narrative","version":skill["version"],"hash":digest(skill["content"].encode()),"included":["narrative"],"trimmed":["outline","html","inspection"]},"input_snapshot_hash":view["snapshot_hash"]}
+        metadata={"parent":prior,"action":"generate" if not prior else "regenerate","scope":scope,"summary":"生成整稿叙事结构","model":model_name,"skill":{"action":"narrative","version":skill["version"],"hash":digest(skill["content"].encode()),"included":["narrative"],"trimmed":["outline","html","inspection"]},"input_snapshot_hash":view["snapshot_hash"],"claim_ledger_hash":ledger["hash"],"claim_bindings":claim_bindings["bindings"],"unbound_claim_count":0}
         h=self._record_p3(task_id,"narrative",model,metadata,"narrative_generate")
         if state.stage in {state.stage.CLARIFICATION,state.stage.CREATED}:
             self.command(task_id,f"narrative-stage-{h[:12]}","advance")
@@ -630,11 +764,12 @@ class TaskService:
         return self.planning_view(task_id)
     def edit_narrative(self,task_id,markdown,summary="直接编辑"):
         self._require_actionable(task_id)
-        self._p3_input(task_id)
+        view=self._p3_input(task_id)
         if not isinstance(markdown,str) or not markdown.strip(): raise ValidationError("叙事 Markdown 不得为空")
+        ledger=view["claim_ledger"]; claim_bindings=assert_claims_bound(markdown,{key:value for key,value in ledger.items() if key!="hash"},"叙事")
         prior=self._current_version(task_id,"narrative"); version=len(self.versions(task_id,"narrative"))+1; content_hash=digest(markdown.encode())
         model=NarrativeDocument.parse({"document_id":f"narrative-{content_hash[:16]}","task_id":task_id,"version":version,"markdown":markdown,"content_hash":content_hash,"created_at":now(),"schema_version":"1.0"})
-        h=self._record_p3(task_id,"narrative",model,{"parent":prior,"action":"direct_edit","summary":summary,"authoritative":True,"invalidated":["outline","sample","deck"]},"narrative_edit","user")
+        h=self._record_p3(task_id,"narrative",model,{"parent":prior,"action":"direct_edit","summary":summary,"authoritative":True,"invalidated":["outline","sample","deck"],"claim_ledger_hash":ledger["hash"],"claim_bindings":claim_bindings["bindings"],"unbound_claim_count":0},"narrative_edit","user")
         self._reset_narrative_gate(task_id,h)
         return self.planning_view(task_id)
     def confirm_narrative(self,task_id):
@@ -654,6 +789,7 @@ class TaskService:
         state=TaskState.parse(self.get(task_id))
         if state.mode=="manual" and self._confirmed_narrative_hash(task_id) != narrative: raise ConflictError("manual 模式须先确认当前版本叙事结构")
         skill=self.skills.load("outline"); count=requested_slide_count(view["task_card"]); resources=view["manifest"].get("resources",[])
+        ledger=view["claim_ledger"]; ledger_value={key:value for key,value in ledger.items() if key!="hash"}
         current=self._current_version(task_id,"outline")
         if slide_ids:
             if not current or not prompt: raise ValidationError("指定页修改需要现有大纲和修改 Prompt")
@@ -667,7 +803,7 @@ class TaskService:
                 text=outline_markdown(view["task_card"],resources,count)
                 if prompt: text += f"\n<!-- 修改要求：{prompt.strip()} -->\n"
             else:
-                payload={"task_id":task_id,"task_card":view["task_card"],"narrative":json.loads(self.version(task_id,narrative))["markdown"],"resources":resources,"slide_count":count,"prompt":prompt}
+                payload={"task_id":task_id,"task_card":view["task_card"],"narrative":json.loads(self.version(task_id,narrative))["markdown"],"resources":resources,"slide_count":count,"prompt":prompt,"claim_ledger":ledger_value}
                 for attempt in range(1,3):
                     generated=self.generator.generate("outline",payload,skill=skill["content"])
                     try:
@@ -680,6 +816,7 @@ class TaskService:
                             text=normalize_outline_markdown(generated["text"],resources,count)
                         else:
                             raise ValidationError("大纲生成响应必须包含 slides 或兼容 text")
+                        assert_claims_bound(text,ledger_value,"大纲")
                         break
                     except ValidationError as exc:
                         self.store.put_version(task_id,"outline-diagnostic",canonical({"attempt":attempt,"candidate":generated}),{
@@ -694,12 +831,13 @@ class TaskService:
         self._require_actionable(task_id)
         view=self._p3_input(task_id); expected=requested_slide_count(view["task_card"])
         markdown=normalize_outline_markdown(markdown,view["manifest"].get("resources",[]),expected)
+        ledger=view["claim_ledger"]; claim_bindings=assert_claims_bound(markdown,{key:value for key,value in ledger.items() if key!="hash"},"大纲")
         slide_ids,blocks=parse_outline(markdown,view["manifest"].get("resources",[]),expected)
         prior=self._current_version(task_id,"outline"); before={}
         if prior: _,before=parse_outline(json.loads(self.version(task_id,prior))["markdown"],view["manifest"].get("resources",[]),None)
         affected=changed_slide_ids(before,blocks); version=len(self.versions(task_id,"outline"))+1; content_hash=digest(markdown.encode())
         model=SlideOutline.parse({"outline_id":f"outline-{content_hash[:16]}","task_id":task_id,"version":version,"markdown":markdown,"slide_ids":slide_ids,"content_hash":content_hash,"created_at":now(),"schema_version":"1.0"})
-        meta={"parent":prior,"action":"generate" if not prior else "edit","summary":summary,"affected":affected,"unchanged":[sid for sid in blocks if sid in before and blocks[sid]==before[sid]],"authoritative":True,"invalidated":{"sample":affected,"deck":affected}}
+        meta={"parent":prior,"action":"generate" if not prior else "edit","summary":summary,"affected":affected,"unchanged":[sid for sid in blocks if sid in before and blocks[sid]==before[sid]],"authoritative":True,"invalidated":{"sample":affected,"deck":affected},"claim_ledger_hash":ledger["hash"],"claim_bindings":claim_bindings["bindings"],"unbound_claim_count":0}
         if skill: meta["skill"]={"action":"outline","version":skill["version"],"hash":digest(skill["content"].encode()),"included":["outline"],"trimmed":["narrative","html","inspection"]}
         h=self._record_p3(task_id,"outline",model,meta,"outline_generate" if not prior else "outline_edit",actor)
         self._invalidate_outline_confirmation(task_id,h)
@@ -732,7 +870,14 @@ class TaskService:
         return None
     def sample_view(self,task_id):
         outline=self._current_version(task_id,"outline"); current=self._current_version(task_id,"sample")
-        result={"state":self.get(task_id),"outline_hash":outline,"selection":None,"sample":None,"confirmation":None,"versions":self.versions(task_id,"sample")}
+        result={"state":self.get(task_id),"outline_hash":outline,"selection":None,"sample":None,"confirmation":None,"design_contract":None,"claim_ledger":None,"versions":self.versions(task_id,"sample")}
+        if outline:
+            contract_record=next((record for record in reversed(self.versions(task_id,"design-contract")) if record["metadata"].get("outline_hash")==outline),None)
+            if contract_record:
+                result["design_contract"]={**json.loads(self.version(task_id,contract_record["hash"])),"hash":contract_record["hash"]}
+        ledger_record=next(iter(reversed(self.versions(task_id,"claim-ledger"))),None)
+        if ledger_record:
+            result["claim_ledger"]={**json.loads(self.version(task_id,ledger_record["hash"])),"hash":ledger_record["hash"]}
         sels=self.versions(task_id,"sample-selection")
         if sels:
             selected=None
@@ -751,6 +896,8 @@ class TaskService:
                     and event["result"].get("confirmed_content_hash")==sample["content_hash"]
                     and event["result"].get("confirmed_outline_hash")==outline
                     and event["result"].get("selection_hash")==selection["hash"]
+                    and event["result"].get("design_contract_hash")==sample["metadata"].get("design_contract_hash")
+                    and event["result"].get("claim_ledger_hash")==sample["metadata"].get("claim_ledger_hash")
                     and sample["metadata"].get("selection_hash")==selection["hash"]):
                     result["confirmation"]=event["result"]
                 break
@@ -778,18 +925,19 @@ class TaskService:
         if not outline or state.stage != state.stage.SAMPLE: raise ConflictError("须先完成并确认逐页大纲")
         if self._confirmed_outline_hash(task_id) != outline: raise ConflictError("须先确认当前版本逐页大纲")
         data=json.loads(self.version(task_id,outline)); valid=list(data["slide_ids"])
+        contract,ledger=self._generation_contracts(task_id,outline)
         if slide_ids is None: slide_ids,reasons=recommend(data["markdown"],count)
         else:
             if not isinstance(slide_ids,list) or not slide_ids or len(slide_ids)>len(valid) or len(set(slide_ids))!=len(slide_ids) or any(x not in valid for x in slide_ids): raise ValidationError("样品页面选择无效或重复")
             reasons={sid:"用户选择" for sid in slide_ids}
         seed=canonical({"outline_hash":outline,"slide_ids":slide_ids}); model=SampleSelection.parse({"selection_id":f"selection-{digest(seed)[:16]}","task_id":task_id,"outline_hash":outline,"slide_ids":slide_ids,"confirmed":False,"schema_version":"1.0"})
-        h=self.store.put_version(task_id,"sample-selection",canonical(model.to_dict()),{"reasons":reasons})
+        h=self.store.put_version(task_id,"sample-selection",canonical(model.to_dict()),{"reasons":reasons,"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"]})
         state=TaskState.parse(self.get(task_id))
         new=(TaskState(**{**state.__dict__,"sample_confirmed":False,"status":state.status.WAITING_FOR_USER,"waiting_reason":"manual_gate","required_action":"confirm_sample","revision":state.revision+1})
              if state.sample_confirmed else TaskState(**{**state.__dict__,"revision":state.revision+1}))
         event={"event_id":hashlib.sha256(f"{task_id}:select-samples:{h}:{state.revision}".encode()).hexdigest()[:24],"command_id":f"select-samples-{h[:16]}-{state.revision}","action":"select_samples","actor":"user" if slide_ids is not None else "system","request_hash":h,"at":utcnow(),"from":state.to_dict(),"to":new.to_dict(),"result":{"hash":h,"invalidated":["sample_confirmation","deck"] if state.sample_confirmed else []}}
         self.store.commit(task_id,new.to_dict(),event)
-        return {**self.sample_view(task_id),"selection":{**model.to_dict(),"hash":h,"metadata":{"reasons":reasons}}}
+        return {**self.sample_view(task_id),"selection":{**model.to_dict(),"hash":h,"metadata":{"reasons":reasons,"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"]}}}
     def generate_sample(self,task_id,prompt=None):
         from .execution import progress
         self._require_actionable(task_id)
@@ -800,12 +948,15 @@ class TaskService:
         outline=self._current_version(task_id,"outline")
         if selection["outline_hash"] != outline: raise ConflictError("样品选择已因大纲变化而失效")
         data=json.loads(self.version(task_id,outline)); rules=[]; assets=controlled_assets(self.input_view(task_id)["manifest"],self.store.resource_root(task_id))
+        contract,ledger=self._generation_contracts(task_id,outline)
+        contract_value={key:value for key,value in contract.items() if key!="hash"}
+        ledger_value={key:value for key,value in ledger.items() if key!="hash"}
         if prompt: rules.append(prompt.strip())
-        source=render(data["markdown"],selection["slide_ids"],rules,assets=assets) if isinstance(self.builder,FakeHtmlBuilder) else self.builder.build(data["markdown"],action="sample",slide_ids=selection["slide_ids"],rules=rules,assets=assets)
+        source=render(data["markdown"],selection["slide_ids"],rules,assets=assets,design_contract=contract_value,contract_hash=contract["hash"]) if isinstance(self.builder,FakeHtmlBuilder) else self.builder.build(data["markdown"],action="sample",slide_ids=selection["slide_ids"],rules=rules,assets=assets,design_contract=contract_value,design_contract_hash=contract["hash"],claim_ledger=ledger_value,claim_ledger_hash=ledger["hash"])
         progress("validating_html", "校验 HTML")
-        html_text=validate_html(source,selection["slide_ids"],assets)
+        html_text,gate=self._post_render_gate(task_id,source,list(selection["slide_ids"]),contract,ledger,assets)
         version=len(self.versions(task_id,"sample"))+1; content_hash=digest(html_text.encode()); model=DeckArtifact.parse({"artifact_id":f"sample-{content_hash[:16]}","task_id":task_id,"version":version,"kind":"sample","outline_hash":outline,"content_hash":content_hash,"created_at":now(),"schema_version":"1.0"})
-        prior=self._current_version(task_id,"sample"); meta={"html":html_text,"selection_hash":selection["hash"],"parent":prior,"summary":"生成真实 HTML 样品","scope":"global","global_rules":rules,"local_exceptions":{},"build":"success"}
+        prior=self._current_version(task_id,"sample"); meta={"html":html_text,"selection_hash":selection["hash"],"parent":prior,"summary":"生成真实 HTML 样品","scope":"global","global_rules":rules,"local_exceptions":{},"build":"success","design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate":gate}
         h=self._record_p3(task_id,"sample",model,meta,"sample_generate")
         self._invalidate_sample_gate(task_id,h)
         return self.sample_view(task_id)
@@ -823,11 +974,14 @@ class TaskService:
         if scope=="global": rules.append(prompt.strip())
         else: exceptions.setdefault(slide_id,[]).append((f"元素 {element_id}: " if scope=="element" else "")+prompt.strip())
         outline=self._current_version(task_id,"outline"); data=json.loads(self.version(task_id,outline)); assets=controlled_assets(self.input_view(task_id)["manifest"],self.store.resource_root(task_id))
+        contract,ledger=self._generation_contracts(task_id,outline)
+        contract_value={key:value for key,value in contract.items() if key!="hash"}
+        ledger_value={key:value for key,value in ledger.items() if key!="hash"}
         previous_slides="".join(self._slide_fragments(sample["html"]).get(sid,"") for sid in ids)
-        source=render(data["markdown"],ids,rules,exceptions,assets) if isinstance(self.builder,FakeHtmlBuilder) else self.builder.build(data["markdown"],action="sample",slide_ids=ids,rules=rules,exceptions=exceptions,assets=assets,previous_slides=previous_slides,prompt=prompt,scope=scope,slide_id=slide_id,element_id=element_id)
-        html_text=validate_html(source,ids,assets)
+        source=render(data["markdown"],ids,rules,exceptions,assets,contract_value,contract["hash"]) if isinstance(self.builder,FakeHtmlBuilder) else self.builder.build(data["markdown"],action="sample",slide_ids=ids,rules=rules,exceptions=exceptions,assets=assets,previous_slides=previous_slides,prompt=prompt,scope=scope,slide_id=slide_id,element_id=element_id,design_contract=contract_value,design_contract_hash=contract["hash"],claim_ledger=ledger_value,claim_ledger_hash=ledger["hash"])
+        html_text,gate=self._post_render_gate(task_id,source,ids,contract,ledger,assets)
         version=len(self.versions(task_id,"sample"))+1; ch=digest(html_text.encode()); model=DeckArtifact.parse({"artifact_id":f"sample-{ch[:16]}","task_id":task_id,"version":version,"kind":"sample","outline_hash":outline,"content_hash":ch,"created_at":now(),"schema_version":"1.0"})
-        h=self._record_p3(task_id,"sample",model,{"html":html_text,"selection_hash":view["selection"]["hash"],"parent":sample["hash"],"summary":prompt.strip(),"scope":scope,"scope_understanding":understanding,"slide_id":slide_id,"element_id":element_id,"global_rules":rules,"local_exceptions":exceptions,"build":"success"},"sample_modify","user")
+        h=self._record_p3(task_id,"sample",model,{"html":html_text,"selection_hash":view["selection"]["hash"],"parent":sample["hash"],"summary":prompt.strip(),"scope":scope,"scope_understanding":understanding,"slide_id":slide_id,"element_id":element_id,"global_rules":rules,"local_exceptions":exceptions,"build":"success","design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate":gate},"sample_modify","user")
         self._invalidate_sample_gate(task_id,h)
         return self.sample_view(task_id)
     def confirm_sample(self,task_id):
@@ -842,6 +996,11 @@ class TaskService:
                 or selection["outline_hash"] != outline
                 or sample["metadata"].get("selection_hash") != selection["hash"]):
                 raise ConflictError("须先基于当前大纲和页面选择重新生成样品")
+            contract,ledger=self._generation_contracts(task_id,outline)
+            if (sample["metadata"].get("design_contract_hash")!=contract["hash"]
+                or sample["metadata"].get("claim_ledger_hash")!=ledger["hash"]
+                or not sample["metadata"].get("post_render_gate",{}).get("passed")):
+                raise ConflictError("样品未绑定当前 DesignContract、Claim Ledger 或渲染硬门禁证据")
             state=TaskState.parse(self.get(task_id))
             if state.stage==state.stage.DECK and state.sample_confirmed and view["confirmation"]:
                 return view
@@ -851,7 +1010,7 @@ class TaskService:
             if set(pages) != set(selection["slide_ids"]): raise ConflictError("样品页面边界无效，无法确认")
             new=transition(state,"confirm_sample",actor="user")
             confirmed_pages={sid:{"html":fragment,"sha256":digest(fragment.encode())} for sid,fragment in pages.items()}
-            result={"confirmed_outline_hash":outline,"confirmed_sample_hash":sample["hash"],"confirmed_content_hash":sample["content_hash"],"selection_hash":view["selection"]["hash"],"confirmed_pages":confirmed_pages}
+            result={"confirmed_outline_hash":outline,"confirmed_sample_hash":sample["hash"],"confirmed_content_hash":sample["content_hash"],"selection_hash":view["selection"]["hash"],"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate_hash":sample["metadata"]["post_render_gate"]["evidence_hash"],"confirmed_pages":confirmed_pages}
             event={"event_id":hashlib.sha256(f"{task_id}:confirm-sample:{sample['hash']}".encode()).hexdigest()[:24],"command_id":f"confirm-sample-{sample['hash'][:16]}","action":"confirm_sample_version","actor":"user","request_hash":sample["hash"],"at":utcnow(),"from":state.to_dict(),"to":new.to_dict(),"result":result}
             self.store.commit(task_id,new.to_dict(),event)
             return self.sample_view(task_id)
@@ -919,13 +1078,18 @@ class TaskService:
         outline=self._current_version(task_id,"outline"); data=json.loads(self.version(task_id,outline)); ids=list(data["slide_ids"])
         sample=sample_view["sample"]; meta=sample["metadata"]
         assets=controlled_assets(self.input_view(task_id)["manifest"],self.store.resource_root(task_id))
+        contract,ledger=self._generation_contracts(task_id,outline)
+        contract_value={key:value for key,value in contract.items() if key!="hash"}
+        ledger_value={key:value for key,value in ledger.items() if key!="hash"}
+        if meta.get("design_contract_hash")!=contract["hash"] or meta.get("claim_ledger_hash")!=ledger["hash"]:
+            raise ConflictError("确认样品未绑定当前 DesignContract 或 Claim Ledger")
         confirmation=sample_view["confirmation"] or {}
         confirmed_pages=confirmation.get("confirmed_pages") or {}
         sample_fragments={sid:item["html"] for sid,item in confirmed_pages.items()}
         if not sample_fragments or any(digest(fragment.encode()) != confirmed_pages[sid].get("sha256") for sid,fragment in sample_fragments.items()):
             raise ConflictError("确认样品原始页面或 SHA-256 无效")
         if isinstance(self.builder,FakeHtmlBuilder):
-            html_text=render(data["markdown"],ids,meta.get("global_rules",[]),meta.get("local_exceptions",{}),assets)
+            html_text=render(data["markdown"],ids,meta.get("global_rules",[]),meta.get("local_exceptions",{}),assets,contract_value,contract["hash"])
         else:
             from .execution import checkpoint, progress
             unconfirmed=[sid for sid in ids if sid not in sample_fragments]
@@ -933,20 +1097,20 @@ class TaskService:
             for index in range(0,len(unconfirmed),3):
                 checkpoint(); batch=unconfirmed[index:index+3]
                 progress("generating_batch",f"生成未确认页面 {index+1}-{index+len(batch)} / {len(unconfirmed)}")
-                partial=self.builder.build(data["markdown"],action="deck",slide_ids=batch,rules=meta.get("global_rules",[]),exceptions=meta.get("local_exceptions",{}),assets=assets)
+                partial=self.builder.build(data["markdown"],action="deck",slide_ids=batch,rules=meta.get("global_rules",[]),exceptions=meta.get("local_exceptions",{}),assets=assets,design_contract={**contract_value,"slide_contracts":[item for item in contract_value["slide_contracts"] if item["slide_id"] in batch]},design_contract_hash=contract["hash"],claim_ledger=ledger_value,claim_ledger_hash=ledger["hash"])
                 generated.update(self._slide_fragments(validate_html(partial,batch,assets)))
             ordered={**generated,**sample_fragments}
-            shell=render(data["markdown"],ids,meta.get("global_rules",[]),meta.get("local_exceptions",{}),assets)
+            shell=render(data["markdown"],ids,meta.get("global_rules",[]),meta.get("local_exceptions",{}),assets,contract_value,contract["hash"])
             html_text=self._replace_slide_fragments(shell,ordered)
         html_text=validate_html(html_text,ids,assets); deck_fragments=self._slide_fragments(html_text)
         # Confirmed fragments are immutable and are merged by the server for
         # every builder implementation, including deterministic test/fallback
         # builders.
         html_text=self._replace_slide_fragments(html_text,sample_fragments)
-        html_text=validate_html(html_text,ids,assets); deck_fragments=self._slide_fragments(html_text)
+        html_text,gate=self._post_render_gate(task_id,html_text,ids,contract,ledger,assets); deck_fragments=self._slide_fragments(html_text)
         preserved={sid:digest(deck_fragments[sid].encode())==digest(fragment.encode()) for sid,fragment in sample_fragments.items()}
         if not all(preserved.values()): raise ConflictError("确认样品发生未提示变化")
-        return self._commit_candidate_deck(task_id,html_text,outline,{"parent":token["parent_deck_hash"],"summary":"生成未检查候选稿","scope":"global","affected":ids,"sample_hash":sample["hash"],"sample_pages_preserved":preserved,"outline_consistent":True,"inspection_status":"pending","global_rules":meta.get("global_rules",[]),"local_exceptions":meta.get("local_exceptions",{})},"deck_generate",token)
+        return self._commit_candidate_deck(task_id,html_text,outline,{"parent":token["parent_deck_hash"],"summary":"生成未检查候选稿","scope":"global","affected":ids,"sample_hash":sample["hash"],"sample_pages_preserved":preserved,"outline_consistent":True,"inspection_status":"pending","global_rules":meta.get("global_rules",[]),"local_exceptions":meta.get("local_exceptions",{}),"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate":gate},"deck_generate",token)
     def modify_deck(self,task_id,prompt,change_type="visual",scope=None,slide_ids=None,element_id=None):
         with self.store.lock(task_id):
             token=self._candidate_write_token(task_id)
@@ -974,16 +1138,23 @@ class TaskService:
         else:
             for sid in affected: exceptions.setdefault(sid,[]).append((f"元素 {element_id}: " if inferred=="element" else "")+prompt.strip())
         assets=controlled_assets(self.input_view(task_id)["manifest"],self.store.resource_root(task_id))
+        contract,ledger=self._bound_deck_contracts(task_id,deck)
+        # Content edits prepare a new outline version but retain the frozen visual
+        # contract and Claim Ledger until that cross-artifact transaction commits.
+        if deck["metadata"].get("design_contract_hash")!=contract["hash"] or deck["metadata"].get("claim_ledger_hash")!=ledger["hash"]:
+            raise ConflictError("候选全稿未绑定当前 DesignContract 或 Claim Ledger")
+        contract_value={key:value for key,value in contract.items() if key!="hash"}
+        ledger_value={key:value for key,value in ledger.items() if key!="hash"}
         deck_slides=self._slide_fragments(deck["html"])
         previous_slides="".join(deck_slides.get(sid,"") for sid in all_ids)
-        source=render(markdown,all_ids,rules,exceptions,assets) if isinstance(self.builder,FakeHtmlBuilder) else self.builder.build(markdown,action="deck",slide_ids=all_ids,rules=rules,exceptions=exceptions,assets=assets,previous_slides=previous_slides,prompt=prompt,scope=inferred,affected_slide_ids=affected,element_id=element_id)
-        html_text=validate_html(source,all_ids,assets)
+        source=render(markdown,all_ids,rules,exceptions,assets,contract_value,contract["hash"]) if isinstance(self.builder,FakeHtmlBuilder) else self.builder.build(markdown,action="deck",slide_ids=all_ids,rules=rules,exceptions=exceptions,assets=assets,previous_slides=previous_slides,prompt=prompt,scope=inferred,affected_slide_ids=affected,element_id=element_id,design_contract=contract_value,design_contract_hash=contract["hash"],claim_ledger=ledger_value,claim_ledger_hash=ledger["hash"])
+        html_text,gate=self._post_render_gate(task_id,source,all_ids,contract,ledger,assets)
         before=deck["metadata"]["page_hashes"]; after={sid:digest(fragment.encode()) for sid,fragment in self._slide_fragments(html_text).items()}; actual=[sid for sid in all_ids if before[sid]!=after[sid]]
         if any(s not in affected for s in actual): raise ConflictError("修改超出声明影响范围")
         # Cross-artifact edits are prepared and validated above. Only successful
         # render/validation may publish the outline and deck versions.
         publish_outline=(lambda:self._record_p3(task_id,"outline",pending_outline[0],pending_outline[1],"outline_edit","user")) if pending_outline else None
-        return self._commit_candidate_deck(task_id,html_text,outline_hash,{"parent":deck["hash"],"summary":prompt.strip(),"scope":inferred,"change_type":change_type,"affected":actual,"requested_affected":affected,"unchanged":[s for s in all_ids if s not in actual],"scope_understanding":understanding,"element_id":element_id,"outline_consistent":True,"global_rules":rules,"local_exceptions":exceptions},"deck_modify",token,"user",publish_outline)
+        return self._commit_candidate_deck(task_id,html_text,outline_hash,{"parent":deck["hash"],"summary":prompt.strip(),"scope":inferred,"change_type":change_type,"affected":actual,"requested_affected":affected,"unchanged":[s for s in all_ids if s not in actual],"scope_understanding":understanding,"element_id":element_id,"outline_consistent":True,"global_rules":rules,"local_exceptions":exceptions,"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate":gate},"deck_modify",token,"user",publish_outline)
     def rollback_deck(self,task_id,target_hash):
         with self.store.lock(task_id):
             token=self._candidate_write_token(task_id)
@@ -991,7 +1162,7 @@ class TaskService:
             if target_hash not in known: raise ValidationError("目标全稿版本不存在")
             target=json.loads(self.version(task_id,target_hash)); meta=next(v["metadata"] for v in self.versions(task_id,"deck") if v["hash"]==target_hash)
             current_outline=self._current_version(task_id,"outline"); inconsistent=target["outline_hash"]!=current_outline
-        return self._commit_candidate_deck(task_id,meta["html"],target["outline_hash"],{"parent":token["parent_deck_hash"],"rollback_from":target_hash,"summary":f"回退自 {target_hash[:12]}","scope":"global","affected":list(meta["page_hashes"]),"outline_consistent":not inconsistent,"regenerate_required":list(meta["page_hashes"]) if inconsistent else [],"global_rules":meta.get("global_rules",[]),"local_exceptions":meta.get("local_exceptions",{})},"deck_rollback",token,"user")
+        return self._commit_candidate_deck(task_id,meta["html"],target["outline_hash"],{"parent":token["parent_deck_hash"],"rollback_from":target_hash,"summary":f"回退自 {target_hash[:12]}","scope":"global","affected":list(meta["page_hashes"]),"outline_consistent":not inconsistent,"regenerate_required":list(meta["page_hashes"]) if inconsistent else [],"global_rules":meta.get("global_rules",[]),"local_exceptions":meta.get("local_exceptions",{}),"design_contract_hash":meta.get("design_contract_hash"),"claim_ledger_hash":meta.get("claim_ledger_hash"),"post_render_gate":meta.get("post_render_gate")},"deck_rollback",token,"user")
 
     def inspection_view(self,task_id):
         deck=self.deck_view(task_id)["deck"]; reports=self.versions(task_id,"inspection")
@@ -1030,9 +1201,34 @@ class TaskService:
     def _prepare_inspection_result(self,task_id,deck):
         outline=json.loads(self.version(task_id,deck["outline_hash"]))["markdown"]
         input_view=self.input_view(task_id)
+        ledger=self._ensure_claim_ledger(task_id,input_view)
+        ledger_value={key:value for key,value in ledger.items() if key!="hash"}
         content_evidence=inspect_content_quality(deck["html"],{
             "source":input_view.get("source"),
             "task_card":input_view.get("task_card"),
+        })
+        ledger_evidence=audit_html_claims(deck["html"],ledger_value)
+        bound_values={item["value"] for item in ledger_evidence["bindings"] if item["status"] in {"bound","derived"}}
+        content_evidence["issues"]=[
+            item for item in content_evidence.get("issues",[])
+            if item.get("code") not in {"unverified_critical_fact","unverified_fact"}
+            or not any(value in item.get("evidence","") for value in bound_values)
+        ]
+        for item in ledger_evidence["unbound"]:
+            identity=f"{item['kind']}\0{item['normalized_value']}"
+            content_evidence["issues"].append({
+                "issue_id":f"claim-unbound-{hashlib.sha256(identity.encode()).hexdigest()[:16]}",
+                "severity":"blocker","level":"deck","code":"unbound_claim",
+                "message":"演示稿包含未绑定事实","slide_id":"","element_id":"",
+                "evidence":f"Claim Ledger 未绑定：{item['value']}",
+                "suggestion":"绑定来源 claim、记录可审计公式，或删除该事实",
+                "source":"semantic_deterministic",
+            })
+        content_evidence.update({
+            "passed":not content_evidence["issues"],
+            "claim_ledger_hash":ledger["hash"],
+            "claim_binding_count":ledger_evidence["binding_count"],
+            "unbound_claim_count":ledger_evidence["unbound_count"],
         })
         browser_evidence=None
         if self.browser_inspector is not None:
@@ -1100,9 +1296,12 @@ class TaskService:
             "issue_count":len(content.get("issues",[])),
             "visible_text_hash":content.get("visible_text_hash"),
             "source_binding_hash":content.get("source_binding_hash"),
+            "claim_ledger_hash":content.get("claim_ledger_hash"),
+            "claim_binding_count":content.get("claim_binding_count",0),
+            "unbound_claim_count":content.get("unbound_claim_count",0),
             "evidence_hash":fingerprint(content),
         }
-        metadata={"deck_hash":deck["hash"],"scope":scope,"affected_slide_ids":affected,"includes_deck_consistency":True,"includes_content_quality":content_meta is not None,"includes_browser_render":browser_meta is not None,"content_evidence":content_meta,"browser_evidence":browser_meta,"quality_checks":raw.get("quality_checks",{}),"issue_sources":{item["issue_id"]:item["source"] for item in issues},"round":round_number,"model":raw.get("model","unknown"),"skill":{"action":"inspection","version":skill["version"],"hash":digest(skill["content"].encode()),"files":skill.get("files",[])},"input_fields":["original_outline","html","frozen_source_binding",*(["browser_evidence"] if browser_meta is not None else [])],"excluded_fields":["generation_context","self_description","images","screenshots"]}
+        metadata={"deck_hash":deck["hash"],"scope":scope,"affected_slide_ids":affected,"includes_deck_consistency":True,"includes_content_quality":content_meta is not None,"includes_browser_render":browser_meta is not None,"content_evidence":content_meta,"browser_evidence":browser_meta,"quality_checks":raw.get("quality_checks",{}),"issue_sources":{item["issue_id"]:item["source"] for item in issues},"round":round_number,"model":raw.get("model","unknown"),"skill":{"action":"inspection","version":skill["version"],"hash":digest(skill["content"].encode()),"files":skill.get("files",[])},"input_fields":["original_outline","html","frozen_source_binding","design_contract","claim_ledger",*(["browser_evidence"] if browser_meta is not None else [])],"excluded_fields":["generation_context","self_description","images","screenshots"],"design_contract_hash":deck["metadata"].get("design_contract_hash"),"claim_ledger_hash":deck["metadata"].get("claim_ledger_hash"),"post_render_gate":deck["metadata"].get("post_render_gate")}
         h=self.store.put_version(task_id,"inspection",canonical(report.to_dict()),metadata)
         return {**report.to_dict(),"hash":h,"metadata":metadata}
 
@@ -1117,18 +1316,21 @@ class TaskService:
         if not affected: affected=list(deck["metadata"]["page_hashes"])
         outline=json.loads(self.version(task_id,deck["outline_hash"]))["markdown"]
         assets=controlled_assets(self.input_view(task_id)["manifest"],self.store.resource_root(task_id))
+        contract,ledger=self._bound_deck_contracts(task_id,deck)
+        contract_value={key:value for key,value in contract.items() if key!="hash"}
+        ledger_value={key:value for key,value in ledger.items() if key!="hash"}
         suggestions=[{"issue_id":i["issue_id"],"slide_id":i["slide_id"],"element_id":i["element_id"],"code":i["code"],"suggestion":i["suggestion"]} for i in selected]
         if isinstance(self.builder,FakeHtmlBuilder):
             rules=list(deck["metadata"].get("global_rules",[])); exceptions={k:list(v) for k,v in deck["metadata"].get("local_exceptions",{}).items()}
             for slide_id in affected: exceptions.setdefault(slide_id,[]).append(f"检查修复第 {round_number} 轮："+"；".join(s["suggestion"] for s in suggestions if s["slide_id"]==slide_id))
-            html_text=render(outline,list(deck["metadata"]["page_hashes"]),rules,exceptions,assets)
+            html_text=render(outline,list(deck["metadata"]["page_hashes"]),rules,exceptions,assets,contract_value,contract["hash"])
         else:
-            html_text=self.builder.build(outline,action="inspection",slide_ids=list(deck["metadata"]["page_hashes"]),assets=assets,previous_html=deck["html"],inspection_report=report,suggestions=suggestions,affected_slide_ids=affected)
+            html_text=self.builder.build(outline,action="inspection",slide_ids=list(deck["metadata"]["page_hashes"]),assets=assets,previous_html=deck["html"],inspection_report=report,suggestions=suggestions,affected_slide_ids=affected,design_contract=contract_value,design_contract_hash=contract["hash"],claim_ledger=ledger_value,claim_ledger_hash=ledger["hash"])
         html_text=validate_html(html_text,list(deck["metadata"]["page_hashes"]),assets)
         candidate_slides=self._slide_fragments(html_text)
         html_text=self._replace_slide_fragments(deck["html"],{slide_id:candidate_slides[slide_id] for slide_id in affected})
-        html_text=validate_html(html_text,list(deck["metadata"]["page_hashes"]),assets)
-        metadata={"parent":deck["hash"],"summary":f"自动修复第 {round_number} 轮","scope":"page","affected":affected,"outline_consistent":True,"global_rules":deck["metadata"].get("global_rules",[]),"local_exceptions":deck["metadata"].get("local_exceptions",{}),"inspection_report_hash":report["hash"],"inspection_issue_ids":[item["issue_id"] for item in selected],"auto_fix_round":round_number}
+        html_text,gate=self._post_render_gate(task_id,html_text,list(deck["metadata"]["page_hashes"]),contract,ledger,assets)
+        metadata={"parent":deck["hash"],"summary":f"自动修复第 {round_number} 轮","scope":"page","affected":affected,"outline_consistent":True,"global_rules":deck["metadata"].get("global_rules",[]),"local_exceptions":deck["metadata"].get("local_exceptions",{}),"inspection_report_hash":report["hash"],"inspection_issue_ids":[item["issue_id"] for item in selected],"auto_fix_round":round_number,"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate":gate}
         return html_text,deck["outline_hash"],metadata,token
 
     def _auto_fix(self,task_id,report,round_number,prepared=None):
@@ -1150,8 +1352,11 @@ class TaskService:
             deck=self.deck_view(task_id)["deck"]
         result=fit_deck_html(deck["html"],max_rounds=2)
         if not result["available"] or not result["rules"]: return None
-        metadata={"parent":deck["hash"],"summary":f"确定性溢出修复 {len(result['rules'])} 处（{result['rounds']} 轮）","scope":"global","affected":list(deck["metadata"]["page_hashes"]),"outline_consistent":True,"overflow_autofit":{"rules":result["rules"],"rounds":result["rounds"],"converged":result["converged"],"remaining":result["remaining"]},"global_rules":deck["metadata"].get("global_rules",[]),"local_exceptions":deck["metadata"].get("local_exceptions",{})}
-        self._commit_candidate_deck(task_id,result["html"],deck["outline_hash"],metadata,"deck_overflow_autofit",token,"system")
+        contract,ledger=self._bound_deck_contracts(task_id,deck)
+        assets=controlled_assets(self.input_view(task_id)["manifest"],self.store.resource_root(task_id))
+        html_text,gate=self._post_render_gate(task_id,result["html"],list(deck["metadata"]["page_hashes"]),contract,ledger,assets)
+        metadata={"parent":deck["hash"],"summary":f"确定性溢出修复 {len(result['rules'])} 处（{result['rounds']} 轮）","scope":"global","affected":list(deck["metadata"]["page_hashes"]),"outline_consistent":True,"overflow_autofit":{"rules":result["rules"],"rounds":result["rounds"],"converged":result["converged"],"remaining":result["remaining"]},"global_rules":deck["metadata"].get("global_rules",[]),"local_exceptions":deck["metadata"].get("local_exceptions",{}),"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate":gate}
+        self._commit_candidate_deck(task_id,html_text,deck["outline_hash"],metadata,"deck_overflow_autofit",token,"system")
         return self._inspect_once(task_id,"full",list(deck["metadata"]["page_hashes"]),0)
 
     def autofit_overflow(self,task_id,max_rounds=2):
@@ -1168,8 +1373,11 @@ class TaskService:
         if not result["available"]: raise ConflictError("Chromium 渲染不可用，无法执行确定性溢出修复")
         if not result["rules"]:
             return {**self.inspection_view(task_id),"autofit":{"applied":0,"rounds":0,"converged":result["converged"],"remaining":result["remaining"]}}
-        metadata={"parent":deck["hash"],"summary":f"确定性溢出修复 {len(result['rules'])} 处（{result['rounds']} 轮）","scope":"global","affected":list(deck["metadata"]["page_hashes"]),"outline_consistent":True,"overflow_autofit":{"rules":result["rules"],"rounds":result["rounds"],"converged":result["converged"],"remaining":result["remaining"]},"global_rules":deck["metadata"].get("global_rules",[]),"local_exceptions":deck["metadata"].get("local_exceptions",{})}
-        self._commit_candidate_deck(task_id,result["html"],deck["outline_hash"],metadata,"deck_overflow_autofit",token,"system")
+        contract,ledger=self._bound_deck_contracts(task_id,deck)
+        assets=controlled_assets(self.input_view(task_id)["manifest"],self.store.resource_root(task_id))
+        html_text,gate=self._post_render_gate(task_id,result["html"],list(deck["metadata"]["page_hashes"]),contract,ledger,assets)
+        metadata={"parent":deck["hash"],"summary":f"确定性溢出修复 {len(result['rules'])} 处（{result['rounds']} 轮）","scope":"global","affected":list(deck["metadata"]["page_hashes"]),"outline_consistent":True,"overflow_autofit":{"rules":result["rules"],"rounds":result["rounds"],"converged":result["converged"],"remaining":result["remaining"]},"global_rules":deck["metadata"].get("global_rules",[]),"local_exceptions":deck["metadata"].get("local_exceptions",{}),"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate":gate}
+        self._commit_candidate_deck(task_id,html_text,deck["outline_hash"],metadata,"deck_overflow_autofit",token,"system")
         report=self._inspect_once(task_id,"full",list(deck["metadata"]["page_hashes"]),0)
         return {**self.inspection_view(task_id),"autofit":{"applied":len(result["rules"]),"rounds":result["rounds"],"converged":result["converged"],"remaining":result["remaining"],"report_hash":report["hash"]}}
 
@@ -1254,11 +1462,29 @@ class TaskService:
             result=self.dispose_issue(task_id,issue_id,action,rationale); hashes.append(result["disposition_hash"])
         return {**self.inspection_view(task_id),"disposition_hashes":hashes,"batch_scope":issue_ids}
 
+    def _assert_current_post_render_gate(self,task_id):
+        deck=self.deck_view(task_id)["deck"]
+        if not deck: raise ConflictError("尚未生成全稿")
+        contract,ledger=self._bound_deck_contracts(task_id,deck)
+        gate=deck["metadata"].get("post_render_gate") or {}
+        valid=(
+            deck["metadata"].get("design_contract_hash")==contract["hash"]
+            and deck["metadata"].get("claim_ledger_hash")==ledger["hash"]
+            and gate.get("passed") is True
+            and gate.get("blocker_count")==0
+            and gate.get("layout",{}).get("layout_registration_percent")==100
+            and gate.get("claims",{}).get("unbound_count")==0
+            and gate.get("geometry",{}).get("overflow_count")==0
+        )
+        if not valid: raise ConflictError("当前全稿未通过 DesignContract、Claim Ledger 与渲染后硬门禁")
+        return {"deck":deck,"design_contract":contract,"claim_ledger":ledger,"post_render_gate":gate}
+
     def assert_delivery_gate(self,task_id):
+        generation=self._assert_current_post_render_gate(task_id)
         view=self.inspection_view(task_id)
         if view["blocking_issues"]: raise ConflictError("仍有未解决且未豁免的阻断问题，禁止交付")
         if not view["report"] or view["report"]["stale"]: raise ConflictError("当前 HTML 版本须先完成检查")
-        return {"delivery_allowed":True,"warnings":[x for x in view["unresolved"] if x["severity"]=="warning"]}
+        return {"delivery_allowed":True,"warnings":[x for x in view["unresolved"] if x["severity"]=="warning"],**generation}
 
     def finalization_view(self,task_id):
         deck=self.deck_view(task_id)["deck"]
@@ -1280,6 +1506,7 @@ class TaskService:
             state=TaskState.parse(self.get(task_id)); deck=self.deck_view(task_id)["deck"]
             if state.stage not in {state.stage.DECK,state.stage.REVIEW}: raise ConflictError("只能在全稿或自检与修改阶段确定终稿")
             if not deck or deck["hash"]!=deck_hash: raise ConflictError("终稿必须绑定当前候选 HTML 版本")
+            generation=self._assert_current_post_render_gate(task_id)
             inspection=self.inspection_view(task_id); report=inspection["report"]
             if not report or report["stale"]:
                 inspection_status="unchecked" if not report else "stale"
@@ -1302,8 +1529,8 @@ class TaskService:
             if existing and existing["inspection_status"]==inspection_status and existing["unresolved_issue_count"]==len(inspection["unresolved"]) and existing["blocking_issue_count"]==len(inspection["blocking_issues"]) and existing.get("finalization_mode","standard")==finalization_mode:
                 return {"state":self.get(task_id),"finalization":existing}
             finalized_at=utcnow()
-            payload={"finalization_id":f"final-{deck_hash[:16]}","task_id":task_id,"deck_hash":deck_hash,"finalized_by":"user","finalized_at":finalized_at,"source":source if source in {"deck","review"} else "deck","inspection_status":inspection_status,"inspection_report_hash":None if not report or report["stale"] else report["hash"],"unresolved_issue_count":len(inspection["unresolved"]),"blocking_issue_count":len(inspection["blocking_issues"]),"finalization_mode":finalization_mode,"risk_rationale":risk_rationale.strip() if finalization_mode=="risk_accepted" else "","schema_version":"1.0"}
-            final_hash=self.store.put_version(task_id,"final-deck",canonical(payload),{"deck_hash":deck_hash,"source":payload["source"],"inspection_status":inspection_status,"finalization_mode":finalization_mode})
+            payload={"finalization_id":f"final-{deck_hash[:16]}","task_id":task_id,"deck_hash":deck_hash,"finalized_by":"user","finalized_at":finalized_at,"source":source if source in {"deck","review"} else "deck","inspection_status":inspection_status,"inspection_report_hash":None if not report or report["stale"] else report["hash"],"unresolved_issue_count":len(inspection["unresolved"]),"blocking_issue_count":len(inspection["blocking_issues"]),"finalization_mode":finalization_mode,"risk_rationale":risk_rationale.strip() if finalization_mode=="risk_accepted" else "","design_contract_hash":generation["design_contract"]["hash"],"claim_ledger_hash":generation["claim_ledger"]["hash"],"post_render_gate_hash":generation["post_render_gate"]["evidence_hash"],"schema_version":"1.0"}
+            final_hash=self.store.put_version(task_id,"final-deck",canonical(payload),{"deck_hash":deck_hash,"source":payload["source"],"inspection_status":inspection_status,"finalization_mode":finalization_mode,"design_contract_hash":payload["design_contract_hash"],"claim_ledger_hash":payload["claim_ledger_hash"],"post_render_gate_hash":payload["post_render_gate_hash"]})
             new=TaskState(**{**state.__dict__,"stage":state.stage.DELIVERY,"status":state.status.READY,"waiting_reason":"final_ready","required_action":"publish_delivery","revision":state.revision+1})
             event={"event_id":digest(f"{task_id}:finalize:{deck_hash}".encode())[:24],"command_id":f"finalize-{deck_hash[:16]}","action":"finalize_deck","actor":"user","request_hash":deck_hash,"at":finalized_at,"from":state.to_dict(),"to":new.to_dict(),"result":{"finalization_hash":final_hash,"deck_hash":deck_hash,"inspection_status":inspection_status,"finalization_mode":finalization_mode}}
             self.store.commit(task_id,new.to_dict(),event)
@@ -1319,12 +1546,14 @@ class TaskService:
 
     def status_summary(self,task_id):
         state=self.get(task_id); latest={}
-        for kind in ("input-snapshot","narrative","outline","sample","deck","inspection","final-deck","delivery"):
+        for kind in ("input-snapshot","claim-ledger","narrative","outline","design-contract","sample","deck","inspection","final-deck","delivery"):
             records=self.versions(task_id,kind)
             if not records: continue
             if kind in {"narrative","outline","sample","deck"}: current=self._current_version(task_id,kind)
             elif kind=="input-snapshot": current=next((e["result"].get("snapshot_hash") for e in reversed(self.events(task_id)) if e["action"] in {"import_input","rebuild_input"}),None)
             elif kind=="inspection": current=next((e["result"].get("report_hash") for e in reversed(self.events(task_id)) if e["action"]=="inspection_complete"),None)
+            elif kind=="design-contract": current=self.deck_view(task_id)["deck"]["metadata"].get("design_contract_hash") if self.deck_view(task_id)["deck"] else records[-1]["hash"]
+            elif kind=="claim-ledger": current=records[-1]["hash"]
             else: current=records[-1]["hash"]
             if current: latest[kind]=current
         progress={"created":5,"clarification":15,"narrative":30,"outline":45,"sample":60,"deck":72,"review":85,"delivery":95}.get(state["stage"],0)
@@ -1338,6 +1567,11 @@ class TaskService:
         finalization=self.finalization_view(task_id)["current"]
         if not current or not finalization or finalization["deck_hash"]!=current["hash"]: raise ConflictError("请先将当前候选确定为终稿")
         deck_hash=current["hash"]
+        design_contract_hash=finalization.get("design_contract_hash")
+        claim_ledger_hash=finalization.get("claim_ledger_hash")
+        if (design_contract_hash!=current["metadata"].get("design_contract_hash")
+            or claim_ledger_hash!=current["metadata"].get("claim_ledger_hash")):
+            raise ConflictError("终稿与当前 DesignContract 或 Claim Ledger 不一致")
         if state.stage!=state.stage.DELIVERY: raise ConflictError("当前阶段不能交付")
         narrative_hash=self._current_version(task_id,"narrative"); outline_hash=current["outline_hash"]
         snapshot=self.input_view(task_id)
@@ -1375,7 +1609,7 @@ class TaskService:
             warnings.append({"code":"finalized_with_issues","count":finalization["unresolved_issue_count"],"inspection_status":finalization["inspection_status"]})
 
         def complete(model,hashes,localized_count,delivery_hash=None):
-            delivery_hash=delivery_hash or self.store.put_version(task_id,"delivery",canonical(model.to_dict()),{"file_hashes":hashes,"warnings":warnings,"issue_summary":{"unresolved":finalization["unresolved_issue_count"],"blockers":finalization["blocking_issue_count"]},"finalization_hash":finalization["hash"],"localized_resources":localized_count,"package":delivery_id})
+            delivery_hash=delivery_hash or self.store.put_version(task_id,"delivery",canonical(model.to_dict()),{"file_hashes":hashes,"warnings":warnings,"issue_summary":{"unresolved":finalization["unresolved_issue_count"],"blockers":finalization["blocking_issue_count"]},"finalization_hash":finalization["hash"],"design_contract_hash":design_contract_hash,"claim_ledger_hash":claim_ledger_hash,"post_render_gate_hash":finalization.get("post_render_gate_hash"),"localized_resources":localized_count,"package":delivery_id})
             if self.store.fault: self.store.fault("after_delivery_fact")
             final=self.command(task_id,f"confirm-delivery-{delivery_hash[:16]}","confirm_delivery","user",{"deck_hash":deck_hash,"delivery_hash":delivery_hash})
             if self.store.fault: self.store.fault("after_delivery_completed")
@@ -1410,7 +1644,7 @@ class TaskService:
         resource_root=self.store.resource_root(task_id)
         localized_html,localized_resources,localization_records=localize_delivery_html(current["html"],snapshot["manifest"],resource_root)
         result_summary={"version":delivery_id,"status":{"stage":"delivery","status":"completed"},"description":"用户确定的终稿已写入工程文件夹并通过离线校验"}
-        files={"deck.html":localized_html.encode(),"index.html":offline_player(localized_html).encode(),"narrative.md":json.loads(self.version(task_id,narrative_hash))["markdown"].encode(),"outline.md":json.loads(self.version(task_id,outline_hash))["markdown"].encode(),"resource-manifest.json":canonical(snapshot["manifest"]),"localized-resources.json":canonical({"resources":localization_records}),"result.json":canonical({"task_id":task_id,"deck_hash":deck_hash,"finalization_hash":finalization["hash"],"inspection_status":finalization["inspection_status"],"finalization_mode":finalization_mode,"warnings":warnings,"confirmed_at":confirmed_at,**result_summary}),**offline_assets(),**localized_resources}
+        files={"deck.html":localized_html.encode(),"index.html":offline_player(localized_html).encode(),"narrative.md":json.loads(self.version(task_id,narrative_hash))["markdown"].encode(),"outline.md":json.loads(self.version(task_id,outline_hash))["markdown"].encode(),"design-contract.json":self.version(task_id,design_contract_hash),"claim-ledger.json":self.version(task_id,claim_ledger_hash),"resource-manifest.json":canonical(snapshot["manifest"]),"localized-resources.json":canonical({"resources":localization_records}),"result.json":canonical({"task_id":task_id,"deck_hash":deck_hash,"finalization_hash":finalization["hash"],"design_contract_hash":design_contract_hash,"claim_ledger_hash":claim_ledger_hash,"post_render_gate_hash":finalization.get("post_render_gate_hash"),"inspection_status":finalization["inspection_status"],"finalization_mode":finalization_mode,"warnings":warnings,"confirmed_at":confirmed_at,**result_summary}),**offline_assets(),**localized_resources}
         for item in snapshot["manifest"].get("resources",[]):
             relative=Path(item["uri"].removeprefix("resources://"))
             source=resource_root/relative
@@ -1452,5 +1686,5 @@ class TaskService:
             reopened=TaskState(**{**current.__dict__,"stage":current.stage.DECK,"status":current.status.READY,"delivery_confirmed":False,"blockers_resolved":False,"revision":current.revision+1})
             event={"event_id":digest(f"{task_id}:derive:{delivery_hash}:{current.revision}".encode())[:24],"command_id":f"derive-{delivery_hash[:16]}-{current.revision}","action":"derive_delivery","actor":"user","request_hash":fingerprint({"prompt":prompt,"slide_ids":slide_ids}),"at":utcnow(),"from":current.to_dict(),"to":reopened.to_dict(),"result":{"delivery_hash":delivery_hash,"deck_hash":delivered["deck_hash"]}}
             self.store.commit(task_id,reopened.to_dict(),event)
-            self._record_deck(task_id,meta["html"],target["outline_hash"],{"parent":delivered["deck_hash"],"derived_from_delivery":delivery_hash,"summary":"从已交付版本派生候选","scope":"global","affected":[],"outline_consistent":True,"global_rules":meta.get("global_rules",[]),"local_exceptions":meta.get("local_exceptions",{})},"delivery_derive","user")
+            self._record_deck(task_id,meta["html"],target["outline_hash"],{"parent":delivered["deck_hash"],"derived_from_delivery":delivery_hash,"summary":"从已交付版本派生候选","scope":"global","affected":[],"outline_consistent":True,"global_rules":meta.get("global_rules",[]),"local_exceptions":meta.get("local_exceptions",{}),"design_contract_hash":meta.get("design_contract_hash"),"claim_ledger_hash":meta.get("claim_ledger_hash"),"post_render_gate":meta.get("post_render_gate")},"delivery_derive","user")
         return self.modify_deck(task_id,prompt,scope="page" if slide_ids else "global",slide_ids=slide_ids or [])

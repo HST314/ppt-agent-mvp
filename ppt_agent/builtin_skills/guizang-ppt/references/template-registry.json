@@ -1,0 +1,28 @@
+{
+  "version": "2026-08-21",
+  "default_style_id": "editorial",
+  "templates": [
+    {
+      "style_id": "editorial",
+      "aliases": ["style a", "风格a", "风格 a", "电子杂志", "editorial"],
+      "template_id": "template-editorial-2026-08-20",
+      "asset_path": "assets/template.html",
+      "theme_id": "default",
+      "allowed_layouts": ["A01", "A02", "A03", "A04", "A05", "A06", "A07", "A08", "A09", "A10"],
+      "body_layouts": ["A03", "A04", "A05", "A06", "A08", "A09"],
+      "cover_layout": "A01",
+      "closing_layout": "A10"
+    },
+    {
+      "style_id": "swiss",
+      "aliases": ["style b", "风格b", "风格 b", "瑞士", "swiss", "international typographic"],
+      "template_id": "template-swiss-2026-08-20",
+      "asset_path": "assets/template-swiss.html",
+      "theme_id": "ikb",
+      "allowed_layouts": ["S01", "S02", "S03", "S04", "S05", "S06", "S07", "S08", "S09", "S10", "S11", "S12", "S13", "S14", "S15", "S16", "S17", "S18", "S19", "S20", "S21", "S22"],
+      "body_layouts": ["S02", "S04", "S06", "S07", "S08", "S11", "S15", "S16", "S18", "S20", "S21"],
+      "cover_layout": "S01",
+      "closing_layout": "S10"
+    }
+  ]
+}
