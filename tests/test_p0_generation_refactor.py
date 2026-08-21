@@ -56,6 +56,18 @@ class P0GenerationRefactorTests(unittest.TestCase):
         self.assertIn('assets/template.html#',html)
         self.assertNotIn('linear-gradient(135deg,#172033,#253858)',html)
         self.assertEqual(gateway.runtime.last_audit[-1]["applied_skill_files"],["references/design-pack-v1.md"])
+        tool_output=next(item for item in client.inputs[1]["input"] if item.get("type")=="function_call_output")
+        contract=json.loads(tool_output["output"])
+        self.assertGreaterEqual(contract["bytes"],10000)
+        for required_rule in (
+            "不可违反的事实边界",
+            "每批次先冻结微型 DesignContract",
+            "允许的布局 archetype",
+            "动效 contract",
+            "返回前的确定性自检",
+        ):
+            self.assertIn(required_rule,contract["content"])
+        self.assertIn("最小但完整的 Generation Contract",client.inputs[0]["input"][0]["content"])
 
     def test_sample_cannot_finish_without_applying_required_design_pack(self):
         fragment='<section class="slide" id="slide-1" data-slide-id="slide-1"><h1>样品</h1></section>'
@@ -67,7 +79,7 @@ class P0GenerationRefactorTests(unittest.TestCase):
         self.assertEqual(caught.exception.code,"agent_required_skill_missing")
         self.assertEqual(caught.exception.audit[-1]["unique_skill_files"],0)
 
-    def test_sample_reads_lightweight_pack_once_and_deduplicates_same_round(self):
+    def test_sample_reads_complete_contract_once_and_deduplicates_same_round(self):
         fragment='<section class="slide" id="slide-1" data-slide-id="slide-1"><h1>样品</h1></section>'
         client=RecordingClient([
             ModelTurn(None,"r1",(

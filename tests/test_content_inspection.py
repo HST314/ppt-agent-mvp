@@ -44,6 +44,34 @@ class ContentInspectionTests(unittest.TestCase):
         self.assertEqual(structural["severity"], "warning")
         self.assertFalse(any("80" in item["evidence"] for item in result["issues"]))
 
+    def test_reported_p0_claims_and_single_x_date_placeholder_are_blockers(self):
+        result = inspect_content_quality(deck(
+            '<div data-element-id="body">'
+            '<p>已经完成 12 周试点，SLA <strong>99.5%</strong></p>'
+            '<p>扩容后业务量覆盖 <strong>3×</strong>，预期季度节省 100 万+</p>'
+            '<p>会后 3 个工作日内输出项目章程</p>'
+            '<p>响应时间下降 42%</p>'
+            '<p>2025 年 X 月 X 日</p>'
+            '</div>'
+        ), {"known_facts": {"response_time": "响应时间下降42%"}})
+
+        blockers = [item for item in result["issues"] if item["severity"] == "blocker"]
+        evidence = "\n".join(item["evidence"] for item in blockers)
+        for token in ("12 周", "99.5%", "3×", "100 万+", "3 个工作日", "2025 年 X 月 X 日"):
+            self.assertIn(token, evidence)
+        self.assertFalse(any("42%" in item["evidence"] for item in result["issues"]))
+        self.assertTrue(all(item["element_id"] == "body" for item in blockers))
+
+    def test_disclosed_unknown_metric_warns_without_hiding_other_unbound_claims(self):
+        result = inspect_content_quality(deck(
+            '<p>试点 SLA 99.5%（数据待确认）</p><p>预计节省 100 万+</p>'
+        ), {"topic": "试点"})
+
+        codes = [(item["code"], item["severity"], item["evidence"]) for item in result["issues"]]
+        self.assertTrue(any(code == "unconfirmed_fact" and severity == "warning" for code, severity, _ in codes))
+        self.assertFalse(any("99.5%" in evidence and code.startswith("unverified") for code, _, evidence in codes))
+        self.assertTrue(any("100 万+" in evidence and severity == "blocker" for _, severity, evidence in codes))
+
 
 if __name__ == "__main__":
     unittest.main()

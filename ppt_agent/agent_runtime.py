@@ -28,19 +28,25 @@ STAGE_PROMPTS = {
         "helper_text、0 个或多个带 value/label/description 的 options、allow_other 与 blocking。"
         "本阶段不提供也不需要任何 Skill 工具，禁止请求工具。"
     ),
-    "narrative": "根据任务卡生成叙事结构 Markdown；不要生成逐页 HTML。按需最多读取 1 个当前阶段已列出的规划摘要，不要重复读取。",
+    "narrative": (
+        "根据任务卡生成叙事结构 Markdown；不要生成逐页 HTML。数字、日期、实体、效果与承诺只能来自冻结任务卡，"
+        "不得把计划改写成已发生事实，不得补造 SLA/KPI/倍数/期限，也不得输出 XX、TBD、[必填]、X 月 X 日等占位符。"
+        "按需最多读取 1 个当前阶段已列出的规划摘要，不要重复读取。"
+    ),
     "outline": (
         "根据已确认叙事生成结构化逐页大纲；不要自行编写页面 ID，也不要返回 markdown 字段。"
         "每页必须只包含 title、purpose、content_markdown、resource_uris；resource_uris 只能选自输入的冻结资源清单，"
         "没有合适资源时返回空数组。content_markdown 只写页内正文或列表，不得包含一级、二级标题。"
         "例如：{\"slides\":[{\"title\":\"开场与目标\",\"purpose\":\"建立共同目标\","
         "\"content_markdown\":\"- 背景\\n- 目标\",\"resource_uris\":[]}]}}。"
+        "所有事实、数字、日期、实体与承诺必须能在冻结任务卡中找到依据；不得沿用叙事中的无依据新增值，"
+        "不得输出 XX、TBD、[必填]、X 月 X 日等占位符。"
         "若输入包含 semantic_correction，须依据其中的具体错误修正并重新提交完整 slides。"
         "按需最多读取 1 个当前阶段已列出的规划摘要，禁止尝试读取布局、主题、图片或 HTML 模板文件；"
         "读取后立即提交大纲 JSON，不要重复读取。"
     ),
-    "sample": "仅为外层状态机指定的样品页生成 section 片段，不得生成公共模板或扩展到全稿；优先直接使用输入和轻量 design pack 清单，最多进行两轮必要探索；每项 html 必须严格以 <section class=\"slide\" id=\"给定ID\" data-slide-id=\"给定ID\"> 开始并以 </section> 结束。",
-    "deck": "仅为外层状态机给定的未确认页面生成 section 片段；不得重做确认样品、不得生成公共模板；优先直接使用输入和轻量 design pack 清单，避免重复探索；每项 html 必须严格以 <section class=\"slide\" id=\"给定ID\" data-slide-id=\"给定ID\"> 开始并以 </section> 结束。",
+    "sample": "仅为外层状态机指定的样品页生成 section 片段，不得生成公共模板或扩展到全稿；必须完整应用版本化 Generation Contract 中的事实、主题、布局、组件与动效约束；每项 html 必须严格以 <section class=\"slide\" id=\"给定ID\" data-slide-id=\"给定ID\"> 开始并以 </section> 结束。",
+    "deck": "仅为外层状态机给定的未确认页面生成 section 片段；不得重做确认样品、不得生成公共模板；必须复用样稿设计语言并完整应用版本化 Generation Contract，避免重复探索；每项 html 必须严格以 <section class=\"slide\" id=\"给定ID\" data-slide-id=\"给定ID\"> 开始并以 </section> 结束。",
     "inspection": "独立检查大纲与 HTML；必须逐项应用检查清单并结合 browser_evidence 中的 Chromium 渲染测量，仅报告有证据的问题，不得直接修改产物。浏览器证据不可用或包含问题时不得返回 passed=true。",
 }
 
@@ -673,8 +679,8 @@ class AgentRuntime:
         if stage in RENDERING_STAGES:
             allowed = "、".join(sorted(stage_files or ())) or "（无）"
             return (
-                f"工具契约：轻量 design pack 的锁定文件清单为：{allowed}。"
-                "无需先调用 list_skill_files；提交最终 JSON 前必须读取该 design pack；read_skill_file.path 只能从该清单选择，已读路径不会再次返回正文。"
+                f"工具契约：最小但完整的 Generation Contract 锁定文件清单为：{allowed}。"
+                "无需先调用 list_skill_files；提交最终 JSON 前必须读取该 Generation Contract；read_skill_file.path 只能从该清单选择，已读路径不会再次返回正文。"
                 "达到探索、唯一文件或字节预算后工具会被移除，必须提交最终 JSON。"
             )
         return "工具契约：仅可使用当前请求中提供的只读 Skill 工具；也可以不调用工具直接提交最终 JSON。"
