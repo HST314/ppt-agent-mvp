@@ -26,6 +26,11 @@ Zoom semantics exploited here (Chromium applies ``zoom`` to used values):
   ``MIN_ZOOM`` and would also scale computed font sizes below the hard
   ``text_too_small`` gate.  The box is grown into the slack with an
   explicit compensated size instead, which changes no font metrics.
+* nested scroll overflow is repaired from the deepest DOM leaves toward the
+  slide root.  A round never sizes an ancestor from stale geometry while an
+  overflowing descendant is still pending; after leaf growth Chromium is
+  re-measured and the resulting ancestor delta is propagated into measured
+  sibling/slide slack on the next round.
 
 All declarations carry ``!important``: real decks size offending elements
 through inline ``style=`` attributes, which otherwise silently win over the
@@ -47,6 +52,7 @@ SAFETY = 0.99
 MIN_ZOOM = 0.85
 MAX_RULES = 24
 GROW_MARGIN_PX = 1.0
+MAX_CASCADE_ROUNDS = 5
 
 GEOMETRIC_CODES = ("content_out_of_bounds", "element_scroll_overflow")
 
@@ -96,6 +102,15 @@ _MEASURE_JS = r"""slides => slides.map((slide, slideIndex) => {
         return `${scope} > ${parts.join(' > ')}`;
     };
     const descendants = [...slide.querySelectorAll('*')].filter(visible);
+    const depthFor = element => {
+        let depth = 0;
+        let node = element;
+        while (node && node !== slide) {
+            depth += 1;
+            node = node.parentElement;
+        }
+        return depth;
+    };
     const oobRoots = new Map();
     descendants.forEach(element => {
         const box = element.getBoundingClientRect();
@@ -115,28 +130,24 @@ _MEASURE_JS = r"""slides => slides.map((slide, slideIndex) => {
             if (!covered) oobRoots.set(element, { box, delta });
         }
     });
-    const scrollRoots = new Set();
-    descendants.forEach(element => {
-        if (element.clientWidth > 0 && element.clientHeight > 0 &&
-            (element.scrollWidth > element.clientWidth + 1 || element.scrollHeight > element.clientHeight + 1)) {
-            let ancestor = element.parentElement;
-            let covered = false;
-            while (ancestor && ancestor !== slide) {
-                if (scrollRoots.has(ancestor)) { covered = true; break; }
-                ancestor = ancestor.parentElement;
-            }
-            if (!covered) scrollRoots.add(element);
-        }
-    });
-    // Room a box can grow into without overlapping the next visible element
-    // stacked against it (horizontal overlap for downward growth, vertical
-    // overlap for rightward growth).  Falls back to the slide edge.
+    const scrollElements = descendants.filter(element =>
+        element.clientWidth > 0 && element.clientHeight > 0 &&
+        (element.scrollWidth > element.clientWidth + 1 || element.scrollHeight > element.clientHeight + 1)
+    );
+    // Room a box can grow into without overlapping fixed-position siblings.
+    // Normal-flow siblings move when the box grows, so their existing gap is
+    // not a capacity limit: the delta consumes downstream/ancestor slack and
+    // is verified after reflow.  Positioned siblings do not move and remain
+    // hard boundaries.  The slide edge is the final fail-closed boundary.
     const clearanceFor = element => {
         const box = element.getBoundingClientRect();
         let below = rect.bottom - box.bottom;
         let right = rect.right - box.right;
-        descendants.forEach(other => {
-            if (other === element || element.contains(other) || other.contains(element)) return;
+        const position = getComputedStyle(element).position;
+        const inFlow = position !== 'absolute' && position !== 'fixed';
+        if (inFlow) return { below: Math.max(0, below), right: Math.max(0, right), flow: true };
+        [...element.parentElement.children].filter(visible).forEach(other => {
+            if (other === element) return;
             const otherBox = other.getBoundingClientRect();
             const horizontalOverlap = Math.min(box.right, otherBox.right) - Math.max(box.left, otherBox.left);
             if (horizontalOverlap > 1 && otherBox.top >= box.bottom - 1) {
@@ -147,23 +158,28 @@ _MEASURE_JS = r"""slides => slides.map((slide, slideIndex) => {
                 right = Math.min(right, otherBox.left - box.right);
             }
         });
-        return { below: Math.max(0, below), right: Math.max(0, right) };
+        return { below: Math.max(0, below), right: Math.max(0, right), flow: false };
     };
     const targets = [];
     oobRoots.forEach((value, element) => targets.push({
         kind: 'oob',
         selector: selectorFor(element),
+        depth: depthFor(element),
+        has_scroll_descendant: scrollElements.some(other => other !== element && element.contains(other)),
         box: { left: value.box.left, top: value.box.top, width: value.box.width, height: value.box.height },
         delta: value.delta,
     }));
-    scrollRoots.forEach(element => targets.push({
+    scrollElements.forEach(element => targets.push({
         kind: 'scroll',
         selector: selectorFor(element),
+        depth: depthFor(element),
+        has_scroll_descendant: scrollElements.some(other => other !== element && element.contains(other)),
         box: (box => ({ left: box.left, top: box.top, width: box.width, height: box.height }))(element.getBoundingClientRect()),
         client: { width: element.clientWidth, height: element.clientHeight },
         scroll: { width: element.scrollWidth, height: element.scrollHeight },
         clear: clearanceFor(element),
     }));
+    targets.sort((left, right) => (right.depth || 0) - (left.depth || 0));
     return {
         slide_id: slide.getAttribute('data-slide-id') || slide.id || '',
         index: slideIndex,
@@ -247,7 +263,7 @@ def _rules_for(measured: list[dict], known: dict[str, str]) -> tuple[dict[str, s
         return True
 
     for slide in measured:
-        targets = slide.get("targets") or []
+        targets = [target for target in (slide.get("targets") or []) if not target.get("has_scroll_descendant")]
         dims = slide.get("slide_dims") or {}
         if (
             not targets

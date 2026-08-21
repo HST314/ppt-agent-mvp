@@ -7,6 +7,7 @@ from unittest.mock import patch
 from ppt_agent.claim_ledger import assert_claims_bound, audit_claims, audit_html_claims, build_claim_ledger
 from ppt_agent.design_contract import TemplateRegistry
 from ppt_agent.errors import ConflictError, ValidationError
+from ppt_agent.overflow_autofit import MAX_CASCADE_ROUNDS
 from ppt_agent.p2 import canonical, digest, now
 from ppt_agent.render_gate import canonical_post_render_evidence, post_render_evidence_hash
 from ppt_agent.service import TaskService
@@ -205,7 +206,7 @@ class ContractLedgerGateTests(unittest.TestCase):
             }
 
             def fit(html_text, max_rounds):
-                self.assertEqual(max_rounds, 2)
+                self.assertEqual(max_rounds, MAX_CASCADE_ROUNDS)
                 return {**fitted, "html": html_text}
 
             with patch("ppt_agent.service.fit_deck_html", side_effect=fit):

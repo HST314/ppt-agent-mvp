@@ -55,6 +55,42 @@ def leaf_label_deck(top=200):
     )])
 
 
+def nested_cascade_deck():
+    """Reproduce the locked real-run leaf -> parent cascade geometries.
+
+    Slide 1 has one normal-flow 63px leaf.  Its 67px content grows the leaf
+    to 68px, consuming the parent's 3px tail slack and leaving exactly
+    278px -> 280px ancestor scroll overflow.
+
+    Slide 2 has two adjacent normal-flow leaves.  Both must grow (the first
+    must not mistake the second for a fixed obstacle); together they consume
+    3px of tail slack and leave the locked 575px -> 582px ancestor delta.
+    """
+    leaf = (
+        '<div data-element-id="leaf-278" style="width:130px;height:63px;overflow:hidden;font-size:16px;line-height:1.4">'
+        '<div style="width:130px;height:67px">63 到 67 像素的叶节点</div></div>'
+    )
+    first = _slide(
+        "slide-1",
+        _TITLE % "278 像素父容器"
+        + '<div data-element-id="parent-278" style="position:absolute;left:64px;top:100px;width:1152px;height:278px;overflow:hidden">'
+        '<div style="height:212px"></div>' + leaf + '</div>',
+    )
+    two_leaves = (
+        '<div data-element-id="leaf-575-a" style="width:130px;height:63px;overflow:hidden;font-size:16px;line-height:1.4">'
+        '<div style="width:130px;height:67px">第一个 63 到 67 像素叶节点</div></div>'
+        '<div data-element-id="leaf-575-b" style="width:121px;height:63px;overflow:hidden;font-size:16px;line-height:1.4">'
+        '<div style="width:121px;height:67px">第二个 63 到 67 像素叶节点</div></div>'
+    )
+    second = _slide(
+        "slide-2",
+        _TITLE % "575 像素父容器"
+        + '<div data-element-id="parent-575" style="position:absolute;left:64px;top:80px;width:1152px;height:575px;overflow:hidden">'
+        '<div style="height:446px"></div>' + two_leaves + '</div>',
+    )
+    return assemble_locked_template([first, second])
+
+
 class OverflowAutofitBrowserGate(unittest.TestCase):
     def test_autofit_clears_geometric_blockers_and_reinspects_green(self):
         html = overflowing_deck()
@@ -140,6 +176,66 @@ class OverflowAutofitBrowserGate(unittest.TestCase):
         self.assertFalse(result["converged"])
         self.assertIn("zoom_below_floor", {item["reason"] for item in result["remaining"]})
         self.assertFalse(ChromiumDeckInspector().inspect(result["html"], ["slide-1"])["passed"])
+
+    def test_nested_leaf_growth_propagates_to_ancestors_using_flow_sibling_slack(self):
+        html = nested_cascade_deck()
+        slide_ids = ["slide-1", "slide-2"]
+        validate_html(html, slide_ids)
+        inspector = ChromiumDeckInspector()
+
+        before = inspector.inspect(html, slide_ids)
+        self.assertTrue(before["available"])
+        leaf_issues = [item for item in before["issues"] if item["code"] == "element_scroll_overflow"]
+        self.assertEqual(len(leaf_issues), 3, before["issues"])
+        self.assertEqual(
+            {(item["geometry"]["client_height"], item["geometry"]["scroll_height"]) for item in leaf_issues},
+            {(63, 67)},
+        )
+
+        # One repair round may only grow deepest leaves.  Chromium is then
+        # re-measured and must expose the exact real-run ancestor deltas.
+        leaf_round = fit_deck_html(html, max_rounds=1)
+        self.assertFalse(leaf_round["converged"])
+        self.assertEqual(len(leaf_round["rules"]), 3)
+        self.assertTrue(all("height: 68.00px !important" in rule for rule in leaf_round["rules"].values()))
+        self.assertTrue(all("zoom" not in rule for rule in leaf_round["rules"].values()))
+        after_leaf = inspector.inspect(leaf_round["html"], slide_ids)
+        parent_issues = [item for item in after_leaf["issues"] if item["code"] == "element_scroll_overflow"]
+        self.assertEqual(
+            {
+                (item["geometry"]["client_height"], item["geometry"]["scroll_height"])
+                for item in parent_issues
+            },
+            {(278, 280), (575, 582)},
+            parent_issues,
+        )
+
+        result = fit_deck_html(html, max_rounds=2)
+
+        self.assertTrue(result["available"])
+        self.assertTrue(result["converged"], result["remaining"])
+        self.assertEqual(result["remaining"], [])
+        self.assertEqual(result["rounds"], 2)
+        self.assertEqual(len(result["rules"]), 5)
+        leaf_selectors = [selector for selector in result["rules"] if "leaf-" in selector]
+        parent_selectors = [selector for selector in result["rules"] if "parent-" in selector]
+        self.assertEqual(len(leaf_selectors), 3)
+        self.assertEqual(len(parent_selectors), 2)
+        self.assertLess(
+            max(result["html"].index(selector) for selector in leaf_selectors),
+            min(result["html"].index(selector) for selector in parent_selectors),
+        )
+        self.assertTrue(all("zoom" not in result["rules"][selector] for selector in leaf_selectors + parent_selectors))
+        validate_html(result["html"], slide_ids)
+        after = inspector.inspect(result["html"], slide_ids)
+        self.assertTrue(after["passed"], after["issues"])
+        self.assertEqual(after["issues"], [])
+
+        # Rebuilding from the fitted input must reach the same fixed point.
+        second = fit_deck_html(result["html"], max_rounds=2)
+        self.assertEqual(second["rules"], result["rules"])
+        self.assertEqual(second["html"], result["html"])
+        self.assertTrue(second["converged"])
 
     def test_unfixable_overflow_stays_on_the_remaining_list(self):
         # 需要缩放到 0.5 以下才能放行的目标低于 MIN_ZOOM 下限，确定性路径

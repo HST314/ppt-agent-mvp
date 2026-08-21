@@ -20,7 +20,7 @@ from .p3 import changed_slide_ids, narrative_markdown, normalize_outline_markdow
 from .p4 import apply_design_contract, controlled_assets, infer_scope, recommend, render, validate_html
 from .render_gate import canonical_post_render_evidence, post_render_evidence_hash, run_post_render_gate
 from .offline import localize_delivery_html, offline_assets, offline_performance, offline_player, verify_delivery
-from .overflow_autofit import GEOMETRIC_CODES, fit_deck_html
+from .overflow_autofit import GEOMETRIC_CODES, MAX_CASCADE_ROUNDS, fit_deck_html
 
 def utcnow(): return datetime.now(timezone.utc).isoformat()
 def fingerprint(value): return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(",",":")).encode()).hexdigest()
@@ -822,7 +822,7 @@ class TaskService:
         )
         autofit=None
         if browser is not None and first["geometry"]["overflow_count"]:
-            fitted=fit_deck_html(html_text,max_rounds=2)
+            fitted=fit_deck_html(html_text,max_rounds=MAX_CASCADE_ROUNDS)
             if fitted.get("available") and fitted.get("rules"):
                 html_text=validate_html(fitted["html"],slide_ids,assets)
                 autofit={
@@ -1722,7 +1722,7 @@ class TaskService:
         with self.store.lock(task_id):
             token=self._candidate_write_token(task_id)
             deck=self.deck_view(task_id)["deck"]
-        result=fit_deck_html(deck["html"],max_rounds=2)
+        result=fit_deck_html(deck["html"],max_rounds=MAX_CASCADE_ROUNDS)
         if not result["available"] or not result["rules"]: return None
         contract,ledger=self._bound_deck_contracts(task_id,deck)
         assets=controlled_assets(self.input_view(task_id)["manifest"],self.store.resource_root(task_id))
