@@ -67,6 +67,9 @@ class FinalizeGateBrowserBase(unittest.TestCase):
         self.page = self.browser.new_page(viewport={"width": 1280, "height": 900})
         self.page.goto(self.base + "/tasks/task?stage=review")
         self.page.get_by_role("heading", name="自检与修改", exact=True).wait_for()
+        # 自检页正文为异步 hydrate（skeleton 先挂载，数据返回后整体替换为 .stage-grid），
+        # 仅等标题会在定稿按钮尚未渲染时产生竞态。
+        self.page.locator("#stage-content .stage-grid").wait_for()
 
     def tearDown(self):
         self.page.close()
@@ -103,11 +106,17 @@ class FinalizeBlockedBrowserTests(FinalizeGateBrowserBase):
         self.assertEqual(body["risk_rationale"], "客户已确认接受越界风险")
 
         self.page.get_by_role("heading", name="交付", exact=True).wait_for()
-        self.assertTrue(self.page.get_by_text("该版本为带风险终稿", exact=True).is_visible())
+        # 交付页正文为异步 hydrate：等待可识别的异步内容完成态（带风险终稿提示挂载即
+        # 说明 delivery stage 的三个接口已返回、.stage-grid 已整体替换 skeleton），再断言。
+        risk_notice = self.page.get_by_text("该版本为带风险终稿", exact=True)
+        risk_notice.wait_for()
+        self.assertTrue(risk_notice.is_visible())
         self.assertGreaterEqual(self.page.get_by_text("带风险终稿", exact=True).count(), 1)
         self.assertIn("客户已确认接受越界风险", self.page.locator(".stage-grid").inner_text())
         # 带风险终稿不放松发布门禁：渲染预检仍未通过，发布保持禁止。
-        self.assertTrue(self.page.get_by_text("渲染预检未通过，已禁止发布", exact=True).is_visible())
+        publish_blocked = self.page.get_by_text("渲染预检未通过，已禁止发布", exact=True)
+        publish_blocked.wait_for()
+        self.assertTrue(publish_blocked.is_visible())
 
 
 class FinalizeStandardBrowserTests(FinalizeGateBrowserBase):
@@ -126,6 +135,8 @@ class FinalizeStandardBrowserTests(FinalizeGateBrowserBase):
         self.assertNotIn("risk_rationale", body)
 
         self.page.get_by_role("heading", name="交付", exact=True).wait_for()
+        # 正常定稿无专属提示文本，等待 hydration 完成态（.stage-grid 替换 skeleton）后再做零计数断言。
+        self.page.locator("#stage-content .stage-grid").wait_for()
         self.assertEqual(self.page.get_by_text("带风险终稿", exact=True).count(), 0)
 
 
