@@ -387,7 +387,7 @@ class P0GenerationRefactorTests(unittest.TestCase):
                 self.assertIn(value,{item["value"] for item in correction["required_claims_by_slide"][slide_id]})
             self.assertEqual(sample["metadata"]["post_render_gate"]["claims"]["missing_required_count"],0)
 
-    def test_persistent_wrong_page_claim_is_fail_closed_with_page_evidence(self):
+    def test_persistent_wrong_page_claim_is_bound_into_target_page_server_slot(self):
         with tempfile.TemporaryDirectory() as root:
             builder=MisplacedRequiredClaimBuilder(always_bad=True)
             svc=TaskService(WorkspaceStore(root),builder=builder); svc.create("task","manual")
@@ -396,14 +396,15 @@ class P0GenerationRefactorTests(unittest.TestCase):
             svc.generate_outline("task"); svc.confirm_outline("task")
             svc.select_samples("task",["slide-1","slide-2","slide-3"])
 
-            with self.assertRaisesRegex(ValidationError,"missing_required_claim"):
-                svc.generate_sample("task")
+            sample=svc.generate_sample("task")["sample"]
 
-            self.assertFalse(svc.versions("task","sample"))
-            record=svc.versions("task","post-render-gate-evidence")[-1]
-            evidence=json.loads(svc.version("task",record["hash"]))
-            self.assertEqual(evidence["claims"]["missing_required_count"],1)
-            self.assertTrue(evidence["claims"]["missing_required"][0]["slide_id"].startswith("slide-"))
+            materialization=sample["metadata"]["locked_theme_generation"]["server_claim_materialization"]
+            self.assertEqual(materialization["materialized_count"],1)
+            self.assertEqual(materialization["placements"][0]["slide_id"],next(
+                slide_id for slide_id,claims in builder.calls[0]["required_claims_by_slide"].items() if claims
+            ))
+            self.assertEqual(sample["metadata"]["post_render_gate"]["claims"]["missing_required_count"],0)
+            self.assertIn('data-server-materialized="true"',sample["html"])
 
     def test_agent_builder_exposes_page_visible_claim_boundary_self_check(self):
         ledger=build_claim_ledger(
@@ -430,7 +431,7 @@ class P0GenerationRefactorTests(unittest.TestCase):
         self.assertEqual(html.builder_boundary["missing_required_count"],1)
         self.assertEqual(html.builder_boundary["missing_required"][0]["slide_id"],"slide-1")
 
-    def test_persistent_sample_required_claim_omission_remains_fail_closed(self):
+    def test_persistent_sample_required_claim_omission_uses_deterministic_visible_slot(self):
         with tempfile.TemporaryDirectory() as root:
             builder=RequiredClaimRetryBuilder(always_bad=True)
             svc=TaskService(WorkspaceStore(root),builder=builder); svc.create("task","manual")
@@ -439,14 +440,18 @@ class P0GenerationRefactorTests(unittest.TestCase):
             svc.generate_outline("task"); svc.confirm_outline("task")
             svc.select_samples("task",["slide-1","slide-2","slide-3"])
 
-            with self.assertRaisesRegex(ValidationError,"missing_required_claim"):
-                svc.generate_sample("task")
+            sample=svc.generate_sample("task")["sample"]
 
             self.assertEqual(len(builder.calls),2)
-            self.assertFalse(svc.versions("task","sample"))
-            record=svc.versions("task","post-render-gate-evidence")[-1]
-            evidence=json.loads(svc.version("task",record["hash"]))
-            self.assertEqual(evidence["claims"]["missing_required_count"],1)
+            slots=builder.calls[0]["required_claim_slots_by_slide"]
+            self.assertEqual(
+                {claim["value"] for claims in slots.values() for claim in claims},
+                {"80 万元"},
+            )
+            materialization=sample["metadata"]["locked_theme_generation"]["server_claim_materialization"]
+            self.assertEqual(materialization["materialized_count"],1)
+            self.assertEqual(sample["metadata"]["post_render_gate"]["claims"]["missing_required_count"],0)
+            self.assertIn('data-server-materialized="true">80 万元</span>',sample["html"])
 
     def test_deck_batch_locked_theme_override_is_corrected_once_in_same_job(self):
         with tempfile.TemporaryDirectory() as root:

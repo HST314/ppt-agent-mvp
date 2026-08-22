@@ -139,6 +139,39 @@ class P0HybridInspectionBrowserGate(unittest.TestCase):
         self.assertTrue(any("class=.ghost-layout-section" in item for item in undefined), evidence["issues"])
         self.assertTrue(any("matched_css_rule=0" in item for item in undefined))
 
+    def test_ancestor_semantic_class_defined_by_real_descendant_rule_passes(self):
+        fragment = (
+            '<section class="slide split" id="slide-1" data-slide-id="slide-1" data-layout="S10">'
+            '<div class="canvas-card"><div class="split-half">'
+            '<div class="half"><h1 data-element-id="title">S10 左侧</h1></div>'
+            '<div class="half"><p>右侧说明</p></div>'
+            '</div></div></section>'
+        )
+        html = f'<!doctype html><html><head><style>{locked_template("swiss")["style"]}</style></head><body>{fragment}</body></html>'
+
+        evidence = ChromiumDeckInspector().inspect(html, ["slide-1"])
+
+        self.assertTrue(evidence["available"], evidence["issues"])
+        undefined = [item for item in evidence["issues"] if item["code"] == "undefined_layout_class"]
+        self.assertFalse(any("class=.split" in item["evidence"] for item in undefined), evidence["issues"])
+
+    def test_ancestor_class_without_a_real_subtree_match_remains_blocked(self):
+        fragment = (
+            '<section class="slide missing-class" id="slide-1" data-slide-id="slide-1" data-layout="S10">'
+            '<h1 data-element-id="title">缺失后代</h1><p>真实内容</p></section>'
+        )
+        html = (
+            '<!doctype html><html><head><style>'
+            f'{locked_template("swiss")["style"]}'
+            '.slide.missing-class .required-descendant{display:grid}'
+            '</style></head><body>' + fragment + '</body></html>'
+        )
+
+        evidence = ChromiumDeckInspector().inspect(html, ["slide-1"])
+
+        undefined = [item for item in evidence["issues"] if item["code"] == "undefined_layout_class"]
+        self.assertTrue(any("class=.missing-class" in item["evidence"] for item in undefined), evidence["issues"])
+
     def test_swiss_body_zh_is_a_real_locked_cssom_class(self):
         fragment = (
             '<section class="slide light" id="slide-1" data-slide-id="slide-1" data-layout="S07">'

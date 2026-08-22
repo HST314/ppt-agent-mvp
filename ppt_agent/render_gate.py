@@ -139,6 +139,16 @@ def run_post_render_gate(
 ) -> dict[str, Any]:
     validate_claim_ledger(claim_ledger)
     structure = inspect_contract(html_text, expected_slide_ids, contract, contract_hash)
+    structural_signatures = (canonical_validation or {}).get("structural_signatures") or {}
+    if structural_signatures.get("applicable"):
+        checked = int(structural_signatures.get("checked_slide_count") or 0)
+        matched = int(structural_signatures.get("matched_slide_count") or 0)
+        structure = {
+            **structure,
+            "structural_signature_checked_count": checked,
+            "structural_signature_matched_count": matched,
+            "structural_signature_percent": round(matched * 100 / checked, 2) if checked else 0,
+        }
     claims = audit_html_claims(html_text, claim_ledger, required_claim_ids=required_claim_ids)
     page_claims = None
     if required_claim_ids_by_slide is not None:

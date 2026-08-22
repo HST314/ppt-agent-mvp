@@ -20,7 +20,7 @@
     "references/swiss-map-component.md": "057db8cc245d2c3d760206dd73cd57a57e66c831ffc02c0c67ed799fc2092b8d",
     "references/themes-swiss.md": "eec246cd44a1674990d6fe614ee32a59912695c317279a1b86d2710db0319bc8",
     "references/themes.md": "a4bee3ef7b22d56fb904b0643a117368d85f0265ceccdf5111ad497fe22cc656",
-    "references/template-registry.json": "d90744a1a384f28668d0575e51a18b2d12365b85bd366b5aa9d9d436eb637fe5",
+    "references/template-registry.json": "ded797e740d293301e1d6d62e0715073bb5eb207aaa48c831b7f1bdbc07b76d4",
     "scripts/validate-swiss-deck.mjs": "282f05a476c2f25f9542be453f80d2b9736e64e11c3af4d297992687fe203b86"
   }
 }

@@ -159,6 +159,10 @@ body{display:block;padding:24px 0}
 .slide .step-desc{font-size:16px}
 .slide p,.slide li,.slide td,.slide th{font-family:var(--sans-zh);font-size:24px;line-height:1.5}
 .slide small{font-size:16px;line-height:1.4}
+.slide .required-claim-slot{position:absolute;left:5vw;right:5vw;bottom:4.4vh;z-index:3;display:flex;flex-wrap:wrap;gap:8px 16px;padding:8px 12px;background:var(--paper);border-top:2px solid var(--accent)}
+.slide.dark .required-claim-slot,.slide.accent .required-claim-slot{background:var(--ink)}
+.slide .required-claim-row{display:flex;align-items:baseline;gap:8px;min-width:0}
+.slide .required-claim-value{font-family:var(--sans-zh);font-size:18px;line-height:1.3;font-weight:500}
 .slide :focus-visible{outline:2px solid currentColor;outline-offset:2px}
 @media (prefers-reduced-motion:reduce){.slide [data-anim]{opacity:1!important;transform:none!important}}
 """.strip().replace("GUARD", EDITORIAL_TITLE_GUARD)
@@ -192,6 +196,18 @@ body{display:block;padding:24px 0}
 .slide .step-meta{font-size:14px}
 .slide p,.slide li,.slide td,.slide th{font-family:var(--sans),var(--sans-zh);font-size:24px;line-height:1.45}
 .slide small{font-size:16px;line-height:1.4}
+.slide .cell,.slide .cell-6,.slide .sub-card-stack,.slide .sub-card,
+.slide .kpi-tower-row,.slide .tower-col,.slide .duo-half,.slide .tl-h-node,
+.slide .manifesto-top,.slide .ink-banner-full,.slide .three-forces,.slide .hero-ink-col,.slide .force-card,
+.slide .loop-diagram,.slide .loop-steps,.slide .loop-svg,.slide .matrix-fill,.slide .matrix-cell,.slide .hero-stat-bottom,
+.slide .brief-grid,.slide .brief-card,.slide .system-diagram,.slide .sys-svg,.slide .sys-label,
+.slide .why-now-grid,.slide .why-col,.slide .why-num-bottom,.slide .four-cards,.slide .fc-col,
+.slide .stacked-ledger,.slide .tech-spec,.slide .spec-title-col,.slide .spec-kpi-grid,.slide .spec-bars,.slide .bar-vert,
+.slide .image-hero,.slide .hero-img-wrap,.slide .hero-overlay-block,.slide .hero-stats{min-width:0}
+.slide .required-claim-slot{position:absolute;left:5vw;right:5vw;bottom:4.4vh;z-index:3;display:flex;flex-wrap:wrap;gap:8px 16px;padding:8px 12px;background:var(--paper);border-top:2px solid var(--accent)}
+.slide.dark .required-claim-slot,.slide.accent .required-claim-slot{background:var(--ink)}
+.slide .required-claim-row{display:flex;align-items:baseline;gap:8px;min-width:0}
+.slide .required-claim-value{font-family:var(--sans),var(--sans-zh);font-size:18px;line-height:1.3;font-weight:500}
 .slide :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .slide.dark :focus-visible,.slide.accent :focus-visible{outline-color:currentColor}
 @media (prefers-reduced-motion:reduce){.slide [data-anim]{opacity:1!important;transform:none!important}}
@@ -833,6 +849,11 @@ def render(markdown: str, slide_ids: list[str], rules=None, exceptions=None, ass
     blocks = {m.group(1): m.group(2).strip() for m in SLIDE.finditer(markdown)}
     rules = rules or []
     exceptions = exceptions or {}
+    contracts = {
+        item["slide_id"]: item
+        for item in (design_contract or {}).get("slide_contracts", [])
+        if isinstance(item, dict)
+    }
     sections = []
     for sid in slide_ids:
         text = blocks[sid]
@@ -845,8 +866,159 @@ def render(markdown: str, slide_ids: list[str], rules=None, exceptions=None, ass
             if uri not in (assets or {}):
                 raise ValidationError("大纲引用不属于当前冻结资源清单")
             images.append(f'<img data-element-id="resource" src="{html.escape(assets[uri], quote=True)}" alt="{html.escape(alt, quote=True)}">')
-        sections.append(f'<section class="slide" id="{sid}" data-slide-id="{sid}"><h1 data-element-id="title">{title}</h1><div data-element-id="body">{body}</div>{"".join(images)}{note}</section>')
+        content = f'<h1 data-element-id="title">{title}</h1><div data-element-id="body">{body}</div>{"".join(images)}{note}'
+        layout_id = str(contracts.get(sid, {}).get("layout_id") or "")
+        sections.append(_deterministic_layout_fragment(sid, layout_id, content))
     return assemble_locked_template(sections, rules, design_contract, contract_hash)
+
+
+def _repeated(class_name: str, count: int, content: str, *, child: str = "") -> str:
+    items = []
+    for index in range(count):
+        inner = content if index == 0 else f'<span aria-hidden="true">{index + 1:02d}</span>'
+        items.append(f'<div class="{class_name}">{inner}{child}</div>')
+    return "".join(items)
+
+
+def _deterministic_layout_fragment(slide_id: str, layout_id: str, content: str) -> str:
+    """Render test/fallback content in the same registered skeletons as production."""
+    root_classes = "slide split" if layout_id == "S10" else "slide"
+    bar_tower = '<div class="bar-tower"></div>'
+    bar_fill = '<div class="bar-fill"></div>'
+    ledger_num = '<span class="ledger-num">—</span>'
+    skeletons = {
+        "S01": f'<div class="canvas-card"><canvas class="ascii-bg" aria-hidden="true"></canvas>{content}</div>',
+        "S02": f'<div class="timeline-v"><div class="tl-node">{content}</div></div><div class="kpi-row-4"></div>',
+        "S03": f'<div class="h-statement">{content}</div>',
+        "S04": f'<div class="sub-grid-3-2">{_repeated("cell", 6, content)}</div>',
+        "S05": f'<div class="stack-row">{_repeated("sub-card", 3, content)}</div>',
+        "S06": f'<div class="kpi-tower-row">{_repeated("tower-col", 4, content, child=bar_tower)}</div>',
+        "S07": f'<div class="h-bar-chart">{_repeated("bar-row", 5, content, child=bar_fill)}</div>',
+        "S08": f'<div class="duo-compare">{_repeated("duo-half", 2, content)}</div>',
+        "S09": f'<div class="dot-mat">{content}</div>',
+        "S10": f'<div class="canvas-card"><div class="split-half">{_repeated("half", 2, content)}</div></div>',
+        "S11": f'<div class="timeline-h">{_repeated("tl-h-node", 4, content)}</div>',
+        "S12": f'<div class="manifesto-top">{content}</div><div class="ink-banner-full">结论</div>',
+        "S13": f'<div class="three-forces"><div class="hero-ink-col">{content}</div>{_repeated("force-card", 3, "要点")}</div>',
+        "S14": f'<div class="loop-diagram"><div class="loop-steps">{content}</div><div class="loop-svg"></div></div>',
+        "S15": f'<div class="matrix-fill">{_repeated("matrix-cell", 8, content)}</div><div class="hero-stat-bottom">总览</div>',
+        "S16": f'<div class="brief-grid">{_repeated("brief-card", 6, content)}</div>',
+        "S17": f'<div class="system-diagram"><div class="sys-svg">{content}</div>{_repeated("sys-label", 3, "层级")}</div>',
+        "S18": f'<div class="why-now-grid">{_repeated("why-col", 3, content)}</div><div class="why-num-bottom">01</div>',
+        "S19": f'<div class="four-cards">{_repeated("fc-col", 4, content)}</div>',
+        "S20": f'<div class="stacked-ledger">{_repeated("ledger-row", 4, content, child=ledger_num)}</div>',
+        "S21": f'<div class="tech-spec"><div class="spec-title-col">{content}</div><div class="spec-kpi-grid"></div><div class="spec-bars">{_repeated("bar-vert", 9, "")}</div></div>',
+        "S22": f'<div class="image-hero"><div class="hero-img-wrap">{content}</div><div class="hero-overlay-block">案例</div><div class="hero-stats"></div></div>',
+    }
+    inner = skeletons.get(layout_id, content)
+    return f'<section class="{root_classes}" id="{slide_id}" data-slide-id="{slide_id}">{inner}</section>'
+
+
+def _class_element_spans(fragment: str, class_name: str) -> list[tuple[int, int]]:
+    opening_re = re.compile(r"<([a-z][a-z0-9:-]*)\b[^>]*>", re.I)
+    class_re = re.compile(r"\bclass\s*=\s*(['\"])(.*?)\1", re.I | re.S)
+    spans = []
+    for opening in opening_re.finditer(fragment):
+        classes = class_re.search(opening.group(0))
+        if not classes or class_name not in classes.group(2).split() or opening.group(0).rstrip().endswith("/>"):
+            continue
+        tag = opening.group(1)
+        tag_re = re.compile(rf"</?{re.escape(tag)}\b[^>]*>", re.I)
+        depth = 0
+        for token in tag_re.finditer(fragment, opening.start()):
+            raw = token.group(0)
+            if raw.lower().startswith("</"):
+                depth -= 1
+                if depth == 0:
+                    spans.append((opening.start(), token.start()))
+                    break
+            elif not raw.rstrip().endswith("/>"):
+                depth += 1
+    return spans
+
+
+def materialize_required_claim_slots(
+    html_text: str,
+    missing_claims_by_slide: dict[str, list[dict]],
+    layout_by_slide: dict[str, str],
+) -> tuple[str, dict]:
+    """Bind missing frozen facts into visible, page-scoped server-owned slots."""
+    tag_re = re.compile(r'<section\b[^>]*>|</section\s*>', re.I)
+    id_re = re.compile(r'\b(?:data-slide-id|id)=["\']([A-Za-z0-9_-]+)["\']', re.I)
+    class_re = re.compile(r'\bclass=["\']([^"\']*)["\']', re.I)
+    stack = []
+    spans: dict[str, tuple[int, int]] = {}
+    for match in tag_re.finditer(html_text):
+        tag = match.group(0)
+        if tag.lower().startswith("</"):
+            if not stack:
+                continue
+            start, slide_id = stack.pop()
+            if slide_id is not None:
+                spans[slide_id] = (start, match.end())
+            continue
+        identifier = id_re.search(tag)
+        classes = class_re.search(tag)
+        is_slide = bool(classes and "slide" in classes.group(1).split())
+        stack.append((match.start(), identifier.group(1) if is_slide and identifier and not stack else None))
+
+    evidence = []
+    replacements = []
+    slot_class_by_layout = {
+        "S01": "canvas-card", "S02": "tl-node", "S03": "h-statement", "S04": "cell",
+        "S05": "sub-card", "S06": "tower-col", "S07": "bar-row", "S08": "duo-half",
+        "S09": "dot-mat", "S10": "half", "S11": "tl-h-node", "S12": "manifesto-top",
+        "S13": "force-card", "S14": "loop-steps", "S15": "matrix-cell", "S16": "brief-card",
+        "S17": "sys-label", "S18": "why-col", "S19": "fc-col", "S20": "ledger-row",
+        "S21": "spec-title-col", "S22": "hero-stats",
+    }
+    for slide_id, claims in missing_claims_by_slide.items():
+        if not claims:
+            continue
+        if slide_id not in spans:
+            raise ValidationError("确定性事实槽位找不到目标页面")
+        start, end = spans[slide_id]
+        fragment = html_text[start:end]
+        values = [
+            (
+                f'<span class="required-claim-value" data-claim-id="{html.escape(str(claim["claim_id"]), quote=True)}" '
+                f'data-server-materialized="true">{html.escape(str(claim["value"]))}</span>'
+            )
+            for claim in claims
+        ]
+        slot_class = slot_class_by_layout.get(layout_by_slide.get(slide_id, ""), "")
+        hosts = _class_element_spans(fragment, slot_class) if slot_class else []
+        inserted = bool(hosts)
+        if inserted:
+            by_closing: dict[int, list[str]] = {}
+            for index, value in enumerate(values):
+                closing = hosts[index % len(hosts)][1]
+                by_closing.setdefault(closing, []).append(value)
+            for closing, host_values in sorted(by_closing.items(), reverse=True):
+                fragment = fragment[:closing] + "".join(host_values) + fragment[closing:]
+        if not inserted:
+            rows = "".join(
+                f'<span class="required-claim-row">{value}</span>'
+                for value in values
+            )
+            slot = f'<div class="required-claim-slot" data-element-id="required-claim-slot">{rows}</div>'
+            closing = fragment.lower().rfind("</section")
+            if closing < 0:
+                raise ValidationError("确定性事实槽位页面边界无效")
+            fragment = fragment[:closing] + slot + fragment[closing:]
+        replacements.append((start, end, fragment))
+        evidence.extend({
+            "slide_id": slide_id,
+            "claim_id": claim["claim_id"],
+            "layout_id": layout_by_slide.get(slide_id, ""),
+            "slot": slot_class if inserted else "required-claim-slot",
+        } for claim in claims)
+    for start, end, fragment in sorted(replacements, reverse=True):
+        html_text = html_text[:start] + fragment + html_text[end:]
+    return html_text, {
+        "materialized_count": len(evidence),
+        "placements": evidence,
+    }
 
 
 def validate_html(value: str, expected_ids: list[str], allowed_assets=()):

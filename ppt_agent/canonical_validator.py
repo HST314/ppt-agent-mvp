@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from .layout_structure import run_layout_structure_validator
 from .skill_runtime import SkillRuntime
 
 
@@ -44,13 +45,23 @@ def run_canonical_validator(html_text: str, style_id: str, *, timeout_seconds: f
             "upstream_commit": UPSTREAM_COMMIT,
             "errors": [],
             "warnings": [],
+            "structural_signatures": run_layout_structure_validator(html_text, style_id),
         }
+    structural = run_layout_structure_validator(html_text, style_id)
+
+    def result(**payload):
+        errors = list(payload.get("errors") or [])
+        payload["errors"] = [*structural["errors"], *errors]
+        payload["passed"] = bool(payload.get("passed")) and structural["passed"]
+        payload["structural_signatures"] = structural
+        return payload
+
     skill = SkillRuntime.builtin()
     script_hash = skill.manifest.get(VALIDATOR_PATH)
     try:
         script_path, _ = skill._locked_bytes(VALIDATOR_PATH)  # verified, server-owned path
     except Exception:
-        return {
+        return result(**{
             "applicable": True,
             "passed": False,
             "script": VALIDATOR_PATH,
@@ -58,7 +69,7 @@ def run_canonical_validator(html_text: str, style_id: str, *, timeout_seconds: f
             "upstream_commit": UPSTREAM_COMMIT,
             "errors": ["canonical validator 缺失或哈希校验失败"],
             "warnings": [],
-        }
+        })
     temporary_path = None
     try:
         with tempfile.NamedTemporaryFile("w", suffix=".html", encoding="utf-8", delete=False) as handle:
@@ -78,7 +89,7 @@ def run_canonical_validator(html_text: str, style_id: str, *, timeout_seconds: f
         warnings = _messages(combined, "Warnings:")
         if completed.returncode and not errors:
             errors = [f"canonical validator 异常退出（code={completed.returncode}）"]
-        return {
+        return result(**{
             "applicable": True,
             "passed": completed.returncode == 0,
             "script": VALIDATOR_PATH,
@@ -86,9 +97,9 @@ def run_canonical_validator(html_text: str, style_id: str, *, timeout_seconds: f
             "upstream_commit": UPSTREAM_COMMIT,
             "errors": errors,
             "warnings": warnings,
-        }
+        })
     except FileNotFoundError:
-        return {
+        return result(**{
             "applicable": True,
             "passed": False,
             "script": VALIDATOR_PATH,
@@ -96,9 +107,9 @@ def run_canonical_validator(html_text: str, style_id: str, *, timeout_seconds: f
             "upstream_commit": UPSTREAM_COMMIT,
             "errors": ["Node.js 不可用，canonical validator 未执行"],
             "warnings": [],
-        }
+        })
     except subprocess.TimeoutExpired:
-        return {
+        return result(**{
             "applicable": True,
             "passed": False,
             "script": VALIDATOR_PATH,
@@ -106,7 +117,7 @@ def run_canonical_validator(html_text: str, style_id: str, *, timeout_seconds: f
             "upstream_commit": UPSTREAM_COMMIT,
             "errors": ["canonical validator 执行超时"],
             "warnings": [],
-        }
+        })
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)

@@ -8,9 +8,10 @@ from ppt_agent.canonical_validator import run_canonical_validator
 from ppt_agent.claim_ledger import assert_claims_bound, audit_claims, audit_html_claims, build_claim_ledger
 from ppt_agent.design_contract import TemplateRegistry, build_design_contract
 from ppt_agent.errors import ConflictError, ValidationError
+from ppt_agent.layout_structure import run_layout_structure_validator
 from ppt_agent.overflow_autofit import MAX_CASCADE_ROUNDS
 from ppt_agent.p2 import canonical, digest, now
-from ppt_agent.p4 import apply_design_contract, assemble_locked_template
+from ppt_agent.p4 import apply_design_contract, assemble_locked_template, render
 from ppt_agent.render_gate import canonical_post_render_evidence, post_render_evidence_hash
 from ppt_agent.service import TaskService
 from ppt_agent.store import WorkspaceStore
@@ -79,6 +80,26 @@ class ClaimDroppingBuilder:
         return "<!doctype html><html><head><meta charset=\"utf-8\"></head><body>" + "".join(sections) + "</body></html>"
 
 
+class RegisteredClaimDroppingBuilder:
+    def __init__(self):
+        self.calls = []
+
+    def build(self, outline, **context):
+        self.calls.append(dict(context))
+        html = render(
+            outline,
+            context["slide_ids"],
+            context.get("rules"),
+            context.get("exceptions"),
+            context.get("assets"),
+            context.get("design_contract"),
+            context.get("design_contract_hash"),
+        )
+        for claim in context.get("required_claims_verbatim", []):
+            html = html.replace(claim["value"], "冻结事实待服务端绑定")
+        return html
+
+
 class ContractLedgerGateTests(unittest.TestCase):
     def _service(self, root, browser=None):
         return TaskService(
@@ -137,9 +158,9 @@ class ContractLedgerGateTests(unittest.TestCase):
         )
         contract_hash=digest(canonical(contract))
         fragments=[
-            '<section class="slide" id="slide-1" data-slide-id="slide-1"><h1 style="text-align:center">封面</h1><p>封面摘要</p></section>',
-            '<section class="slide" id="slide-2" data-slide-id="slide-2"><h1 style="text-align:center;align-self:center">正文</h1><p>正文摘要</p></section>',
-            '<section class="slide" id="slide-3" data-slide-id="slide-3"><h1>结尾</h1><p>行动建议</p></section>',
+            '<section class="slide" id="slide-1" data-slide-id="slide-1"><div class="cover-row"><h1 style="text-align:center">封面</h1><p>封面摘要</p></div></section>',
+            '<section class="slide" id="slide-2" data-slide-id="slide-2"><div class="timeline-v"><h1 style="text-align:center;align-self:center">正文</h1><p>正文摘要</p><div class="kpi-row-4"></div></div></section>',
+            '<section class="slide" id="slide-3" data-slide-id="slide-3"><div class="split-half"><div class="half"><h1>结尾</h1></div><div class="half"><p>行动建议</p></div></div></section>',
         ]
         html=assemble_locked_template(fragments,design_contract=contract,contract_hash=contract_hash)
         html=apply_design_contract(html,contract,contract_hash)
@@ -338,7 +359,8 @@ class ContractLedgerGateTests(unittest.TestCase):
 
     def test_hash_locked_canonical_validator_accepts_registered_and_rejects_missing_layout(self):
         valid = run_canonical_validator(
-            '<!doctype html><html><body><section class="slide" data-layout="S01"><h1>标题</h1></section></body></html>',
+            '<!doctype html><html><body><section class="slide accent" data-layout="S01">'
+            '<canvas class="ascii-bg"></canvas><h1>标题</h1></section></body></html>',
             "swiss",
         )
         invalid = run_canonical_validator(
@@ -350,6 +372,67 @@ class ContractLedgerGateTests(unittest.TestCase):
         self.assertRegex(valid["script_hash"], r"^[0-9a-f]{64}$")
         self.assertFalse(invalid["passed"])
         self.assertIn("missing data-layout", " ".join(invalid["errors"]))
+
+    def test_layout_structure_signatures_reject_number_only_compliance(self):
+        fake_s04 = (
+            '<!doctype html><section class="slide" data-layout="S04">'
+            '<div class="frame grid-3">' + '<div class="stat-card">预算</div>' * 5 + '</div></section>'
+        )
+        fake_s06 = (
+            '<!doctype html><section class="slide" data-layout="S06">'
+            '<div class="pipeline">' + '<div class="step">阶段</div>' * 3 + '</div></section>'
+        )
+
+        s04 = run_layout_structure_validator(fake_s04, "swiss")
+        s06 = run_layout_structure_validator(fake_s06, "swiss")
+
+        self.assertFalse(s04["passed"])
+        self.assertIn(".sub-grid-3-2 | .cell-6", " ".join(s04["errors"]))
+        self.assertFalse(s06["passed"])
+        self.assertIn(".kpi-tower-row", " ".join(s06["errors"]))
+
+    def test_layout_structure_signatures_accept_real_s04_s06_and_s10_skeletons(self):
+        html = """<!doctype html><html><body>
+<section class="slide" data-layout="S04"><div class="sub-grid-3-2">
+  <div></div><div></div><div></div><div></div><div></div><div></div>
+</div></section>
+<section class="slide" data-layout="S06"><div class="kpi-tower-row">
+  <div><div class="bar-tower"></div></div><div><div class="bar-tower"></div></div>
+  <div><div class="bar-tower"></div></div><div><div class="bar-tower"></div></div>
+</div></section>
+<section class="slide split" data-layout="S10"><div class="split-half">
+  <div class="half"></div><div class="half"></div>
+</div></section>
+</body></html>"""
+
+        result = run_layout_structure_validator(html, "swiss")
+
+        self.assertTrue(result["passed"], result)
+        self.assertEqual(result["matched_slide_count"], 3)
+
+    def test_swiss_design_contract_selects_layout_from_content_shape(self):
+        slide_ids = [f"slide-{index}" for index in range(1, 6)]
+        blocks = {
+            "slide-1": "## [slide-1] 封面\n- 决策方案",
+            "slide-2": "## [slide-2] 预算构成\n- 软件 36 万元\n- 服务 24 万元\n- 实施 12 万元\n- 培训 8 万元\n- 总预算 80 万元",
+            "slide-3": "## [slide-3] 实施路线图\n- 准备阶段\n- 试点阶段\n- 推广阶段",
+            "slide-4": "## [slide-4] 关键 KPI\n- 响应时间 -42%\n- 满意度 4.2→4.6\n- 转接率 -18%\n- 节省 36 万元",
+            "slide-5": "## [slide-5] 收束\n- 决策请求",
+        }
+        contract = build_design_contract(
+            task_id="shape",
+            task_card={"constraints": {"风格": "Style B 瑞士"}},
+            input_snapshot_hash="a" * 64,
+            outline_hash="b" * 64,
+            slide_ids=slide_ids,
+            created_at=now(),
+            outline_blocks=blocks,
+        )
+        layouts = {item["slide_id"]: item["layout_id"] for item in contract["slide_contracts"]}
+
+        self.assertEqual(layouts["slide-2"], "S20")
+        self.assertEqual(layouts["slide-3"], "S05")
+        self.assertEqual(layouts["slide-4"], "S06")
 
     def test_contract_and_ledger_hashes_survive_every_delivery_stage(self):
         with tempfile.TemporaryDirectory() as root:
@@ -513,7 +596,7 @@ class ContractLedgerGateTests(unittest.TestCase):
 
             self.assertFalse(service.versions("task", "sample"))
 
-    def test_missing_required_claim_blocks_deck_before_artifact_commit(self):
+    def test_server_claim_materialization_does_not_bypass_structure_gate(self):
         with tempfile.TemporaryDirectory() as root:
             service = self._service(root)
             self._to_outline(service)
@@ -522,14 +605,33 @@ class ContractLedgerGateTests(unittest.TestCase):
             service.confirm_sample("task")
             service.builder = ClaimDroppingBuilder()
 
-            with self.assertRaisesRegex(ValidationError, "missing_required_claim"):
+            with self.assertRaisesRegex(ValidationError, "渲染后硬门禁未通过"):
                 service.generate_deck("task")
 
             self.assertFalse(service.versions("task", "deck"))
             failure = next(item for item in service.versions("task", "post-render-gate-evidence") if item["metadata"]["passed"] is False)
             evidence = json.loads(service.version("task", failure["hash"]))
-            self.assertGreater(evidence["claims"]["missing_required_count"], 0)
+            self.assertEqual(evidence["claims"]["missing_required_count"], 0)
             self.assertEqual(evidence["claims"]["unbound_count"], 0)
+            self.assertFalse(evidence["canonical_validator"]["structural_signatures"]["passed"])
+
+    def test_swiss_missing_facts_are_materialized_without_weakening_structure_gate(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root)
+            self._to_outline(service)
+            service.select_samples("task", ["slide-1", "slide-2", "slide-3", "slide-4"])
+            builder = RegisteredClaimDroppingBuilder()
+            service.builder = builder
+
+            sample = service.generate_sample("task")["sample"]
+
+            generation = sample["metadata"]["locked_theme_generation"]
+            self.assertEqual(len(builder.calls), 2)
+            self.assertGreater(generation["server_claim_materialization"]["materialized_count"], 0)
+            self.assertEqual(sample["metadata"]["post_render_gate"]["claims"]["missing_required_count"], 0)
+            signatures = sample["metadata"]["post_render_gate"]["canonical_validator"]["structural_signatures"]
+            self.assertTrue(signatures["passed"], signatures)
+            self.assertEqual(sample["metadata"]["post_render_gate"]["layout"]["structural_signature_percent"], 100)
 
     def test_stale_automatic_sample_selection_is_refreshed_on_generation(self):
         with tempfile.TemporaryDirectory() as root:

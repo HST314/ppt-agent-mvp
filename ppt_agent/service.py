@@ -20,7 +20,7 @@ from .p2 import canonical, digest, now, parse_task_card, questions_for, scan_res
 from .schema import ClarificationSet, ResourceManifest, TaskCard, TaskInputSnapshot
 from .schema import NarrativeDocument, SlideOutline, SampleSelection, DeckArtifact
 from .p3 import assert_narrative_quality, changed_slide_ids, narrative_markdown, narrative_quality_evidence, normalize_outline_markdown, outline_markdown, parse_outline, requested_slide_count, structured_outline_markdown
-from .p4 import LOCKED_THEME_TOKENS, apply_design_contract, assemble_locked_template, controlled_assets, infer_scope, recommend, render, required_sample_targets, validate_html
+from .p4 import LOCKED_THEME_TOKENS, apply_design_contract, assemble_locked_template, controlled_assets, infer_scope, materialize_required_claim_slots, recommend, render, required_sample_targets, validate_html
 from .render_gate import canonical_post_render_evidence, post_render_evidence_hash, run_post_render_gate
 from .offline import localize_delivery_html, offline_assets, offline_performance, offline_player, verify_delivery
 from .overflow_autofit import GEOMETRIC_CODES, MAX_CASCADE_ROUNDS, fit_deck_html
@@ -812,6 +812,11 @@ class TaskService:
                 contract=validate_design_contract(json.loads(self.version(task_id,record["hash"])))
                 return {**contract,"hash":record["hash"]}
         outline=json.loads(self.version(task_id,outline_hash))
+        _,outline_blocks=parse_outline(
+            outline["markdown"],
+            view["manifest"].get("resources",[]),
+            None,
+        )
         contract=build_design_contract(
             task_id=task_id,
             task_card=view["task_card"],
@@ -819,6 +824,7 @@ class TaskService:
             outline_hash=outline_hash,
             slide_ids=list(outline["slide_ids"]),
             created_at=utcnow(),
+            outline_blocks=outline_blocks,
         )
         contract_hash=self.store.put_version(task_id,"design-contract",canonical(contract),{
             "input_snapshot_hash":view["snapshot_hash"],
@@ -1012,6 +1018,23 @@ class TaskService:
         required_claims=list(context.get("required_claims_verbatim") or [])
         required_ids=[claim["claim_id"] for claim in required_claims]
         required_claims_by_slide=dict(context.get("required_claims_by_slide") or {})
+        layout_by_slide={
+            item["slide_id"]:item["layout_id"]
+            for item in context.get("design_contract",{}).get("slide_contracts",[])
+        }
+        required_claim_slots_by_slide={
+            slide_id:[
+                {
+                    **claim,
+                    "slot_id":f"required-{claim['claim_id']}",
+                    "slot_index":index,
+                    "slot_count":len(claims),
+                    "layout_id":layout_by_slide.get(slide_id,""),
+                }
+                for index,claim in enumerate(claims,1)
+            ]
+            for slide_id,claims in required_claims_by_slide.items()
+        }
         required_ids_by_slide={
             slide_id:[claim["claim_id"] for claim in claims]
             for slide_id,claims in required_claims_by_slide.items()
@@ -1020,7 +1043,12 @@ class TaskService:
         context={**context,"layout_capacity_by_slide":capacity_policy}
         attempt_hashes=[]; correction_hashes=[]; parent_attempt_id=""
         for attempt in range(1,LOCKED_THEME_GENERATION_ATTEMPTS+1):
-            request={**context,"locked_theme_policy":policy,"generation_attempt":attempt}
+            request={
+                **context,
+                "locked_theme_policy":policy,
+                "required_claim_slots_by_slide":required_claim_slots_by_slide,
+                "generation_attempt":attempt,
+            }
             if correction is not None: request["semantic_correction"]=correction
             source=self.builder.build(outline,action=action,slide_ids=slide_ids,assets=assets,**request)
             candidate=str(source); validation_error=None
@@ -1061,6 +1089,7 @@ class TaskService:
                             candidate=fitted_candidate; browser_evidence=fitted_browser; browser_blockers=[]
 
             correction=None
+            materialization=None
             if validation_error is not None and self._is_locked_theme_violation(validation_error):
                 correction={
                     "attempt":attempt,"reason":"locked_theme_variable_override","error":validation_error.message,
@@ -1105,7 +1134,88 @@ class TaskService:
                     "rule":"根据 selector 与 geometry 压缩局部内容/间距，必要时切换高容量布局或拆页；不得隐藏内容、降低字号/缩放下限或放宽门禁。",
                 }
 
-            status="accepted" if correction is None and validation_error is None and not (aggregate_coverage or {}).get("unbound_count") and not browser_blockers else ("correction_required" if correction is not None and attempt<LOCKED_THEME_GENERATION_ATTEMPTS else "failed")
+            # The model receives one structured correction.  If the second
+            # candidate still omits a registered frozen fact, bind it into a
+            # visible, layout-owned server slot and rerun every preflight on
+            # the exact candidate that will be evidenced and returned.
+            if (
+                attempt==LOCKED_THEME_GENERATION_ATTEMPTS
+                and correction is not None
+                and correction.get("reason")=="missing_required_claims"
+            ):
+                materialized_claims_by_slide=correction["missing_required_claims_by_slide"]
+                candidate,materialization=materialize_required_claim_slots(
+                    candidate,materialized_claims_by_slide,layout_by_slide,
+                )
+                validation_error=None
+                aggregate_coverage=None; page_coverage=None; capacity_evidence=None
+                canonical_validation=None; canonical_blockers=[]
+                browser_evidence=None; browser_blockers=[]; autofit=None
+                try:
+                    candidate=validate_html(candidate,slide_ids,assets)
+                except ValidationError as exc:
+                    validation_error=exc
+                if validation_error is None and ledger and required_ids:
+                    aggregate_coverage=audit_html_claims(candidate,ledger,required_claim_ids=required_ids)
+                    page_coverage=audit_html_claims_by_slide(
+                        self._slide_fragments(candidate),ledger,required_ids_by_slide,
+                    )
+                if validation_error is None:
+                    capacity_evidence=inspect_layout_capacity(candidate,context["design_contract"])
+                    canonical_validation=run_canonical_validator(candidate,context["design_contract"]["style_id"])
+                    canonical_blockers=structured_canonical_blockers(canonical_validation,context["design_contract"])
+                if (
+                    browser is not None
+                    and capacity_evidence is not None and capacity_evidence["passed"]
+                    and not canonical_blockers
+                    and not (aggregate_coverage or {}).get("unbound_count")
+                    and not (page_coverage or {}).get("missing_required_count")
+                ):
+                    browser_evidence=browser.inspect(candidate,slide_ids)
+                    browser_blockers=hard_browser_blockers(browser_evidence)
+                    geometric=[item for item in browser_blockers if item.get("code") in GEOMETRIC_CODES]
+                    if geometric:
+                        fitted=fit_deck_html(candidate,max_rounds=MAX_CASCADE_ROUNDS)
+                        autofit={key:fitted.get(key) for key in ("available","rules","rounds","converged","remaining")}
+                        if fitted.get("available") and fitted.get("rules"):
+                            fitted_candidate=validate_html(fitted["html"],slide_ids,assets)
+                            fitted_browser=browser.inspect(fitted_candidate,slide_ids)
+                            fitted_blockers=hard_browser_blockers(fitted_browser)
+                            if not fitted_blockers:
+                                candidate=fitted_candidate; browser_evidence=fitted_browser; browser_blockers=[]
+                correction=None
+                if (page_coverage or {}).get("missing_required_count"):
+                    correction={
+                        "attempt":attempt,"reason":"server_claim_materialization_failed",
+                        "error":"确定性事实槽位仍未覆盖目标页",
+                        "missing_required_claims_by_slide":materialized_claims_by_slide,
+                    }
+                elif capacity_evidence and not capacity_evidence["passed"]:
+                    correction={
+                        "attempt":attempt,"reason":"layout_capacity_exceeded","error":"确定性事实槽位后页面超过可读容量",
+                        "capacity_blockers":capacity_evidence["issues"],"layout_capacity_by_slide":capacity_policy,
+                    }
+                elif canonical_blockers:
+                    correction={
+                        "attempt":attempt,"reason":"canonical_validation_failed","error":"确定性事实槽位后 canonical 预检未通过",
+                        "canonical_blockers":canonical_blockers,
+                    }
+                elif browser_blockers:
+                    correction={
+                        "attempt":attempt,"reason":"browser_render_blockers","error":"确定性事实槽位后 Chromium 预检未通过",
+                        "browser_blockers":browser_blockers,"overflow_autofit":autofit,
+                    }
+
+            accepted=(
+                correction is None
+                and validation_error is None
+                and not (aggregate_coverage or {}).get("unbound_count")
+                and not (page_coverage or {}).get("missing_required_count")
+                and (capacity_evidence is None or capacity_evidence.get("passed"))
+                and not canonical_blockers
+                and not browser_blockers
+            )
+            status="accepted" if accepted else ("correction_required" if correction is not None and attempt<LOCKED_THEME_GENERATION_ATTEMPTS else "failed")
             page_hashes={slide_id:page.get("text_hash") for slide_id,page in (page_coverage or {}).get("pages",{}).items()}
             attempt_body={
                 "schema_version":"1.0","task_id":task_id,
@@ -1115,6 +1225,7 @@ class TaskService:
                 "visible_text_hash":digest(canonical(page_hashes)),"aggregate_claims":aggregate_coverage,
                 "layout_capacity":capacity_evidence,"canonical_preflight":canonical_validation,
                 "browser_preflight":browser_evidence,"overflow_autofit":autofit,
+                "server_claim_materialization":materialization,
                 "validation_error":None if validation_error is None else validation_error.message,
                 "status":status,"provider_audit_id":self._latest_generation_audit_id(task_id,action),
                 "result_certainty":"known","created_at":utcnow(),
@@ -1122,7 +1233,9 @@ class TaskService:
             attempt_hash=self._persist_generation_attempt(task_id,attempt_body)
             attempt_hashes.append(attempt_hash); parent_attempt_id=attempt_hash
             if status=="accepted":
-                return candidate,{"attempts":attempt,"retry_count":attempt-1,"max_attempts":LOCKED_THEME_GENERATION_ATTEMPTS,"attempt_evidence_hashes":attempt_hashes,"correction_evidence_hashes":correction_hashes}
+                generation_meta={"attempts":attempt,"retry_count":attempt-1,"max_attempts":LOCKED_THEME_GENERATION_ATTEMPTS,"attempt_evidence_hashes":attempt_hashes,"correction_evidence_hashes":correction_hashes}
+                if materialization is not None: generation_meta["server_claim_materialization"]=materialization
+                return candidate,generation_meta
             if correction is not None and attempt<LOCKED_THEME_GENERATION_ATTEMPTS:
                 correction_body={
                     "schema_version":"1.0","task_id":attempt_body["task_id"],"action":action,
@@ -1134,7 +1247,9 @@ class TaskService:
                 continue
             if validation_error is not None:
                 raise validation_error
-            return candidate,{"attempts":attempt,"retry_count":attempt-1,"max_attempts":LOCKED_THEME_GENERATION_ATTEMPTS,"attempt_evidence_hashes":attempt_hashes,"correction_evidence_hashes":correction_hashes}
+            generation_meta={"attempts":attempt,"retry_count":attempt-1,"max_attempts":LOCKED_THEME_GENERATION_ATTEMPTS,"attempt_evidence_hashes":attempt_hashes,"correction_evidence_hashes":correction_hashes}
+            if materialization is not None: generation_meta["server_claim_materialization"]=materialization
+            return candidate,generation_meta
         raise AssertionError("锁定主题变量有界重取未终止")
     def planning_view(self,task_id):
         state=self.get(task_id); result={"state":state,"narrative":None,"outline":None,"versions":self.versions(task_id)}

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import time
+from pathlib import Path
 from typing import Any
 
 
@@ -205,7 +206,17 @@ class ChromiumDeckInspector:
         from playwright.sync_api import sync_playwright
 
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(headless=True)
+            try:
+                browser = playwright.chromium.launch(headless=True)
+            except Exception:
+                # On unsupported Linux distributions Playwright can install
+                # the full Chromium fallback without the separate headless
+                # shell.  Use the verified Playwright-managed executable;
+                # launch failures from that path still propagate fail-closed.
+                executable = Path(playwright.chromium.executable_path)
+                if not executable.is_file():
+                    raise
+                browser = playwright.chromium.launch(headless=True, executable_path=str(executable))
             try:
                 context = browser.new_context(viewport=VIEWPORT, reduced_motion="reduce")
                 try:
@@ -368,7 +379,18 @@ class ChromiumDeckInspector:
                                     const defined = selectors.some(selector => {
                                         if (!selector.includes(token)) return false;
                                         return owners.some(owner => {
-                                            try { return owner.matches(selector); } catch (_) { return false; }
+                                            try {
+                                                if (owner.matches(selector)) return true;
+                                                // A semantic class can own the ancestor compound of a
+                                                // descendant rule, e.g. `.slide.split .canvas-card`.
+                                                // In that case the owner cannot match the full selector;
+                                                // require the complete selector to match a real element in
+                                                // this owner's subtree instead of treating the class as
+                                                // undefined (or globally trusting a token-only CSS rule).
+                                                return [...document.querySelectorAll(selector)].some(
+                                                    matched => matched === owner || owner.contains(matched)
+                                                );
+                                            } catch (_) { return false; }
                                         });
                                     });
                                     if (!defined) {

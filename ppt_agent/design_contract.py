@@ -12,10 +12,84 @@ from .skill_runtime import SkillRuntime
 
 REGISTRY_PATH = "references/template-registry.json"
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+_LIST_ITEM = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)、]\s*)\S")
+_QUANTIFIED = re.compile(
+    r"(?<![A-Za-z0-9])(?:"
+    r"\d+(?:\.\d+)?\s*(?:%|％|万元|万|元|周|月|天|日|小时|分钟|人|项|个|次|倍|分)"
+    r"|\d+(?:\.\d+)?\s*(?:→|->)\s*\d+(?:\.\d+)?"
+    r"|[¥￥$]\s*\d)"
+)
+
+
+def _swiss_layout_for_outline(block: str, fallback_index: int) -> str:
+    """Choose a registered Swiss skeleton from the page's content shape."""
+    text = str(block or "")
+    lowered = text.casefold()
+    item_count = sum(
+        1
+        for line in text.splitlines()
+        if _LIST_ITEM.search(line)
+        and not re.match(r"^\s*[-*+]\s*(?:页面目的|主要内容|视觉资源)\s*[：:]", line)
+    )
+    quantified_count = len(_QUANTIFIED.findall(text))
+    has_budget = bool(re.search(r"预算|成本|费用|报价|财务|支出|投入|budget|cost", lowered))
+    has_timeline = bool(re.search(r"路线图|时间线|里程碑|阶段|实施|推进|排期|roadmap|timeline|milestone", lowered))
+    has_comparison = bool(re.search(r"对比|比较|排名|占比|before|after|versus|\bvs\b", lowered))
+    has_kpi = bool(re.search(r"\bkpi\b|指标|性能|效率|满意度|转接率|响应时间|达成率|增长率", lowered))
+    has_image = "resources://" in lowered
+
+    if has_image and quantified_count >= 3:
+        return "S22"
+    if has_budget and 4 <= max(item_count, quantified_count) <= 6:
+        return "S20"
+    if has_timeline:
+        if item_count == 3:
+            return "S05"
+        if 4 <= item_count <= 7:
+            return "S11"
+        return "S11"
+    if has_comparison and item_count == 2:
+        return "S08"
+    if has_kpi and item_count == 4 and quantified_count >= 4:
+        return "S06"
+    if has_comparison and 5 <= item_count <= 10 and quantified_count >= item_count:
+        return "S07"
+    if item_count == 6:
+        return "S04"
+    if item_count == 3:
+        return "S05"
+    if item_count == 4:
+        return "S19"
+    if 8 <= item_count <= 12:
+        return "S15"
+    if quantified_count >= 4:
+        return "S20"
+    # General-purpose fallbacks avoid data-only S06/S07/S20 when the page
+    # does not actually carry comparable quantitative values.
+    return ("S03", "S08", "S19")[fallback_index % 3]
 
 
 def _canonical(value: Any) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+
+
+@dataclass(frozen=True)
+class LayoutSignature:
+    root_classes: tuple[str, ...]
+    container_any_of: tuple[str, ...]
+    direct_children: tuple[int, int] | None
+    required_classes: tuple[tuple[str, int, int], ...]
+
+    def public(self) -> dict[str, Any]:
+        return {
+            "root_classes": list(self.root_classes),
+            "container_any_of": list(self.container_any_of),
+            "direct_children": list(self.direct_children) if self.direct_children else None,
+            "required_classes": {
+                class_name: [minimum, maximum]
+                for class_name, minimum, maximum in self.required_classes
+            },
+        }
 
 
 @dataclass(frozen=True)
@@ -31,6 +105,7 @@ class TemplateRecord:
     body_layouts: tuple[str, ...]
     cover_layout: str
     closing_layout: str
+    layout_signatures: dict[str, LayoutSignature]
 
     def public(self) -> dict[str, Any]:
         return {
@@ -44,6 +119,10 @@ class TemplateRecord:
             "body_layouts": list(self.body_layouts),
             "cover_layout": self.cover_layout,
             "closing_layout": self.closing_layout,
+            "layout_signatures": {
+                layout_id: signature.public()
+                for layout_id, signature in self.layout_signatures.items()
+            },
         }
 
 
@@ -68,6 +147,7 @@ class TemplateRegistry:
             required = {
                 "style_id", "aliases", "template_id", "asset_path", "theme_id",
                 "semantic_classes", "allowed_layouts", "body_layouts", "cover_layout", "closing_layout",
+                "layout_signatures",
             }
             if set(item) != required:
                 raise ValidationError("模板注册项字段无效")
@@ -87,6 +167,51 @@ class TemplateRegistry:
                 raise ValidationError("模板语义类登记无效")
             if item["cover_layout"] not in allowed or item["closing_layout"] not in allowed:
                 raise ValidationError("模板封面或封底布局未登记")
+            raw_signatures = item["layout_signatures"]
+            if not isinstance(raw_signatures, dict):
+                raise ValidationError("模板布局结构签名无效")
+            if raw_signatures and set(raw_signatures) != set(allowed):
+                raise ValidationError("模板布局结构签名必须完整覆盖已登记版式")
+            signatures: dict[str, LayoutSignature] = {}
+            for layout_id, signature in raw_signatures.items():
+                if not isinstance(signature, dict) or set(signature) != {
+                    "root_classes", "container_any_of", "direct_children", "required_classes",
+                }:
+                    raise ValidationError("模板布局结构签名字段无效")
+                roots = signature["root_classes"]
+                containers = signature["container_any_of"]
+                direct = signature["direct_children"]
+                required_classes = signature["required_classes"]
+                if (
+                    not isinstance(roots, list) or not roots
+                    or not isinstance(containers, list) or not containers
+                    or any(not isinstance(name, str) or not _IDENTIFIER.fullmatch(name) for name in (*roots, *containers))
+                    or len(roots) != len(set(roots)) or len(containers) != len(set(containers))
+                    or not isinstance(required_classes, dict)
+                ):
+                    raise ValidationError("模板布局结构签名类名无效")
+                if direct is not None and (
+                    not isinstance(direct, list) or len(direct) != 2
+                    or any(not isinstance(value, int) or value < 0 for value in direct)
+                    or direct[0] > direct[1]
+                ):
+                    raise ValidationError("模板布局结构签名子节点范围无效")
+                class_rules = []
+                for class_name, bounds in required_classes.items():
+                    if (
+                        not isinstance(class_name, str) or not _IDENTIFIER.fullmatch(class_name)
+                        or not isinstance(bounds, list) or len(bounds) != 2
+                        or any(not isinstance(value, int) or value < 0 for value in bounds)
+                        or bounds[0] > bounds[1]
+                    ):
+                        raise ValidationError("模板布局结构签名数量范围无效")
+                    class_rules.append((class_name, bounds[0], bounds[1]))
+                signatures[layout_id] = LayoutSignature(
+                    root_classes=tuple(roots),
+                    container_any_of=tuple(containers),
+                    direct_children=tuple(direct) if direct is not None else None,
+                    required_classes=tuple(class_rules),
+                )
             aliases = tuple(str(alias).strip().casefold() for alias in item["aliases"] if str(alias).strip())
             if not aliases:
                 raise ValidationError("模板别名不得为空")
@@ -109,6 +234,7 @@ class TemplateRegistry:
                 body_layouts=body,
                 cover_layout=item["cover_layout"],
                 closing_layout=item["closing_layout"],
+                layout_signatures=signatures,
             )
         if self.default_style_id not in records:
             raise ValidationError("模板注册表默认风格不存在")
@@ -141,12 +267,15 @@ def build_design_contract(
     outline_hash: str,
     slide_ids: list[str],
     created_at: str,
+    outline_blocks: dict[str, str] | None = None,
     registry: TemplateRegistry | None = None,
 ) -> dict[str, Any]:
     registry = registry or TemplateRegistry()
     if not slide_ids or len(slide_ids) != len(set(slide_ids)):
         raise ValidationError("DesignContract 页面范围无效")
     template = registry.select(task_card)
+    if outline_blocks is not None and set(outline_blocks) != set(slide_ids):
+        raise ValidationError("DesignContract 内容形状页面范围无效")
     contracts = []
     body_index = 0
     for index, slide_id in enumerate(slide_ids):
@@ -155,7 +284,11 @@ def build_design_contract(
         elif index == len(slide_ids) - 1 and len(slide_ids) > 1:
             layout, theme, role, recipe = template.closing_layout, "split" if template.style_id == "swiss" else "light", "closing", "split-statement" if template.style_id == "swiss" else "cascade"
         else:
-            layout = template.body_layouts[body_index % len(template.body_layouts)]
+            layout = (
+                _swiss_layout_for_outline(outline_blocks.get(slide_id, ""), body_index)
+                if template.style_id == "swiss" and outline_blocks is not None
+                else template.body_layouts[body_index % len(template.body_layouts)]
+            )
             theme = ("light", "grey", "dark")[body_index % 3] if template.style_id == "swiss" else ("light", "dark")[body_index % 2]
             role, recipe = "body", "cascade"
             body_index += 1
