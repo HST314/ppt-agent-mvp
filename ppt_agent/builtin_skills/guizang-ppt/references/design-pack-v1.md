@@ -43,9 +43,10 @@
 
 在脑中先完成下列决策，再写任何 HTML。不要把决策过程或额外字段输出到 JSON：
 
-1. 从用户 brief 提取明暗倾向、主色、强调色、正式程度和信息密度。
-2. 整批只选择一个 palette。没有明确颜色时使用模板默认 `ink_classic`；用户明确
-   指定颜色时，在每页根 section 上声明同一组 CSS 变量。
+1. 从冻结 DesignContract 读取每页的主题 class、明暗节奏、正式程度和信息密度；
+   用户颜色偏好不得越过服务端已冻结的主题决定。
+2. 整批只消费锁定模板 palette。不得在根 section 或任何后代的 inline style 中
+   声明、重定义或覆盖主题 CSS 变量；只能引用模板已有的 `var(--*)`。
 3. 为每页选择一个 `data-layout`，相邻页面避免重复；封面和信息密度最高页必须
    使用不同 archetype。
 4. 为每页选择一个 `data-animate` recipe，并给 2–8 个叶子内容节点添加
@@ -53,22 +54,26 @@
 5. 样稿必须代表整稿：优先覆盖封面/hero 与信息密度最高的数据、流程或决策页，
    不能只做两个普通卡片页。
 
-允许的 palette 写法：
+允许的主题写法：
 
 ```html
-<!-- 默认墨水经典：无需声明变量 -->
-<section class="slide light" ...>
-
-<!-- 用户明确要求深蓝/青色时，整批每页复用完全相同的 token -->
-<section class="slide dark" style="--ink:#08233f;--ink-rgb:8,35,63;--paper:#f4fbff;--paper-rgb:244,251,255;--accent:#18b6c9" ...>
+<!-- 只使用 DesignContract 指定的 light/dark/accent/grey 等主题 class；不声明主题变量 -->
+<section class="slide dark" ...>
 ```
 
 颜色约束：
 
+- 以下锁定主题变量在所有 inline style 中均禁止声明：`--accent`、
+  `--accent-rgb`、`--accent-on`、`--accent-bright`、`--ink`、`--ink-rgb`、
+  `--ink-tint`、`--paper`、`--paper-rgb`、`--paper-tint`、`--grey-1`、
+  `--grey-2`、`--grey-3`、`--text-primary`、`--text-secondary`、
+  `--text-helper`、`--text-placeholder`、`--text-on-color`、`--border-subtle`、
+  `--border-strong`、`--sans`、`--sans-zh`、`--serif-en`、`--serif-body-en`、
+  `--serif-zh`、`--mono`。布局局部变量（例如 `--cols`）仍可使用。
 - 根 section 之外禁止出现裸 hex、`rgb()` 或 `hsl()`；内容强调只能引用
   `var(--ink)`、`var(--paper)`、`var(--accent)`、`currentColor` 或带透明度的
   `rgba(var(--ink-rgb),A)` / `rgba(var(--paper-rgb),A)`。
-- 同一批次不得逐页更换 token。封面、章节页、结论页可用 `dark`，正文页用
+- 同一批次不得改写 token。封面、章节页、结论页可用 `dark`，正文页用
   `light`；除非用户明确要求全浅色，否则 5 页以上整稿至少有一页深色 hero。
 - 颜色不能作为唯一状态信号；风险、完成、待定还要有文字标签或形状差异。
 
@@ -185,7 +190,7 @@
 2. 每页都有合法 `data-layout`；相邻页不重复，5 页以上至少 3 种 layout。
 3. 每页有合法 `data-animate`；除显式静态页外有 2–8 个叶子 `data-anim`。
 4. 所有数字、日期、实体和承诺都来自冻结输入；没有占位符、默认字段或虚构来源。
-5. 色板 token 整批一致；内容节点无裸颜色；明暗节奏符合 brief。
+5. 未声明任何锁定主题变量；内容节点无裸颜色；明暗节奏符合 DesignContract。
 6. 标题、正文、卡片、图形均位于 1280×720 内；没有裁切、重叠或滚动。
 7. 正文不低于 16px，长文已缩写为短句，每页只有一个视觉焦点。
 8. 图片只来自授权 assets，`alt` 非空；没有图片时没有空占位框。

@@ -146,6 +146,41 @@ class StageCIntegrationTests(unittest.TestCase):
 
             self.assertEqual(len(client.inputs),2)
             self.assertFalse(svc.versions("task","narrative"))
+
+    def test_narrative_correction_copies_frozen_context_verbatim(self):
+        with tempfile.TemporaryDirectory() as root:
+            client=ScriptedClient(
+                narrative_response(goal="扩容决策",audience="管理层",topic="AI客服试点"),
+                narrative_response(goal="扩容决策",audience="管理层",topic="AI 客服试点"),
+            )
+            svc=service(root,client); svc.create("task","manual")
+            svc.import_input("task",{"goal":"扩容决策","audience":"管理层","topic":"AI 客服试点"})
+
+            narrative=svc.generate_narrative("task")["narrative"]
+
+            self.assertIn("AI 客服试点",narrative["markdown"])
+            self.assertEqual(len(client.inputs),2)
+            correction=json.loads(client.inputs[1]["input"][1]["content"])["semantic_correction"]
+            self.assertEqual(correction["missing_context_fields"],["topic"])
+            self.assertEqual(correction["required_context_verbatim"],[
+                {"field":"topic","value":"AI 客服试点"},
+                {"field":"goal","value":"扩容决策"},
+                {"field":"audience","value":"管理层"},
+            ])
+            self.assertIn("逐字写入正文",correction["rule"])
+
+    def test_persistently_paraphrased_frozen_context_remains_fail_closed(self):
+        with tempfile.TemporaryDirectory() as root:
+            compact=narrative_response(goal="扩容决策",audience="管理层",topic="AI客服试点")
+            client=ScriptedClient(compact,compact)
+            svc=service(root,client); svc.create("task","manual")
+            svc.import_input("task",{"goal":"扩容决策","audience":"管理层","topic":"AI 客服试点"})
+
+            with self.assertRaisesRegex(ValidationError,"最低语义/结构门禁"):
+                svc.generate_narrative("task")
+
+            self.assertEqual(len(client.inputs),2)
+            self.assertFalse(svc.versions("task","narrative"))
     def test_reported_natural_language_input_uses_tool_free_agent_contract(self):
         with tempfile.TemporaryDirectory() as root:
             client=ScriptedClient('{"questions":[]}')

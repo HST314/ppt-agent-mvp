@@ -63,7 +63,6 @@ def narrative_quality_evidence(markdown, card):
         section_bodies.append(_semantic_text(body))
     body_text = re.sub(r"^#{1,6}\s+.*$", "", markdown, flags=re.MULTILINE)
     body_characters = len(_semantic_text(body_text))
-    normalized = _semantic_text(markdown)
     required_context = []
     for field in ("topic", "goal", "audience"):
         value = card.get(field) if isinstance(card, dict) else None
@@ -71,7 +70,10 @@ def narrative_quality_evidence(markdown, card):
         # Single-character synthetic values used by low-level tests are not a
         # meaningful semantic contract for a real narrative.
         if len(token) >= 2:
-            required_context.append({"field": field, "value": value, "covered": token in normalized})
+            # Frozen task context is an identity contract, not a fuzzy topic
+            # match.  Requiring the literal value prevents a correction from
+            # silently paraphrasing or compacting user-owned wording.
+            required_context.append({"field": field, "value": value, "covered": value in body_text})
     missing_context = [item for item in required_context if not item["covered"]]
     issues = []
     if not markdown.strip():

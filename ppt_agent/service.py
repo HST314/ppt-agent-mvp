@@ -18,7 +18,7 @@ from .p2 import canonical, digest, now, parse_task_card, questions_for, scan_res
 from .schema import ClarificationSet, ResourceManifest, TaskCard, TaskInputSnapshot
 from .schema import NarrativeDocument, SlideOutline, SampleSelection, DeckArtifact
 from .p3 import assert_narrative_quality, changed_slide_ids, narrative_markdown, narrative_quality_evidence, normalize_outline_markdown, outline_markdown, parse_outline, requested_slide_count, structured_outline_markdown
-from .p4 import apply_design_contract, controlled_assets, infer_scope, recommend, render, validate_html
+from .p4 import LOCKED_THEME_TOKENS, apply_design_contract, controlled_assets, infer_scope, recommend, render, validate_html
 from .render_gate import canonical_post_render_evidence, post_render_evidence_hash, run_post_render_gate
 from .offline import localize_delivery_html, offline_assets, offline_performance, offline_player, verify_delivery
 from .overflow_autofit import GEOMETRIC_CODES, MAX_CASCADE_ROUNDS, fit_deck_html
@@ -44,7 +44,7 @@ def narrative_numeric_policy(ledger):
 
 def narrative_structure_policy(task_card):
     return {
-        "mode":"minimum_semantic_structure",
+        "mode":"minimum_semantic_structure_exact_context",
         "minimum_h1_count":1,
         "minimum_section_count":2,
         "minimum_body_characters":60,
@@ -53,7 +53,16 @@ def narrative_structure_policy(task_card):
             for field in ("topic","goal","audience")
             if isinstance(task_card.get(field),str) and len(re.sub(r"\s+","",task_card[field]))>=2
         ],
-        "rule":"输出完整 Markdown 叙事，不得返回分析请求、待办或元说明；显式覆盖任务主题、目标、受众，并用至少两个有实质正文的二级章节表达核心论点与页面推进逻辑。",
+        "rule":"输出完整 Markdown 叙事，不得返回分析请求、待办或元说明；将 required_context 每项 value 逐字写入正文，不得缩写、改写或省略，并用至少两个有实质正文的二级章节表达核心论点与页面推进逻辑。",
+    }
+
+LOCKED_THEME_GENERATION_ATTEMPTS=2
+
+def locked_theme_generation_policy():
+    return {
+        "mode":"locked_theme_tokens_consume_only",
+        "forbidden_inline_tokens":sorted(LOCKED_THEME_TOKENS),
+        "rule":"section 根节点及全部后代的 inline style 均不得声明这些锁定主题变量；只能消费模板已有 var(--*) 或使用 DesignContract 指定的主题 class。",
     }
 
 INSPECTION_SOURCES=frozenset({"semantic_model","semantic_deterministic","technical_browser"})
@@ -920,6 +929,35 @@ class TaskService:
             summary="；".join(f"{item.get('code')}:{item.get('evidence','')}" for item in evidence["blockers"][:5])
             raise ValidationError(f"渲染后硬门禁未通过（evidence {evidence_hash[:12]}）：{summary}")
         return html_text,evidence
+    @staticmethod
+    def _is_locked_theme_violation(error):
+        return isinstance(error,ValidationError) and "锁定主题变量" in error.message
+    def _build_with_locked_theme_retry(self,outline,*,action,slide_ids,assets,context):
+        """Regenerate a theme-violating sample/deck batch once in the same Job.
+
+        Validation stays server-owned.  Only the narrowly classified locked
+        theme violation is retryable; every other validation failure exits
+        immediately, and a second theme violation remains fail-closed.
+        """
+        policy=locked_theme_generation_policy(); correction=None
+        for attempt in range(1,LOCKED_THEME_GENERATION_ATTEMPTS+1):
+            request={**context,"locked_theme_policy":policy,"generation_attempt":attempt}
+            if correction is not None: request["semantic_correction"]=correction
+            source=self.builder.build(outline,action=action,slide_ids=slide_ids,assets=assets,**request)
+            try:
+                validate_html(source,slide_ids,assets)
+                return source,{"attempts":attempt,"retry_count":attempt-1,"max_attempts":LOCKED_THEME_GENERATION_ATTEMPTS}
+            except ValidationError as exc:
+                if not self._is_locked_theme_violation(exc) or attempt==LOCKED_THEME_GENERATION_ATTEMPTS:
+                    raise
+                correction={
+                    "attempt":attempt,
+                    "reason":"locked_theme_variable_override",
+                    "error":exc.message,
+                    "forbidden_inline_tokens":policy["forbidden_inline_tokens"],
+                    "rule":"删除 section 根节点及全部后代 inline style 中对 forbidden_inline_tokens 的全部声明；保留 DesignContract 指定的主题 class，只消费模板已有 var(--*)，重新提交本批完整 slides。",
+                }
+        raise AssertionError("锁定主题变量有界重取未终止")
     def planning_view(self,task_id):
         state=self.get(task_id); result={"state":state,"narrative":None,"outline":None,"versions":self.versions(task_id)}
         for kind in ("narrative","outline"):
@@ -967,7 +1005,8 @@ class TaskService:
                     "error":"；".join(errors),
                     "forbidden_values":[item["value"] for item in evidence["unbound"]],
                     "missing_context_fields":quality_evidence["missing_context_fields"],
-                    "rule":"删除全部未绑定量化值；不得改标为假设、建议、示例或待确认。阶段改用无数字名称，仅保留 narrative_numeric_policy.allowed_claims 中的原始量化事实。并按 narrative_structure_policy 返回完整叙事，补齐任务主题、目标、受众、核心论点与页面推进逻辑；不得返回分析请求或元说明。",
+                    "required_context_verbatim":structure_policy["required_context"],
+                    "rule":"删除全部未绑定量化值；不得改标为假设、建议、示例或待确认。阶段改用无数字名称，仅保留 narrative_numeric_policy.allowed_claims 中的原始量化事实。并按 narrative_structure_policy 返回完整叙事，将 semantic_correction.required_context_verbatim 每项 value 逐字写入正文，不得缩写、改写或省略；补齐核心论点与页面推进逻辑，不得返回分析请求或元说明。",
                 }}
         version=len(self.versions(task_id,"narrative"))+1; content_hash=digest(text.encode())
         model=NarrativeDocument.parse({"document_id":f"narrative-{content_hash[:16]}","task_id":task_id,"version":version,"markdown":text,"content_hash":content_hash,"created_at":now(),"schema_version":"1.0"})
@@ -1190,11 +1229,18 @@ class TaskService:
         contract_value={key:value for key,value in contract.items() if key!="hash"}
         ledger_value={key:value for key,value in ledger.items() if key!="hash"}
         if prompt: rules.append(prompt.strip())
-        source=render(data["markdown"],selection["slide_ids"],rules,assets=assets,design_contract=contract_value,contract_hash=contract["hash"]) if isinstance(self.builder,FakeHtmlBuilder) else self.builder.build(data["markdown"],action="sample",slide_ids=selection["slide_ids"],rules=rules,assets=assets,design_contract=contract_value,design_contract_hash=contract["hash"],claim_ledger=ledger_value,claim_ledger_hash=ledger["hash"])
+        if isinstance(self.builder,FakeHtmlBuilder):
+            source=render(data["markdown"],selection["slide_ids"],rules,assets=assets,design_contract=contract_value,contract_hash=contract["hash"])
+            generation={"attempts":1,"retry_count":0,"max_attempts":1}
+        else:
+            source,generation=self._build_with_locked_theme_retry(
+                data["markdown"],action="sample",slide_ids=list(selection["slide_ids"]),assets=assets,
+                context={"rules":rules,"design_contract":contract_value,"design_contract_hash":contract["hash"],"claim_ledger":ledger_value,"claim_ledger_hash":ledger["hash"]},
+            )
         progress("validating_html", "校验 HTML")
         html_text,gate=self._post_render_gate(task_id,source,list(selection["slide_ids"]),contract,ledger,assets)
         version=len(self.versions(task_id,"sample"))+1; content_hash=digest(html_text.encode()); model=DeckArtifact.parse({"artifact_id":f"sample-{content_hash[:16]}","task_id":task_id,"version":version,"kind":"sample","outline_hash":outline,"content_hash":content_hash,"created_at":now(),"schema_version":"1.0"})
-        prior=self._current_version(task_id,"sample"); meta={"html":html_text,"selection_hash":selection["hash"],"parent":prior,"summary":"生成真实 HTML 样品","scope":"global","global_rules":rules,"local_exceptions":{},"build":"success","design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate":gate}
+        prior=self._current_version(task_id,"sample"); meta={"html":html_text,"selection_hash":selection["hash"],"parent":prior,"summary":"生成真实 HTML 样品","scope":"global","global_rules":rules,"local_exceptions":{},"build":"success","locked_theme_generation":generation,"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate":gate}
         h=self._record_p3(task_id,"sample",model,meta,"sample_generate")
         self._invalidate_sample_gate(task_id,h)
         return self.sample_view(task_id)
@@ -1216,10 +1262,17 @@ class TaskService:
         contract_value={key:value for key,value in contract.items() if key!="hash"}
         ledger_value={key:value for key,value in ledger.items() if key!="hash"}
         previous_slides="".join(self._slide_fragments(sample["html"]).get(sid,"") for sid in ids)
-        source=render(data["markdown"],ids,rules,exceptions,assets,contract_value,contract["hash"]) if isinstance(self.builder,FakeHtmlBuilder) else self.builder.build(data["markdown"],action="sample",slide_ids=ids,rules=rules,exceptions=exceptions,assets=assets,previous_slides=previous_slides,prompt=prompt,scope=scope,slide_id=slide_id,element_id=element_id,design_contract=contract_value,design_contract_hash=contract["hash"],claim_ledger=ledger_value,claim_ledger_hash=ledger["hash"])
+        if isinstance(self.builder,FakeHtmlBuilder):
+            source=render(data["markdown"],ids,rules,exceptions,assets,contract_value,contract["hash"])
+            generation={"attempts":1,"retry_count":0,"max_attempts":1}
+        else:
+            source,generation=self._build_with_locked_theme_retry(
+                data["markdown"],action="sample",slide_ids=ids,assets=assets,
+                context={"rules":rules,"exceptions":exceptions,"previous_slides":previous_slides,"prompt":prompt,"scope":scope,"slide_id":slide_id,"element_id":element_id,"design_contract":contract_value,"design_contract_hash":contract["hash"],"claim_ledger":ledger_value,"claim_ledger_hash":ledger["hash"]},
+            )
         html_text,gate=self._post_render_gate(task_id,source,ids,contract,ledger,assets)
         version=len(self.versions(task_id,"sample"))+1; ch=digest(html_text.encode()); model=DeckArtifact.parse({"artifact_id":f"sample-{ch[:16]}","task_id":task_id,"version":version,"kind":"sample","outline_hash":outline,"content_hash":ch,"created_at":now(),"schema_version":"1.0"})
-        h=self._record_p3(task_id,"sample",model,{"html":html_text,"selection_hash":view["selection"]["hash"],"parent":sample["hash"],"summary":prompt.strip(),"scope":scope,"scope_understanding":understanding,"slide_id":slide_id,"element_id":element_id,"global_rules":rules,"local_exceptions":exceptions,"build":"success","design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate":gate},"sample_modify","user")
+        h=self._record_p3(task_id,"sample",model,{"html":html_text,"selection_hash":view["selection"]["hash"],"parent":sample["hash"],"summary":prompt.strip(),"scope":scope,"scope_understanding":understanding,"slide_id":slide_id,"element_id":element_id,"global_rules":rules,"local_exceptions":exceptions,"build":"success","locked_theme_generation":generation,"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate":gate},"sample_modify","user")
         self._invalidate_sample_gate(task_id,h)
         return self.sample_view(task_id)
     def confirm_sample(self,task_id):
@@ -1326,6 +1379,7 @@ class TaskService:
         sample_fragments={sid:item["html"] for sid,item in confirmed_pages.items()}
         if not sample_fragments or any(digest(fragment.encode()) != confirmed_pages[sid].get("sha256") for sid,fragment in sample_fragments.items()):
             raise ConflictError("确认样品原始页面或 SHA-256 无效")
+        generation_batches=[]
         if isinstance(self.builder,FakeHtmlBuilder):
             html_text=render(data["markdown"],ids,meta.get("global_rules",[]),meta.get("local_exceptions",{}),assets,contract_value,contract["hash"])
         else:
@@ -1336,7 +1390,11 @@ class TaskService:
                 checkpoint(); batch=unconfirmed[index:index+3]
                 progress("generating_batch",f"生成未确认页面 {index+1}-{index+len(batch)} / {len(unconfirmed)}")
                 batch_contract=scope_design_contract(contract_value,batch)
-                partial=self.builder.build(data["markdown"],action="deck",slide_ids=batch,rules=meta.get("global_rules",[]),exceptions=meta.get("local_exceptions",{}),assets=assets,design_contract=batch_contract,design_contract_hash=contract["hash"],claim_ledger=ledger_value,claim_ledger_hash=ledger["hash"])
+                partial,batch_generation=self._build_with_locked_theme_retry(
+                    data["markdown"],action="deck",slide_ids=batch,assets=assets,
+                    context={"rules":meta.get("global_rules",[]),"exceptions":meta.get("local_exceptions",{}),"design_contract":batch_contract,"design_contract_hash":contract["hash"],"claim_ledger":ledger_value,"claim_ledger_hash":ledger["hash"]},
+                )
+                generation_batches.append({"slide_ids":list(batch),**batch_generation})
                 generated.update(self._slide_fragments(validate_html(partial,batch,assets)))
             ordered={**generated,**sample_fragments}
             shell=render(data["markdown"],ids,meta.get("global_rules",[]),meta.get("local_exceptions",{}),assets,contract_value,contract["hash"])
@@ -1349,7 +1407,7 @@ class TaskService:
         html_text,gate=self._post_render_gate(task_id,html_text,ids,contract,ledger,assets); deck_fragments=self._slide_fragments(html_text)
         preserved={sid:digest(deck_fragments[sid].encode())==digest(fragment.encode()) for sid,fragment in sample_fragments.items()}
         if not all(preserved.values()): raise ConflictError("确认样品发生未提示变化")
-        return self._commit_candidate_deck(task_id,html_text,outline,{"parent":token["parent_deck_hash"],"summary":"生成未检查候选稿","scope":"global","affected":ids,"sample_hash":sample["hash"],"sample_pages_preserved":preserved,"outline_consistent":True,"inspection_status":"pending","global_rules":meta.get("global_rules",[]),"local_exceptions":meta.get("local_exceptions",{}),"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate":gate},"deck_generate",token)
+        return self._commit_candidate_deck(task_id,html_text,outline,{"parent":token["parent_deck_hash"],"summary":"生成未检查候选稿","scope":"global","affected":ids,"sample_hash":sample["hash"],"sample_pages_preserved":preserved,"outline_consistent":True,"inspection_status":"pending","global_rules":meta.get("global_rules",[]),"local_exceptions":meta.get("local_exceptions",{}),"locked_theme_generation_batches":generation_batches,"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate":gate},"deck_generate",token)
     def modify_deck(self,task_id,prompt,change_type="visual",scope=None,slide_ids=None,element_id=None):
         with self.store.lock(task_id):
             token=self._candidate_write_token(task_id)
@@ -1386,14 +1444,21 @@ class TaskService:
         ledger_value={key:value for key,value in ledger.items() if key!="hash"}
         deck_slides=self._slide_fragments(deck["html"])
         previous_slides="".join(deck_slides.get(sid,"") for sid in all_ids)
-        source=render(markdown,all_ids,rules,exceptions,assets,contract_value,contract["hash"]) if isinstance(self.builder,FakeHtmlBuilder) else self.builder.build(markdown,action="deck",slide_ids=all_ids,rules=rules,exceptions=exceptions,assets=assets,previous_slides=previous_slides,prompt=prompt,scope=inferred,affected_slide_ids=affected,element_id=element_id,design_contract=contract_value,design_contract_hash=contract["hash"],claim_ledger=ledger_value,claim_ledger_hash=ledger["hash"])
+        if isinstance(self.builder,FakeHtmlBuilder):
+            source=render(markdown,all_ids,rules,exceptions,assets,contract_value,contract["hash"])
+            generation={"attempts":1,"retry_count":0,"max_attempts":1}
+        else:
+            source,generation=self._build_with_locked_theme_retry(
+                markdown,action="deck",slide_ids=all_ids,assets=assets,
+                context={"rules":rules,"exceptions":exceptions,"previous_slides":previous_slides,"prompt":prompt,"scope":inferred,"affected_slide_ids":affected,"element_id":element_id,"design_contract":contract_value,"design_contract_hash":contract["hash"],"claim_ledger":ledger_value,"claim_ledger_hash":ledger["hash"]},
+            )
         html_text,gate=self._post_render_gate(task_id,source,all_ids,contract,ledger,assets)
         before=deck["metadata"]["page_hashes"]; after={sid:digest(fragment.encode()) for sid,fragment in self._slide_fragments(html_text).items()}; actual=[sid for sid in all_ids if before[sid]!=after[sid]]
         if any(s not in affected for s in actual): raise ConflictError("修改超出声明影响范围")
         # Cross-artifact edits are prepared and validated above. Only successful
         # render/validation may publish the outline and deck versions.
         publish_outline=(lambda:self._record_p3(task_id,"outline",pending_outline[0],pending_outline[1],"outline_edit","user")) if pending_outline else None
-        return self._commit_candidate_deck(task_id,html_text,outline_hash,{"parent":deck["hash"],"summary":prompt.strip(),"scope":inferred,"change_type":change_type,"affected":actual,"requested_affected":affected,"unchanged":[s for s in all_ids if s not in actual],"scope_understanding":understanding,"element_id":element_id,"outline_consistent":True,"global_rules":rules,"local_exceptions":exceptions,"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate":gate},"deck_modify",token,"user",publish_outline)
+        return self._commit_candidate_deck(task_id,html_text,outline_hash,{"parent":deck["hash"],"summary":prompt.strip(),"scope":inferred,"change_type":change_type,"affected":actual,"requested_affected":affected,"unchanged":[s for s in all_ids if s not in actual],"scope_understanding":understanding,"element_id":element_id,"outline_consistent":True,"global_rules":rules,"local_exceptions":exceptions,"locked_theme_generation":generation,"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate":gate},"deck_modify",token,"user",publish_outline)
     def rollback_deck(self,task_id,target_hash):
         with self.store.lock(task_id):
             token=self._candidate_write_token(task_id)

@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from ppt_agent.agent_runtime import AgentRuntime
 from ppt_agent.design_contract import validate_design_contract
-from ppt_agent.errors import GatewayError
+from ppt_agent.errors import GatewayError, ValidationError
 from ppt_agent.gateways import AgentGateway
 from ppt_agent.model_clients import ModelToolCall, ModelTurn
 from ppt_agent.model_clients import OpenAIResponsesClient
@@ -31,6 +31,26 @@ class BatchBuilder:
     def build(self, outline, **context):
         self.calls.append(dict(context))
         return render(outline,context["slide_ids"],context.get("rules"),context.get("exceptions"),context.get("assets"))
+
+
+class LockedThemeRetryBuilder:
+    def __init__(self, *, always_bad=False):
+        self.always_bad=always_bad; self.calls=[]
+
+    def build(self, outline, **context):
+        self.calls.append(dict(context))
+        html=render(
+            outline,
+            context["slide_ids"],
+            context.get("rules"),
+            context.get("exceptions"),
+            context.get("assets"),
+            context.get("design_contract"),
+            context.get("design_contract_hash"),
+        )
+        if self.always_bad or len(self.calls)==1:
+            return html.replace("<section ",'<section style="--ink:#fff" ',1)
+        return html
 
 
 class P0GenerationRefactorTests(unittest.TestCase):
@@ -141,6 +161,71 @@ class P0GenerationRefactorTests(unittest.TestCase):
             self.assertTrue(all(len(call["slide_ids"]) <= 3 for call in builder.calls))
             self.assertEqual(candidate["metadata"]["inspection_status"],"pending")
             self.assertFalse(svc.versions("task","inspection"))
+
+    def test_sample_locked_theme_override_is_corrected_once_in_same_job(self):
+        with tempfile.TemporaryDirectory() as root:
+            builder=LockedThemeRetryBuilder()
+            svc=TaskService(WorkspaceStore(root),builder=builder); svc.create("task","manual")
+            svc.import_input("task",{"goal":"发布","audience":"客户","topic":"方案","页数":3})
+            svc.generate_narrative("task"); svc.confirm_narrative("task")
+            svc.generate_outline("task"); svc.confirm_outline("task")
+            svc.select_samples("task",["slide-1"])
+
+            sample=svc.generate_sample("task")["sample"]
+
+            self.assertEqual(len(builder.calls),2)
+            self.assertEqual(builder.calls[0]["generation_attempt"],1)
+            self.assertIn("--ink",builder.calls[0]["locked_theme_policy"]["forbidden_inline_tokens"])
+            self.assertEqual(builder.calls[1]["semantic_correction"]["reason"],"locked_theme_variable_override")
+            self.assertEqual(sample["metadata"]["locked_theme_generation"],{"attempts":2,"retry_count":1,"max_attempts":2})
+            self.assertEqual(len(svc.versions("task","sample")),1)
+
+    def test_persistent_sample_locked_theme_override_remains_fail_closed(self):
+        with tempfile.TemporaryDirectory() as root:
+            builder=LockedThemeRetryBuilder(always_bad=True)
+            svc=TaskService(WorkspaceStore(root),builder=builder); svc.create("task","manual")
+            svc.import_input("task",{"goal":"发布","audience":"客户","topic":"方案","页数":3})
+            svc.generate_narrative("task"); svc.confirm_narrative("task")
+            svc.generate_outline("task"); svc.confirm_outline("task")
+            svc.select_samples("task",["slide-1"])
+
+            with self.assertRaisesRegex(ValidationError,"锁定主题变量"):
+                svc.generate_sample("task")
+
+            self.assertEqual(len(builder.calls),2)
+            self.assertFalse(svc.versions("task","sample"))
+
+    def test_deck_batch_locked_theme_override_is_corrected_once_in_same_job(self):
+        with tempfile.TemporaryDirectory() as root:
+            svc=TaskService(WorkspaceStore(root)); svc.create("task","manual")
+            svc.import_input("task",{"goal":"发布","audience":"客户","topic":"方案","页数":3})
+            svc.generate_narrative("task"); svc.confirm_narrative("task")
+            svc.generate_outline("task"); svc.confirm_outline("task")
+            svc.select_samples("task",["slide-1"]); svc.generate_sample("task"); svc.confirm_sample("task")
+            builder=LockedThemeRetryBuilder(); svc.builder=builder
+
+            deck=svc.generate_deck("task")["deck"]
+
+            self.assertEqual(len(builder.calls),2)
+            self.assertEqual(builder.calls[1]["semantic_correction"]["reason"],"locked_theme_variable_override")
+            self.assertEqual(deck["metadata"]["locked_theme_generation_batches"],[{
+                "slide_ids":["slide-2","slide-3"],"attempts":2,"retry_count":1,"max_attempts":2,
+            }])
+
+    def test_persistent_deck_locked_theme_override_remains_fail_closed(self):
+        with tempfile.TemporaryDirectory() as root:
+            svc=TaskService(WorkspaceStore(root)); svc.create("task","manual")
+            svc.import_input("task",{"goal":"发布","audience":"客户","topic":"方案","页数":3})
+            svc.generate_narrative("task"); svc.confirm_narrative("task")
+            svc.generate_outline("task"); svc.confirm_outline("task")
+            svc.select_samples("task",["slide-1"]); svc.generate_sample("task"); svc.confirm_sample("task")
+            builder=LockedThemeRetryBuilder(always_bad=True); svc.builder=builder
+
+            with self.assertRaisesRegex(ValidationError,"锁定主题变量"):
+                svc.generate_deck("task")
+
+            self.assertEqual(len(builder.calls),2)
+            self.assertFalse(svc.versions("task","deck"))
 
     def test_production_agent_builder_receives_valid_scoped_contract_per_batch(self):
         class ContractAwareClient:
