@@ -59,7 +59,8 @@ clarification:
   style: minimal
 
 skills:
-  active: guizang-ppt-skill
+  root: ../ppt_agent/builtin_skills
+  active: guizang-ppt
 
 capabilities:
   network_tools: false

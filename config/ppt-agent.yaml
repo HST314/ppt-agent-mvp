@@ -68,7 +68,8 @@ review:
   default_max_rounds: 2
 
 skills:
-  active: guizang-ppt-skill
+  root: ../ppt_agent/builtin_skills
+  active: guizang-ppt
 
 capabilities:
   network_tools: false

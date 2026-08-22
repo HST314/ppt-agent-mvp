@@ -176,6 +176,16 @@ python -m uvicorn main_front:app --host 127.0.0.1 --port 8000
 
 真实模式要求兼容 Responses API 的模型端点。Base URL 必须使用 HTTPS，本机回环调试地址除外。生成与检查推荐使用独立模型配置；如果检查模型回退到生成模型，必须在配置中显式开启。
 
+全局当前 Skill 由同一份 YAML 唯一指定：
+
+```yaml
+skills:
+  root: ../ppt_agent/builtin_skills
+  active: guizang-ppt
+```
+
+`root` 相对配置文件所在目录解析，`active` 只能指向该根目录内的一个标准 Skill 目录。目录必须包含带 `name`、`description` frontmatter 的 `SKILL.md`，并可按需包含 `references/`、`assets/`、`scripts/`；不要求 PPT 专属 manifest 或 `SKILL_LOCK.json`。启动时会拒绝越界路径和软链接，并为当前目录计算内容摘要。每个新 Job 获取一个不可变摘要快照，运行中的 Job 不会因之后切换全局 Skill 而混用文件。
+
 样品和全稿在提交模型结果前强制读取锁定的 `references/design-pack-v1.md`，公共壳从哈希锁定的 `assets/template.html` 静态样式层组装；零 Skill 读取不能再产生成功产物。独立检查同样强制读取 `references/checklist.md`，并合并本机 Chromium 的 1280×720 DOM 几何、溢出、字号和图片解码证据。浏览器缺失或测量失败会生成 blocker 并关闭通过，不能退化为假绿。
 
 启动后用 `/livez` 检查 Web 进程存活，用 `/readyz` 检查真实模型运行契约；模型认证、模型名、限流、上游故障或能力探测失败时 `/readyz` 返回 503，依赖模型的 Job 不会入队。修复配置或等待上游恢复后，可从工作台“设置 → 系统与显示”执行一次显式重新检测。设置页保存的工作流、Job 与自检默认值会原子更新当前全局 YAML，不会写入任务数据目录。`/healthz` 保留兼容用途，并与 readiness 使用相同的 200/503 语义。
@@ -205,7 +215,7 @@ FastAPI Web Adapter
 ```text
 frontend/                 浏览器应用壳、阶段页面和设计系统
 ppt_agent/                领域服务、存储、Agent Runtime 与 Web API
-ppt_agent/builtin_skills/ 内置 PPT Skill 与锁定资产
+ppt_agent/builtin_skills/ 默认 PPT Skill 与配套资产
 config/                   运行配置
 schemas/                  持久化与交付 JSON Schema
 scripts/                  启动、门禁、导出和离线打包脚本

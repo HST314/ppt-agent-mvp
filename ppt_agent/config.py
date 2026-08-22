@@ -91,6 +91,15 @@ class ReviewSettingsConfig:
 
 
 @dataclass(frozen=True)
+class SkillsConfig:
+    root: Path
+    active: str
+
+    def public(self) -> dict:
+        return {"root": str(self.root), "active": self.active}
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     mode: str
     generation: ModelConfig | None = None
@@ -99,6 +108,7 @@ class RuntimeConfig:
     clarification: ClarificationConfig = ClarificationConfig()
     jobs: JobSettingsConfig = JobSettingsConfig()
     review: ReviewSettingsConfig = ReviewSettingsConfig()
+    skills: SkillsConfig | None = None
 
     def public(self) -> dict:
         return {
@@ -111,6 +121,7 @@ class RuntimeConfig:
             "clarification": self.clarification.public(),
             "jobs": self.jobs.public(),
             "review": self.review.public(),
+            "skills": self.skills.public() if self.skills else None,
         }
 
 
@@ -130,6 +141,8 @@ _CLARIFICATION_KEYS = {"max_questions_per_round", "max_rounds", "style"}
 _CLARIFICATION_STYLES = {"minimal", "comprehensive"}
 _JOB_KEYS = {"generation_timeout_seconds", "inspection_timeout_seconds", "delivery_timeout_seconds"}
 _REVIEW_KEYS = {"default_max_rounds"}
+_SKILLS_KEYS = {"root", "active"}
+_DEFAULT_SKILLS_ROOT = Path(__file__).resolve().parent / "builtin_skills"
 
 
 def _mapping(value, name: str) -> dict:
@@ -294,6 +307,32 @@ def _review(value) -> ReviewSettingsConfig:
     return ReviewSettingsConfig(rounds)
 
 
+def _skills(value, *, config_path: Path) -> SkillsConfig:
+    value = _mapping(value, "skills")
+    unknown = set(value) - _SKILLS_KEYS
+    if unknown:
+        raise ValidationError(f"skills 包含未知字段：{', '.join(sorted(unknown))}")
+    raw_root = value.get("root")
+    active = value.get("active", "guizang-ppt")
+    if raw_root is None:
+        root = _DEFAULT_SKILLS_ROOT
+    elif not isinstance(raw_root, str) or not raw_root.strip() or "\0" in raw_root:
+        raise ValidationError("skills.root 必须为非空路径")
+    else:
+        candidate = Path(raw_root.strip())
+        root = candidate if candidate.is_absolute() else config_path.parent / candidate
+    if not isinstance(active, str) or not active.strip() or active != active.strip():
+        raise ValidationError("skills.active 必须为非空相对目录")
+    # Configuration loading is fail-closed: a successful RuntimeConfig always
+    # points at one valid standard Skill and never defers traversal/frontmatter
+    # errors until the first model Job.
+    from .skill_runtime import ActiveSkillResolver
+
+    resolver = ActiveSkillResolver(root, active)
+    resolver.resolve()
+    return SkillsConfig(resolver.root, resolver.active)
+
+
 def load_config(path: str | Path | None = None, *, env_file: str | Path | None = None) -> RuntimeConfig:
     load_dotenv(env_file, override=False) if env_file is not None else load_dotenv(override=False)
     config_path = Path(path or os.getenv("PPT_AGENT_CONFIG", "config/ppt-agent.yaml"))
@@ -311,9 +350,7 @@ def load_config(path: str | Path | None = None, *, env_file: str | Path | None =
     mode = gateway.get("mode", "fake")
     if mode not in {"fake", "agent"}:
         raise ValidationError("gateway.mode 只能是 fake 或 agent")
-    skills = _mapping(raw.get("skills", {}), "skills")
-    if set(skills) - {"active"} or ("active" in skills and not isinstance(skills["active"], str)):
-        raise ValidationError("skills 配置无效")
+    skills = _skills(raw.get("skills", {}), config_path=config_path.resolve())
     capabilities = _mapping(raw.get("capabilities", {}), "capabilities")
     allowed_capabilities = {"network_tools", "image_input", "image_generation"}
     if set(capabilities) - allowed_capabilities or any(not isinstance(value, bool) for value in capabilities.values()):
@@ -324,7 +361,7 @@ def load_config(path: str | Path | None = None, *, env_file: str | Path | None =
     review = _review(raw.get("review", {}))
     if mode == "fake":
         jobs = _jobs(raw.get("jobs", {}), generation_default=630, inspection_default=630)
-        return RuntimeConfig(mode="fake", clarification=clarification, jobs=jobs, review=review)
+        return RuntimeConfig(mode="fake", clarification=clarification, jobs=jobs, review=review, skills=skills)
     models = _mapping(raw.get("models"), "models")
     if set(models) - {"generation", "inspection"}:
         raise ValidationError("models 包含未知字段")
@@ -354,4 +391,5 @@ def load_config(path: str | Path | None = None, *, env_file: str | Path | None =
         clarification=clarification,
         jobs=jobs,
         review=review,
+        skills=skills,
     )

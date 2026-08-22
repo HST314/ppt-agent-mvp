@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import httpx
 from openai import APIConnectionError, APIStatusError, APITimeoutError
 
-from ppt_agent.agent_runtime import AgentRuntime, STAGE_OUTPUT_SCHEMAS, STAGE_PROVIDER_SCHEMAS, STAGE_PROMPTS, TOOLS
+from ppt_agent.agent_runtime import AgentRuntime, LEGACY_STAGE_FILES, STAGE_OUTPUT_SCHEMAS, STAGE_PROVIDER_SCHEMAS, STAGE_PROMPTS, TOOLS
 from ppt_agent.errors import GatewayError, GatewayUnknownResult, ValidationError
 from ppt_agent.gateways import AgentGateway
 from ppt_agent.model_clients import ModelToolCall, ModelTurn, OpenAIResponsesClient
@@ -39,11 +39,11 @@ class FailingClient:
 
 
 def make_skill(root: Path, files: dict[str, bytes]):
-    import hashlib
+    files = dict(files)
+    if not files.get("SKILL.md", b"").startswith(b"---"):
+        files["SKILL.md"] = b"---\nname: test-skill\ndescription: Test skill.\n---\n\n" + files.get("SKILL.md", b"")
     for name, content in files.items():
         path = root / name; path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(content)
-    lock = {name: hashlib.sha256(content).hexdigest() for name, content in files.items()}
-    (root / "SKILL_LOCK.json").write_text(json.dumps({"files": lock}))
 
 
 class StageBSkillTests(unittest.TestCase):
@@ -58,18 +58,18 @@ class StageBSkillTests(unittest.TestCase):
 
     def test_path_type_size_and_total_quota(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp); make_skill(root, {"SKILL.md": b"1234", "references/a.md": b"5678", "assets/x.bin": b"xx", "private.txt": b"no"})
+            root = Path(tmp); make_skill(root, {"SKILL.md": b"entry", "references/a.md": b"1234", "references/b.md": b"5678", "assets/x.bin": b"xx", "private.txt": b"no"})
             skill = SkillRuntime(root, max_file_bytes=4, max_total_bytes=6)
             for path in ("../secret", "/etc/passwd", "private.txt", "assets/x.bin"):
                 with self.subTest(path=path), self.assertRaises(ValidationError): skill.read_skill_file(path)
-            skill.read_skill_file("SKILL.md")
-            with self.assertRaises(ValidationError): skill.read_skill_file("references/a.md")
+            skill.read_skill_file("references/a.md")
+            with self.assertRaises(ValidationError): skill.read_skill_file("references/b.md")
 
     def test_tool_path_prefixes_are_normalized_but_whitelist_stays_strict(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); make_skill(root, {"SKILL.md": b"ok", "references/a.md": b"a"})
             skill = SkillRuntime(root)
-            for variant in ("./SKILL.md", "/SKILL.md", "guizang-ppt/SKILL.md", "./guizang-ppt/references/a.md"):
+            for variant in ("./SKILL.md", "/SKILL.md", "test-skill/SKILL.md", f"./{root.name}/references/a.md"):
                 with self.subTest(variant=variant):
                     self.assertTrue(skill.read_skill_file(variant)["content"])
             for hostile in ("../SKILL_LOCK.json", "guizang-ppt/../SKILL_LOCK.json", "private.txt", "SKILL_LOCK.json"):
@@ -85,14 +85,12 @@ class StageBSkillTests(unittest.TestCase):
             message = caught.exception.message
             self.assertIn("SKILL.md", message); self.assertIn("references/a.md", message)
 
-    def test_symlink_and_tampered_lock_are_rejected(self):
+    def test_symlink_is_rejected_without_requiring_a_lock_file(self):
         if not hasattr(os, "symlink"): self.skipTest("symlink unsupported")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); (root / "references").mkdir(); (root / "target").write_text("secret")
             os.symlink(root / "target", root / "references" / "a.md")
             make_skill(root, {"SKILL.md": b"ok"})
-            lock = json.loads((root / "SKILL_LOCK.json").read_text()); lock["files"]["references/a.md"] = "0" * 64
-            (root / "SKILL_LOCK.json").write_text(json.dumps(lock))
             with self.assertRaises(ValidationError): SkillRuntime(root)
 
 
@@ -519,7 +517,7 @@ class StageBAgentTests(unittest.TestCase):
         self.assertEqual(caught.exception.code,"agent_invalid_output")
         self.assertEqual(caught.exception.audit[-1]["reason"],"invalid_output")
 
-    def test_lock_is_closed_and_rechecked_on_every_read(self):
+    def test_snapshot_is_closed_and_rechecked_on_every_read(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); make_skill(root, {"SKILL.md": b"ok"})
             skill = SkillRuntime(root); (root / "references").mkdir(); (root / "references/unlocked.md").write_text("no")
@@ -765,11 +763,11 @@ class StageBAgentTests(unittest.TestCase):
 
     def test_outline_skill_view_hides_rendering_only_references(self):
         skill = SkillRuntime.builtin()
-        allowed = skill.files_for_stage("outline")
+        allowed = LEGACY_STAGE_FILES["outline"]
         self.assertEqual(skill.list_skill_files(allowed_files=allowed)["files"], ["references/planning-summary.md"])
         with self.assertRaises(ValidationError):
             skill.dispatch("read_skill_file", {"path": "references/themes.md"}, allowed_files=allowed)
-        self.assertEqual(skill.files_for_stage("deck"),frozenset({"references/design-pack-v1.md"}))
+        self.assertEqual(LEGACY_STAGE_FILES["deck"],frozenset({"references/design-pack-v1.md"}))
 
     def test_client_structured_output_modes_control_text_format(self):
         schema = {"name": "narrative", "strict": True, "schema": {"type": "object"}}

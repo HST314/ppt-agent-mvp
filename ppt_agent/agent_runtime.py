@@ -5,6 +5,7 @@ import json
 import re
 import time
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import Any
 
 from .errors import GatewayError, ValidationError
@@ -14,6 +15,17 @@ from .skill_runtime import SkillRuntime
 STAGES = {"clarification", "narrative", "outline", "sample", "deck", "inspection"}
 PLANNING_STAGES = frozenset({"narrative", "outline", "inspection"})
 RENDERING_STAGES = frozenset({"sample", "deck"})
+# Temporary stage policy retained by the Agent protocol until task 2 replaces
+# it with mandatory SKILL.md-first progressive discovery.  It deliberately
+# lives outside the generic SkillRuntime and falls back to the whole standard
+# directory when an alternate Skill does not carry these legacy file names.
+LEGACY_STAGE_FILES = {
+    "narrative": frozenset({"references/planning-summary.md"}),
+    "outline": frozenset({"references/planning-summary.md"}),
+    "sample": frozenset({"references/design-pack-v1.md"}),
+    "deck": frozenset({"references/design-pack-v1.md"}),
+    "inspection": frozenset({"SKILL.md", "references/checklist.md"}),
+}
 REQUIRED_STAGE_FILES = {
     "sample": frozenset({"references/design-pack-v1.md"}),
     "deck": frozenset({"references/design-pack-v1.md"}),
@@ -273,10 +285,24 @@ class AgentRuntime:
         if not isinstance(payload, dict):
             raise ValidationError("Agent 输入无效")
         payload = self._text_only(payload)
-        stage_files = self.skill.files_for_stage(stage)
-        required_files = REQUIRED_STAGE_FILES.get(stage, frozenset())
+        preferred_stage_files = LEGACY_STAGE_FILES.get(stage)
+        available_text_files = frozenset(
+            name
+            for name in self.skill.manifest
+            if PurePosixPath(name).suffix.lower() in self.skill.TEXT_SUFFIXES
+        )
+        stage_files = (
+            preferred_stage_files
+            if preferred_stage_files is not None and preferred_stage_files.issubset(self.skill.manifest)
+            else available_text_files
+        )
+        required_files = (
+            REQUIRED_STAGE_FILES.get(stage, frozenset()).intersection(self.skill.manifest)
+            if stage_files == preferred_stage_files
+            else frozenset()
+        )
         if stage_files is not None and not required_files.issubset(stage_files):
-            raise ValidationError("阶段必读 Skill 文件不在锁定白名单")
+            raise ValidationError("阶段必读 Skill 文件不在当前快照")
         stage_tools = _tools_for_stage(stage, stage_files)
         override = CLARIFICATION_OVERRIDE if stage == "clarification" else PRODUCT_OVERRIDE
         started, audit, tool_count, tool_error_rounds, schema_corrections = self.clock(), [], 0, 0, 0
@@ -309,9 +335,9 @@ class AgentRuntime:
         remaining_paths: frozenset[str] | None = None
         input_json=json.dumps(payload,ensure_ascii=False,sort_keys=True,separators=(",",":"))
         stage_file_contract = json.dumps(sorted(stage_files) if stage_files is not None else ["*"])
-        tool_contract = self._stage_tool_contract(stage, stage_files)
+        tool_contract = self._stage_tool_contract(stage, stage_files, required_files)
         tool_schema_contract = json.dumps(stage_tools, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        audit.append({"event": "run", "stage": stage, "skill": self.skill.skill_name, "skill_version": self.skill.skill_version, "lock_sha256": hashlib.sha256(json.dumps(self.skill.manifest, sort_keys=True).encode()).hexdigest(), "input_sha256": hashlib.sha256(input_json.encode()).hexdigest(), "config_sha256": hashlib.sha256((STAGE_PROMPTS[stage]+override+stage_file_contract+tool_contract+tool_schema_contract).encode()).hexdigest(), "stage_files": sorted(stage_files or ()), "required_skill_files": sorted(required_files), "max_exploration_rounds": self.max_exploration_rounds, "max_unique_files": self.max_unique_files, "max_skill_bytes": self.max_skill_bytes, "reserved_final_calls": self.reserved_final_calls})
+        audit.append({"event": "run", "stage": stage, "skill": self.skill.skill_name, "skill_version": self.skill.skill_version, "skill_snapshot_sha256": self.skill.snapshot.digest, "input_sha256": hashlib.sha256(input_json.encode()).hexdigest(), "config_sha256": hashlib.sha256((STAGE_PROMPTS[stage]+override+stage_file_contract+tool_contract+tool_schema_contract).encode()).hexdigest(), "stage_files": sorted(stage_files or ()), "required_skill_files": sorted(required_files), "max_exploration_rounds": self.max_exploration_rounds, "max_unique_files": self.max_unique_files, "max_skill_bytes": self.max_skill_bytes, "reserved_final_calls": self.reserved_final_calls})
         def probe_phase(reason: str) -> str:
             if stage == "clarification":
                 return "strict_json_schema"
@@ -672,12 +698,16 @@ class AgentRuntime:
         return "capability_probe_failed"
 
     @staticmethod
-    def _stage_tool_contract(stage: str, stage_files: frozenset[str] | None) -> str:
+    def _stage_tool_contract(
+        stage: str,
+        stage_files: frozenset[str] | None,
+        required_files: frozenset[str] | None = None,
+    ) -> str:
         if stage == "clarification":
             return "工具契约：本阶段没有可用工具，请直接提交最终 JSON。"
         if stage in PLANNING_STAGES:
             allowed = "、".join(sorted(stage_files or ())) or "（无）"
-            required = "、".join(sorted(REQUIRED_STAGE_FILES.get(stage, ())))
+            required = "、".join(sorted(required_files or ()))
             return (
                 "工具契约：本阶段仅提供 list_skill_files 与 read_skill_file，不提供 get_asset_info；"
                 f"read_skill_file.path 只允许：{allowed}。最多成功读取 {MAX_PLANNING_FILE_READS} 个文件；"
@@ -686,7 +716,7 @@ class AgentRuntime:
         if stage in RENDERING_STAGES:
             allowed = "、".join(sorted(stage_files or ())) or "（无）"
             return (
-                f"工具契约：最小但完整的 Generation Contract 锁定文件清单为：{allowed}。"
+                f"工具契约：最小但完整的 Generation Contract 快照文件清单为：{allowed}。"
                 "无需先调用 list_skill_files；提交最终 JSON 前必须读取该 Generation Contract；read_skill_file.path 只能从该清单选择，已读路径不会再次返回正文。"
                 "达到探索、唯一文件或字节预算后工具会被移除，必须提交最终 JSON。"
             )
@@ -740,7 +770,7 @@ class AgentRuntime:
             return "unauthorized_tool"
         if "上限" in message:
             return "quota_exceeded"
-        if any(marker in message for marker in ("路径", "白名单", "固定文件", "Asset")):
+        if any(marker in message for marker in ("路径", "白名单", "固定文件", "快照", "Asset")):
             return "path_not_in_lock"
         return "tool_validation_error"
 

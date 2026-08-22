@@ -5,11 +5,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 from .errors import GatewayError, GatewayUnknownResult, ValidationError
-from .agent_runtime import AgentRuntime, STAGE_OUTPUT_SCHEMAS, STAGE_PROVIDER_SCHEMAS, _extract_json_object, normalize_rendering_output
+from .agent_runtime import AgentRuntime, LEGACY_STAGE_FILES, STAGE_OUTPUT_SCHEMAS, STAGE_PROVIDER_SCHEMAS, _extract_json_object, normalize_rendering_output
 from .audit import current_agent_audit_context
 from .claim_ledger import audit_html_claims_by_slide
 from .p4 import assemble_locked_template
-from .skill_runtime import SkillRuntime
+from .skill_runtime import ActiveSkillResolver, SkillRuntime
 
 class GenerationGateway(Protocol):
     def generate(self, action:str, payload:dict, *, skill:str)->dict: ...
@@ -105,13 +105,24 @@ class AgentGateway:
     It deliberately exposes no workflow operation to the model.  The service
     remains the only owner of stages, versions, approvals and commits.
     """
-    def __init__(self, client, *, skill=None, max_steps=12, max_tool_calls=24, max_provider_calls=8, run_timeout_seconds=300, job_timeout_seconds=330, model="agent", stage_budgets=None):
+    def __init__(self, client, *, skill=None, skill_resolver=None, max_steps=12, max_tool_calls=24, max_provider_calls=8, run_timeout_seconds=300, job_timeout_seconds=330, model="agent", stage_budgets=None):
         self.requires_browser_evidence = True
         self.client, self.model = client, model
         self.max_steps, self.max_tool_calls, self.max_provider_calls = max_steps, max_tool_calls, max_provider_calls
         self.run_timeout_seconds, self.job_timeout_seconds = run_timeout_seconds, job_timeout_seconds
         self.stage_budgets = stage_budgets or {}
-        self.skill_factory = SkillRuntime.builtin if skill is None else lambda: SkillRuntime(skill.root, max_file_bytes=skill.max_file_bytes, max_total_bytes=skill.max_total_bytes)
+        if skill is not None and skill_resolver is not None:
+            raise ValidationError("AgentGateway 不能同时指定 Skill 与 ActiveSkillResolver")
+        if skill is not None:
+            if not isinstance(skill, SkillRuntime):
+                raise ValidationError("AgentGateway Skill 无效")
+            self.skill_resolver = None
+            self.skill_factory = skill.clone
+        else:
+            self.skill_resolver = skill_resolver or ActiveSkillResolver.builtin()
+            if not isinstance(self.skill_resolver, ActiveSkillResolver):
+                raise ValidationError("AgentGateway ActiveSkillResolver 无效")
+            self.skill_factory = self.skill_resolver.runtime
         self.runtime = None
         self.audit_sink = None
         self.last_probe_audit = None
@@ -372,16 +383,31 @@ class AgentGateway:
 
 class LockedSkillMetadataLoader:
     """Metadata-only compatibility port; Skill text is read by Agent tools."""
-    def __init__(self, skill=None): self.skill = skill or SkillRuntime.builtin()
+    def __init__(self, skill=None, *, skill_resolver=None):
+        if skill is not None and skill_resolver is not None:
+            raise ValidationError("Skill metadata loader 不能同时指定 Skill 与 ActiveSkillResolver")
+        if skill is not None:
+            if not isinstance(skill, SkillRuntime):
+                raise ValidationError("Skill metadata loader 的 Skill 无效")
+            self.skill_factory = skill.clone
+        else:
+            resolver = skill_resolver or ActiveSkillResolver.builtin()
+            if not isinstance(resolver, ActiveSkillResolver):
+                raise ValidationError("Skill metadata loader 的 ActiveSkillResolver 无效")
+            self.skill_factory = resolver.runtime
     def load(self, action):
         if action not in {"narrative", "outline", "sample", "deck", "inspection"}: raise ValidationError("Skill action 不在允许列表")
-        files=sorted(self.skill.files_for_stage(action) or ())
-        if action in {"sample","deck"}:
+        skill=self.skill_factory()
+        preferred=LEGACY_STAGE_FILES.get(action, frozenset())
+        files=sorted(name for name in preferred if name in skill.manifest)
+        if not files and "SKILL.md" in skill.manifest:
+            files=["SKILL.md"]
+        if action in {"sample","deck"} and "assets/template.html" in skill.manifest:
             files.append("assets/template.html")
-        file_hashes={name:self.skill.manifest[name] for name in files}
+        file_hashes={name:skill.manifest[name] for name in files}
         return {
             "action":action,
-            "version":self.skill.skill_version,
+            "version":skill.skill_version,
             "content":json.dumps(file_hashes,sort_keys=True,separators=(",",":")),
             "files":files,
             "file_hashes":file_hashes,
@@ -390,9 +416,10 @@ class LockedSkillMetadataLoader:
 def agent_gateways_from_config(config):
     if config.mode == "fake": return {}
     from .model_clients import model_clients_from_config
-    clients = model_clients_from_config(config); skill = SkillRuntime.builtin()
+    clients = model_clients_from_config(config)
+    resolver = ActiveSkillResolver(config.skills.root, config.skills.active)
     generation = AgentGateway(
-        clients["generation"], skill=skill,
+        clients["generation"], skill_resolver=resolver,
         max_steps=config.generation.max_steps,
         max_tool_calls=config.generation.max_tool_calls,
         max_provider_calls=config.generation.max_provider_calls,
@@ -402,7 +429,7 @@ def agent_gateways_from_config(config):
         stage_budgets=config.generation.stage_budgets,
     )
     inspection = AgentGateway(
-        clients["inspection"], skill=skill,
+        clients["inspection"], skill_resolver=resolver,
         max_steps=config.inspection.max_steps,
         max_tool_calls=config.inspection.max_tool_calls,
         max_provider_calls=config.inspection.max_provider_calls,
@@ -410,7 +437,7 @@ def agent_gateways_from_config(config):
         job_timeout_seconds=config.inspection.job_timeout_seconds,
         model=config.inspection.model,
     )
-    return {"generator": generation, "clarifier": generation, "builder": generation, "inspector": inspection, "skills": LockedSkillMetadataLoader(skill)}
+    return {"generator": generation, "clarifier": generation, "builder": generation, "inspector": inspection, "skills": LockedSkillMetadataLoader(skill_resolver=resolver)}
 
 def gateways_from_env():
     mode=os.environ.get("PPT_AGENT_GATEWAY_MODE","fake")
