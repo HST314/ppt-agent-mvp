@@ -68,7 +68,7 @@ slides.forEach((slide) => {
     errors.push(`Slide ${slide.idx}: uses experimental P23/P24 image structure. Use S22 or S15/S16 image-grid adaptations instead.`);
   }
 
-  const isStatement = layout === 'S03' || layout === 'S09' || layout === 'S10' || layout === 'SWISS-COVER-ASCII' || layout === 'SWISS-CLOSING-ASCII';
+  const isStatement = layout === 'S01' || layout === 'S03' || layout === 'S09' || layout === 'S10' || layout === 'SWISS-COVER-ASCII' || layout === 'SWISS-CLOSING-ASCII';
   const topChunk = slide.html.slice(0, 1800);
 
   if (!isStatement && /text-align\s*:\s*center/i.test(topChunk)) {
@@ -309,4 +309,3 @@ if (errors.length) {
 }
 
 console.log(`Swiss deck validation passed: ${slides.length} slide(s).`);
-

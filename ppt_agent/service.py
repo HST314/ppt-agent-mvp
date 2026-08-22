@@ -5,6 +5,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 from .config import ClarificationConfig
+from .audit import current_agent_audit_context
 from .claim_ledger import assert_claims_bound, audit_claims, audit_html_claims, audit_html_claims_by_slide, build_claim_ledger, validate_claim_ledger
 from .canonical_validator import run_canonical_validator
 from .content_inspection import inspect_content_quality
@@ -13,12 +14,13 @@ from .diagnostics import log_exception_chain
 from .errors import ConflictError, GatewayError, NotFoundError, RuntimeUnavailableError, ValidationError
 from .fsm import TaskState, transition
 from .gateways import FakeGenerationGateway, FakeHtmlBuilder, FakeInspectionGateway, FakeSkillLoader
+from .generation_preflight import hard_browser_blockers, inspect_layout_capacity, layout_capacity_policy, structured_canonical_blockers
 from .schema import DeliveryManifest, InspectionReport, IssueDisposition
 from .p2 import canonical, digest, now, parse_task_card, questions_for, scan_resources, validate_answer
 from .schema import ClarificationSet, ResourceManifest, TaskCard, TaskInputSnapshot
 from .schema import NarrativeDocument, SlideOutline, SampleSelection, DeckArtifact
 from .p3 import assert_narrative_quality, changed_slide_ids, narrative_markdown, narrative_quality_evidence, normalize_outline_markdown, outline_markdown, parse_outline, requested_slide_count, structured_outline_markdown
-from .p4 import LOCKED_THEME_TOKENS, apply_design_contract, controlled_assets, infer_scope, recommend, render, validate_html
+from .p4 import LOCKED_THEME_TOKENS, apply_design_contract, assemble_locked_template, controlled_assets, infer_scope, recommend, render, required_sample_targets, validate_html
 from .render_gate import canonical_post_render_evidence, post_render_evidence_hash, run_post_render_gate
 from .offline import localize_delivery_html, offline_assets, offline_performance, offline_player, verify_delivery
 from .overflow_autofit import GEOMETRIC_CODES, MAX_CASCADE_ROUNDS, fit_deck_html
@@ -906,7 +908,7 @@ class TaskService:
             {"claim_id":claim["claim_id"],"kind":claim["kind"],"value":claim["value"]}
             for claim in ledger["claims"] if claim["claim_id"] in required_ids
         ]
-    def _post_render_gate(self,task_id,html_text,slide_ids,contract,ledger,assets):
+    def _post_render_gate(self,task_id,html_text,slide_ids,contract,ledger,assets,generation_attempt_evidence_hashes=None):
         contract_hash=contract["hash"]; ledger_hash=ledger["hash"]
         contract_value={key:value for key,value in contract.items() if key!="hash"}
         ledger_value={key:value for key,value in ledger.items() if key!="hash"}
@@ -929,6 +931,7 @@ class TaskService:
             html_by_slide=html_by_slide,
             browser_inspector=browser,
             canonical_validation=canonical_validation,
+            generation_attempt_evidence_hashes=generation_attempt_evidence_hashes,
         )
         autofit=None
         if browser is not None and first["geometry"]["overflow_count"]:
@@ -954,6 +957,7 @@ class TaskService:
             browser_inspector=browser,
             overflow_autofit=autofit,
             canonical_validation=canonical_validation,
+            generation_attempt_evidence_hashes=generation_attempt_evidence_hashes,
         )
         # Persist pass AND failure evidence.  Failed diagnostics carry the
         # slide / selector / scroll-client geometry of every blocker and must
@@ -974,14 +978,34 @@ class TaskService:
     @staticmethod
     def _is_locked_theme_violation(error):
         return isinstance(error,ValidationError) and "锁定主题变量" in error.message
-    def _build_with_locked_theme_retry(self,outline,*,action,slide_ids,assets,context):
-        """Regenerate a repairable sample/deck batch once in the same Job.
+    def _latest_generation_audit_id(self,task_id,action):
+        if not hasattr(self.store,"agent_audits"): return ""
+        context=current_agent_audit_context()
+        try:
+            audits=self.store.agent_audits(task_id=task_id,job_id=context.get("job_id"))
+        except Exception:
+            return ""
+        stage="deck" if action=="deck" else "sample"
+        return next((str(item.get("audit_id") or "") for item in reversed(audits) if item.get("stage")==stage),"")
+    def _persist_generation_attempt(self,task_id,body):
+        raw=canonical(body)
+        return self.store.put_version(task_id,"generation-attempt-evidence",raw,{
+            "action":body["action"],"attempt":body["attempt"],"status":body["status"],
+            "candidate_hash":body["candidate_hash"],"immutable":True,
+        })
+    def _persist_generation_correction(self,task_id,body):
+        return self.store.put_version(task_id,"generation-correction-evidence",canonical(body),{
+            "action":body["action"],"next_attempt":body["next_attempt"],
+            "parent_attempt_id":body["parent_attempt_id"],"immutable":True,
+        })
+    def _build_with_locked_theme_retry(self,task_id,outline,*,action,slide_ids,assets,context):
+        """Run one bounded, fully evidenced generation/correction loop.
 
-        Validation stays server-owned.  A locked-theme violation or missing
-        required claim may trigger the single correction turn.  Unbound facts
-        and every other validation failure exit immediately.  A second
-        violation is returned to the full post-render gate, which persists the
-        failure evidence and remains fail-closed.
+        The builder boundary owns deterministic validation.  Required claims,
+        coarse layout capacity, canonical rules and real Chromium blockers all
+        become structured correction payloads.  Every candidate and correction
+        is persisted immutably; a second failure still reaches the authoritative
+        final gate (or raises for unsafe HTML) and never commits a sample/deck.
         """
         policy=locked_theme_generation_policy(); correction=None
         ledger=context.get("claim_ledger")
@@ -992,55 +1016,125 @@ class TaskService:
             slide_id:[claim["claim_id"] for claim in claims]
             for slide_id,claims in required_claims_by_slide.items()
         }
+        capacity_policy=layout_capacity_policy(context["design_contract"])
+        context={**context,"layout_capacity_by_slide":capacity_policy}
+        attempt_hashes=[]; correction_hashes=[]; parent_attempt_id=""
         for attempt in range(1,LOCKED_THEME_GENERATION_ATTEMPTS+1):
             request={**context,"locked_theme_policy":policy,"generation_attempt":attempt}
             if correction is not None: request["semantic_correction"]=correction
             source=self.builder.build(outline,action=action,slide_ids=slide_ids,assets=assets,**request)
+            candidate=str(source); validation_error=None
+            page_coverage=getattr(source,"builder_boundary",None)
+            aggregate_coverage=None; capacity_evidence=None; canonical_validation=None
+            canonical_blockers=[]; browser_evidence=None; browser_blockers=[]; autofit=None
             try:
-                validate_html(source,slide_ids,assets)
+                candidate=validate_html(candidate,slide_ids,assets)
+                fragments=self._slide_fragments(candidate)
+                candidate=assemble_locked_template(
+                    [fragments[slide_id] for slide_id in slide_ids],
+                    context.get("rules",[]),context["design_contract"],context["design_contract_hash"],
+                )
+                candidate=validate_html(candidate,slide_ids,assets)
             except ValidationError as exc:
-                if not self._is_locked_theme_violation(exc) or attempt==LOCKED_THEME_GENERATION_ATTEMPTS:
-                    raise
+                validation_error=exc
+            if validation_error is None and ledger and required_ids:
+                aggregate_coverage=audit_html_claims(candidate,ledger,required_claim_ids=required_ids)
+                if not isinstance(page_coverage,dict):
+                    page_coverage=audit_html_claims_by_slide(self._slide_fragments(candidate),ledger,required_ids_by_slide)
+            if validation_error is None:
+                capacity_evidence=inspect_layout_capacity(candidate,context["design_contract"])
+                canonical_validation=run_canonical_validator(candidate,context["design_contract"]["style_id"])
+                canonical_blockers=structured_canonical_blockers(canonical_validation,context["design_contract"])
+            browser=self._generation_browser_gate() if validation_error is None else None
+            if browser is not None and capacity_evidence["passed"] and not canonical_blockers and not (aggregate_coverage or {}).get("unbound_count") and not (page_coverage or {}).get("missing_required_count"):
+                browser_evidence=browser.inspect(candidate,slide_ids)
+                browser_blockers=hard_browser_blockers(browser_evidence)
+                geometric=[item for item in browser_blockers if item.get("code") in GEOMETRIC_CODES]
+                if geometric:
+                    fitted=fit_deck_html(candidate,max_rounds=MAX_CASCADE_ROUNDS)
+                    autofit={key:fitted.get(key) for key in ("available","rules","rounds","converged","remaining")}
+                    if fitted.get("available") and fitted.get("rules"):
+                        fitted_candidate=validate_html(fitted["html"],slide_ids,assets)
+                        fitted_browser=browser.inspect(fitted_candidate,slide_ids)
+                        fitted_blockers=hard_browser_blockers(fitted_browser)
+                        if not fitted_blockers:
+                            candidate=fitted_candidate; browser_evidence=fitted_browser; browser_blockers=[]
+
+            correction=None
+            if validation_error is not None and self._is_locked_theme_violation(validation_error):
                 correction={
-                    "attempt":attempt,
-                    "reason":"locked_theme_variable_override",
-                    "error":exc.message,
+                    "attempt":attempt,"reason":"locked_theme_variable_override","error":validation_error.message,
                     "forbidden_inline_tokens":policy["forbidden_inline_tokens"],
                     "rule":"删除 section 根节点及全部后代 inline style 中对 forbidden_inline_tokens 的全部声明；保留 DesignContract 指定的主题 class，只消费模板已有 var(--*)，重新提交本批完整 slides。",
                 }
+            elif validation_error is not None:
+                correction=None
+            elif (aggregate_coverage or {}).get("unbound_count"):
+                correction=None
+            elif (page_coverage or {}).get("missing_required_count"):
+                missing_ids={claim["claim_id"] for claim in page_coverage["missing_required"]}
+                missing_by_slide={
+                    slide_id:[
+                        claim for claim in required_claims_by_slide[slide_id]
+                        if any(item["slide_id"]==slide_id and item["claim_id"]==claim["claim_id"] for item in page_coverage["missing_required"])
+                    ] for slide_id in slide_ids
+                }
+                correction={
+                    "attempt":attempt,"reason":"missing_required_claims","error":"本批页面遗漏或错放必需冻结事实",
+                    "required_claims_verbatim":required_claims,"required_claims_by_slide":required_claims_by_slide,
+                    "missing_required_claims_verbatim":[claim for claim in required_claims if claim["claim_id"] in missing_ids],
+                    "missing_required_claims_by_slide":missing_by_slide,
+                    "rule":"重新提交本批完整 slides；逐页把 required_claims_by_slide 对应 value 逐字写入该 slide 的可见正文，尤其补齐 missing_required_claims_by_slide；出现在其他页不算覆盖。不得放入隐藏节点、样式、脚本或元数据，不得新增 Claim Ledger 之外的量化事实。",
+                }
+            elif capacity_evidence and not capacity_evidence["passed"]:
+                correction={
+                    "attempt":attempt,"reason":"layout_capacity_exceeded","error":"页面内容超过锁定布局的可读容量",
+                    "capacity_blockers":capacity_evidence["issues"],"layout_capacity_by_slide":capacity_policy,
+                    "rule":"优先压缩正文和卡片/行项目，必要时改用更高容量布局或拆页；不得隐藏、裁切内容，不得降低正文到 16px 以下。",
+                }
+            elif canonical_blockers:
+                correction={
+                    "attempt":attempt,"reason":"canonical_validation_failed","error":"锁定模板 canonical 预检未通过",
+                    "canonical_blockers":canonical_blockers,
+                    "rule":"逐项按 rule_id、slide_id、selector、expected 修复后重新提交本批完整 slides；不得删除或绕过 canonical validator。",
+                }
+            elif browser_blockers:
+                correction={
+                    "attempt":attempt,"reason":"browser_render_blockers","error":"Chromium builder 边界预检未通过",
+                    "browser_blockers":browser_blockers,"overflow_autofit":autofit,
+                    "rule":"根据 selector 与 geometry 压缩局部内容/间距，必要时切换高容量布局或拆页；不得隐藏内容、降低字号/缩放下限或放宽门禁。",
+                }
+
+            status="accepted" if correction is None and validation_error is None and not (aggregate_coverage or {}).get("unbound_count") and not browser_blockers else ("correction_required" if correction is not None and attempt<LOCKED_THEME_GENERATION_ATTEMPTS else "failed")
+            page_hashes={slide_id:page.get("text_hash") for slide_id,page in (page_coverage or {}).get("pages",{}).items()}
+            attempt_body={
+                "schema_version":"1.0","task_id":task_id,
+                "action":action,"attempt":attempt,"parent_attempt_id":parent_attempt_id,
+                "input_hash":digest(canonical(request)),"candidate_hash":digest(candidate.encode()),"candidate_html":candidate,
+                "required_claims_by_slide":required_claims_by_slide,"builder_boundary":page_coverage,
+                "visible_text_hash":digest(canonical(page_hashes)),"aggregate_claims":aggregate_coverage,
+                "layout_capacity":capacity_evidence,"canonical_preflight":canonical_validation,
+                "browser_preflight":browser_evidence,"overflow_autofit":autofit,
+                "validation_error":None if validation_error is None else validation_error.message,
+                "status":status,"provider_audit_id":self._latest_generation_audit_id(task_id,action),
+                "result_certainty":"known","created_at":utcnow(),
+            }
+            attempt_hash=self._persist_generation_attempt(task_id,attempt_body)
+            attempt_hashes.append(attempt_hash); parent_attempt_id=attempt_hash
+            if status=="accepted":
+                return candidate,{"attempts":attempt,"retry_count":attempt-1,"max_attempts":LOCKED_THEME_GENERATION_ATTEMPTS,"attempt_evidence_hashes":attempt_hashes,"correction_evidence_hashes":correction_hashes}
+            if correction is not None and attempt<LOCKED_THEME_GENERATION_ATTEMPTS:
+                correction_body={
+                    "schema_version":"1.0","task_id":attempt_body["task_id"],"action":action,
+                    "parent_attempt_id":attempt_hash,"next_attempt":attempt+1,"correction":correction,
+                    "correction_hash":digest(canonical(correction)),"provider_audit_id":attempt_body["provider_audit_id"],
+                    "result_certainty":"known","created_at":utcnow(),
+                }
+                correction_hashes.append(self._persist_generation_correction(task_id,correction_body))
                 continue
-            if ledger and required_ids:
-                coverage=audit_html_claims(source,ledger,required_claim_ids=required_ids)
-                if coverage["unbound_count"]:
-                    return source,{"attempts":attempt,"retry_count":attempt-1,"max_attempts":LOCKED_THEME_GENERATION_ATTEMPTS}
-                page_coverage=getattr(source,"builder_boundary",None)
-                if not isinstance(page_coverage,dict):
-                    page_coverage=audit_html_claims_by_slide(self._slide_fragments(source),ledger,required_ids_by_slide)
-                if page_coverage["missing_required_count"]:
-                    if attempt==LOCKED_THEME_GENERATION_ATTEMPTS:
-                        return source,{"attempts":attempt,"retry_count":attempt-1,"max_attempts":LOCKED_THEME_GENERATION_ATTEMPTS}
-                    missing_ids={claim["claim_id"] for claim in page_coverage["missing_required"]}
-                    missing_by_slide={
-                        slide_id:[
-                            claim for claim in required_claims_by_slide[slide_id]
-                            if any(item["slide_id"]==slide_id and item["claim_id"]==claim["claim_id"] for item in page_coverage["missing_required"])
-                        ]
-                        for slide_id in slide_ids
-                    }
-                    correction={
-                        "attempt":attempt,
-                        "reason":"missing_required_claims",
-                        "error":"本批页面遗漏或错放必需冻结事实",
-                        "required_claims_verbatim":required_claims,
-                        "required_claims_by_slide":required_claims_by_slide,
-                        "missing_required_claims_verbatim":[
-                            claim for claim in required_claims if claim["claim_id"] in missing_ids
-                        ],
-                        "missing_required_claims_by_slide":missing_by_slide,
-                        "rule":"重新提交本批完整 slides；逐页把 required_claims_by_slide 对应 value 逐字写入该 slide 的可见正文，尤其补齐 missing_required_claims_by_slide；出现在其他页不算覆盖。不得放入隐藏节点、样式、脚本或元数据，不得新增 Claim Ledger 之外的量化事实。",
-                    }
-                    continue
-            return source,{"attempts":attempt,"retry_count":attempt-1,"max_attempts":LOCKED_THEME_GENERATION_ATTEMPTS}
+            if validation_error is not None:
+                raise validation_error
+            return candidate,{"attempts":attempt,"retry_count":attempt-1,"max_attempts":LOCKED_THEME_GENERATION_ATTEMPTS,"attempt_evidence_hashes":attempt_hashes,"correction_evidence_hashes":correction_hashes}
         raise AssertionError("锁定主题变量有界重取未终止")
     def planning_view(self,task_id):
         state=self.get(task_id); result={"state":state,"narrative":None,"outline":None,"versions":self.versions(task_id)}
@@ -1299,12 +1393,20 @@ class TaskService:
         data=json.loads(self.version(task_id,outline)); valid=list(data["slide_ids"])
         contract,ledger=self._generation_contracts(task_id,outline)
         automatic_selection=slide_ids is None
-        if automatic_selection: slide_ids,reasons=recommend(data["markdown"],count,contract["slide_contracts"])
+        if automatic_selection:
+            sample_targets=required_sample_targets(data["markdown"],count)
+            slide_ids,reasons=recommend(
+                data["markdown"],count,contract["slide_contracts"],required_targets=sample_targets,
+            )
         else:
             if not isinstance(slide_ids,list) or not slide_ids or len(slide_ids)>len(valid) or len(set(slide_ids))!=len(slide_ids) or any(x not in valid for x in slide_ids): raise ValidationError("样品页面选择无效或重复")
             reasons={sid:"用户选择" for sid in slide_ids}
-        seed=canonical({"outline_hash":outline,"slide_ids":slide_ids}); model=SampleSelection.parse({"selection_id":f"selection-{digest(seed)[:16]}","task_id":task_id,"outline_hash":outline,"slide_ids":slide_ids,"confirmed":False,"schema_version":"1.0"})
-        selection_metadata={"reasons":reasons,"strategy":"representative-diversity-v1" if automatic_selection else "user-selected","design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"]}
+            sample_targets=[{"slide_id":sid,"role":"user-selected","basis":"explicit user selection"} for sid in slide_ids]
+        target_ids={item["slide_id"] for item in sample_targets}
+        if not target_ids.issubset(set(slide_ids)):
+            raise ValidationError("样品页面选择未覆盖 required sample targets")
+        seed=canonical({"outline_hash":outline,"slide_ids":slide_ids,"required_sample_targets":sample_targets}); model=SampleSelection.parse({"selection_id":f"selection-{digest(seed)[:16]}","task_id":task_id,"outline_hash":outline,"slide_ids":slide_ids,"confirmed":False,"required_sample_targets":sample_targets,"schema_version":"1.0"})
+        selection_metadata={"reasons":reasons,"strategy":"representative-diversity-v1" if automatic_selection else "user-selected","required_sample_targets":sample_targets,"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"]}
         h=self.store.put_version(task_id,"sample-selection",canonical(model.to_dict()),selection_metadata)
         state=TaskState.parse(self.get(task_id))
         new=(TaskState(**{**state.__dict__,"sample_confirmed":False,"status":state.status.WAITING_FOR_USER,"waiting_reason":"manual_gate","required_action":"confirm_sample","revision":state.revision+1})
@@ -1344,11 +1446,11 @@ class TaskService:
             generation={"attempts":1,"retry_count":0,"max_attempts":1}
         else:
             source,generation=self._build_with_locked_theme_retry(
-                data["markdown"],action="sample",slide_ids=list(selection["slide_ids"]),assets=assets,
+                task_id,data["markdown"],action="sample",slide_ids=list(selection["slide_ids"]),assets=assets,
                 context={"rules":rules,"design_contract":contract_value,"design_contract_hash":contract["hash"],"claim_ledger":ledger_value,"claim_ledger_hash":ledger["hash"],"required_claims_verbatim":required_claims,"required_claims_by_slide":required_claims_by_slide},
             )
         progress("validating_html", "校验 HTML")
-        html_text,gate=self._post_render_gate(task_id,source,list(selection["slide_ids"]),contract,ledger,assets)
+        html_text,gate=self._post_render_gate(task_id,source,list(selection["slide_ids"]),contract,ledger,assets,generation.get("attempt_evidence_hashes"))
         version=len(self.versions(task_id,"sample"))+1; content_hash=digest(html_text.encode()); model=DeckArtifact.parse({"artifact_id":f"sample-{content_hash[:16]}","task_id":task_id,"version":version,"kind":"sample","outline_hash":outline,"content_hash":content_hash,"created_at":now(),"schema_version":"1.0"})
         prior=self._current_version(task_id,"sample"); meta={"html":html_text,"selection_hash":selection["hash"],"parent":prior,"summary":"生成真实 HTML 样品","scope":"global","global_rules":rules,"local_exceptions":{},"build":"success","locked_theme_generation":generation,"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate":gate}
         h=self._record_p3(task_id,"sample",model,meta,"sample_generate")
@@ -1379,10 +1481,10 @@ class TaskService:
             generation={"attempts":1,"retry_count":0,"max_attempts":1}
         else:
             source,generation=self._build_with_locked_theme_retry(
-                data["markdown"],action="sample",slide_ids=ids,assets=assets,
+                task_id,data["markdown"],action="sample",slide_ids=ids,assets=assets,
                 context={"rules":rules,"exceptions":exceptions,"previous_slides":previous_slides,"prompt":prompt,"scope":scope,"slide_id":slide_id,"element_id":element_id,"design_contract":contract_value,"design_contract_hash":contract["hash"],"claim_ledger":ledger_value,"claim_ledger_hash":ledger["hash"],"required_claims_verbatim":required_claims,"required_claims_by_slide":required_claims_by_slide},
             )
-        html_text,gate=self._post_render_gate(task_id,source,ids,contract,ledger,assets)
+        html_text,gate=self._post_render_gate(task_id,source,ids,contract,ledger,assets,generation.get("attempt_evidence_hashes"))
         version=len(self.versions(task_id,"sample"))+1; ch=digest(html_text.encode()); model=DeckArtifact.parse({"artifact_id":f"sample-{ch[:16]}","task_id":task_id,"version":version,"kind":"sample","outline_hash":outline,"content_hash":ch,"created_at":now(),"schema_version":"1.0"})
         h=self._record_p3(task_id,"sample",model,{"html":html_text,"selection_hash":view["selection"]["hash"],"parent":sample["hash"],"summary":prompt.strip(),"scope":scope,"scope_understanding":understanding,"slide_id":slide_id,"element_id":element_id,"global_rules":rules,"local_exceptions":exceptions,"build":"success","locked_theme_generation":generation,"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate":gate},"sample_modify","user")
         self._invalidate_sample_gate(task_id,h)
@@ -1505,7 +1607,7 @@ class TaskService:
                 required_claims=self._required_claims_verbatim(task_id,batch,contract,ledger)
                 required_claims_by_slide=self._required_claims_by_slide(task_id,batch,ledger)
                 partial,batch_generation=self._build_with_locked_theme_retry(
-                    data["markdown"],action="deck",slide_ids=batch,assets=assets,
+                    task_id,data["markdown"],action="deck",slide_ids=batch,assets=assets,
                     context={"rules":meta.get("global_rules",[]),"exceptions":meta.get("local_exceptions",{}),"design_contract":batch_contract,"design_contract_hash":contract["hash"],"claim_ledger":ledger_value,"claim_ledger_hash":ledger["hash"],"required_claims_verbatim":required_claims,"required_claims_by_slide":required_claims_by_slide},
                 )
                 generation_batches.append({"slide_ids":list(batch),**batch_generation})
@@ -1518,7 +1620,8 @@ class TaskService:
         # every builder implementation, including deterministic test/fallback
         # builders.
         html_text=self._replace_slide_fragments(html_text,sample_fragments)
-        html_text,gate=self._post_render_gate(task_id,html_text,ids,contract,ledger,assets); deck_fragments=self._slide_fragments(html_text)
+        generation_attempt_hashes=[item for batch in generation_batches for item in batch.get("attempt_evidence_hashes",[])]
+        html_text,gate=self._post_render_gate(task_id,html_text,ids,contract,ledger,assets,generation_attempt_hashes); deck_fragments=self._slide_fragments(html_text)
         preserved={sid:digest(deck_fragments[sid].encode())==digest(fragment.encode()) for sid,fragment in sample_fragments.items()}
         if not all(preserved.values()): raise ConflictError("确认样品发生未提示变化")
         return self._commit_candidate_deck(task_id,html_text,outline,{"parent":token["parent_deck_hash"],"summary":"生成未检查候选稿","scope":"global","affected":ids,"sample_hash":sample["hash"],"sample_pages_preserved":preserved,"outline_consistent":True,"inspection_status":"pending","global_rules":meta.get("global_rules",[]),"local_exceptions":meta.get("local_exceptions",{}),"locked_theme_generation_batches":generation_batches,"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate":gate},"deck_generate",token)
@@ -1565,10 +1668,10 @@ class TaskService:
             generation={"attempts":1,"retry_count":0,"max_attempts":1}
         else:
             source,generation=self._build_with_locked_theme_retry(
-                markdown,action="deck",slide_ids=all_ids,assets=assets,
+                task_id,markdown,action="deck",slide_ids=all_ids,assets=assets,
                 context={"rules":rules,"exceptions":exceptions,"previous_slides":previous_slides,"prompt":prompt,"scope":inferred,"affected_slide_ids":affected,"element_id":element_id,"design_contract":contract_value,"design_contract_hash":contract["hash"],"claim_ledger":ledger_value,"claim_ledger_hash":ledger["hash"],"required_claims_verbatim":required_claims,"required_claims_by_slide":required_claims_by_slide},
             )
-        html_text,gate=self._post_render_gate(task_id,source,all_ids,contract,ledger,assets)
+        html_text,gate=self._post_render_gate(task_id,source,all_ids,contract,ledger,assets,generation.get("attempt_evidence_hashes"))
         before=deck["metadata"]["page_hashes"]; after={sid:digest(fragment.encode()) for sid,fragment in self._slide_fragments(html_text).items()}; actual=[sid for sid in all_ids if before[sid]!=after[sid]]
         if any(s not in affected for s in actual): raise ConflictError("修改超出声明影响范围")
         # Cross-artifact edits are prepared and validated above. Only successful

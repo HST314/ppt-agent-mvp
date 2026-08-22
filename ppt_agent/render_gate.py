@@ -135,6 +135,7 @@ def run_post_render_gate(
     browser_inspector=None,
     overflow_autofit: dict[str, Any] | None = None,
     canonical_validation: dict[str, Any] | None = None,
+    generation_attempt_evidence_hashes: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     validate_claim_ledger(claim_ledger)
     structure = inspect_contract(html_text, expected_slide_ids, contract, contract_hash)
@@ -225,6 +226,7 @@ def run_post_render_gate(
             "text_hash": claims["text_hash"],
         },
         "canonical_validator": canonical_validation,
+        "generation_attempt_evidence_hashes": list(generation_attempt_evidence_hashes or ()),
         "geometry": {
             "available": browser is not None and bool(browser.get("available")),
             "passed": None if browser is None else bool(browser.get("passed")) and not browser_blockers,

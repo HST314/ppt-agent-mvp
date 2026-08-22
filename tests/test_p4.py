@@ -5,7 +5,7 @@ from ppt_agent.api import App
 from ppt_agent.errors import ConflictError, ValidationError
 from ppt_agent.service import TaskService
 from ppt_agent.store import WorkspaceStore
-from ppt_agent.p4 import validate_html
+from ppt_agent.p4 import recommend, required_sample_targets, validate_html
 
 PNG=b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
 
@@ -20,6 +20,24 @@ class P4Tests(unittest.TestCase):
         self.assertEqual(len(view["selection"]["slide_ids"]),2); self.assertEqual(view["selection"]["outline_hash"],view["outline_hash"])
         with self.assertRaises(ValidationError): self.s.select_samples("p4",["slide-1","slide-1"])
         with self.assertRaises(ValidationError): self.s.select_samples("p4",["foreign"])
+    def test_dedicated_period_and_budget_pages_are_required_sample_targets(self):
+        markdown="""# 大纲
+## [slide-1] 决策封面
+- 总周期 12 周，总预算 80 万元
+## [slide-2] 背景
+- 现状
+## [slide-3] 实施周期与阶段划分
+- 专门说明 12 周实施节奏
+## [slide-4] 投资预算
+- 专门说明 80 万元预算
+"""
+        targets=required_sample_targets(markdown,2)
+        selected,_=recommend(markdown,2,required_targets=targets)
+        self.assertEqual(targets,[
+            {"slide_id":"slide-3","role":"period","basis":"dedicated_outline_title:实施周期与阶段划分"},
+            {"slide_id":"slide-4","role":"budget","basis":"dedicated_outline_title:投资预算"},
+        ])
+        self.assertEqual(selected,["slide-3","slide-4"])
     def test_real_html_versions_and_scopes(self):
         first=self.s.generate_sample("p4")["sample"]
         self.assertTrue(first["html"].startswith("<!doctype html>")); self.assertNotIn("<script",first["html"])

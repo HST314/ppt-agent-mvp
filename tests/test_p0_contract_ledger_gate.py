@@ -6,10 +6,11 @@ from unittest.mock import patch
 
 from ppt_agent.canonical_validator import run_canonical_validator
 from ppt_agent.claim_ledger import assert_claims_bound, audit_claims, audit_html_claims, build_claim_ledger
-from ppt_agent.design_contract import TemplateRegistry
+from ppt_agent.design_contract import TemplateRegistry, build_design_contract
 from ppt_agent.errors import ConflictError, ValidationError
 from ppt_agent.overflow_autofit import MAX_CASCADE_ROUNDS
 from ppt_agent.p2 import canonical, digest, now
+from ppt_agent.p4 import apply_design_contract, assemble_locked_template
 from ppt_agent.render_gate import canonical_post_render_evidence, post_render_evidence_hash
 from ppt_agent.service import TaskService
 from ppt_agent.store import WorkspaceStore
@@ -116,6 +117,37 @@ class ContractLedgerGateTests(unittest.TestCase):
         self.assertEqual(selected.asset_path, "assets/template-swiss.html")
         self.assertEqual(len(selected.allowed_layouts), 22)
         self.assertEqual(selected.template_hash, registry.skill.manifest[selected.asset_path])
+        self.assertEqual(set(selected.semantic_classes),{"light","grey","dark","accent","split","hero"})
+
+    def test_editorial_contract_uses_only_registered_real_semantic_classes(self):
+        contract=build_design_contract(
+            task_id="semantic",task_card={"topic":"运营复盘"},input_snapshot_hash="a"*64,
+            outline_hash="b"*64,slide_ids=["slide-1","slide-2"],created_at=now(),
+        )
+
+        self.assertEqual(contract["slide_contracts"][0]["theme"],"dark")
+        self.assertNotIn("hero-dark",json.dumps(contract,ensure_ascii=False))
+        self.assertEqual(contract["semantic_classes"],["light","dark","hero"])
+
+    def test_swiss_body_title_alignment_is_normalized_but_cover_center_is_preserved(self):
+        contract=build_design_contract(
+            task_id="canonical-normalize",task_card={"constraints":{"风格":"Style B 瑞士"}},
+            input_snapshot_hash="c"*64,outline_hash="d"*64,
+            slide_ids=["slide-1","slide-2","slide-3"],created_at=now(),
+        )
+        contract_hash=digest(canonical(contract))
+        fragments=[
+            '<section class="slide" id="slide-1" data-slide-id="slide-1"><h1 style="text-align:center">封面</h1><p>封面摘要</p></section>',
+            '<section class="slide" id="slide-2" data-slide-id="slide-2"><h1 style="text-align:center;align-self:center">正文</h1><p>正文摘要</p></section>',
+            '<section class="slide" id="slide-3" data-slide-id="slide-3"><h1>结尾</h1><p>行动建议</p></section>',
+        ]
+        html=assemble_locked_template(fragments,design_contract=contract,contract_hash=contract_hash)
+        html=apply_design_contract(html,contract,contract_hash)
+
+        self.assertIn('style="text-align:center"',html)
+        self.assertIn('style="text-align:left;align-self:flex-start"',html)
+        validation=run_canonical_validator(html,"swiss")
+        self.assertTrue(validation["passed"],validation)
 
     def test_claim_ledger_binds_source_and_accepts_only_auditable_derivation(self):
         ledger = build_claim_ledger(
@@ -169,6 +201,35 @@ class ContractLedgerGateTests(unittest.TestCase):
         self.assertTrue(result["passed"])
         self.assertEqual(result["covered_required_claim_ids"],[claim_id])
         self.assertEqual(result["bindings"][0]["value"],"4.2 提升至 4.6")
+
+    def test_markdown_transition_with_compound_unit_is_one_directional_claim(self):
+        ledger = build_claim_ledger(
+            task_id="compound-transition",
+            input_snapshot_hash="c" * 64,
+            source_binding="拣选效率由 **110 单/小时** 提升至 **145 单/小时**。",
+            created_at="2026-08-22T00:00:00+00:00",
+        )
+
+        relation = [claim for claim in ledger["claims"] if claim["kind"] == "metric_transition"]
+        self.assertEqual(len(relation), 1)
+        self.assertEqual(relation[0]["normalized_value"], "110单/小时→145单/小时")
+        rendered = audit_claims("拣选效率从 110 单/小时 → 145 单/小时", ledger)
+        self.assertTrue(rendered["passed"], rendered)
+        self.assertIn(relation[0]["claim_id"], {
+            claim_id
+            for binding in rendered["bindings"]
+            for claim_id in binding["source_claim_ids"]
+        })
+
+    def test_transition_unit_mismatch_is_not_collapsed_into_relationship(self):
+        ledger = build_claim_ledger(
+            task_id="mismatched-transition",
+            input_snapshot_hash="d" * 64,
+            source_binding="吞吐从 110 单/小时 提升至 145 件/日。",
+            created_at="2026-08-22T00:00:00+00:00",
+        )
+
+        self.assertFalse(any(claim["kind"] == "metric_transition" for claim in ledger["claims"]))
 
     def test_generated_narrative_cannot_disclose_invented_metrics_as_assumptions(self):
         ledger = build_claim_ledger(

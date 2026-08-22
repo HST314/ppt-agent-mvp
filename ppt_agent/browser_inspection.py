@@ -353,10 +353,14 @@ class ChromiumDeckInspector:
                             const classElements = [slide, ...slide.querySelectorAll('[class]')];
                             const undefinedClasses = [];
                             const seenClasses = new Set();
-                            const semanticClasses = new Set(['slide', 'light', 'dark', 'grey', 'accent', 'hero', 'split']);
+                            const semanticMeta = document.querySelector('meta[name="ppt-semantic-classes"]');
+                            const semanticClasses = new Set([
+                                'slide',
+                                ...(semanticMeta ? semanticMeta.content.split(/\s+/).filter(Boolean) : ['light', 'dark', 'grey', 'accent', 'hero', 'split']),
+                            ]);
                             for (const element of classElements) {
                                 for (const className of [...element.classList]) {
-                                    if (seenClasses.has(className) || semanticClasses.has(className) || /^lucide(?:-|$)/.test(className)) continue;
+                                    if (seenClasses.has(className) || /^lucide(?:-|$)/.test(className)) continue;
                                     seenClasses.add(className);
                                     const token = `.${CSS.escape(className)}`;
                                     const owners = [...slide.getElementsByClassName(className)];
@@ -449,6 +453,7 @@ class ChromiumDeckInspector:
                                     css_rule_count: selectors.length,
                                     used_class_count: seenClasses.size,
                                     undefined_classes: undefinedClasses.slice(0, 20),
+                                    registered_semantic_classes: [...semanticClasses].sort(),
                                     content_top: Math.round(contentTop),
                                     content_bottom: Math.round(contentBottom),
                                     active_height_ratio: rect.height ? Number(((contentBottom - contentTop) / rect.height).toFixed(4)) : 0,

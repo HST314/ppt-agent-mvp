@@ -6,8 +6,8 @@
     "LICENSE": "0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0",
     "SKILL.md": "5f0b84f2e6bdc93d629e8777dd3e0d0dc7de1170959714807267b439f4733ec7",
     "assets/motion.min.js": "61b3a38dabf65a31778bc7fa9e71936bfa36ec2f567e50de261b958a3037e84e",
-    "assets/template-swiss.html": "6462896f79e7b3b5a7cfe36658c7c62572f87b2cbfb32160713c8b4d0eb1cc35",
-    "assets/template.html": "59a3e53ebdda5a3f9f5097b98ae8d0bf94d4414ed1b2f6eb804c707c9ffab71a",
+    "assets/template-swiss.html": "a5641ef6bca388415240afe3fab121cbb1ff0fe4b9328da33cf24ad35ee5cddb",
+    "assets/template.html": "e78275111a3d5e039b06e1ec0157486f558eded91a0c175b039cae06decca3af",
     "references/checklist.md": "36c8f217cea25e52c9e0dee5c7556bf1f9d2a3f3a475182f54478d691d1f80f2",
     "references/components.md": "b1dc1f1cacf231736db1e5037e5ec7b805ddbcb7a718a38f5d04504eaefe1f3f",
     "references/design-pack-v1.md": "e1f19574e2dfee17bedc47e3ef05c6af4c98ccf82905ebf450311374bc397ea4",
@@ -20,7 +20,7 @@
     "references/swiss-map-component.md": "057db8cc245d2c3d760206dd73cd57a57e66c831ffc02c0c67ed799fc2092b8d",
     "references/themes-swiss.md": "eec246cd44a1674990d6fe614ee32a59912695c317279a1b86d2710db0319bc8",
     "references/themes.md": "a4bee3ef7b22d56fb904b0643a117368d85f0265ceccdf5111ad497fe22cc656",
-    "references/template-registry.json": "b0219c1a516ee13c2f9ba81041fd9856f2db55f303f0412195a57487df886535",
-    "scripts/validate-swiss-deck.mjs": "73278430e5510343e8869c1590f1aa34e2f70840cc93a8ee88b082da613e90fc"
+    "references/template-registry.json": "d90744a1a384f28668d0575e51a18b2d12365b85bd366b5aa9d9d436eb637fe5",
+    "scripts/validate-swiss-deck.mjs": "282f05a476c2f25f9542be453f80d2b9736e64e11c3af4d297992687fe203b86"
   }
 }

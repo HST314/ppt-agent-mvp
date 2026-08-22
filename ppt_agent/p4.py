@@ -4,6 +4,7 @@ import base64, binascii, hashlib, html, re
 from functools import lru_cache
 from html.parser import HTMLParser
 from pathlib import PurePosixPath
+from typing import Any
 from urllib.parse import unquote, urlsplit
 
 from .design_contract import TemplateRegistry, validate_design_contract
@@ -212,7 +213,7 @@ LOCKED_THEME_TOKENS = frozenset({
 
 
 @lru_cache(maxsize=4)
-def locked_template(style_id: str = "editorial") -> dict[str, str]:
+def locked_template(style_id: str = "editorial") -> dict[str, Any]:
     """Load the inert style layer from the hash-locked built-in template.
 
     The active scripts, external font links and example slides in the source
@@ -237,6 +238,7 @@ def locked_template(style_id: str = "editorial") -> dict[str, str]:
         "style_id": record.style_id,
         "path": record.asset_path,
         "sha256": record.template_hash,
+        "semantic_classes": list(record.semantic_classes),
         "style": style.strip() + "\n" + (SWISS_TEMPLATE_OVERRIDES if style_id == "swiss" else EDITORIAL_TEMPLATE_OVERRIDES),
     }
 
@@ -278,6 +280,7 @@ def assemble_locked_template(sections, rules=None, design_contract=None, contrac
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
         + f"<title>{html.escape(_deck_title(sections))}</title>"
         + (f'<meta name="design-contract" content="{contract_hash}">' if design_contract else "")
+        + f'<meta name="ppt-semantic-classes" content="{html.escape(" ".join(template["semantic_classes"]), quote=True)}">'
         + f'<meta name="ppt-template" content="{provenance}"><style>{template["style"]}</style>'
         + f'</head><body><aside hidden data-global-rules="{rule_text}" data-template="{provenance}"></aside>'
         + "".join(sections)
@@ -295,14 +298,44 @@ def _set_attribute(tag: str, name: str, value: str) -> str:
     return tag[:-1] + replacement + ">"
 
 
-def _contract_fragment(fragment: str, item: dict[str, object], contract_hash: str) -> str:
+_SWISS_STATEMENT_LAYOUTS = {"S01", "S03", "S09", "S10", "SWISS-COVER-ASCII", "SWISS-CLOSING-ASCII"}
+
+
+def _normalize_locked_canonical_fragment(fragment: str, item: dict[str, object], style_id: str) -> str:
+    """Apply only unambiguous locked-template repairs at the trusted boundary.
+
+    Swiss body-page title alignment is a template invariant, not a creative
+    choice.  The upstream canonical validator intentionally rejects any
+    ``text-align:center``/``align-self:center`` declaration in the title-area
+    prefix.  Normalizing exactly those declarations keeps statement/cover
+    layouts untouched and avoids spending a probabilistic model correction on
+    a deterministic rule.
+    """
+    if style_id != "swiss" or str(item.get("layout_id")) in _SWISS_STATEMENT_LAYOUTS:
+        return fragment
+    prefix, suffix = fragment[:1800], fragment[1800:]
+    prefix = re.sub(r"(?i)(text-align\s*:\s*)center\b", r"\1left", prefix)
+    prefix = re.sub(r"(?i)(align-self\s*:\s*)center\b", r"\1flex-start", prefix)
+    return prefix + suffix
+
+
+def _contract_fragment(
+    fragment: str,
+    item: dict[str, object],
+    contract_hash: str,
+    style_id: str,
+    semantic_classes: set[str],
+) -> str:
     opening = re.match(r"<section\b[^>]*>", fragment, re.I)
     if not opening:
         raise ValidationError("DesignContract 页面不是 section 片段")
     tag = opening.group(0)
     classes_match = re.search(r"\bclass\s*=\s*(['\"])(.*?)\1", tag, re.I | re.S)
     classes = classes_match.group(2).split() if classes_match else []
-    for name in ("slide", *str(item["theme"]).split("-")):
+    visual_classes = [str(item["theme"])]
+    if item.get("animation_recipe") == "hero" and "hero" in semantic_classes:
+        visual_classes.append("hero")
+    for name in ("slide", *visual_classes):
         if name and name not in classes:
             classes.append(name)
     for name, value in (
@@ -313,6 +346,7 @@ def _contract_fragment(fragment: str, item: dict[str, object], contract_hash: st
     ):
         tag = _set_attribute(tag, name, value)
     fragment = tag + fragment[opening.end():]
+    fragment = _normalize_locked_canonical_fragment(fragment, item, style_id)
     marker_count = len(re.findall(r"\bdata-anim(?:\s*=|\s|>)", fragment, re.I))
     needed = max(0, int(item["minimum_animation_markers"]) - marker_count)
     if needed:
@@ -360,13 +394,32 @@ def apply_design_contract(html_text: str, design_contract: dict | None, contract
     if not fragments or not set(fragments).issubset(expected):
         raise ValidationError("DesignContract 与 HTML 页面范围不一致")
     for slide_id, (start, end, fragment) in sorted(fragments.items(), key=lambda pair: pair[1][0], reverse=True):
-        replacement = _contract_fragment(fragment, expected[slide_id], contract_hash)
+        replacement = _contract_fragment(
+            fragment,
+            expected[slide_id],
+            contract_hash,
+            str(design_contract["style_id"]),
+            set(design_contract["semantic_classes"]),
+        )
         html_text = html_text[:start] + replacement + html_text[end:]
     meta = f'<meta name="design-contract" content="{contract_hash}">'
     if re.search(r'<meta\b[^>]*name=["\']design-contract["\'][^>]*>', html_text, re.I):
         html_text = re.sub(r'<meta\b[^>]*name=["\']design-contract["\'][^>]*>', meta, html_text, count=1, flags=re.I)
     else:
         html_text = re.sub(r"<head\b[^>]*>", lambda match: match.group(0) + meta, html_text, count=1, flags=re.I)
+    semantic_meta = '<meta name="ppt-semantic-classes" content="' + html.escape(
+        " ".join(design_contract["semantic_classes"]), quote=True,
+    ) + '">'
+    if re.search(r'<meta\b[^>]*name=["\']ppt-semantic-classes["\'][^>]*>', html_text, re.I):
+        html_text = re.sub(
+            r'<meta\b[^>]*name=["\']ppt-semantic-classes["\'][^>]*>',
+            semantic_meta,
+            html_text,
+            count=1,
+            flags=re.I,
+        )
+    else:
+        html_text = re.sub(r"<head\b[^>]*>", lambda match: match.group(0) + semantic_meta, html_text, count=1, flags=re.I)
     return html_text
 
 
@@ -598,7 +651,53 @@ class _SafeHtmlParser(HTMLParser):
             self.slide_ids.append(values["data-slide-id"])
 
 
-def recommend(markdown: str, count: int = 2, slide_contracts: list[dict] | None = None):
+_SAMPLE_TARGET_PATTERNS = (
+    ("period", re.compile(r"周期|进度|排期|时间表|阶段划分|里程碑")),
+    ("budget", re.compile(r"预算|成本|投资|费用|资金投入")),
+)
+
+
+def required_sample_targets(markdown: str, count: int = 2) -> list[dict[str, str]]:
+    """Derive dedicated scenario pages that a sample must actually include.
+
+    A cover repeating ``12 周`` is valid factual copy but is not a substitute
+    for a dedicated period page when the outline also contains one.  Targets
+    are therefore title-first, deterministic and limited to the available
+    sample slots.  Generic decks with no dedicated decision pages keep the
+    existing representative-cover strategy.
+    """
+    slides = [(index, match.group(1), match.group(2)) for index, match in enumerate(SLIDE.finditer(markdown))]
+    if not slides:
+        raise ValidationError("逐页大纲不包含有效页面")
+    count = max(1, min(count, len(slides)))
+    targets: list[dict[str, str]] = []
+    used: set[str] = set()
+    for role, pattern in _SAMPLE_TARGET_PATTERNS:
+        ranked = []
+        for index, slide_id, block in slides:
+            title = block.splitlines()[0].strip() if block.splitlines() else ""
+            title_hits = len(pattern.findall(title))
+            body_hits = len(pattern.findall(block))
+            if not title_hits and not body_hits:
+                continue
+            ranked.append((-(title_hits * 100 + body_hits * 10 - (25 if index == 0 else 0)), index, slide_id, title))
+        for _, _, slide_id, title in sorted(ranked):
+            if slide_id in used:
+                continue
+            targets.append({"slide_id": slide_id, "role": role, "basis": f"dedicated_outline_title:{title}"})
+            used.add(slide_id)
+            break
+        if len(targets) >= count:
+            break
+    return targets
+
+
+def recommend(
+    markdown: str,
+    count: int = 2,
+    slide_contracts: list[dict] | None = None,
+    required_targets: list[dict[str, str]] | None = None,
+):
     """Choose a representative, diverse sample instead of the longest pages.
 
     A two-page automatic sample always contains the visual cover/hero and the
@@ -637,7 +736,15 @@ def recommend(markdown: str, count: int = 2, slide_contracts: list[dict] | None 
         })
 
     cover = next((item for item in candidates if item["role"] in {"cover", "hero"}), candidates[0])
-    selected = [cover]
+    required_targets = list(required_targets or [])
+    target_ids = [item.get("slide_id") for item in required_targets]
+    if len(target_ids) != len(set(target_ids)) or any(slide_id not in {item["slide_id"] for item in candidates} for slide_id in target_ids):
+        raise ValidationError("required sample targets 页面范围无效或重复")
+    selected = [item for item in candidates if item["slide_id"] in target_ids]
+    if len(selected) > count:
+        raise ValidationError("required sample targets 超过样品页容量")
+    if not selected:
+        selected = [cover]
     while len(selected) < count:
         selected_ids = {item["slide_id"] for item in selected}
         selected_layouts = {item["layout"] for item in selected}
@@ -663,7 +770,10 @@ def recommend(markdown: str, count: int = 2, slide_contracts: list[dict] | None 
     chosen = sorted(selected, key=lambda item: item["index"])
     reasons = {}
     for item in chosen:
-        if item["slide_id"] == cover["slide_id"]:
+        target = next((target for target in required_targets if target["slide_id"] == item["slide_id"]), None)
+        if target:
+            reasons[item["slide_id"]] = f"场景必选目标页；role={target['role']}；basis={target['basis']}；layout_id={item['layout']}"
+        elif item["slide_id"] == cover["slide_id"]:
             reasons[item["slide_id"]] = f"代表封面/hero；visual_role={item['role']}；layout_id={item['layout']}"
         else:
             resource_role = "有资源" if item["resource_count"] else "无资源"

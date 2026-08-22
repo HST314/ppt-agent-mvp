@@ -26,6 +26,7 @@ class TemplateRecord:
     asset_path: str
     template_hash: str
     theme_id: str
+    semantic_classes: tuple[str, ...]
     allowed_layouts: tuple[str, ...]
     body_layouts: tuple[str, ...]
     cover_layout: str
@@ -38,6 +39,7 @@ class TemplateRecord:
             "asset_path": self.asset_path,
             "template_hash": self.template_hash,
             "theme_id": self.theme_id,
+            "semantic_classes": list(self.semantic_classes),
             "allowed_layouts": list(self.allowed_layouts),
             "body_layouts": list(self.body_layouts),
             "cover_layout": self.cover_layout,
@@ -65,7 +67,7 @@ class TemplateRegistry:
                 raise ValidationError("模板注册项必须是对象")
             required = {
                 "style_id", "aliases", "template_id", "asset_path", "theme_id",
-                "allowed_layouts", "body_layouts", "cover_layout", "closing_layout",
+                "semantic_classes", "allowed_layouts", "body_layouts", "cover_layout", "closing_layout",
             }
             if set(item) != required:
                 raise ValidationError("模板注册项字段无效")
@@ -73,18 +75,28 @@ class TemplateRegistry:
             path = item["asset_path"]
             allowed = tuple(item["allowed_layouts"])
             body = tuple(item["body_layouts"])
-            values = (style_id, item["template_id"], item["theme_id"], *allowed)
+            semantic = tuple(item["semantic_classes"])
+            values = (style_id, item["template_id"], item["theme_id"], *semantic, *allowed)
             if any(not isinstance(value, str) or not _IDENTIFIER.fullmatch(value) for value in values):
                 raise ValidationError("模板注册项标识无效")
             if style_id in records or path not in self.skill.manifest or not path.startswith("assets/"):
                 raise ValidationError("模板注册项重复或未锁定")
             if not allowed or len(set(allowed)) != len(allowed) or not body or not set(body).issubset(allowed):
                 raise ValidationError("模板布局登记无效")
+            if not semantic or len(set(semantic)) != len(semantic):
+                raise ValidationError("模板语义类登记无效")
             if item["cover_layout"] not in allowed or item["closing_layout"] not in allowed:
                 raise ValidationError("模板封面或封底布局未登记")
             aliases = tuple(str(alias).strip().casefold() for alias in item["aliases"] if str(alias).strip())
             if not aliases:
                 raise ValidationError("模板别名不得为空")
+            template_css = self.skill.read_locked_text(path)
+            missing_semantic = [
+                name for name in semantic
+                if not re.search(rf"\.slide(?:[.#:\[\]A-Za-z0-9_ -]*)\.{re.escape(name)}(?:\b|[.#:\[])", template_css)
+            ]
+            if missing_semantic:
+                raise ValidationError("模板语义类缺少真实 CSS 规则：" + "、".join(missing_semantic))
             records[style_id] = TemplateRecord(
                 style_id=style_id,
                 aliases=aliases,
@@ -92,6 +104,7 @@ class TemplateRegistry:
                 asset_path=path,
                 template_hash=self.skill.manifest[path],
                 theme_id=item["theme_id"],
+                semantic_classes=semantic,
                 allowed_layouts=allowed,
                 body_layouts=body,
                 cover_layout=item["cover_layout"],
@@ -138,7 +151,7 @@ def build_design_contract(
     body_index = 0
     for index, slide_id in enumerate(slide_ids):
         if index == 0:
-            layout, theme, role, recipe = template.cover_layout, "accent" if template.style_id == "swiss" else "hero-dark", "cover", "hero"
+            layout, theme, role, recipe = template.cover_layout, "accent" if template.style_id == "swiss" else "dark", "cover", "hero"
         elif index == len(slide_ids) - 1 and len(slide_ids) > 1:
             layout, theme, role, recipe = template.closing_layout, "split" if template.style_id == "swiss" else "light", "closing", "split-statement" if template.style_id == "swiss" else "cascade"
         else:
@@ -162,6 +175,7 @@ def build_design_contract(
         "template_id": template.template_id,
         "template_hash": template.template_hash,
         "theme_id": template.theme_id,
+        "semantic_classes": list(template.semantic_classes),
         "registry_version": registry.version,
         "registry_hash": registry.registry_hash,
         "allowed_layouts": list(template.allowed_layouts),
@@ -203,7 +217,7 @@ def scope_design_contract(
     }
     seed = {key: scoped[key] for key in (
         "task_id", "input_snapshot_hash", "outline_hash", "style_id", "template_id",
-        "template_hash", "theme_id", "registry_version", "registry_hash",
+        "template_hash", "theme_id", "semantic_classes", "registry_version", "registry_hash",
         "allowed_layouts", "slide_contracts",
     )}
     scoped["contract_id"] = f"design-{hashlib.sha256(_canonical(seed)).hexdigest()[:20]}"
@@ -214,7 +228,7 @@ def validate_design_contract(contract: dict[str, Any], registry: TemplateRegistr
     registry = registry or TemplateRegistry()
     required = {
         "contract_id", "task_id", "input_snapshot_hash", "outline_hash", "style_id",
-        "template_id", "template_hash", "theme_id", "registry_version", "registry_hash",
+        "template_id", "template_hash", "theme_id", "semantic_classes", "registry_version", "registry_hash",
         "allowed_layouts", "slide_contracts", "created_at", "schema_version",
     }
     if not isinstance(contract, dict) or set(contract) != required or contract.get("schema_version") != "1.0":
@@ -231,11 +245,14 @@ def validate_design_contract(contract: dict[str, Any], registry: TemplateRegistr
         contract["template_id"] != template.template_id
         or contract["template_hash"] != template.template_hash
         or contract["theme_id"] != template.theme_id
+        or contract["semantic_classes"] != list(template.semantic_classes)
         or contract["registry_version"] != registry.version
         or contract["registry_hash"] != registry.registry_hash
         or contract["allowed_layouts"] != list(template.allowed_layouts)
     ):
         raise ValidationError("DesignContract 与锁定模板注册表不一致")
+    if not isinstance(contract["semantic_classes"], list) or len(contract["semantic_classes"]) != len(set(contract["semantic_classes"])):
+        raise ValidationError("DesignContract 语义类清单无效")
     slides = contract.get("slide_contracts")
     if not isinstance(slides, list) or not slides:
         raise ValidationError("DesignContract 缺少页面契约")
@@ -251,12 +268,14 @@ def validate_design_contract(contract: dict[str, Any], registry: TemplateRegistr
             raise ValidationError("DesignContract 页面标识无效")
         if item["slide_id"] in seen or item["layout_id"] not in allowed:
             raise ValidationError("DesignContract 页面布局未登记或重复")
+        if item["theme"] not in set(contract["semantic_classes"]):
+            raise ValidationError("DesignContract 页面主题类未登记")
         if not isinstance(item["minimum_animation_markers"], int) or item["minimum_animation_markers"] < 0:
             raise ValidationError("DesignContract 动效数量无效")
         seen.add(item["slide_id"])
     seed = {key: contract[key] for key in (
         "task_id", "input_snapshot_hash", "outline_hash", "style_id", "template_id",
-        "template_hash", "theme_id", "registry_version", "registry_hash",
+        "template_hash", "theme_id", "semantic_classes", "registry_version", "registry_hash",
         "allowed_layouts", "slide_contracts",
     )}
     expected_id = f"design-{hashlib.sha256(_canonical(seed)).hexdigest()[:20]}"

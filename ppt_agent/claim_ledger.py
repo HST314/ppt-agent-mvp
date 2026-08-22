@@ -11,17 +11,22 @@ from .errors import ValidationError
 
 _DATE = re.compile(r"(?<!\d)(?:19|20)\d{2}\s*(?:[-/.年])\s*\d{1,2}(?:\s*(?:[-/.月])\s*\d{1,2}\s*日?)?(?!\d)")
 _QUARTER = re.compile(r"(?<!\d)(?:19|20)\d{2}\s*(?:年\s*)?(?:Q[1-4]|第[一二三四1234]季度)", re.I)
-_METRIC = re.compile(
-    r"(?<![A-Za-z0-9])\d+(?:[\s,，]\d{3})*(?:\.\d+)?\s*"
-    # Longest, dimension-bearing forms come first.  In particular, ``万人``
-    # must never be truncated to the currency shorthand ``万``.
-    r"(?:%|％|(?:人民币)?亿元|(?:人民币)?万元|亿美元|万美元|亿元|万元|万人|万家|万条|万次|"
+_NUMBER = r"\d+(?:[\s,，]\d{3})*(?:\.\d+)?"
+# One controlled unit vocabulary is shared by standalone metrics and both
+# endpoints of metric transitions.  Longest/dimension-bearing spellings must
+# come first so ``万人`` is never truncated to ``万`` and ``单/小时`` is not
+# split into an unrelated number plus ``小时``.
+_UNIT = (
+    r"(?:单\s*[/／]\s*小时|件\s*[/／]\s*日|人\s*[/／]\s*天|人天|"
+    r"%|％|(?:人民币)?亿元|(?:人民币)?万元|亿美元|万美元|亿元|万元|万人|万家|万条|万次|"
     r"百万\+?|亿\+?|万\+?(?![元人家条次])|美元|人民币|元|个\s*工作日|工作日|"
-    r"毫秒|秒|分钟|小时|天|周|个月|月|年|倍|[×xX]|条|次|人|家|业务线)(?![A-Za-z])"
+    r"毫秒|秒|分钟|小时|天|周|个月|月|年|倍|[×xX]|单|件|条|次|人|家|业务线)"
 )
+_METRIC = re.compile(rf"(?<![A-Za-z0-9]){_NUMBER}\s*{_UNIT}(?![A-Za-z])")
 _TRANSITION_WORD = r"(?:→|⇒|->|至|到|提升(?:到|至)|提高(?:到|至)|增长(?:到|至)|增至|升至|下降(?:到|至)|降低(?:到|至)|降至|变为)"
 _TRANSITION = re.compile(
-    rf"(?<![A-Za-z0-9])\d+(?:\.\d+)?\s*{_TRANSITION_WORD}\s*\d+(?:\.\d+)?(?:\s*[%％])?(?![A-Za-z0-9])"
+    rf"(?<![A-Za-z0-9])(?P<before>{_NUMBER})\s*(?P<before_unit>{_UNIT})?\s*"
+    rf"(?P<operator>{_TRANSITION_WORD})\s*(?P<after>{_NUMBER})\s*(?P<after_unit>{_UNIT})?(?![A-Za-z0-9])"
 )
 _FREQUENCY = re.compile(r"(?:7\s*[×xX]\s*24|每(?:周|月|季度|年)|双周|会后\s*[一二三四五六七八九十两\d]+\s*(?:天|周|个工作日))")
 _LEGAL = re.compile(r"(?:符合|遵守|满足)《[^》]{2,60}》")
@@ -38,13 +43,17 @@ def _canonical(value: Any) -> bytes:
 
 
 def _normalized(value: str) -> str:
-    normalized = re.sub(r"[\s,，]", "", value).replace("％", "%").casefold()
-    transition = re.fullmatch(
-        rf"(?P<before>\d+(?:\.\d+)?){_TRANSITION_WORD}(?P<after>\d+(?:\.\d+)?)(?P<unit>%?)",
-        normalized,
-    )
+    normalized = re.sub(r"[\s,，]", "", value).replace("％", "%").replace("／", "/").casefold()
+    transition = _TRANSITION.fullmatch(normalized)
     if transition:
-        normalized = f"{transition.group('before')}→{transition.group('after')}{transition.group('unit')}"
+        before_unit = transition.group("before_unit") or ""
+        after_unit = transition.group("after_unit") or ""
+        # A unit written once applies to both endpoints.  Explicitly different
+        # dimensions are not collapsed into one relationship identity.
+        if before_unit and after_unit and before_unit != after_unit:
+            return normalized
+        unit = before_unit or after_unit
+        normalized = f"{transition.group('before')}{unit}→{transition.group('after')}{unit}"
     # Chinese budget copy routinely alternates between ``24万`` and
     # ``24万元``.  They are the same RMB magnitude; dimension-bearing forms
     # such as ``24万人`` remain distinct and therefore fail closed.
@@ -79,6 +88,11 @@ def _occurrences(text: str) -> list[dict[str, Any]]:
     for pattern in (_DATE, _QUARTER, _TRANSITION, _METRIC, _FREQUENCY, _LEGAL, _ORG):
         for match in pattern.finditer(scan_text):
             visible_value = re.sub(r"[*_`]", "", text[match.start():match.end()])
+            if pattern is _TRANSITION:
+                before_unit = re.sub(r"\s+", "", match.group("before_unit") or "").replace("／", "/")
+                after_unit = re.sub(r"\s+", "", match.group("after_unit") or "").replace("／", "/")
+                if before_unit and after_unit and before_unit != after_unit:
+                    continue
             found.append({
                 "kind": _kind(pattern),
                 "value": visible_value,

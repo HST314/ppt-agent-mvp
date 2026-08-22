@@ -102,7 +102,7 @@ class StrictModel:
         if not isinstance(value, dict): raise ValidationError(f"{cls.__name__} 必须是对象")
         allowed = {f.name for f in fields(cls)}
         if set(value) - allowed: raise ValidationError(f"{cls.__name__} 包含未知字段")
-        optional_compat={"level","element_id","evidence","suggestion","source","sources","evidence_refs","source_issues","evidence_artifacts","target_deck_hash","rationale"}
+        optional_compat={"level","element_id","evidence","suggestion","source","sources","evidence_refs","source_issues","evidence_artifacts","target_deck_hash","rationale","required_sample_targets"}
         required = {f.name for f in fields(cls) if f.name != "schema_version" and f.name not in optional_compat}
         if required - set(value): raise ValidationError(f"{cls.__name__} 缺少必填字段")
         hints=get_type_hints(cls)
@@ -117,7 +117,7 @@ class StrictModel:
         hints = get_type_hints(cls)
         props = {f.name:_property_schema(f.name,hints[f.name]) for f in fields(cls)}
         props["schema_version"]["const"] = "1.0"
-        optional_compat={"level","element_id","evidence","suggestion","source","sources","evidence_refs","source_issues","evidence_artifacts","target_deck_hash","rationale"}
+        optional_compat={"level","element_id","evidence","suggestion","source","sources","evidence_refs","source_issues","evidence_artifacts","target_deck_hash","rationale","required_sample_targets"}
         return {"$schema":"https://json-schema.org/draft/2020-12/schema","title":cls.__name__,"type":"object","additionalProperties":False,"properties":props,"required":[f.name for f in fields(cls) if f.name != "schema_version" and f.name not in optional_compat]}
 
 @dataclass(frozen=True)
@@ -147,7 +147,22 @@ class NarrativeDocument(StrictModel):
 @dataclass(frozen=True)
 class SlideOutline(StrictModel): outline_id:str=""; task_id:str=""; version:int=1; markdown:str=""; slide_ids:tuple[str,...]=(); content_hash:str=""; created_at:str=""
 @dataclass(frozen=True)
-class SampleSelection(StrictModel): selection_id:str=""; task_id:str=""; outline_hash:str=""; slide_ids:tuple[str,...]=(); confirmed:bool=False
+class SampleTarget:
+    slide_id:str; role:str; basis:str
+    def validate(self):
+        if not ID.fullmatch(self.slide_id) or not ID.fullmatch(self.role) or not self.basis.strip():
+            raise ValidationError("样品目标页字段无效")
+
+
+@dataclass(frozen=True)
+class SampleSelection(StrictModel):
+    selection_id:str=""; task_id:str=""; outline_hash:str=""; slide_ids:tuple[str,...]=(); confirmed:bool=False
+    required_sample_targets:tuple[SampleTarget,...]=()
+    def __post_init__(self):
+        super().__post_init__()
+        target_ids=[item.slide_id for item in self.required_sample_targets]
+        if len(target_ids)!=len(set(target_ids)) or not set(target_ids).issubset(set(self.slide_ids)):
+            raise ValidationError("样品选择未覆盖 required sample targets")
 @dataclass(frozen=True)
 class DeckArtifact(StrictModel):
     artifact_id:str=""; task_id:str=""; version:int=1; kind:str="sample"; outline_hash:str=""; content_hash:str=""; created_at:str=""

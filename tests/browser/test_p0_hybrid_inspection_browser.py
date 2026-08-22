@@ -154,6 +154,19 @@ class P0HybridInspectionBrowserGate(unittest.TestCase):
         undefined = [item for item in evidence["issues"] if item["code"] == "undefined_layout_class"]
         self.assertFalse(undefined, evidence["issues"])
 
+    def test_editorial_hero_dark_semantics_are_backed_by_real_css_rules(self):
+        fragment = (
+            '<section class="slide hero dark" id="slide-1" data-slide-id="slide-1" data-layout="A01">'
+            '<h1 data-element-id="title">运营复盘</h1><p class="body-zh">决策摘要</p></section>'
+        )
+        html = f'<!doctype html><html><head><meta name="ppt-semantic-classes" content="light dark hero"><style>{locked_template("editorial")["style"]}</style></head><body>{fragment}</body></html>'
+
+        evidence = ChromiumDeckInspector().inspect(html, ["slide-1"])
+
+        undefined = [item for item in evidence["issues"] if item["code"] == "undefined_layout_class"]
+        self.assertFalse(undefined, evidence["issues"])
+        self.assertIn("hero", evidence["slides"][0]["layout_validation"]["registered_semantic_classes"])
+
 
 if __name__ == "__main__":
     unittest.main()

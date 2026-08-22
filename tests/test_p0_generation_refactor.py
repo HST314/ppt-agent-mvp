@@ -113,7 +113,63 @@ class ReportedClaimRetryBuilder:
         return html
 
 
+class GeometryCorrectionBuilder:
+    def __init__(self): self.calls=[]
+    def build(self,outline,**context):
+        self.calls.append(dict(context))
+        html=render(
+            outline,context["slide_ids"],context.get("rules"),context.get("exceptions"),
+            context.get("assets"),context.get("design_contract"),context.get("design_contract_hash"),
+        )
+        if context.get("semantic_correction",{}).get("reason")!="browser_render_blockers":
+            return html.replace("<section ",'<section data-needs-layout-correction="true" ',1)
+        return html
+
+
+class GeometryCorrectionBrowser:
+    enforce_on_generation=True
+    def inspect(self,html,expected_slide_ids):
+        issues=[]
+        if "data-needs-layout-correction" in html:
+            issues=[{
+                "issue_id":"capacity-overflow","severity":"blocker","level":"element",
+                "code":"element_scroll_overflow","message":"高密度正文滚动溢出",
+                "slide_id":expected_slide_ids[0],"element_id":"body",
+                "selector":f'.slide[data-slide-id="{expected_slide_ids[0]}"] [data-element-id="body"]',
+                "geometry":{"client_width":1126,"client_height":468,"scroll_width":1126,"scroll_height":613,"delta_height":145},
+                "evidence":"client=1126x468; scroll=1126x613","suggestion":"压缩内容或切换布局",
+            }]
+        return {
+            "available":True,"passed":not issues,"engine":"chromium","engine_version":"preflight-test",
+            "viewport":{"width":1280,"height":720},"issues":issues,
+            "slides":[{"slide_id":slide_id} for slide_id in expected_slide_ids],
+        }
+
+
 class P0GenerationRefactorTests(unittest.TestCase):
+    def test_unfixable_geometry_gets_one_structured_regeneration_and_evidence_chain(self):
+        with tempfile.TemporaryDirectory() as root:
+            builder=GeometryCorrectionBuilder()
+            svc=TaskService(WorkspaceStore(root),builder=builder,browser_inspector=GeometryCorrectionBrowser())
+            svc.create("geometry","manual")
+            svc.import_input("geometry",{"goal":"批准投资","audience":"管理层","topic":"投资方案","页数":3})
+            svc.generate_narrative("geometry"); svc.confirm_narrative("geometry")
+            svc.generate_outline("geometry"); svc.confirm_outline("geometry")
+            svc.select_samples("geometry",["slide-1"])
+
+            sample=svc.generate_sample("geometry")["sample"]
+
+            self.assertEqual(len(builder.calls),2)
+            correction=builder.calls[1]["semantic_correction"]
+            self.assertEqual(correction["reason"],"browser_render_blockers")
+            blocker=correction["browser_blockers"][0]
+            self.assertEqual(blocker["geometry"]["scroll_height"],613)
+            generation=sample["metadata"]["locked_theme_generation"]
+            attempts=[json.loads(svc.version("geometry",item)) for item in generation["attempt_evidence_hashes"]]
+            self.assertEqual([item["status"] for item in attempts],["correction_required","accepted"])
+            self.assertEqual(attempts[1]["parent_attempt_id"],generation["attempt_evidence_hashes"][0])
+            self.assertEqual(sample["metadata"]["post_render_gate"]["generation_attempt_evidence_hashes"],generation["attempt_evidence_hashes"])
+
     def test_sample_exposes_only_read_only_skill_tools_and_server_assembles_public_shell(self):
         fragment='<section class="slide" id="slide-1" data-slide-id="slide-1"><h1>样品</h1></section>'
         client=RecordingClient([
@@ -237,7 +293,10 @@ class P0GenerationRefactorTests(unittest.TestCase):
             self.assertEqual(builder.calls[0]["generation_attempt"],1)
             self.assertIn("--ink",builder.calls[0]["locked_theme_policy"]["forbidden_inline_tokens"])
             self.assertEqual(builder.calls[1]["semantic_correction"]["reason"],"locked_theme_variable_override")
-            self.assertEqual(sample["metadata"]["locked_theme_generation"],{"attempts":2,"retry_count":1,"max_attempts":2})
+            generation=sample["metadata"]["locked_theme_generation"]
+            self.assertEqual({key:generation[key] for key in ("attempts","retry_count","max_attempts")},{"attempts":2,"retry_count":1,"max_attempts":2})
+            self.assertEqual(len(generation["attempt_evidence_hashes"]),2)
+            self.assertEqual(len(generation["correction_evidence_hashes"]),1)
             self.assertEqual(len(svc.versions("task","sample")),1)
 
     def test_persistent_sample_locked_theme_override_remains_fail_closed(self):
@@ -274,7 +333,15 @@ class P0GenerationRefactorTests(unittest.TestCase):
             self.assertEqual(correction["required_claims_verbatim"],required)
             self.assertEqual(correction["missing_required_claims_verbatim"],required)
             self.assertEqual(correction["required_claims_by_slide"],builder.calls[0]["required_claims_by_slide"])
-            self.assertEqual(sample["metadata"]["locked_theme_generation"],{"attempts":2,"retry_count":1,"max_attempts":2})
+            generation=sample["metadata"]["locked_theme_generation"]
+            self.assertEqual({key:generation[key] for key in ("attempts","retry_count","max_attempts")},{"attempts":2,"retry_count":1,"max_attempts":2})
+            attempts=[json.loads(svc.version("task",item)) for item in generation["attempt_evidence_hashes"]]
+            correction_evidence=json.loads(svc.version("task",generation["correction_evidence_hashes"][0]))
+            self.assertEqual(attempts[0]["status"],"correction_required")
+            self.assertEqual(attempts[1]["parent_attempt_id"],generation["attempt_evidence_hashes"][0])
+            self.assertEqual(correction_evidence["parent_attempt_id"],generation["attempt_evidence_hashes"][0])
+            self.assertEqual(correction_evidence["correction"]["missing_required_claims_by_slide"],correction["missing_required_claims_by_slide"])
+            self.assertEqual(sample["metadata"]["post_render_gate"]["generation_attempt_evidence_hashes"],generation["attempt_evidence_hashes"])
 
     def test_sample_claim_on_wrong_page_is_corrected_from_page_mapping(self):
         with tempfile.TemporaryDirectory() as root:
@@ -394,9 +461,12 @@ class P0GenerationRefactorTests(unittest.TestCase):
 
             self.assertEqual(len(builder.calls),2)
             self.assertEqual(builder.calls[1]["semantic_correction"]["reason"],"locked_theme_variable_override")
-            self.assertEqual(deck["metadata"]["locked_theme_generation_batches"],[{
+            batch=deck["metadata"]["locked_theme_generation_batches"][0]
+            self.assertEqual({key:batch[key] for key in ("slide_ids","attempts","retry_count","max_attempts")},{
                 "slide_ids":["slide-2","slide-3"],"attempts":2,"retry_count":1,"max_attempts":2,
-            }])
+            })
+            self.assertEqual(len(batch["attempt_evidence_hashes"]),2)
+            self.assertEqual(len(batch["correction_evidence_hashes"]),1)
 
     def test_persistent_deck_locked_theme_override_remains_fail_closed(self):
         with tempfile.TemporaryDirectory() as root:
