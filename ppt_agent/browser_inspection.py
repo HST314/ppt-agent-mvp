@@ -218,7 +218,18 @@ class ChromiumDeckInspector:
                     page.evaluate("document.fonts && document.fonts.ready")
                     slides = page.eval_on_selector_all(
                         ".slide",
-                        """slides => slides.map((slide, slideIndex) => {
+                        """slides => {
+                        const selectors = [];
+                        const collectRules = rules => {
+                            for (const rule of [...(rules || [])]) {
+                                if (rule.selectorText && rule.style && rule.style.length) selectors.push(rule.selectorText);
+                                if (rule.cssRules) collectRules(rule.cssRules);
+                            }
+                        };
+                        for (const sheet of [...document.styleSheets]) {
+                            try { collectRules(sheet.cssRules); } catch (_) { /* generated decks use same-origin inline CSS */ }
+                        }
+                        return slides.map((slide, slideIndex) => {
                             const rect = slide.getBoundingClientRect();
                             const visible = element => {
                                 const style = getComputedStyle(element);
@@ -339,6 +350,36 @@ class ChromiumDeckInspector:
                             const brokenImages = [...slide.querySelectorAll('img')]
                                 .filter(image => !image.complete || image.naturalWidth === 0)
                                 .map((image, index) => label(image, descendants.indexOf(image) >= 0 ? descendants.indexOf(image) : index));
+                            const classElements = [slide, ...slide.querySelectorAll('[class]')];
+                            const undefinedClasses = [];
+                            const seenClasses = new Set();
+                            const semanticClasses = new Set(['slide', 'light', 'dark', 'grey', 'accent', 'hero', 'split']);
+                            for (const element of classElements) {
+                                for (const className of [...element.classList]) {
+                                    if (seenClasses.has(className) || semanticClasses.has(className) || /^lucide(?:-|$)/.test(className)) continue;
+                                    seenClasses.add(className);
+                                    const token = `.${CSS.escape(className)}`;
+                                    const owners = [...slide.getElementsByClassName(className)];
+                                    if (slide.classList.contains(className)) owners.unshift(slide);
+                                    const defined = selectors.some(selector => {
+                                        if (!selector.includes(token)) return false;
+                                        return owners.some(owner => {
+                                            try { return owner.matches(selector); } catch (_) { return false; }
+                                        });
+                                    });
+                                    if (!defined) {
+                                        undefinedClasses.push({
+                                            class_name: className,
+                                            element_id: label(element, descendants.indexOf(element)),
+                                            selector: selectorFor(element),
+                                        });
+                                    }
+                                }
+                            }
+                            const layoutMeaningful = descendants.filter(element =>
+                                (element.innerText || '').trim() || element.matches('img,svg,canvas,table'));
+                            const contentTop = layoutMeaningful.length ? Math.min(...layoutMeaningful.map(element => element.getBoundingClientRect().top - rect.top)) : 0;
+                            const contentBottom = layoutMeaningful.length ? Math.max(...layoutMeaningful.map(element => element.getBoundingClientRect().bottom - rect.top)) : 0;
                             const ownText = element => [...element.childNodes].some(node => node.nodeType === Node.TEXT_NODE && (node.textContent || '').trim());
                             const meaningful = descendants.filter(element => {
                                 const box = element.getBoundingClientRect();
@@ -403,8 +444,18 @@ class ChromiumDeckInspector:
                                 balance_offset: balanceOffset,
                                 meaningful_element_count: meaningful.length,
                                 geometry_signature: geometrySignature,
+                                layout_validation: {
+                                    layout_id: slide.getAttribute('data-layout') || '',
+                                    css_rule_count: selectors.length,
+                                    used_class_count: seenClasses.size,
+                                    undefined_classes: undefinedClasses.slice(0, 20),
+                                    content_top: Math.round(contentTop),
+                                    content_bottom: Math.round(contentBottom),
+                                    active_height_ratio: rect.height ? Number(((contentBottom - contentTop) / rect.height).toFixed(4)) : 0,
+                                },
                             };
-                        })""",
+                        });
+                        }""",
                     )
                     screenshots = []
                     if capture_screenshots:
@@ -584,5 +635,20 @@ class ChromiumDeckInspector:
                     element_id=str(element_id),
                     evidence="image.complete=false 或 naturalWidth=0",
                     suggestion="检查冻结资源、媒体类型与图片内容",
+                ))
+            layout = slide.get("layout_validation") or {}
+            for item in layout.get("undefined_classes") or []:
+                issues.append(_issue(
+                    "undefined_layout_class",
+                    "页面使用了没有任何实际 CSS 规则命中的布局类",
+                    slide_id=slide_id,
+                    element_id=str(item.get("element_id") or item.get("class_name") or "layout"),
+                    evidence=(
+                        f"layout={layout.get('layout_id') or 'unregistered'}; "
+                        f"class=.{item.get('class_name')}; matched_css_rule=0; "
+                        f"active_height_ratio={float(layout.get('active_height_ratio') or 0):.4f}"
+                    ),
+                    suggestion="只使用锁定模板已定义的布局骨架和类名，或先在受控模板中补齐对应 CSS",
+                    selector=str(item.get("selector") or ""),
                 ))
         return issues

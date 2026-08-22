@@ -13,9 +13,13 @@ _DATE = re.compile(r"(?<!\d)(?:19|20)\d{2}\s*(?:[-/.年])\s*\d{1,2}(?:\s*(?:[-/.
 _QUARTER = re.compile(r"(?<!\d)(?:19|20)\d{2}\s*(?:年\s*)?(?:Q[1-4]|第[一二三四1234]季度)", re.I)
 _METRIC = re.compile(
     r"(?<![A-Za-z0-9])\d+(?:[\s,，]\d{3})*(?:\.\d+)?\s*"
-    r"(?:%|％|亿元|万元|百万\+?|亿\+?|万\+?|美元|人民币|元|个\s*工作日|工作日|"
+    # Longest, dimension-bearing forms come first.  In particular, ``万人``
+    # must never be truncated to the currency shorthand ``万``.
+    r"(?:%|％|(?:人民币)?亿元|(?:人民币)?万元|亿美元|万美元|亿元|万元|万人|万家|万条|万次|"
+    r"百万\+?|亿\+?|万\+?(?![元人家条次])|美元|人民币|元|个\s*工作日|工作日|"
     r"毫秒|秒|分钟|小时|天|周|个月|月|年|倍|[×xX]|条|次|人|家|业务线)(?![A-Za-z])"
 )
+_TRANSITION = re.compile(r"(?<![A-Za-z0-9])\d+(?:\.\d+)?\s*(?:→|⇒|->|至)\s*\d+(?:\.\d+)?(?:\s*[%％])?(?![A-Za-z0-9])")
 _FREQUENCY = re.compile(r"(?:7\s*[×xX]\s*24|每(?:周|月|季度|年)|双周|会后\s*[一二三四五六七八九十两\d]+\s*(?:天|周|个工作日))")
 _LEGAL = re.compile(r"(?:符合|遵守|满足)《[^》]{2,60}》")
 _ORG = re.compile(r"(?:由|包含|组建|覆盖)[^。；;\n]{0,50}(?:法务|财务|运维|合规)[^。；;\n]{0,30}(?:代表|团队|小组|部门)")
@@ -31,19 +35,33 @@ def _canonical(value: Any) -> bytes:
 
 
 def _normalized(value: str) -> str:
+    normalized = re.sub(r"[\s,，]", "", value).replace("％", "%").casefold()
+    normalized = normalized.replace("⇒", "→").replace("->", "→").replace("至", "→")
+    # Chinese budget copy routinely alternates between ``24万`` and
+    # ``24万元``.  They are the same RMB magnitude; dimension-bearing forms
+    # such as ``24万人`` remain distinct and therefore fail closed.
+    normalized = re.sub(r"(?<=\d)人民币万元$", "万", normalized)
+    normalized = re.sub(r"(?<=\d)万元$", "万", normalized)
+    normalized = re.sub(r"(?<=\d)人民币亿元$", "亿", normalized)
+    normalized = re.sub(r"(?<=\d)亿元$", "亿", normalized)
+    return normalized
+
+
+def _legacy_normalized(value: str) -> str:
+    """The persisted v1 spelling before semantic currency normalization."""
     return re.sub(r"[\s,，]", "", value).replace("％", "%").casefold()
 
 
 def _kind(pattern: re.Pattern[str]) -> str:
     return {
-        _DATE: "date", _QUARTER: "quarter", _METRIC: "metric", _FREQUENCY: "frequency",
+        _DATE: "date", _QUARTER: "quarter", _METRIC: "metric", _TRANSITION: "metric_transition", _FREQUENCY: "frequency",
         _LEGAL: "legal_commitment", _ORG: "organization_commitment",
     }[pattern]
 
 
 def _occurrences(text: str) -> list[dict[str, Any]]:
     found = []
-    for pattern in (_DATE, _QUARTER, _METRIC, _FREQUENCY, _LEGAL, _ORG):
+    for pattern in (_DATE, _QUARTER, _TRANSITION, _METRIC, _FREQUENCY, _LEGAL, _ORG):
         for match in pattern.finditer(text):
             found.append({
                 "kind": _kind(pattern),
@@ -113,7 +131,7 @@ def validate_claim_ledger(ledger: dict[str, Any]) -> dict[str, Any]:
         expected_claim_id = f"claim-{hashlib.sha256(identity.encode()).hexdigest()[:20]}"
         if (
             claim["claim_id"] != expected_claim_id
-            or claim["normalized_value"] != _normalized(claim["value"])
+            or claim["normalized_value"] not in {_normalized(claim["value"]), _legacy_normalized(claim["value"])}
             or not re.fullmatch(r"[0-9a-f]{64}", claim["source_hash"])
             or claim["source_path"] != "frozen_input"
         ):
@@ -145,9 +163,20 @@ def _derived_binding(text: str, occurrence: dict[str, Any], known: dict[str, dic
     return None
 
 
-def audit_claims(text: str, ledger: dict[str, Any]) -> dict[str, Any]:
+def audit_claims(
+    text: str,
+    ledger: dict[str, Any],
+    *,
+    required_claim_ids: list[str] | tuple[str, ...] | set[str] | None = None,
+) -> dict[str, Any]:
     validate_claim_ledger(ledger)
-    known = {claim["normalized_value"]: claim for claim in ledger["claims"]}
+    # Recompute the semantic key from the immutable display value so ledgers
+    # persisted before the currency-equivalence fix remain readable.
+    known = {_normalized(claim["value"]): claim for claim in ledger["claims"]}
+    known_ids = {claim["claim_id"] for claim in ledger["claims"]}
+    required = set(required_claim_ids or ())
+    if not required.issubset(known_ids):
+        raise ValidationError("Claim Ledger required_claim_ids 包含未知 claim")
     bindings, unbound = [], []
     for occurrence in _occurrences(text):
         context = text[max(0, occurrence["start"] - 32): min(len(text), occurrence["end"] + 32)]
@@ -163,12 +192,25 @@ def audit_claims(text: str, ledger: dict[str, Any]) -> dict[str, Any]:
             bindings.append({**occurrence, **derived})
             continue
         unbound.append(occurrence)
+    covered_ids = {
+        claim_id
+        for binding in bindings
+        for claim_id in binding.get("source_claim_ids", [])
+        if claim_id in known_ids
+    }
+    missing = [claim for claim in ledger["claims"] if claim["claim_id"] in required - covered_ids]
     return {
-        "passed": not unbound,
+        "passed": not unbound and not missing,
         "bindings": bindings,
         "unbound": unbound,
         "binding_count": len(bindings),
         "unbound_count": len(unbound),
+        "required_claim_ids": sorted(required),
+        "required_count": len(required),
+        "covered_required_claim_ids": sorted(required & covered_ids),
+        "covered_required_count": len(required & covered_ids),
+        "missing_required": missing,
+        "missing_required_count": len(missing),
         "text_hash": hashlib.sha256(text.encode()).hexdigest(),
     }
 
@@ -208,16 +250,25 @@ class _VisibleText(HTMLParser):
             self.text.append(re.sub(r"\s+", " ", data).strip())
 
 
-def audit_html_claims(html_text: str, ledger: dict[str, Any]) -> dict[str, Any]:
+def audit_html_claims(
+    html_text: str,
+    ledger: dict[str, Any],
+    *,
+    required_claim_ids: list[str] | tuple[str, ...] | set[str] | None = None,
+) -> dict[str, Any]:
     parser = _VisibleText()
     parser.feed(html_text)
     parser.close()
-    return audit_claims("\n".join(parser.text), ledger)
+    return audit_claims("\n".join(parser.text), ledger, required_claim_ids=required_claim_ids)
 
 
-def assert_claims_bound(text: str, ledger: dict[str, Any], stage: str) -> dict[str, Any]:
-    result = audit_claims(text, ledger)
+def assert_claims_bound(text: str, ledger: dict[str, Any], stage: str, *, require_all: bool = False) -> dict[str, Any]:
+    required = [claim["claim_id"] for claim in ledger["claims"]] if require_all else None
+    result = audit_claims(text, ledger, required_claim_ids=required)
     if result["unbound"]:
         values = "、".join(item["value"] for item in result["unbound"][:5])
         raise ValidationError(f"{stage} 包含未绑定事实：{values}")
+    if result["missing_required"]:
+        values = "、".join(item["value"] for item in result["missing_required"][:5])
+        raise ValidationError(f"{stage} 遗漏必需事实：{values}")
     return result

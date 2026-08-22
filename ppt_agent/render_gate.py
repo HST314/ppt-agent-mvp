@@ -12,7 +12,7 @@ from .errors import ValidationError
 
 
 _OVERFLOW_CODES = {"content_out_of_bounds", "element_scroll_overflow", "canvas_size", "slide_sequence_mismatch"}
-_HARD_BROWSER_CODES = _OVERFLOW_CODES | {"render_unavailable", "invalid_measurement", "empty_slide", "broken_image", "missing_title", "title_too_small", "text_too_small"}
+_HARD_BROWSER_CODES = _OVERFLOW_CODES | {"render_unavailable", "invalid_measurement", "empty_slide", "broken_image", "missing_title", "title_too_small", "text_too_small", "undefined_layout_class"}
 
 
 def canonical_post_render_evidence(evidence: dict[str, Any]) -> bytes:
@@ -129,12 +129,14 @@ def run_post_render_gate(
     contract_hash: str,
     claim_ledger: dict[str, Any],
     claim_ledger_hash: str,
+    required_claim_ids: list[str] | tuple[str, ...] | set[str] | None = None,
     browser_inspector=None,
     overflow_autofit: dict[str, Any] | None = None,
+    canonical_validation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     validate_claim_ledger(claim_ledger)
     structure = inspect_contract(html_text, expected_slide_ids, contract, contract_hash)
-    claims = audit_html_claims(html_text, claim_ledger)
+    claims = audit_html_claims(html_text, claim_ledger, required_claim_ids=required_claim_ids)
     browser = None
     browser_blockers = []
     if browser_inspector is not None:
@@ -152,6 +154,14 @@ def run_post_render_gate(
         *[{
             "source": "claim_ledger", "code": "unbound_claim", "evidence": item["value"],
         } for item in claims["unbound"]],
+        *[{
+            "source": "claim_ledger", "code": "missing_required_claim", "evidence": item["value"],
+        } for item in claims["missing_required"]],
+        *([] if canonical_validation is None or canonical_validation.get("passed") else [{
+            "source": "canonical_validator",
+            "code": "canonical_validation_failed",
+            "evidence": "; ".join(canonical_validation.get("errors", [])[:5]) or "canonical validator 未通过",
+        }]),
         *[{"source": "chromium", **item} for item in browser_blockers],
     ]
     overflow = [item for item in browser_blockers if item.get("code") in _OVERFLOW_CODES]
@@ -185,8 +195,14 @@ def run_post_render_gate(
             "binding_count": claims["binding_count"],
             "unbound_count": claims["unbound_count"],
             "unbound": claims["unbound"],
+            "required_count": claims["required_count"],
+            "covered_required_count": claims["covered_required_count"],
+            "covered_required_claim_ids": claims["covered_required_claim_ids"],
+            "missing_required_count": claims["missing_required_count"],
+            "missing_required": claims["missing_required"],
             "text_hash": claims["text_hash"],
         },
+        "canonical_validator": canonical_validation,
         "geometry": {
             "available": browser is not None and bool(browser.get("available")),
             "passed": None if browser is None else bool(browser.get("passed")) and not browser_blockers,

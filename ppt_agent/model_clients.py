@@ -138,6 +138,7 @@ class OpenAIResponsesClient:
 
         use_format = bool(response_schema) and self.structured_output != "prompt" and not self._text_format_unsupported
         empty_attempts = 0
+        empty_shapes: list[dict[str, Any]] = []
         timeout_attempts = 0
         budget = provider_call_budget
         if budget is None and provider_call_limit is not None:
@@ -209,7 +210,7 @@ class OpenAIResponsesClient:
                 if self._client is None:
                     request_client.close()
             checkpoint()
-            text = getattr(response, "output_text", None)
+            text = self._response_text(response)
             calls = []
             for item in getattr(response, "output", ()) or ():
                 if getattr(item, "type", None) == "function_call":
@@ -221,14 +222,56 @@ class OpenAIResponsesClient:
                 # 端点偶发返回空响应（请求已被完整处理、服务端无副作用），在同一
                 # 调用内有界重试；仍为空才判失败。
                 empty_attempts += 1
+                empty_shapes.append(self._response_shape(response))
                 if empty_attempts <= 2:
                     continue
                 raise GatewayError(
                     "模型响应缺少文本结果",
-                    audit_details={"category": "empty_response", "retryable": False},
+                    audit_details={
+                        "category": "empty_response",
+                        "retryable": False,
+                        "attempts": empty_attempts,
+                        "response_shapes": empty_shapes,
+                    },
                 )
             response_id = getattr(response, "id", None)
             return ModelTurn(text=text if isinstance(text, str) else None, response_id=response_id if isinstance(response_id, str) else None, tool_calls=tuple(calls))
+
+    @staticmethod
+    def _field(value: Any, name: str, default=None):
+        return value.get(name, default) if isinstance(value, dict) else getattr(value, name, default)
+
+    @classmethod
+    def _response_text(cls, response: Any) -> str | None:
+        """Normalize SDK response shapes without treating tool output as text."""
+        direct = cls._field(response, "output_text")
+        if isinstance(direct, str) and direct.strip():
+            return direct
+        pieces: list[str] = []
+        for item in cls._field(response, "output", ()) or ():
+            if cls._field(item, "type") != "message":
+                continue
+            for part in cls._field(item, "content", ()) or ():
+                if cls._field(part, "type") not in {"output_text", "text"}:
+                    continue
+                value = cls._field(part, "text")
+                if not isinstance(value, str):
+                    value = cls._field(value, "value")
+                if isinstance(value, str) and value.strip():
+                    pieces.append(value)
+        return "\n".join(pieces) if pieces else direct if isinstance(direct, str) else None
+
+    @classmethod
+    def _response_shape(cls, response: Any) -> dict[str, Any]:
+        details = cls._field(response, "incomplete_details")
+        return {
+            "status": str(cls._field(response, "status") or "unknown")[:64],
+            "incomplete_reason": str(cls._field(details, "reason") or "")[:64],
+            "output_item_types": [
+                str(cls._field(item, "type") or "unknown")[:64]
+                for item in (cls._field(response, "output", ()) or ())
+            ][:16],
+        }
 
     @staticmethod
     def _request_id_hash(exc: Exception) -> str | None:

@@ -63,6 +63,12 @@ def main() -> int:
             "overflow_count": gate["geometry"]["overflow_count"],
             "layout_registration_percent": gate["layout"]["layout_registration_percent"],
             "unbound_count": gate["claims"]["unbound_count"],
+            "missing_required_count": gate["claims"]["missing_required_count"],
+            "required_claim_coverage_percent": round(
+                gate["claims"]["covered_required_count"] * 100 / gate["claims"]["required_count"], 2
+            ) if gate["claims"]["required_count"] else 100,
+            "canonical_validator_passed": gate["canonical_validator"]["passed"],
+            "canonical_validator_hash": gate["canonical_validator"]["script_hash"],
             "browser_available": gate["geometry"]["available"],
             "browser_engine": gate["geometry"]["engine"],
             "browser_engine_version": gate["geometry"]["engine_version"],
@@ -85,6 +91,9 @@ def main() -> int:
             "overflow_count": 0,
             "layout_registration_percent": 100,
             "unbound_count": 0,
+            "missing_required_count": 0,
+            "required_claim_coverage_percent": 100,
+            "canonical_validator_passed": True,
             "browser_available": True,
             "browser_engine": "chromium",
             "style_id": "swiss",

@@ -11,7 +11,7 @@ from .errors import ValidationError
 class SkillRuntime:
     """Read-only, quota-bound view of a locked standard Skill directory."""
 
-    TEXT_SUFFIXES = {".md", ".html", ".js", ".css", ".json", ".txt"}
+    TEXT_SUFFIXES = {".md", ".html", ".js", ".mjs", ".css", ".json", ".txt"}
     STAGE_FILES = {
         "narrative": frozenset({"references/planning-summary.md"}),
         "outline": frozenset({"references/planning-summary.md"}),
@@ -75,7 +75,7 @@ class SkillRuntime:
         return resolved
 
     def _allowed(self, name: str) -> bool:
-        return name == "SKILL.md" or name.startswith("references/") or name.startswith("assets/")
+        return name == "SKILL.md" or name.startswith("references/") or name.startswith("assets/") or name.startswith("scripts/")
 
     def files_for_stage(self, stage: str) -> frozenset[str] | None:
         """Return a least-privilege file view for planning/checking stages.

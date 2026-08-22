@@ -227,5 +227,38 @@ class EmptyResponseRetryTests(unittest.TestCase):
         turn=OpenAIResponsesClient(cfg,sdk_client=sdk).create(input="x")
         self.assertEqual(len(turn.tool_calls),1); self.assertEqual(sdk.calls,1)
 
+    def test_message_content_text_is_normalized_when_output_text_is_empty(self):
+        cfg=self.config()
+        message=SimpleNamespace(
+            output_text="",
+            id="r-message",
+            output=[SimpleNamespace(type="message", content=[SimpleNamespace(type="output_text", text="recovered")])],
+        )
+        sdk=self.SequenceSDK([message])
+
+        turn=OpenAIResponsesClient(cfg,sdk_client=sdk).create(input="x")
+
+        self.assertEqual(turn.text,"recovered")
+        self.assertEqual(sdk.calls,1)
+
+    def test_persistent_truncated_empty_response_records_safe_shapes(self):
+        cfg=self.config()
+        empty=lambda: SimpleNamespace(
+            output_text="",
+            id="secret-provider-id",
+            status="incomplete",
+            incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+            output=[],
+        )
+        sdk=self.SequenceSDK([empty(),empty(),empty()])
+
+        with self.assertRaises(GatewayError) as caught:
+            OpenAIResponsesClient(cfg,sdk_client=sdk).create(input="x")
+
+        details=caught.exception.audit_details
+        self.assertEqual(details["attempts"],3)
+        self.assertEqual(details["response_shapes"][-1]["incomplete_reason"],"max_output_tokens")
+        self.assertNotIn("secret-provider-id",str(details))
+
 
 if __name__ == "__main__": unittest.main()

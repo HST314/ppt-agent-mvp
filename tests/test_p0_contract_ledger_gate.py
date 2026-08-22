@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from ppt_agent.canonical_validator import run_canonical_validator
 from ppt_agent.claim_ledger import assert_claims_bound, audit_claims, audit_html_claims, build_claim_ledger
 from ppt_agent.design_contract import TemplateRegistry
 from ppt_agent.errors import ConflictError, ValidationError
@@ -67,6 +68,16 @@ class AutofitGenerationBrowser(OverflowGenerationBrowser):
         return PassingGenerationBrowser.inspect(self, _html, expected_slide_ids)
 
 
+class ClaimDroppingBuilder:
+    def build(self, _outline, **context):
+        sections = [
+            f'<section class="slide" id="{slide_id}" data-slide-id="{slide_id}">'
+            f'<h2 data-element-id="title">{slide_id}</h2><p data-element-id="body">无数字摘要</p></section>'
+            for slide_id in context["slide_ids"]
+        ]
+        return "<!doctype html><html><head><meta charset=\"utf-8\"></head><body>" + "".join(sections) + "</body></html>"
+
+
 class ContractLedgerGateTests(unittest.TestCase):
     def _service(self, root, browser=None):
         return TaskService(
@@ -120,6 +131,45 @@ class ContractLedgerGateTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             assert_claims_bound("预计 7 个月回本。", ledger, "叙事")
 
+    def test_currency_scale_equivalence_does_not_merge_other_dimensions(self):
+        ledger = build_claim_ledger(
+            task_id="task",
+            input_snapshot_hash="a" * 64,
+            source_binding={"known_facts": ["软件预算 24万", "覆盖客户 24万人"]},
+            created_at=now(),
+        )
+
+        result = audit_claims("软件预算 24 万元，覆盖客户 24万人。", ledger)
+
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["unbound_count"], 0)
+        with self.assertRaisesRegex(ValidationError, "未绑定事实"):
+            assert_claims_bound("覆盖客户 24万元。", build_claim_ledger(
+                task_id="people",
+                input_snapshot_hash="b" * 64,
+                source_binding={"known_facts": ["覆盖客户 24万人"]},
+                created_at=now(),
+            ), "大纲")
+
+    def test_required_claim_coverage_is_bidirectional_and_reports_omissions(self):
+        ledger = build_claim_ledger(
+            task_id="task",
+            input_snapshot_hash="a" * 64,
+            source_binding={"known_facts": ["响应时间下降 42%", "满意度 4.2 → 4.6"]},
+            created_at=now(),
+        )
+        required = [claim["claim_id"] for claim in ledger["claims"]]
+
+        missing = audit_claims("响应时间下降 42%。", ledger, required_claim_ids=required)
+
+        self.assertFalse(missing["passed"])
+        self.assertEqual(missing["unbound_count"], 0)
+        self.assertEqual(missing["missing_required_count"], 1)
+        self.assertEqual(missing["missing_required"][0]["normalized_value"], "4.2→4.6")
+        complete = audit_claims("响应时间下降 42%，满意度 4.2→4.6。", ledger, required_claim_ids=required)
+        self.assertTrue(complete["passed"])
+        self.assertEqual(complete["covered_required_count"], 2)
+
     def test_standard_head_meta_and_body_void_tags_do_not_hide_claim_text(self):
         ledger = build_claim_ledger(
             task_id="task",
@@ -148,7 +198,22 @@ class ContractLedgerGateTests(unittest.TestCase):
         self.assertFalse(result["passed"])
         self.assertEqual(result["binding_count"], 4)
         self.assertEqual(result["unbound_count"], 1)
-        self.assertEqual(result["unbound"][0]["normalized_value"], "80万元")
+        self.assertEqual(result["unbound"][0]["normalized_value"], "80万")
+
+    def test_hash_locked_canonical_validator_accepts_registered_and_rejects_missing_layout(self):
+        valid = run_canonical_validator(
+            '<!doctype html><html><body><section class="slide" data-layout="S01"><h1>标题</h1></section></body></html>',
+            "swiss",
+        )
+        invalid = run_canonical_validator(
+            '<!doctype html><html><body><section class="slide"><h1>标题</h1></section></body></html>',
+            "swiss",
+        )
+
+        self.assertTrue(valid["passed"], valid)
+        self.assertRegex(valid["script_hash"], r"^[0-9a-f]{64}$")
+        self.assertFalse(invalid["passed"])
+        self.assertIn("missing data-layout", " ".join(invalid["errors"]))
 
     def test_contract_and_ledger_hashes_survive_every_delivery_stage(self):
         with tempfile.TemporaryDirectory() as root:
@@ -311,6 +376,39 @@ class ContractLedgerGateTests(unittest.TestCase):
                 service.generate_sample("task")
 
             self.assertFalse(service.versions("task", "sample"))
+
+    def test_missing_required_claim_blocks_deck_before_artifact_commit(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root)
+            self._to_outline(service)
+            service.select_samples("task", ["slide-1", "slide-3"])
+            service.generate_sample("task")
+            service.confirm_sample("task")
+            service.builder = ClaimDroppingBuilder()
+
+            with self.assertRaisesRegex(ValidationError, "missing_required_claim"):
+                service.generate_deck("task")
+
+            self.assertFalse(service.versions("task", "deck"))
+            failure = next(item for item in service.versions("task", "post-render-gate-evidence") if item["metadata"]["passed"] is False)
+            evidence = json.loads(service.version("task", failure["hash"]))
+            self.assertGreater(evidence["claims"]["missing_required_count"], 0)
+            self.assertEqual(evidence["claims"]["unbound_count"], 0)
+
+    def test_stale_automatic_sample_selection_is_refreshed_on_generation(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root)
+            self._to_outline(service)
+            first = service.select_samples("task")["selection"]
+            outline = service.planning_view("task")["outline"]["markdown"]
+            service.edit_outline("task", outline + "\n<!-- clarify copy -->\n")
+            service.confirm_outline("task")
+
+            generated = service.generate_sample("task")
+
+            self.assertNotEqual(generated["selection"]["hash"], first["hash"])
+            self.assertEqual(generated["selection"]["outline_hash"], generated["outline_hash"])
+            self.assertEqual(generated["selection"]["metadata"]["strategy"], "representative-diversity-v1")
 
     def test_failed_gate_persists_evidence_with_blocker_diagnostics(self):
         with tempfile.TemporaryDirectory() as root:

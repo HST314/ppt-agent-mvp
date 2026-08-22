@@ -2,7 +2,7 @@ import unittest
 from unittest import mock
 
 from ppt_agent.browser_inspection import ChromiumDeckInspector
-from ppt_agent.p4 import assemble_locked_template, render, validate_html
+from ppt_agent.p4 import assemble_locked_template, locked_template, render, validate_html
 
 
 class P0HybridInspectionBrowserGate(unittest.TestCase):
@@ -120,6 +120,24 @@ class P0HybridInspectionBrowserGate(unittest.TestCase):
         self.assertTrue({"excessive_whitespace", "visual_imbalance", "repetitive_layout", "flat_theme_rhythm"}.issubset(codes))
         self.assertTrue(all(item["severity"] == "warning" for item in evidence["issues"]))
         self.assertTrue(evidence["passed"], "advisory warnings must not fail the technical hard gate")
+
+    def test_undefined_layout_class_is_blocked_from_real_cssom_evidence(self):
+        fragment = (
+            '<section class="slide light" id="slide-1" data-slide-id="slide-1" data-layout="S11">'
+            '<h1 data-element-id="title">真实 CSSOM 门禁</h1>'
+            '<div class="pipeline-section"><div class="pipeline">阶段一</div></div>'
+            '</section>'
+        )
+        html = f'<!doctype html><html><head><style>{locked_template("swiss")["style"]}</style></head><body>{fragment}</body></html>'
+        validate_html(html, ["slide-1"])
+
+        evidence = ChromiumDeckInspector().inspect(html, ["slide-1"])
+
+        self.assertTrue(evidence["available"])
+        self.assertFalse(evidence["passed"])
+        undefined = {item["evidence"] for item in evidence["issues"] if item["code"] == "undefined_layout_class"}
+        self.assertTrue(any("class=.pipeline-section" in item for item in undefined), evidence["issues"])
+        self.assertTrue(any("matched_css_rule=0" in item for item in undefined))
 
 
 if __name__ == "__main__":

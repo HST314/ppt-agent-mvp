@@ -5,7 +5,8 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 from .config import ClarificationConfig
-from .claim_ledger import assert_claims_bound, audit_html_claims, build_claim_ledger, validate_claim_ledger
+from .claim_ledger import assert_claims_bound, audit_claims, audit_html_claims, build_claim_ledger, validate_claim_ledger
+from .canonical_validator import run_canonical_validator
 from .content_inspection import inspect_content_quality
 from .design_contract import build_design_contract, scope_design_contract, validate_design_contract
 from .diagnostics import log_exception_chain
@@ -804,12 +805,41 @@ class TaskService:
         if inspector is None: return None
         enabled=getattr(inspector,"enforce_on_generation",type(inspector).__name__=="ChromiumDeckInspector")
         return inspector if enabled else None
+    def _required_claim_ids(self,task_id,slide_ids,contract,ledger):
+        all_slide_ids=[item["slide_id"] for item in contract["slide_contracts"]]
+        all_claim_ids=[item["claim_id"] for item in ledger["claims"]]
+        if list(slide_ids)==all_slide_ids:
+            return all_claim_ids
+        outline_hash=self._current_version(task_id,"outline")
+        if not outline_hash:
+            raise ConflictError("须先冻结逐页大纲再计算必需事实覆盖")
+        outline=json.loads(self.version(task_id,outline_hash))
+        _,blocks=parse_outline(outline["markdown"],self.input_view(task_id)["manifest"].get("resources",[]),None)
+        if any(slide_id not in blocks for slide_id in slide_ids):
+            raise ConflictError("样品页面不属于当前逐页大纲")
+        record=next((item for item in self.versions(task_id,"outline") if item["hash"]==outline_hash),None)
+        persisted_mapping=(record or {}).get("metadata",{}).get("required_claim_ids_by_slide")
+        if isinstance(persisted_mapping,dict) and all(isinstance(persisted_mapping.get(slide_id),list) for slide_id in slide_ids):
+            known={claim["claim_id"] for claim in ledger["claims"]}
+            scoped={claim_id for slide_id in slide_ids for claim_id in persisted_mapping[slide_id]}
+            if not scoped.issubset(known):
+                raise ConflictError("逐页大纲的 required claim 映射与当前 Claim Ledger 不一致")
+            return sorted(scoped)
+        scoped="\n\n".join(blocks[slide_id] for slide_id in slide_ids)
+        coverage=audit_claims(scoped,{key:value for key,value in ledger.items() if key!="hash"})
+        return sorted({
+            claim_id
+            for binding in coverage["bindings"]
+            for claim_id in binding.get("source_claim_ids",[])
+        })
     def _post_render_gate(self,task_id,html_text,slide_ids,contract,ledger,assets):
         contract_hash=contract["hash"]; ledger_hash=ledger["hash"]
         contract_value={key:value for key,value in contract.items() if key!="hash"}
         ledger_value={key:value for key,value in ledger.items() if key!="hash"}
+        required_claim_ids=self._required_claim_ids(task_id,slide_ids,contract,ledger)
         html_text=apply_design_contract(html_text,contract_value,contract_hash)
         html_text=validate_html(html_text,slide_ids,assets)
+        canonical_validation=run_canonical_validator(html_text,contract_value["style_id"])
         browser=self._generation_browser_gate()
         first=run_post_render_gate(
             html_text,
@@ -818,13 +848,16 @@ class TaskService:
             contract_hash=contract_hash,
             claim_ledger=ledger_value,
             claim_ledger_hash=ledger_hash,
+            required_claim_ids=required_claim_ids,
             browser_inspector=browser,
+            canonical_validation=canonical_validation,
         )
         autofit=None
         if browser is not None and first["geometry"]["overflow_count"]:
             fitted=fit_deck_html(html_text,max_rounds=MAX_CASCADE_ROUNDS)
             if fitted.get("available") and fitted.get("rules"):
                 html_text=validate_html(fitted["html"],slide_ids,assets)
+                canonical_validation=run_canonical_validator(html_text,contract_value["style_id"])
                 autofit={
                     "rules":fitted["rules"],"rounds":fitted["rounds"],
                     "converged":fitted["converged"],"remaining":fitted["remaining"],
@@ -836,8 +869,10 @@ class TaskService:
             contract_hash=contract_hash,
             claim_ledger=ledger_value,
             claim_ledger_hash=ledger_hash,
+            required_claim_ids=required_claim_ids,
             browser_inspector=browser,
             overflow_autofit=autofit,
+            canonical_validation=canonical_validation,
         )
         # Persist pass AND failure evidence.  Failed diagnostics carry the
         # slide / selector / scroll-client geometry of every blocker and must
@@ -947,7 +982,7 @@ class TaskService:
                             text=normalize_outline_markdown(generated["text"],resources,count)
                         else:
                             raise ValidationError("大纲生成响应必须包含 slides 或兼容 text")
-                        assert_claims_bound(text,ledger_value,"大纲")
+                        assert_claims_bound(text,ledger_value,"大纲",require_all=True)
                         break
                     except ValidationError as exc:
                         self.store.put_version(task_id,"outline-diagnostic",canonical({"attempt":attempt,"candidate":generated}),{
@@ -962,13 +997,21 @@ class TaskService:
         self._require_actionable(task_id)
         view=self._p3_input(task_id); expected=requested_slide_count(view["task_card"])
         markdown=normalize_outline_markdown(markdown,view["manifest"].get("resources",[]),expected)
-        ledger=view["claim_ledger"]; claim_bindings=assert_claims_bound(markdown,{key:value for key,value in ledger.items() if key!="hash"},"大纲")
+        ledger=view["claim_ledger"]; ledger_value={key:value for key,value in ledger.items() if key!="hash"}; claim_bindings=assert_claims_bound(markdown,ledger_value,"大纲",require_all=True)
         slide_ids,blocks=parse_outline(markdown,view["manifest"].get("resources",[]),expected)
+        required_claim_ids_by_slide={
+            slide_id:sorted({
+                claim_id
+                for binding in audit_claims(block,ledger_value)["bindings"]
+                for claim_id in binding.get("source_claim_ids",[])
+            })
+            for slide_id,block in blocks.items()
+        }
         prior=self._current_version(task_id,"outline"); before={}
         if prior: _,before=parse_outline(json.loads(self.version(task_id,prior))["markdown"],view["manifest"].get("resources",[]),None)
         affected=changed_slide_ids(before,blocks); version=len(self.versions(task_id,"outline"))+1; content_hash=digest(markdown.encode())
         model=SlideOutline.parse({"outline_id":f"outline-{content_hash[:16]}","task_id":task_id,"version":version,"markdown":markdown,"slide_ids":slide_ids,"content_hash":content_hash,"created_at":now(),"schema_version":"1.0"})
-        meta={"parent":prior,"action":"generate" if not prior else "edit","summary":summary,"affected":affected,"unchanged":[sid for sid in blocks if sid in before and blocks[sid]==before[sid]],"authoritative":True,"invalidated":{"sample":affected,"deck":affected},"claim_ledger_hash":ledger["hash"],"claim_bindings":claim_bindings["bindings"],"unbound_claim_count":0}
+        meta={"parent":prior,"action":"generate" if not prior else "edit","summary":summary,"affected":affected,"unchanged":[sid for sid in blocks if sid in before and blocks[sid]==before[sid]],"authoritative":True,"invalidated":{"sample":affected,"deck":affected},"claim_ledger_hash":ledger["hash"],"claim_bindings":claim_bindings["bindings"],"unbound_claim_count":0,"required_claim_ids":claim_bindings["required_claim_ids"],"required_claim_ids_by_slide":required_claim_ids_by_slide}
         if skill: meta["skill"]={"action":"outline","version":skill["version"],"hash":digest(skill["content"].encode()),"included":["outline"],"trimmed":["narrative","html","inspection"]}
         h=self._record_p3(task_id,"outline",model,meta,"outline_generate" if not prior else "outline_edit",actor)
         self._invalidate_outline_confirmation(task_id,h)
@@ -1077,9 +1120,20 @@ class TaskService:
         view=self.sample_view(task_id)
         if view["state"]["stage"]!="sample": raise ConflictError("当前样品阶段已完成；历史样品只读")
         selection=view["selection"]
-        if not selection: view=self.select_samples(task_id); selection=view["selection"]
+        if not selection:
+            view=self.select_samples(task_id); selection=view["selection"]
         outline=self._current_version(task_id,"outline")
-        if selection["outline_hash"] != outline: raise ConflictError("样品选择已因大纲变化而失效")
+        if selection["outline_hash"] != outline:
+            if selection.get("metadata",{}).get("strategy")=="representative-diversity-v1":
+                # An automatic selection has no user-authored intent to
+                # preserve.  Refresh it against the newly confirmed outline in
+                # the same command so the UI cannot enqueue a guaranteed 0 ms
+                # conflict after an outline edit.  Explicit user selections
+                # remain fail-closed and require reconfirmation.
+                view=self.select_samples(task_id,count=len(selection["slide_ids"]))
+                selection=view["selection"]
+            else:
+                raise ConflictError("用户样品选择已因大纲变化而失效，请重新选择页面")
         data=json.loads(self.version(task_id,outline)); rules=[]; assets=controlled_assets(self.input_view(task_id)["manifest"],self.store.resource_root(task_id))
         contract,ledger=self._generation_contracts(task_id,outline)
         contract_value={key:value for key,value in contract.items() if key!="hash"}
@@ -1881,6 +1935,9 @@ class TaskService:
             and gate.get("blocker_count")==0
             and gate.get("layout",{}).get("layout_registration_percent")==100
             and gate.get("claims",{}).get("unbound_count")==0
+            and gate.get("claims",{}).get("missing_required_count")==0
+            and gate.get("claims",{}).get("covered_required_count")==gate.get("claims",{}).get("required_count")
+            and gate.get("canonical_validator",{}).get("passed") is True
             and gate.get("geometry",{}).get("overflow_count")==0
         )
         if not valid: raise ConflictError("当前全稿未通过 DesignContract、Claim Ledger 与渲染后硬门禁")
@@ -1998,6 +2055,10 @@ class TaskService:
         # stay idempotent and never re-evaluate the gate.
         delivery_gate=None
         if not existing_delivery:
+            canonical_validation=run_canonical_validator(current["html"],generation["design_contract"]["style_id"])
+            if not canonical_validation.get("passed"):
+                summary="；".join(canonical_validation.get("errors",[])[:5]) or "canonical validator 未通过"
+                raise ConflictError(f"当前终稿未通过交付前 canonical validator：{summary}")
             delivery_gate=self.assert_delivery_gate(task_id)
         inspection_report=None if delivery_gate is None else delivery_gate["inspection_report"]
         inspection_evidence_hashes=[] if delivery_gate is None else delivery_gate["inspection_evidence"]["artifact_hashes"]

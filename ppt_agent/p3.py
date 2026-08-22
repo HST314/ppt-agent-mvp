@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 
 from .errors import ValidationError
@@ -47,6 +48,13 @@ def outline_markdown(card, resources, count=None):
             blocks.append(f"- 视觉资源：![{item.get('description') or sid}]({item['uri']})")
         else:
             blocks.append("- 视觉资源：待补资源位（可无图片生成）")
+        if index == min(1, count - 1) and card.get("constraints"):
+            # The deterministic fallback must preserve the same required-claim
+            # coverage contract as the model path.  Keeping confirmed source
+            # facts in one auditable outline block also lets sample selection
+            # derive the exact subset it must render.
+            facts = json.dumps(card["constraints"], ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            blocks.append(f"- 已确认输入事实：{facts}")
         blocks.append("")
     return "\n".join(blocks)
 
