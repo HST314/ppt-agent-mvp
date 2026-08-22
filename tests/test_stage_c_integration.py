@@ -169,18 +169,97 @@ class StageCIntegrationTests(unittest.TestCase):
             ])
             self.assertIn("逐字写入正文",correction["rule"])
 
-    def test_persistently_paraphrased_frozen_context_remains_fail_closed(self):
+    def test_long_topic_is_materialized_verbatim_after_bounded_correction(self):
         with tempfile.TemporaryDirectory() as root:
-            compact=narrative_response(goal="扩容决策",audience="管理层",topic="AI客服试点")
+            topic="AI 客服助手试点成效、扩容计划、预算、风险与管理层决策"
+            compact=narrative_response(goal="扩容决策",audience="管理层",topic="AI 客服助手扩容决策")
             client=ScriptedClient(compact,compact)
             svc=service(root,client); svc.create("task","manual")
-            svc.import_input("task",{"goal":"扩容决策","audience":"管理层","topic":"AI 客服试点"})
+            svc.import_input("task",{"goal":"扩容决策","audience":"管理层","topic":topic})
 
-            with self.assertRaisesRegex(ValidationError,"最低语义/结构门禁"):
-                svc.generate_narrative("task")
+            narrative=svc.generate_narrative("task")["narrative"]
 
             self.assertEqual(len(client.inputs),2)
-            self.assertFalse(svc.versions("task","narrative"))
+            self.assertIn(topic,narrative["markdown"])
+            self.assertEqual(
+                {item["field"] for item in narrative["metadata"]["narrative_quality"]["required_context"]},
+                {"topic","goal","audience"},
+            )
+            correction=json.loads(client.inputs[1]["input"][1]["content"])["semantic_correction"]
+            self.assertIn(topic,correction["required_context_markdown_block"])
+            self.assertIn("冻结受众",correction["required_context_markdown_block"])
+
+    def test_real_card_audience_alias_reaches_three_field_narrative_contract(self):
+        with tempfile.TemporaryDirectory() as root:
+            topic="AI 客服助手试点成效、扩容计划、预算、风险与管理层决策"
+            client=ScriptedClient(narrative_response(
+                goal="请管理层批准 AI 客服助手第二阶段扩容方案与预算",
+                audience="CEO、CFO 与客户运营负责人",
+                topic=topic,
+            ))
+            svc=service(root,client); svc.create("task","manual")
+            imported=svc.import_input("task",{
+                "演示目标":"请管理层批准 AI 客服助手第二阶段扩容方案与预算",
+                "主要受众":"CEO、CFO 与客户运营负责人",
+                "核心主题":topic,
+            })
+
+            narrative=svc.generate_narrative("task")["narrative"]
+
+            self.assertEqual(imported["task_card"]["missing"],[])
+            self.assertEqual(
+                {item["field"] for item in narrative["metadata"]["narrative_quality"]["required_context"]},
+                {"topic","goal","audience"},
+            )
+
+    def test_outline_correction_returns_all_budget_claims_verbatim(self):
+        with tempfile.TemporaryDirectory() as root:
+            first=outline_response(6)
+            second_value=json.loads(outline_response(6))
+            second_value["slides"][1]["content_markdown"]="总预算 80 万元：软件 36 万元、服务 24 万元、实施 12 万元、培训 8 万元。"
+            client=ScriptedClient(
+                narrative_response(goal="批准扩容",audience="管理层",topic="扩容决策"),
+                first,
+                json.dumps(second_value,ensure_ascii=False),
+            )
+            svc=service(root,client); svc.create("task","manual")
+            svc.import_input("task",{
+                "goal":"批准扩容","audience":"管理层","topic":"扩容决策","页数":6,
+                "总预算":"80 万元","软件费用":"36 万元","服务费用":"24 万元",
+                "实施费用":"12 万元","培训费用":"8 万元",
+            })
+            svc.generate_narrative("task"); svc.confirm_narrative("task")
+
+            outline=svc.generate_outline("task")["outline"]
+
+            self.assertIn("24 万元",outline["markdown"])
+            correction=json.loads(client.inputs[2]["input"][1]["content"])["semantic_correction"]
+            all_values={item["value"] for item in correction["required_claims_verbatim"]}
+            missing_values={item["value"] for item in correction["missing_required_claims_verbatim"]}
+            self.assertTrue({"80 万元","36 万元","24 万元","12 万元","8 万元"}.issubset(all_values))
+            self.assertTrue({"80 万元","36 万元","24 万元","12 万元","8 万元"}.issubset(missing_values))
+
+    def test_outline_persistent_budget_omission_remains_fail_closed(self):
+        with tempfile.TemporaryDirectory() as root:
+            missing=outline_response(6)
+            client=ScriptedClient(
+                narrative_response(goal="批准扩容",audience="管理层",topic="扩容决策"),
+                missing,
+                missing,
+            )
+            svc=service(root,client); svc.create("task","manual")
+            svc.import_input("task",{
+                "goal":"批准扩容","audience":"管理层","topic":"扩容决策","页数":6,
+                "总预算":"80 万元","软件费用":"36 万元","服务费用":"24 万元",
+                "实施费用":"12 万元","培训费用":"8 万元",
+            })
+            svc.generate_narrative("task"); svc.confirm_narrative("task")
+
+            with self.assertRaisesRegex(ValidationError,"遗漏必需事实"):
+                svc.generate_outline("task")
+
+            self.assertEqual(len(svc.versions("task","outline-diagnostic")),2)
+            self.assertFalse(svc.versions("task","outline"))
     def test_reported_natural_language_input_uses_tool_free_agent_contract(self):
         with tempfile.TemporaryDirectory() as root:
             client=ScriptedClient('{"questions":[]}')

@@ -30,6 +30,11 @@ class P2Tests(unittest.TestCase):
   submitted={q["question_id"]:{"option":"Other","other":"促成审批" if q["field"]=="goal" else "管理层"} for q in questions}
   done=self.svc.answer_clarifications("batch",submitted); self.assertTrue(done["confirmed"])
   view=self.svc.input_view("batch"); self.assertEqual(view["task_card"]["goal"],"促成审批"); self.assertEqual(view["task_card"]["audience"],"管理层")
+ def test_primary_audience_alias_is_frozen_instead_of_left_as_constraint(self):
+  card=parse_task_card({"目标":"批准扩容","主要受众":"CEO、CFO 与客户运营负责人","主题":"扩容决策"})
+  self.assertEqual(card["audience"],"CEO、CFO 与客户运营负责人")
+  self.assertNotIn("audience",card["missing"])
+  self.assertNotIn("主要受众",card["constraints"])
  def setUp(self): self.tmp=tempfile.TemporaryDirectory(); self.store=WorkspaceStore(self.tmp.name); self.svc=TaskService(self.store); self.svc.create("task")
  def tearDown(self): self.tmp.cleanup()
  def test_json_markdown_normalize_and_block(self):

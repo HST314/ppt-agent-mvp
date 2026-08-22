@@ -56,6 +56,25 @@ def narrative_structure_policy(task_card):
         "rule":"输出完整 Markdown 叙事，不得返回分析请求、待办或元说明；将 required_context 每项 value 逐字写入正文，不得缩写、改写或省略，并用至少两个有实质正文的二级章节表达核心论点与页面推进逻辑。",
     }
 
+def required_context_markdown(required_context):
+    """Build the server-owned verbatim context block used on correction.
+
+    The provider still writes the narrative.  The service owns this small
+    identity block so a long topic cannot be shortened by the second model
+    turn before the artifact is validated and committed.
+    """
+    if not required_context: return ""
+    labels={"topic":"冻结主题","goal":"冻结目标","audience":"冻结受众"}
+    lines=["## 冻结任务上下文（逐字）"]
+    for item in required_context:
+        lines.extend((f"**{labels.get(item['field'],item['field'])}**",item["value"],""))
+    return "\n".join(lines).rstrip()
+
+def materialize_required_context(markdown,required_context):
+    block=required_context_markdown(required_context)
+    if not block: return markdown
+    return f"{markdown.rstrip()}\n\n{block}\n"
+
 LOCKED_THEME_GENERATION_ATTEMPTS=2
 
 def locked_theme_generation_policy():
@@ -984,6 +1003,11 @@ class TaskService:
             for attempt in range(1,3):
                 generated=self.generator.generate("narrative",payload,skill=skill["content"])
                 text=generated["text"]; model_name=generated.get("model","unknown")
+                if attempt==2:
+                    # The correction turn may still paraphrase or truncate a
+                    # long identity field.  Assemble the exact frozen values
+                    # at the trusted boundary before validating the candidate.
+                    text=materialize_required_context(text,structure_policy["required_context"])
                 claim_error=quality_error=None
                 try:
                     claim_bindings=assert_claims_bound(text,ledger_value,"叙事",allow_disclosed_assumptions=False)
@@ -1006,7 +1030,8 @@ class TaskService:
                     "forbidden_values":[item["value"] for item in evidence["unbound"]],
                     "missing_context_fields":quality_evidence["missing_context_fields"],
                     "required_context_verbatim":structure_policy["required_context"],
-                    "rule":"删除全部未绑定量化值；不得改标为假设、建议、示例或待确认。阶段改用无数字名称，仅保留 narrative_numeric_policy.allowed_claims 中的原始量化事实。并按 narrative_structure_policy 返回完整叙事，将 semantic_correction.required_context_verbatim 每项 value 逐字写入正文，不得缩写、改写或省略；补齐核心论点与页面推进逻辑，不得返回分析请求或元说明。",
+                    "required_context_markdown_block":required_context_markdown(structure_policy["required_context"]),
+                    "rule":"删除全部未绑定量化值；不得改标为假设、建议、示例或待确认。阶段改用无数字名称，仅保留 narrative_numeric_policy.allowed_claims 中的原始量化事实。并按 narrative_structure_policy 返回完整叙事，将 required_context_verbatim 逐字写入正文；服务端也会将 semantic_correction.required_context_markdown_block 原样组装入纠错产物，正文不得出现与其冲突的主题、目标或受众；补齐核心论点与页面推进逻辑，不得返回分析请求或元说明。",
                 }}
         version=len(self.versions(task_id,"narrative"))+1; content_hash=digest(text.encode())
         model=NarrativeDocument.parse({"document_id":f"narrative-{content_hash[:16]}","task_id":task_id,"version":version,"markdown":text,"content_hash":content_hash,"created_at":now(),"schema_version":"1.0"})
@@ -1059,9 +1084,15 @@ class TaskService:
                 text=outline_markdown(view["task_card"],resources,count)
                 if prompt: text += f"\n<!-- 修改要求：{prompt.strip()} -->\n"
             else:
-                payload={"task_id":task_id,"task_card":view["task_card"],"narrative":json.loads(self.version(task_id,narrative))["markdown"],"resources":resources,"slide_count":count,"prompt":prompt,"claim_ledger":ledger_value}
+                required_claims=[
+                    {"claim_id":claim["claim_id"],"kind":claim["kind"],"value":claim["value"]}
+                    for claim in ledger_value["claims"]
+                ]
+                required_claim_ids=[claim["claim_id"] for claim in required_claims]
+                payload={"task_id":task_id,"task_card":view["task_card"],"narrative":json.loads(self.version(task_id,narrative))["markdown"],"resources":resources,"slide_count":count,"prompt":prompt,"claim_ledger":ledger_value,"outline_required_claims_verbatim":required_claims}
                 for attempt in range(1,3):
                     generated=self.generator.generate("outline",payload,skill=skill["content"])
+                    text=None
                     try:
                         if not isinstance(generated,dict):
                             raise ValidationError("大纲生成响应必须为对象")
@@ -1081,7 +1112,19 @@ class TaskService:
                             "model":generated.get("model","unknown") if isinstance(generated,dict) else "unknown","public_error_exposes_candidate":False,
                         })
                         if attempt == 2: raise
-                        payload={**payload,"semantic_correction":{"attempt":1,"error":exc.message,"previous_candidate":generated}}
+                        missing_claims=required_claims
+                        if isinstance(text,str):
+                            coverage=audit_claims(text,ledger_value,required_claim_ids=required_claim_ids)
+                            missing_ids={claim["claim_id"] for claim in coverage["missing_required"]}
+                            missing_claims=[claim for claim in required_claims if claim["claim_id"] in missing_ids]
+                        payload={**payload,"semantic_correction":{
+                            "attempt":1,
+                            "error":exc.message,
+                            "previous_candidate":generated,
+                            "required_claims_verbatim":required_claims,
+                            "missing_required_claims_verbatim":missing_claims,
+                            "rule":"重新提交完整 slides；逐字覆盖 required_claims_verbatim 的每个 value，尤其不得合并、概括或遗漏预算拆分。missing_required_claims_verbatim 是上一候选明确缺失的子集。不得新增 Claim Ledger 之外的量化事实。",
+                        }}
         return self.edit_outline(task_id,text,"生成逐页大纲",actor="system",skill=skill)
     def edit_outline(self,task_id,markdown,summary="直接编辑",actor="user",skill=None):
         self._require_actionable(task_id)

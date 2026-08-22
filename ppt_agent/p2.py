@@ -8,7 +8,11 @@ from pathlib import Path
 from .errors import ConflictError, ValidationError
 
 IMAGE_SUFFIXES={".png",".jpg",".jpeg",".webp",".gif",".svg"}
-ALIASES={"goal":("goal","objective","演示目标","目标"),"audience":("audience","受众"),"topic":("topic","核心主题","主题")}
+ALIASES={
+    "goal":("goal","objective","演示目标","目标"),
+    "audience":("audience","主要受众","目标受众","受众"),
+    "topic":("topic","核心主题","主题"),
+}
 DEFAULTS={"language":"zh-CN","aspect_ratio":"16:9","sample_count":2}
 PRESENTATION_WORDS=r"(?:ppt|演示文稿|幻灯片|演示)"
 
