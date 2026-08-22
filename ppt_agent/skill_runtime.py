@@ -179,7 +179,15 @@ class ActiveSkillResolver:
 
     @classmethod
     def builtin(cls) -> "ActiveSkillResolver":
-        return cls(Path(__file__).parent / "builtin_skills", "guizang-ppt")
+        root = Path(__file__).parent / "builtin_skills"
+        candidates = sorted(
+            path.name
+            for path in root.iterdir()
+            if path.is_dir() and not path.is_symlink() and (path / "SKILL.md").is_file()
+        )
+        if len(candidates) != 1:
+            raise ValidationError("内置 Skill 目录必须且只能包含一个可发现 Skill")
+        return cls(root, candidates[0])
 
     def _active_root(self, active: str) -> Path:
         relative = _validate_relative_path(active, label="skills.active")

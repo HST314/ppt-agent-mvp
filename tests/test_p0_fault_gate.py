@@ -57,7 +57,7 @@ class P0FaultInjectionGate(unittest.TestCase):
     def test_real_adapter_clarification_cancel_recovers_retry_state(self):
         with tempfile.TemporaryDirectory() as root:
             sdk = BlockingSDK()
-            service = TaskService(WorkspaceStore(root), clarifier=AgentGateway(adapter(sdk)))
+            service = TaskService(WorkspaceStore(root), clarifier=AgentGateway(adapter(sdk),skill=SkillRuntime.builtin()))
             # This gate exercises cancellation after dispatch. Capability-probe
             # readiness is covered separately and would consume the blocking SDK.
             service.require_runtime_ready = Mock(return_value=None)

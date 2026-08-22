@@ -117,7 +117,7 @@ def inspect_contract(html_text: str, expected_slide_ids: list[str], contract: di
 class TechnicalGate:
     """The only authority which may turn presentation findings into blockers.
 
-    Design, content, canonical DOM and Skill-owned findings remain auditable,
+    Design, content, DOM-shape and Skill-owned findings remain auditable,
     but only the explicit technical code sets above can stop generation or
     delivery.  Keeping the classifier here prevents adapters from promoting a
     subjective finding merely by labelling it ``severity=blocker``.
@@ -146,7 +146,7 @@ class TechnicalGate:
 
     @staticmethod
     def validate_candidate_html(html_text: str, expected_slide_ids: list[str], allowed_assets=()) -> str:
-        """Apply the canonical HTML/schema/resource/safety validator."""
+        """Apply the authoritative HTML/schema/resource/safety validator."""
         from .p4 import validate_html
 
         return validate_html(html_text, expected_slide_ids, allowed_assets)
@@ -186,21 +186,10 @@ class TechnicalGate:
         html_by_slide: dict[str, str] | None = None,
         browser_inspector=None,
         overflow_autofit: dict[str, Any] | None = None,
-        canonical_validation: dict[str, Any] | None = None,
         generation_attempt_evidence_hashes: list[str] | tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
         validate_claim_ledger(claim_ledger)
         structure = inspect_contract(html_text, expected_slide_ids, contract, contract_hash)
-        structural_signatures = (canonical_validation or {}).get("structural_signatures") or {}
-        if structural_signatures.get("applicable"):
-            checked = int(structural_signatures.get("checked_slide_count") or 0)
-            matched = int(structural_signatures.get("matched_slide_count") or 0)
-            structure = {
-                **structure,
-                "structural_signature_checked_count": checked,
-                "structural_signature_matched_count": matched,
-                "structural_signature_percent": round(matched * 100 / checked, 2) if checked else 0,
-            }
         claims = audit_html_claims(html_text, claim_ledger, required_claim_ids=required_claim_ids)
         page_claims = None
         if required_claim_ids_by_slide is not None:
@@ -254,19 +243,6 @@ class TechnicalGate:
                 "severity": "warning",
             } for item in browser_issues if not cls.is_browser_blocker(item)],
         ]
-        if canonical_validation is not None and (
-            canonical_validation.get("passed") is False
-            or structural_signatures.get("applicable")
-        ):
-            advisories.append({
-                "source": "canonical_validator",
-                "category": "skill_or_dom_guidance",
-                "severity": "warning",
-                "code": "canonical_validation_advisory",
-                "evidence": "; ".join(str(item) for item in canonical_validation.get("errors", [])[:5])
-                or "canonical/DOM 检查结果仅供参考",
-            })
-
         overflow = [item for item in browser_blockers if item.get("code") in OVERFLOW_CODES]
         autofit = None if overflow_autofit is None else dict(overflow_autofit)
         if autofit is not None:
@@ -322,10 +298,6 @@ class TechnicalGate:
                 },
                 "text_hash": claims["text_hash"],
             },
-            "canonical_validator": None if canonical_validation is None else {
-                **canonical_validation,
-                "advisory": True,
-            },
             "generation_attempt_evidence_hashes": list(generation_attempt_evidence_hashes or ()),
             "geometry": {
                 "available": browser is not None and bool(browser.get("available")),
@@ -350,17 +322,7 @@ class TechnicalGate:
 
     @staticmethod
     def verify_delivery_package(root):
-        """Run the canonical offline package completeness and safety check."""
+        """Run the authoritative offline package completeness and safety check."""
         from .offline import verify_delivery
 
         return verify_delivery(root)
-
-
-def run_post_render_gate(*args, **kwargs) -> dict[str, Any]:
-    """Compatibility wrapper for callers using the pre-refactor API name."""
-    return TechnicalGate.evaluate(*args, **kwargs)
-
-
-def enforce_post_render_gate(*args, **kwargs) -> dict[str, Any]:
-    """Compatibility wrapper for callers using the pre-refactor API name."""
-    return TechnicalGate.enforce(*args, **kwargs)

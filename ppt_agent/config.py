@@ -100,6 +100,23 @@ class SkillsConfig:
 
 
 @dataclass(frozen=True)
+class FeatureFlagsConfig:
+    """Fail-closed rollout admission for the v2-only runtime.
+
+    The legacy implementations are intentionally not retained in this binary.
+    A disabled flag drains new writes from the instance so traffic can be
+    routed to the previous immutable release without silently weakening the
+    Skill or delivery contract.
+    """
+
+    skill_runtime_v2: bool = True
+    technical_gate_v2: bool = True
+
+    def public(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     mode: str
     generation: ModelConfig | None = None
@@ -109,6 +126,7 @@ class RuntimeConfig:
     jobs: JobSettingsConfig = JobSettingsConfig()
     review: ReviewSettingsConfig = ReviewSettingsConfig()
     skills: SkillsConfig | None = None
+    feature_flags: FeatureFlagsConfig = FeatureFlagsConfig()
 
     def public(self) -> dict:
         return {
@@ -122,10 +140,11 @@ class RuntimeConfig:
             "jobs": self.jobs.public(),
             "review": self.review.public(),
             "skills": self.skills.public() if self.skills else None,
+            "feature_flags": self.feature_flags.public(),
         }
 
 
-_ROOT_KEYS = {"gateway", "models", "skills", "capabilities", "clarification", "jobs", "review"}
+_ROOT_KEYS = {"gateway", "models", "skills", "capabilities", "clarification", "jobs", "review", "feature_flags"}
 _MODEL_KEYS = {
     "provider", "model", "api_key_env", "base_url_env", "timeout_seconds",
     "request_timeout_seconds", "run_timeout_seconds", "job_timeout_seconds",
@@ -142,6 +161,7 @@ _CLARIFICATION_STYLES = {"minimal", "comprehensive"}
 _JOB_KEYS = {"generation_timeout_seconds", "inspection_timeout_seconds", "delivery_timeout_seconds"}
 _REVIEW_KEYS = {"default_max_rounds"}
 _SKILLS_KEYS = {"root", "active"}
+_FEATURE_FLAG_KEYS = {"skill_runtime_v2", "technical_gate_v2"}
 _DEFAULT_SKILLS_ROOT = Path(__file__).resolve().parent / "builtin_skills"
 
 
@@ -313,7 +333,6 @@ def _skills(value, *, config_path: Path) -> SkillsConfig:
     if unknown:
         raise ValidationError(f"skills 包含未知字段：{', '.join(sorted(unknown))}")
     raw_root = value.get("root")
-    active = value.get("active", "guizang-ppt")
     if raw_root is None:
         root = _DEFAULT_SKILLS_ROOT
     elif not isinstance(raw_root, str) or not raw_root.strip() or "\0" in raw_root:
@@ -321,6 +340,19 @@ def _skills(value, *, config_path: Path) -> SkillsConfig:
     else:
         candidate = Path(raw_root.strip())
         root = candidate if candidate.is_absolute() else config_path.parent / candidate
+    active = value.get("active")
+    if active is None:
+        try:
+            candidates = sorted(
+                path.name
+                for path in root.iterdir()
+                if path.is_dir() and not path.is_symlink() and (path / "SKILL.md").is_file()
+            )
+        except OSError as exc:
+            raise ValidationError("skills.root 不存在") from exc
+        if len(candidates) != 1:
+            raise ValidationError("skills.active 未配置且 skills.root 中可发现 Skill 不唯一")
+        active = candidates[0]
     if not isinstance(active, str) or not active.strip() or active != active.strip():
         raise ValidationError("skills.active 必须为非空相对目录")
     # Configuration loading is fail-closed: a successful RuntimeConfig always
@@ -331,6 +363,20 @@ def _skills(value, *, config_path: Path) -> SkillsConfig:
     resolver = ActiveSkillResolver(root, active)
     resolver.resolve()
     return SkillsConfig(resolver.root, resolver.active)
+
+
+def _feature_flags(value) -> FeatureFlagsConfig:
+    value = _mapping(value, "feature_flags")
+    unknown = set(value) - _FEATURE_FLAG_KEYS
+    if unknown:
+        raise ValidationError(f"feature_flags 包含未知字段：{', '.join(sorted(unknown))}")
+    flags = FeatureFlagsConfig(
+        skill_runtime_v2=value.get("skill_runtime_v2", True),
+        technical_gate_v2=value.get("technical_gate_v2", True),
+    )
+    if any(not isinstance(item, bool) for item in flags.public().values()):
+        raise ValidationError("feature_flags 所有字段必须为 boolean")
+    return flags
 
 
 def load_config(path: str | Path | None = None, *, env_file: str | Path | None = None) -> RuntimeConfig:
@@ -351,6 +397,7 @@ def load_config(path: str | Path | None = None, *, env_file: str | Path | None =
     if mode not in {"fake", "agent"}:
         raise ValidationError("gateway.mode 只能是 fake 或 agent")
     skills = _skills(raw.get("skills", {}), config_path=config_path.resolve())
+    feature_flags = _feature_flags(raw.get("feature_flags", {}))
     capabilities = _mapping(raw.get("capabilities", {}), "capabilities")
     allowed_capabilities = {"network_tools", "image_input", "image_generation"}
     if set(capabilities) - allowed_capabilities or any(not isinstance(value, bool) for value in capabilities.values()):
@@ -361,7 +408,14 @@ def load_config(path: str | Path | None = None, *, env_file: str | Path | None =
     review = _review(raw.get("review", {}))
     if mode == "fake":
         jobs = _jobs(raw.get("jobs", {}), generation_default=630, inspection_default=630)
-        return RuntimeConfig(mode="fake", clarification=clarification, jobs=jobs, review=review, skills=skills)
+        return RuntimeConfig(
+            mode="fake",
+            clarification=clarification,
+            jobs=jobs,
+            review=review,
+            skills=skills,
+            feature_flags=feature_flags,
+        )
     models = _mapping(raw.get("models"), "models")
     if set(models) - {"generation", "inspection"}:
         raise ValidationError("models 包含未知字段")
@@ -392,4 +446,5 @@ def load_config(path: str | Path | None = None, *, env_file: str | Path | None =
         jobs=jobs,
         review=review,
         skills=skills,
+        feature_flags=feature_flags,
     )

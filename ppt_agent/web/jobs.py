@@ -632,6 +632,7 @@ class JobService:
                 if previous["fingerprint"] != fingerprint:
                     raise ConflictError("相同 idempotency_key 对应了不同请求")
                 return self.public(previous), False
+            self.service.require_release_write_enabled()
             if operation != "delivery.publish":
                 self.service.require_runtime_ready()
             if state["status"] in {"paused", "cancelled", "failed", "completed"}:
@@ -723,6 +724,7 @@ class JobService:
                 # Readiness can change after enqueue or while a queued job is being
                 # recovered. Never cross the model boundary without a fresh gate.
                 try:
+                    self.service.require_release_write_enabled()
                     if record["operation"] != "delivery.publish":
                         self.service.require_runtime_ready()
                 except RuntimeUnavailableError as error:

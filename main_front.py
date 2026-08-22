@@ -25,6 +25,7 @@ def build_app():
         WorkspaceStore(data_root),
         clarification_config=config.clarification,
         settings_store=GlobalSettingsStore(config_path),
+        feature_flags=config.feature_flags,
         **agent_gateways_from_config(config),
     )
     return create_app(service)

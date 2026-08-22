@@ -183,6 +183,10 @@ python -m uvicorn main_front:app --host 127.0.0.1 --port 8000
 skills:
   root: ../ppt_agent/builtin_skills
   active: guizang-ppt
+
+feature_flags:
+  skill_runtime_v2: true
+  technical_gate_v2: true
 ```
 
 `root` 相对配置文件所在目录解析，`active` 只能指向该根目录内的一个标准 Skill 目录。目录必须包含带 `name`、`description` frontmatter 的 `SKILL.md`，并可按需包含 `references/`、`assets/`、`scripts/`；不要求 PPT 专属 manifest 或 `SKILL_LOCK.json`。启动时会拒绝越界路径和软链接，并为当前目录计算内容摘要。每个新 Job 获取一个不可变摘要快照，运行中的 Job 不会因之后切换全局 Skill 而混用文件。
@@ -233,7 +237,7 @@ docs/                     产品契约、架构决策、Runbook 与验收矩阵
 运行标准回归：
 
 ```bash
-python3 -m unittest discover -s tests -v
+python3 scripts/verify_standard_tests.py
 ```
 
 运行固定 Chromium 门禁：
@@ -256,6 +260,14 @@ Playwright Python 包已属于运行时依赖；部署真实 Agent 模式时仍�
 python3 scripts/verify_p0.py
 python3 scripts/export_schemas.py
 ```
+
+发布前运行完整 v2 自动化矩阵：
+
+```bash
+python3 scripts/verify_release_matrix.py --profile full
+```
+
+受控环境中的真实模型发布门禁使用 `--profile real-model`。两个 v2 灰度开关是失败关闭的实例级写入准入开关，不会回退到已删除的旧实现；完整灰度与回滚步骤见 [`docs/release-skill-runtime-v2.md`](docs/release-skill-runtime-v2.md)。
 
 ## 离线交付
 

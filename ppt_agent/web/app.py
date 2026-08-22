@@ -91,6 +91,7 @@ def create_app(
             "config_summary_sha256": hashlib.sha256(json.dumps(config_summary,sort_keys=True,separators=(",",":")).encode()).hexdigest(),
             "clarification_mode":"model" if service.clarifier is not None else "fake",
             "model_capabilities":capabilities,
+            "release":service.release_status(),
             "startup_status":startup,
             "startup_components":dict(bootstrap),
         }

@@ -131,13 +131,27 @@ class GenerationArchitectureTests(unittest.TestCase):
                 "ppt_agent/p4.py",
                 "ppt_agent/agent_runtime.py",
                 "ppt_agent/gateways.py",
-                "ppt_agent/generation_preflight.py",
                 "ppt_agent/browser_inspection.py",
                 "ppt_agent/service.py",
             )
         )
-        for token in ("template-registry.json", "_swiss_layout_for_outline", '"S01"', '"S22"', "validate-swiss-deck"):
+        for token in (
+            "template-registry.json",
+            "_swiss_layout_for_outline",
+            '"S01"',
+            '"S22"',
+            "validate-swiss-deck",
+            "planning-summary.md",
+            "design-pack-v1.md",
+        ):
             self.assertNotIn(token, source)
+
+        for retired in (
+            "ppt_agent/canonical_validator.py",
+            "ppt_agent/layout_structure.py",
+            "ppt_agent/generation_preflight.py",
+        ):
+            self.assertFalse((root / retired).exists())
 
 
 if __name__ == "__main__":

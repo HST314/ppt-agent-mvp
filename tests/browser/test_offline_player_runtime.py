@@ -213,7 +213,7 @@ class OfflinePlayerRuntimeGate(unittest.TestCase):
         self.page.keyboard.press("b")
         self.page.wait_for_timeout(150)
         self.assertIn("low-power", self.page.get_attribute("body", "class") or "")
-        self.assertEqual(self.page.evaluate("localStorage.getItem('guizang-ppt-low-power')"), "1")
+        self.assertEqual(self.page.evaluate("localStorage.getItem('ppt-agent-low-power')"), "1")
         self.assertIn("动态", self.page.locator("#offline-hint").text_content())
         # 静态模式下所有待动画元素立即可见
         opacities = self.page.evaluate(
@@ -229,7 +229,7 @@ class OfflinePlayerRuntimeGate(unittest.TestCase):
         self.page.keyboard.press("b")
         self.page.wait_for_timeout(150)
         self.assertNotIn("low-power", self.page.get_attribute("body", "class") or "")
-        self.assertEqual(self.page.evaluate("localStorage.getItem('guizang-ppt-low-power')"), "0")
+        self.assertEqual(self.page.evaluate("localStorage.getItem('ppt-agent-low-power')"), "0")
 
     def test_reduced_motion_defaults_to_static(self):
         context = self.browser.new_context(viewport={"width": 1280, "height": 720}, reduced_motion="reduce")

@@ -64,6 +64,10 @@ python3 scripts/verify_offline_delivery.py .ppt-agent-data/tasks/<task-id>/deliv
 
 ## 故障排查
 
+### v2 灰度与熔断
+
+`feature_flags.skill_runtime_v2` 与 `feature_flags.technical_gate_v2` 必须同时为 `true` 才接收新写任务。关闭任一开关后 readiness 返回 503、历史内容仍可只读，且不会回退或绕过已删除的旧实现。灰度采用独立部署的 `5% → 25% → 100%` 流量档位；回滚时先关闭候选写入，再把流量切回上一个不可变版本。完整命令、观察指标与终止条件见 `docs/release-skill-runtime-v2.md`。
+
 - 启动时报配置错误：确认 YAML 字段白名单、`gateway.mode`，以及 YAML 引用的环境变量均已在 `.env` 配置。
 - `model_authentication_failed` / `model_permission_denied` / `model_not_found` / `model_request_invalid`：属于确定性配置故障，修复凭据、权限、模型名或 Responses/Schema 兼容性后重新探测，不要连续重试。
 - `model_rate_limited`：遵守响应中的 `retry_after_seconds`（如有），等待后重新探测。

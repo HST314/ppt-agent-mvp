@@ -58,3 +58,17 @@
 - 文件路径是稳定的预期证据位置；任务实现时创建并将“计划”更新为具体测试名/CI 链接。
 - 单元或契约测试不能替代对应 E2E；真实模型不是确定性验收依赖。
 - 任一产品行为调整必须先更新产品契约，再同步本矩阵和测试。
+
+## SkillRuntime v2 / TechnicalGate v2 发布矩阵（2026-08-22）
+
+| 方案验收项 | 自动化证据 | 发布判定 |
+|---|---|---|
+| 全局 Skill 替换 | `tests/test_active_skill_runtime.py` | 两套标准目录只改配置即可切换；运行中快照不混用 |
+| 渐进读取与可选脚本 | `tests/test_skill_progressive_protocol.py` | 入口首读可观察；成功/失败/超时/越权均为脱敏 advisory |
+| 框架去耦与旧实现清理 | `scripts/verify_release_architecture.py`、`tests/test_generation_decoupling.py` | 当前 Skill 名称、固定布局/文件名和 retired adapter 不得回到业务代码 |
+| TechnicalGate 正反例 | `tests/test_generation_preflight.py`、`tests/test_p0_contract_ledger_gate.py`、Chromium suites | DOM/字体/内容 advisory 放行；渲染、越界、裁切、资源、文件与安全错误失败关闭 |
+| 流程可靠性 | `tests/web/test_jobs.py`、`tests/browser/test_job_recovery.py`、E2E suites | SSE 与 polling 均覆盖；终态后同页读取权威视图 |
+| 全量、Chromium 与离线交付 | `scripts/verify_release_matrix.py --profile full` | 所有 lane 通过，浏览器 0 skipped，交付 evidence/hash 可复算 |
+| 真实模型与格式重试 | `scripts/verify_release_matrix.py --profile real-model` | 资料导入到交付完整成功；强制一次 invalid JSON 后由真实模型纠错收敛 |
+
+发布/灰度/回滚操作见 `docs/release-skill-runtime-v2.md`。

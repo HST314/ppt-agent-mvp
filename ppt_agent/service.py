@@ -4,7 +4,7 @@ import hashlib, inspect, json, logging, re, threading, time, uuid
 from pathlib import Path
 from datetime import datetime, timezone
 
-from .config import ClarificationConfig
+from .config import ClarificationConfig, FeatureFlagsConfig
 from .audit import current_agent_audit_context
 from .claim_ledger import assert_claims_bound, audit_claims, audit_html_claims, audit_html_claims_by_slide, build_claim_ledger, validate_claim_ledger
 from .content_inspection import inspect_content_quality
@@ -20,7 +20,6 @@ from .diagnostics import log_exception_chain
 from .errors import ConflictError, GatewayError, GatewayUnknownResult, NotFoundError, RuntimeUnavailableError, ValidationError
 from .fsm import TaskState, transition
 from .gateways import FakeGenerationGateway, FakeHtmlBuilder, FakeInspectionGateway, FakeSkillLoader
-from .generation_preflight import hard_browser_blockers
 from .schema import DeliveryManifest, InspectionReport, IssueDisposition
 from .p2 import canonical, digest, now, parse_task_card, questions_for, scan_resources, validate_answer
 from .schema import ClarificationSet, ResourceManifest, TaskCard, TaskInputSnapshot
@@ -175,8 +174,16 @@ def _clarification_directive(config: ClarificationConfig, round_number: int) -> 
     )
 
 class TaskService:
-    def __init__(self,store,generator=None,inspector=None,skills=None,builder=None,clarifier=None,clarification_config=None,settings_store=None,browser_inspector=None):
+    def __init__(self,store,generator=None,inspector=None,skills=None,builder=None,clarifier=None,clarification_config=None,settings_store=None,browser_inspector=None,feature_flags=None):
         self.store=store; self.generator=generator or FakeGenerationGateway(); self.inspector=inspector or FakeInspectionGateway(); self.skills=skills or FakeSkillLoader(); self.builder=builder or FakeHtmlBuilder(); self.clarifier=clarifier
+        if feature_flags is None:
+            self._feature_flags=FeatureFlagsConfig()
+        elif isinstance(feature_flags,FeatureFlagsConfig):
+            self._feature_flags=feature_flags
+        elif isinstance(feature_flags,dict) and set(feature_flags)=={"skill_runtime_v2","technical_gate_v2"} and all(isinstance(value,bool) for value in feature_flags.values()):
+            self._feature_flags=FeatureFlagsConfig(**feature_flags)
+        else:
+            raise ValidationError("feature_flags 无效")
         self.technical_gate=TechnicalGate()
         if browser_inspector is False:
             self.browser_inspector=None
@@ -194,7 +201,9 @@ class TaskService:
         self._runtime_probe_guard=threading.Lock()
         for gateway in {id(x):x for x in (self.generator,self.inspector,self.builder,self.clarifier) if x is not None}.values():
             if hasattr(gateway,"set_audit_sink"): gateway.set_audit_sink(self.store.append_agent_audit)
-        if self._runtime_gateways():
+        if self._disabled_release_features():
+            self._runtime_capabilities=self._release_disabled_capabilities()
+        elif self._runtime_gateways():
             self._runtime_capabilities={"checked":False,"ready":False,"status":"not_checked","models":[]}
         generation_timeout=max((getattr(gateway,"job_timeout_seconds",0) for gateway in (self.clarifier,self.generator,self.builder) if gateway is not None),default=0) or 630
         inspection_timeout=getattr(self.inspector,"job_timeout_seconds",0) or 630
@@ -219,8 +228,48 @@ class TaskService:
         }
     def _runtime_gateways(self):
         return list({id(x):x for x in (self.generator,self.inspector,self.builder,self.clarifier) if hasattr(x,"probe_capabilities")}.values())
+    def _disabled_release_features(self):
+        return [name for name,value in self._feature_flags.public().items() if not value]
+    def _release_disabled_capabilities(self):
+        disabled=self._disabled_release_features()
+        failed=disabled[0] if disabled else None
+        return {
+            "checked":True,
+            "ready":False,
+            "status":"rollout_disabled",
+            "models":[],
+            "failed_check":failed,
+            "error":{
+                "code":"release_feature_disabled",
+                "failed_check":failed,
+                "retryable":False,
+            },
+            "checked_at":utcnow(),
+        }
+    def _require_feature(self,name):
+        if getattr(self._feature_flags,name): return
+        raise RuntimeUnavailableError(
+            f"{name} 未对本实例开放，已停止接收新的写任务",
+            runtime_error_code="release_feature_disabled",
+            failed_check=name,
+        )
+    def require_release_write_enabled(self):
+        disabled=self._disabled_release_features()
+        if disabled: self._require_feature(disabled[0])
+    def release_status(self):
+        flags=self._feature_flags.public()
+        return {
+            "flags":flags,
+            "write_enabled":all(flags.values()),
+            "rollback_mode":"traffic_to_previous_release",
+            "legacy_implementation_present":False,
+        }
     def initialize_runtime(self):
         with self._runtime_probe_guard:
+            if self._disabled_release_features():
+                with self._runtime_guard:
+                    self._runtime_capabilities=self._release_disabled_capabilities()
+                return self.runtime_health()
             gateways=self._runtime_gateways()
             if not gateways:
                 with self._runtime_guard:
@@ -332,6 +381,7 @@ class TaskService:
         return {
             "mode":"agent" if gateways else "fake",
             "gateways":sorted(gateway_summaries,key=lambda item:(item["model"],item["type"])),
+            "release":self.release_status(),
         }
     def settings_view(self):
         with self._runtime_guard:
@@ -937,6 +987,7 @@ class TaskService:
             for claim in ledger["claims"] if claim["claim_id"] in required_ids
         ]
     def _post_render_gate(self,task_id,html_text,slide_ids,contract,ledger,assets,generation_attempt_evidence_hashes=None):
+        self.require_release_write_enabled()
         contract_hash=contract["hash"]; ledger_hash=ledger["hash"]
         contract_value={key:value for key,value in contract.items() if key!="hash"}
         ledger_value={key:value for key,value in ledger.items() if key!="hash"}
@@ -945,7 +996,6 @@ class TaskService:
         html_text=apply_presentation_technical_contract(html_text,contract_value,contract_hash)
         html_text=self.technical_gate.validate_candidate_html(html_text,slide_ids,assets)
         html_by_slide=self._slide_fragments(html_text)
-        canonical_validation={"applicable":False,"passed":True,"errors":[],"structural_signatures":{"applicable":False}}
         browser=self._generation_browser_gate()
         first=self.technical_gate.evaluate(
             html_text,
@@ -958,7 +1008,6 @@ class TaskService:
             required_claim_ids_by_slide=required_claim_ids_by_slide,
             html_by_slide=html_by_slide,
             browser_inspector=browser,
-            canonical_validation=canonical_validation,
             generation_attempt_evidence_hashes=generation_attempt_evidence_hashes,
         )
         autofit=None
@@ -983,7 +1032,6 @@ class TaskService:
             html_by_slide=html_by_slide,
             browser_inspector=browser,
             overflow_autofit=autofit,
-            canonical_validation=canonical_validation,
             generation_attempt_evidence_hashes=generation_attempt_evidence_hashes,
         )
         # Persist pass AND failure evidence.  Failed diagnostics carry the
@@ -1078,7 +1126,7 @@ class TaskService:
             browser=self._generation_browser_gate() if validation_error is None else None
             if browser is not None and not (aggregate_coverage or {}).get("unbound_count") and not (page_coverage or {}).get("missing_required_count"):
                 browser_evidence=browser.inspect(candidate,slide_ids)
-                browser_blockers=hard_browser_blockers(browser_evidence)
+                browser_blockers=TechnicalGate.browser_blockers(browser_evidence)
                 geometric=[item for item in browser_blockers if item.get("code") in GEOMETRIC_CODES]
                 if geometric:
                     fitted=fit_deck_html(candidate,max_rounds=MAX_CASCADE_ROUNDS)
@@ -1086,7 +1134,7 @@ class TaskService:
                     if fitted.get("available") and fitted.get("rules"):
                         fitted_candidate=self.technical_gate.validate_candidate_html(fitted["html"],slide_ids,assets)
                         fitted_browser=browser.inspect(fitted_candidate,slide_ids)
-                        fitted_blockers=hard_browser_blockers(fitted_browser)
+                        fitted_blockers=TechnicalGate.browser_blockers(fitted_browser)
                         if not fitted_blockers:
                             candidate=fitted_candidate; browser_evidence=fitted_browser; browser_blockers=[]
 
@@ -1152,7 +1200,7 @@ class TaskService:
                     and not (page_coverage or {}).get("missing_required_count")
                 ):
                     browser_evidence=browser.inspect(candidate,slide_ids)
-                    browser_blockers=hard_browser_blockers(browser_evidence)
+                    browser_blockers=TechnicalGate.browser_blockers(browser_evidence)
                     geometric=[item for item in browser_blockers if item.get("code") in GEOMETRIC_CODES]
                     if geometric:
                         fitted=fit_deck_html(candidate,max_rounds=MAX_CASCADE_ROUNDS)
@@ -1160,7 +1208,7 @@ class TaskService:
                         if fitted.get("available") and fitted.get("rules"):
                             fitted_candidate=self.technical_gate.validate_candidate_html(fitted["html"],slide_ids,assets)
                             fitted_browser=browser.inspect(fitted_candidate,slide_ids)
-                            fitted_blockers=hard_browser_blockers(fitted_browser)
+                            fitted_blockers=TechnicalGate.browser_blockers(fitted_browser)
                             if not fitted_blockers:
                                 candidate=fitted_candidate; browser_evidence=fitted_browser; browser_blockers=[]
                 correction=None
@@ -2332,6 +2380,7 @@ class TaskService:
         return {**self.inspection_view(task_id),"disposition_hashes":hashes,"batch_scope":stable_ids}
 
     def _assert_current_post_render_gate(self,task_id):
+        self.require_release_write_enabled()
         deck=self.deck_view(task_id)["deck"]
         if not deck: raise ConflictError("尚未生成全稿")
         contract,ledger=self._bound_deck_contracts(task_id,deck)

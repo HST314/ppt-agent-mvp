@@ -71,6 +71,12 @@ skills:
   root: ../ppt_agent/builtin_skills
   active: guizang-ppt
 
+# v2 是唯一写链路。关闭任一开关会让本实例停止接收新写任务，便于灰度摘流；
+# 不会回退到已删除的旧 Skill/门禁实现。
+feature_flags:
+  skill_runtime_v2: true
+  technical_gate_v2: true
+
 capabilities:
   network_tools: false
   image_input: false

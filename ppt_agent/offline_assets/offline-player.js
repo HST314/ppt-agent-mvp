@@ -10,7 +10,7 @@
   let activeSlide = null;
   let resizeFrame = 0;
   window.__offlinePlayerMetrics = metrics;
-  const LOW_POWER_KEY = 'guizang-ppt-low-power';
+  const LOW_POWER_KEY = 'ppt-agent-low-power';
   const motion = window.Motion || null;
   const animate = motion ? motion.animate : null;
   const stagger = motion ? motion.stagger : null;

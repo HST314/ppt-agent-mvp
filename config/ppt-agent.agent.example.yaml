@@ -62,6 +62,11 @@ skills:
   root: ../ppt_agent/builtin_skills
   active: guizang-ppt
 
+# v2 是唯一写链路；关闭后实例失败关闭，供灰度摘流与版本级回滚使用。
+feature_flags:
+  skill_runtime_v2: true
+  technical_gate_v2: true
+
 capabilities:
   network_tools: false
   image_input: false

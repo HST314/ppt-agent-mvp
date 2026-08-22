@@ -510,8 +510,7 @@ class ContractLedgerGateTests(unittest.TestCase):
             self.assertEqual(len(builder.calls), 2)
             self.assertGreater(generation["server_claim_materialization"]["materialized_count"], 0)
             self.assertEqual(sample["metadata"]["post_render_gate"]["claims"]["missing_required_count"], 0)
-            signatures = sample["metadata"]["post_render_gate"]["canonical_validator"]["structural_signatures"]
-            self.assertFalse(signatures["applicable"])
+            self.assertNotIn("canonical_validator", sample["metadata"]["post_render_gate"])
             self.assertEqual(sample["metadata"]["post_render_gate"]["layout"]["technical_binding_percent"], 100)
 
     def test_stale_automatic_sample_selection_is_refreshed_on_generation(self):

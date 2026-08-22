@@ -115,6 +115,29 @@ class StageAConfigTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValidationError):
                 self.config("gateway: {mode: fake}\n"+invalid,{})
 
+    def test_v2_rollout_flags_are_strict_public_and_default_enabled(self):
+        default = self.config("gateway: {mode: fake}\n", {})
+        self.assertEqual(
+            default.feature_flags.public(),
+            {"skill_runtime_v2": True, "technical_gate_v2": True},
+        )
+        disabled = self.config(
+            "gateway: {mode: fake}\n"
+            "feature_flags: {skill_runtime_v2: false, technical_gate_v2: false}\n",
+            {},
+        )
+        self.assertEqual(
+            disabled.public()["feature_flags"],
+            {"skill_runtime_v2": False, "technical_gate_v2": False},
+        )
+        for invalid in (
+            'feature_flags: {skill_runtime_v2: "true"}\n',
+            "feature_flags: {technical_gate_v2: 1}\n",
+            "feature_flags: {legacy_gate: true}\n",
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(ValidationError):
+                self.config("gateway: {mode: fake}\n" + invalid, {})
+
     def test_inherited_crlf_environment_values_are_normalized(self):
         env={"GEN_KEY":"secret\r","GEN_URL":"https://gen.example/v1\r"}
         cfg=self.config(

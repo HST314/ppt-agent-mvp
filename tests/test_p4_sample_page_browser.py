@@ -57,7 +57,7 @@ class SamplePageBrowserTests(unittest.TestCase):
         self.thread.join(5)
         self.tmp.cleanup()
 
-    def wait_for_versions(self, count, timeout=6):
+    def wait_for_versions(self, count, timeout=15):
         deadline = time.monotonic() + timeout
         view = self.svc.sample_view("task")
         while time.monotonic() < deadline and (

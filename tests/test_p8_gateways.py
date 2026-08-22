@@ -1,46 +1,69 @@
-import json, os, tempfile, threading, unittest
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from ppt_agent.errors import GatewayError, GatewayUnknownResult, ValidationError
-from ppt_agent.gateways import DirectorySkillLoader, JsonHttpModelGateway, gateways_from_env
+from ppt_agent.config import FeatureFlagsConfig
+from ppt_agent.errors import RuntimeUnavailableError, ValidationError
+from ppt_agent.gateways import AgentGateway, LockedSkillMetadataLoader, agent_gateways_from_config
+from ppt_agent.skill_runtime import ActiveSkillResolver, SkillRuntime
 
-class Handler(BaseHTTPRequestHandler):
-    response={"text":"generated"}; seen=[]
-    def do_POST(self):
-        length=int(self.headers["Content-Length"]); type(self).seen.append((dict(self.headers),json.loads(self.rfile.read(length))))
-        raw=json.dumps(type(self).response).encode(); self.send_response(200); self.send_header("Content-Length",str(len(raw))); self.end_headers(); self.wfile.write(raw)
-    def log_message(self,*args): pass
 
 class P8GatewayTests(unittest.TestCase):
-    def setUp(self):
-        Handler.seen=[]; Handler.response={"text":"generated"}; self.server=ThreadingHTTPServer(("127.0.0.1",0),Handler)
-        self.thread=threading.Thread(target=self.server.serve_forever,daemon=True); self.thread.start()
-        self.endpoint=f"http://127.0.0.1:{self.server.server_port}/model"
-    def tearDown(self): self.server.shutdown(); self.server.server_close(); self.thread.join()
-    def test_generation_and_independent_inspection_contracts(self):
-        gateway=JsonHttpModelGateway(self.endpoint,"fixture","secret",1)
-        result=gateway.generate("outline",{"task_id":"t"},skill="rules")
-        self.assertEqual(result["text"],"generated"); self.assertEqual(Handler.seen[0][1]["purpose"],"generation")
-        Handler.response={"passed":True,"issues":[]}
-        inspector=JsonHttpModelGateway(self.endpoint,"checker","secret",1,"independent_inspection")
-        evidence={"available":True,"passed":True,"issues":[]}
-        self.assertTrue(inspector.inspect("outline","<html>",browser_evidence=evidence)["passed"])
-        sent=Handler.seen[-1][1]; self.assertEqual(set(sent)-{"model","purpose"},{"original_outline","html","browser_evidence"}); self.assertEqual(sent["browser_evidence"],evidence); self.assertNotIn("generation_context",sent)
-    def test_invalid_response_and_unknown_result_are_publicly_sanitized(self):
-        Handler.response={"unexpected":True}
-        with self.assertRaises(GatewayError) as caught: JsonHttpModelGateway(self.endpoint,"m","top-secret",1).generate("x",{},skill="s")
-        self.assertNotIn("top-secret",json.dumps(caught.exception.public()))
-        with self.assertRaises(GatewayUnknownResult): JsonHttpModelGateway("http://127.0.0.1:1/model","m","top-secret",.05).generate("x",{},skill="s")
-    def test_endpoint_and_skill_boundaries(self):
-        with self.assertRaises(ValidationError): JsonHttpModelGateway("http://example.test/model","m")
-        with tempfile.TemporaryDirectory() as tmp:
-            with open(os.path.join(tmp,"outline.md"),"w") as handle: handle.write("outline rules")
-            loader=DirectorySkillLoader(tmp); self.assertEqual(loader.load("outline")["content"],"outline rules")
-            with self.assertRaises(ValidationError): loader.load("../secret")
-    def test_fake_is_default_and_http_config_is_explicit(self):
-        with patch.dict(os.environ,{},clear=True): self.assertEqual(gateways_from_env(),{})
-        with patch.dict(os.environ,{"PPT_AGENT_GATEWAY_MODE":"http"},clear=True):
-            with self.assertRaises(ValidationError): gateways_from_env()
+    def test_fake_mode_has_no_model_adapters(self):
+        self.assertEqual(agent_gateways_from_config(SimpleNamespace(mode="fake")), {})
 
-if __name__=="__main__": unittest.main()
+    def test_agent_mode_injects_one_resolver_into_every_current_port(self):
+        resolver = ActiveSkillResolver.builtin()
+        config = SimpleNamespace(
+            mode="agent",
+            skills=SimpleNamespace(root=resolver.root, active=resolver.active),
+            feature_flags=FeatureFlagsConfig(),
+            generation=SimpleNamespace(
+                max_steps=12,
+                max_tool_calls=24,
+                max_provider_calls=8,
+                run_timeout_seconds=300,
+                job_timeout_seconds=330,
+                model="generation",
+                stage_budgets={},
+            ),
+            inspection=SimpleNamespace(
+                max_steps=12,
+                max_tool_calls=24,
+                max_provider_calls=8,
+                run_timeout_seconds=300,
+                job_timeout_seconds=330,
+                model="inspection",
+            ),
+        )
+        clients = {"generation": object(), "inspection": object()}
+        with patch("ppt_agent.model_clients.model_clients_from_config", return_value=clients):
+            ports = agent_gateways_from_config(config)
+
+        self.assertIs(ports["generator"], ports["builder"])
+        self.assertIs(ports["generator"], ports["clarifier"])
+        self.assertIs(ports["generator"].skill_resolver, ports["inspector"].skill_resolver)
+        metadata = ports["skills"].load("outline")
+        self.assertEqual(metadata["protocol"], "skill_runtime_v2")
+        self.assertEqual(metadata["version"], ports["generator"].skill_factory().skill_version)
+
+    def test_explicit_injection_is_required_after_legacy_loader_removal(self):
+        with self.assertRaisesRegex(ValidationError, "显式注入"):
+            AgentGateway(object())
+        with self.assertRaisesRegex(ValidationError, "显式注入"):
+            LockedSkillMetadataLoader()
+
+    def test_disabled_skill_rollout_fails_closed_without_legacy_fallback(self):
+        skill = SkillRuntime.builtin()
+        gateway = AgentGateway(object(), skill=skill, skill_runtime_v2_enabled=False)
+        loader = LockedSkillMetadataLoader(skill=skill, skill_runtime_v2_enabled=False)
+        with self.assertRaises(RuntimeUnavailableError) as gateway_error:
+            gateway._run("narrative", {})
+        with self.assertRaises(RuntimeUnavailableError) as loader_error:
+            loader.load("narrative")
+        self.assertEqual(gateway_error.exception.failed_check, "skill_runtime_v2")
+        self.assertEqual(loader_error.exception.failed_check, "skill_runtime_v2")
+
+
+if __name__ == "__main__":
+    unittest.main()

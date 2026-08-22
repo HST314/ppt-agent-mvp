@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import hashlib, json, os, re, socket, urllib.error, urllib.request, uuid
+import hashlib, json, re, uuid
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Protocol
-from .errors import GatewayError, GatewayUnknownResult, ValidationError
+from .errors import GatewayError, RuntimeUnavailableError, ValidationError
 from .agent_runtime import AgentRuntime, STAGE_OUTPUT_SCHEMAS, STAGE_PROVIDER_SCHEMAS, _extract_json_object, normalize_rendering_output
 from .audit import current_agent_audit_context
 from .claim_ledger import audit_html_claims_by_slide
@@ -60,70 +59,21 @@ class FakeHtmlBuilder:
     shared_assets={"css":"body{background:#111827;font-family:Arial,sans-serif;padding:24px 0}.slide{margin-bottom:24px;background:#fff;color:#111827;padding:56px 64px}.slide h1,.slide h2,.slide [data-element-id=\"title\"]{font-size:52px;line-height:1.12}.slide p,.slide li{font-size:24px;line-height:1.45}"}
     def build(self,outline,**context): return f"<!doctype html><html><body>{outline}</body></html>"
 
-class DirectorySkillLoader:
-    ACTIONS={"narrative","outline","sample","deck","inspection"}
-    def __init__(self,root): self.root=Path(root).resolve()
-    def load(self,action):
-        if action not in self.ACTIONS: raise ValidationError("Skill action 不在允许列表")
-        path=(self.root/f"{action}.md").resolve()
-        if self.root not in path.parents or not path.is_file(): raise ValidationError(f"缺少 Skill：{action}")
-        content=path.read_text(encoding="utf-8")
-        if not content.strip() or len(content.encode())>256*1024: raise ValidationError("Skill 内容为空或超过 256 KiB")
-        return {"action":action,"version":hashlib.sha256(content.encode()).hexdigest()[:16],"content":content}
-
-class JsonHttpModelGateway:
-    """Vendor-neutral adapter. It never blindly retries an unknown result."""
-    def __init__(self,endpoint,model,api_key="",timeout=30.0,purpose="generation"):
-        if not endpoint.startswith("https://") and not endpoint.startswith("http://127.0.0.1:") and not endpoint.startswith("http://localhost:"):
-            raise ValidationError("模型端点必须使用 HTTPS（本机回环地址除外）")
-        self.endpoint,self.model,self.api_key=endpoint,model,api_key
-        self.timeout,self.purpose=float(timeout),purpose
-        self.requires_browser_evidence=purpose=="independent_inspection"
-    def _call(self,payload):
-        body=json.dumps({"model":self.model,"purpose":self.purpose,**payload},ensure_ascii=False).encode()
-        headers={"Content-Type":"application/json","Accept":"application/json"}
-        if self.api_key: headers["Authorization"]=f"Bearer {self.api_key}"
-        request=urllib.request.Request(self.endpoint,data=body,headers=headers,method="POST")
-        try:
-            with urllib.request.urlopen(request,timeout=self.timeout) as response: raw=response.read(4*1024*1024+1)
-        except urllib.error.HTTPError as exc: raise GatewayError(f"模型服务返回 HTTP {exc.code}") from exc
-        except (TimeoutError,socket.timeout) as exc: raise GatewayError("模型调用超时") from exc
-        except (urllib.error.URLError,ConnectionError,OSError) as exc: raise GatewayUnknownResult("模型调用结果未知，请人工确认后再重试") from exc
-        if len(raw)>4*1024*1024: raise GatewayError("模型响应超过 4 MiB")
-        try: value=json.loads(raw)
-        except (UnicodeDecodeError,json.JSONDecodeError) as exc: raise GatewayError("模型响应不是有效 JSON") from exc
-        if not isinstance(value,dict): raise GatewayError("模型响应必须为 JSON object")
-        return value
-    def generate(self,action,payload,*,skill):
-        value=self._call({"action":action,"input":payload,"skill":skill})
-        if not isinstance(value.get("text"),str) or not value["text"].strip(): raise GatewayError("生成响应缺少 text")
-        return {**value,"model":self.model}
-    def inspect(self,original_outline,html,*,browser_evidence=None):
-        value=self._call({"original_outline":original_outline,"html":html,"browser_evidence":browser_evidence})
-        if not isinstance(value.get("passed"),bool) or not isinstance(value.get("issues"),list): raise GatewayError("检查响应契约无效")
-        return {**value,"model":self.model}
-
-class ModelHtmlBuilder:
-    version="model-html-v1"
-    def __init__(self,gateway,skill_loader): self.gateway,self.skills=gateway,skill_loader
-    def build(self,outline,**context):
-        action=context.pop("action", "deck")
-        if action not in {"sample", "deck", "inspection"}: raise ValidationError("HTML Builder action 不在允许列表")
-        skill=self.skills.load(action)
-        return self.gateway.generate(action + "_html",{"outline":outline,**context},skill=skill["content"])["text"]
-
 class AgentGateway:
     """Adapts the constrained stage runtime to the existing FSM ports.
 
     It deliberately exposes no workflow operation to the model.  The service
     remains the only owner of stages, versions, approvals and commits.
     """
-    def __init__(self, client, *, skill=None, skill_resolver=None, max_steps=12, max_tool_calls=24, max_provider_calls=8, run_timeout_seconds=300, job_timeout_seconds=330, model="agent", stage_budgets=None):
+    def __init__(self, client, *, skill=None, skill_resolver=None, max_steps=12, max_tool_calls=24, max_provider_calls=8, run_timeout_seconds=300, job_timeout_seconds=330, model="agent", stage_budgets=None, skill_runtime_v2_enabled=True):
         self.requires_browser_evidence = True
         self.client, self.model = client, model
         self.max_steps, self.max_tool_calls, self.max_provider_calls = max_steps, max_tool_calls, max_provider_calls
         self.run_timeout_seconds, self.job_timeout_seconds = run_timeout_seconds, job_timeout_seconds
         self.stage_budgets = stage_budgets or {}
+        if not isinstance(skill_runtime_v2_enabled, bool):
+            raise ValidationError("skill_runtime_v2 灰度开关必须为 boolean")
+        self.skill_runtime_v2_enabled = skill_runtime_v2_enabled
         if skill is not None and skill_resolver is not None:
             raise ValidationError("AgentGateway 不能同时指定 Skill 与 ActiveSkillResolver")
         if skill is not None:
@@ -132,9 +82,9 @@ class AgentGateway:
             self.skill_resolver = None
             self.skill_factory = skill.clone
         else:
-            self.skill_resolver = skill_resolver or ActiveSkillResolver.builtin()
+            self.skill_resolver = skill_resolver
             if not isinstance(self.skill_resolver, ActiveSkillResolver):
-                raise ValidationError("AgentGateway ActiveSkillResolver 无效")
+                raise ValidationError("AgentGateway 必须显式注入 ActiveSkillResolver")
             self.skill_factory = self.skill_resolver.runtime
         self.runtime = None
         self.audit_sink = None
@@ -147,6 +97,12 @@ class AgentGateway:
         return key() if callable(key) else None
 
     def _run(self, stage, payload):
+        if not self.skill_runtime_v2_enabled:
+            raise RuntimeUnavailableError(
+                "skill_runtime_v2 未对本实例开放，已停止接收新的 Agent 写任务",
+                runtime_error_code="release_feature_disabled",
+                failed_check="skill_runtime_v2",
+            )
         # Read quotas and audit are scoped to one stage invocation.  Reusing a
         # mutable SkillRuntime would let earlier stages consume later budgets.
         stage_budget = self.stage_budgets.get(stage)
@@ -430,8 +386,11 @@ class AgentGateway:
         return {**value, "model": self.model}
 
 class LockedSkillMetadataLoader:
-    """Metadata-only compatibility port; Skill text is read by Agent tools."""
-    def __init__(self, skill=None, *, skill_resolver=None):
+    """Metadata-only port; Skill text is read by Agent tools."""
+    def __init__(self, skill=None, *, skill_resolver=None, skill_runtime_v2_enabled=True):
+        if not isinstance(skill_runtime_v2_enabled, bool):
+            raise ValidationError("skill_runtime_v2 灰度开关必须为 boolean")
+        self.skill_runtime_v2_enabled = skill_runtime_v2_enabled
         if skill is not None and skill_resolver is not None:
             raise ValidationError("Skill metadata loader 不能同时指定 Skill 与 ActiveSkillResolver")
         if skill is not None:
@@ -439,11 +398,17 @@ class LockedSkillMetadataLoader:
                 raise ValidationError("Skill metadata loader 的 Skill 无效")
             self.skill_factory = skill.clone
         else:
-            resolver = skill_resolver or ActiveSkillResolver.builtin()
+            resolver = skill_resolver
             if not isinstance(resolver, ActiveSkillResolver):
-                raise ValidationError("Skill metadata loader 的 ActiveSkillResolver 无效")
+                raise ValidationError("Skill metadata loader 必须显式注入 ActiveSkillResolver")
             self.skill_factory = resolver.runtime
     def load(self, action):
+        if not self.skill_runtime_v2_enabled:
+            raise RuntimeUnavailableError(
+                "skill_runtime_v2 未对本实例开放，已停止读取新的 Skill 快照",
+                runtime_error_code="release_feature_disabled",
+                failed_check="skill_runtime_v2",
+            )
         if action not in {"narrative", "outline", "sample", "deck", "inspection"}: raise ValidationError("Skill action 不在允许列表")
         skill=self.skill_factory()
         files=["SKILL.md"]
@@ -456,6 +421,7 @@ class LockedSkillMetadataLoader:
             "content":json.dumps(file_hashes,sort_keys=True,separators=(",",":")),
             "files":files,
             "file_hashes":file_hashes,
+            "protocol":"skill_runtime_v2",
         }
 
 def agent_gateways_from_config(config):
@@ -472,6 +438,7 @@ def agent_gateways_from_config(config):
         job_timeout_seconds=config.generation.job_timeout_seconds,
         model=config.generation.model,
         stage_budgets=config.generation.stage_budgets,
+        skill_runtime_v2_enabled=config.feature_flags.skill_runtime_v2,
     )
     inspection = AgentGateway(
         clients["inspection"], skill_resolver=resolver,
@@ -481,15 +448,15 @@ def agent_gateways_from_config(config):
         run_timeout_seconds=config.inspection.run_timeout_seconds,
         job_timeout_seconds=config.inspection.job_timeout_seconds,
         model=config.inspection.model,
+        skill_runtime_v2_enabled=config.feature_flags.skill_runtime_v2,
     )
-    return {"generator": generation, "clarifier": generation, "builder": generation, "inspector": inspection, "skills": LockedSkillMetadataLoader(skill_resolver=resolver)}
-
-def gateways_from_env():
-    mode=os.environ.get("PPT_AGENT_GATEWAY_MODE","fake")
-    if mode=="fake": return {}
-    if mode!="http": raise ValidationError("PPT_AGENT_GATEWAY_MODE 只能是 fake 或 http")
-    endpoint=os.environ.get("PPT_AGENT_MODEL_ENDPOINT",""); model=os.environ.get("PPT_AGENT_MODEL",""); skill_root=os.environ.get("PPT_AGENT_SKILL_DIR","")
-    if not endpoint or not model or not skill_root: raise ValidationError("http 模式缺少模型端点、模型名或 Skill 目录")
-    timeout=float(os.environ.get("PPT_AGENT_MODEL_TIMEOUT","30")); key=os.environ.get("PPT_AGENT_API_KEY","")
-    generator=JsonHttpModelGateway(endpoint,model,key,timeout,"generation"); skills=DirectorySkillLoader(skill_root)
-    return {"generator":generator,"inspector":JsonHttpModelGateway(endpoint,model,key,timeout,"independent_inspection"),"skills":skills,"builder":ModelHtmlBuilder(generator,skills)}
+    return {
+        "generator": generation,
+        "clarifier": generation,
+        "builder": generation,
+        "inspector": inspection,
+        "skills": LockedSkillMetadataLoader(
+            skill_resolver=resolver,
+            skill_runtime_v2_enabled=config.feature_flags.skill_runtime_v2,
+        ),
+    }

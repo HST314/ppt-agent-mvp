@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT))
 
 from ppt_agent.browser_inspection import ChromiumDeckInspector  # noqa: E402
 from ppt_agent.render_gate import canonical_post_render_evidence  # noqa: E402
+from ppt_agent.offline import verify_delivery  # noqa: E402
 from ppt_agent.service import TaskService  # noqa: E402
 from ppt_agent.store import WorkspaceStore  # noqa: E402
 
@@ -55,7 +56,9 @@ def main() -> int:
         service.run_inspection(task_id, 0)
         finalization = service.finalize_deck(task_id, deck["hash"], "review")["finalization"]
         delivery = service.publish_delivery(task_id)["delivery"]
-        packaged_evidence = (service.store.delivery_root(task_id, delivery["delivery_id"]) / "post-render-gate-evidence.json").read_bytes()
+        delivery_root = service.store.delivery_root(task_id, delivery["delivery_id"])
+        packaged_evidence = (delivery_root / "post-render-gate-evidence.json").read_bytes()
+        offline_files = verify_delivery(delivery_root)
         result = {
             "sample_gate_passed": sample["metadata"]["post_render_gate"]["passed"],
             "deck_gate_passed": gate["passed"],
@@ -85,6 +88,7 @@ def main() -> int:
             "finalization_evidence_hash_verified": finalization["post_render_gate_hash"] == gate["evidence_hash"],
             "delivery_evidence_included": packaged_evidence == evidence,
             "delivery_evidence_hash_verified": hashlib.sha256(packaged_evidence).hexdigest() == gate["evidence_hash"],
+            "offline_delivery_verified": bool(offline_files),
         }
         expected = {
             "sample_gate_passed": True,
@@ -108,6 +112,7 @@ def main() -> int:
             "finalization_evidence_hash_verified": True,
             "delivery_evidence_included": True,
             "delivery_evidence_hash_verified": True,
+            "offline_delivery_verified": True,
         }
         failures = {name: {"expected": value, "actual": result.get(name)} for name, value in expected.items() if result.get(name) != value}
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
