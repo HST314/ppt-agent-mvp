@@ -151,6 +151,20 @@ class ContractLedgerGateTests(unittest.TestCase):
                 created_at=now(),
             ), "大纲")
 
+    def test_generated_narrative_cannot_disclose_invented_metrics_as_assumptions(self):
+        ledger = build_claim_ledger(
+            task_id="task",
+            input_snapshot_hash="a" * 64,
+            source_binding={"known_facts": ["项目总周期 12 周"]},
+            created_at=now(),
+        )
+
+        disclosed = "建议第 4 周完成启动，并配置 45% 资源（数据待确认）。"
+
+        self.assertTrue(assert_claims_bound(disclosed, ledger, "人工叙事"))
+        with self.assertRaisesRegex(ValidationError, "4 周.*45%"):
+            assert_claims_bound(disclosed, ledger, "模型叙事", allow_disclosed_assumptions=False)
+
     def test_required_claim_coverage_is_bidirectional_and_reports_omissions(self):
         ledger = build_claim_ledger(
             task_id="task",

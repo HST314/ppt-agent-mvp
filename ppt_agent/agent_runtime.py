@@ -31,6 +31,9 @@ STAGE_PROMPTS = {
     "narrative": (
         "根据任务卡生成叙事结构 Markdown；不要生成逐页 HTML。数字、日期、实体、效果与承诺只能来自冻结任务卡，"
         "不得把计划改写成已发生事实，不得补造 SLA/KPI/倍数/期限，也不得输出 XX、TBD、[必填]、X 月 X 日等占位符。"
+        "输入中的 narrative_numeric_policy 是量化事实硬约束：只能使用 allowed_claims 中已有的量化值；"
+        "总周期不得拆成未绑定的阶段周数或累计周数，已有比例不得拆分、重配或补造新占比。"
+        "需要表达阶段时使用不带数字的阶段名称；不得用‘假设/建议/待确认’包装自造数字来绕过约束。"
         "按需最多读取 1 个当前阶段已列出的规划摘要，不要重复读取。"
     ),
     "outline": (
@@ -66,7 +69,7 @@ STAGE_OUTPUT_SCHEMAS = {
             "value": {"type": "string"}, "label": {"type": "string"}, "description": {"type": "string"}
         }, ["value", "label", "description"])}, "allow_other": {"type": "boolean"}, "blocking": {"type": "boolean"}
     }, ["question_id", "field_path", "prompt", "helper_text", "options", "allow_other", "blocking"])}}, ["questions"])},
-    "narrative": {"name": "narrative", "strict": True, "schema": _object_schema({"markdown": {"type": "string"}}, ["markdown"])},
+    "narrative": {"name": "narrative", "strict": True, "schema": _object_schema({"markdown": {"type": "string", "minLength": 1, "pattern": r"\S"}}, ["markdown"])},
     "outline": {"name": "outline", "strict": True, "schema": _object_schema({"slides": {
         "type": "array", "minItems": 1, "items": _object_schema({
             "title": {"type": "string", "minLength": 1},
@@ -86,7 +89,7 @@ STAGE_OUTPUT_SCHEMAS = {
 }
 
 
-_PROVIDER_UNSUPPORTED_SCHEMA_KEYWORDS = frozenset({"minLength", "minItems", "uniqueItems"})
+_PROVIDER_UNSUPPORTED_SCHEMA_KEYWORDS = frozenset({"minLength", "minItems", "pattern", "uniqueItems"})
 
 
 def _provider_schema(value: Any) -> Any:
@@ -763,6 +766,8 @@ class AgentRuntime:
             raise GatewayError(f"Agent 输出不符合 Schema：{path} 枚举无效")
         if expected == "string" and len(value) < schema.get("minLength", 0):
             raise GatewayError(f"Agent 输出不符合 Schema：{path} 长度不足")
+        if expected == "string" and "pattern" in schema and not re.search(schema["pattern"], value):
+            raise GatewayError(f"Agent 输出不符合 Schema：{path} 内容为空")
         if expected == "object":
             properties, required = schema.get("properties", {}), schema.get("required", [])
             missing = [name for name in required if name not in value]

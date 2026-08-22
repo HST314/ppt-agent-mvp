@@ -168,6 +168,7 @@ def audit_claims(
     ledger: dict[str, Any],
     *,
     required_claim_ids: list[str] | tuple[str, ...] | set[str] | None = None,
+    allow_disclosed_assumptions: bool = True,
 ) -> dict[str, Any]:
     validate_claim_ledger(ledger)
     # Recompute the semantic key from the immutable display value so ledgers
@@ -180,7 +181,7 @@ def audit_claims(
     bindings, unbound = [], []
     for occurrence in _occurrences(text):
         context = text[max(0, occurrence["start"] - 32): min(len(text), occurrence["end"] + 32)]
-        if _DISCLOSED.search(context):
+        if allow_disclosed_assumptions and _DISCLOSED.search(context):
             bindings.append({**occurrence, "status": "disclosed_assumption", "source_claim_ids": [], "formula": ""})
             continue
         claim = known.get(occurrence["normalized_value"])
@@ -262,9 +263,21 @@ def audit_html_claims(
     return audit_claims("\n".join(parser.text), ledger, required_claim_ids=required_claim_ids)
 
 
-def assert_claims_bound(text: str, ledger: dict[str, Any], stage: str, *, require_all: bool = False) -> dict[str, Any]:
+def assert_claims_bound(
+    text: str,
+    ledger: dict[str, Any],
+    stage: str,
+    *,
+    require_all: bool = False,
+    allow_disclosed_assumptions: bool = True,
+) -> dict[str, Any]:
     required = [claim["claim_id"] for claim in ledger["claims"]] if require_all else None
-    result = audit_claims(text, ledger, required_claim_ids=required)
+    result = audit_claims(
+        text,
+        ledger,
+        required_claim_ids=required,
+        allow_disclosed_assumptions=allow_disclosed_assumptions,
+    )
     if result["unbound"]:
         values = "、".join(item["value"] for item in result["unbound"][:5])
         raise ValidationError(f"{stage} 包含未绑定事实：{values}")

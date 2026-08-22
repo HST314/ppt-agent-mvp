@@ -26,6 +26,22 @@ from .overflow_autofit import GEOMETRIC_CODES, MAX_CASCADE_ROUNDS, fit_deck_html
 def utcnow(): return datetime.now(timezone.utc).isoformat()
 def fingerprint(value): return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(",",":")).encode()).hexdigest()
 
+def narrative_numeric_policy(ledger):
+    quantified={"date","quarter","metric","metric_transition","frequency"}
+    return {
+        "mode":"claim_ledger_exact_allowlist",
+        "allowed_claims":[
+            {"claim_id":claim["claim_id"],"kind":claim["kind"],"value":claim["value"]}
+            for claim in ledger["claims"] if claim["kind"] in quantified
+        ],
+        "forbidden_transformations":[
+            "不得把总周期拆成新的阶段周数或累计周数",
+            "不得把已有百分比拆分、重配或补造成新的阶段占比",
+            "不得用假设、建议、示例或待确认包装未绑定量化值",
+        ],
+        "unnumbered_stage_labels":["启动阶段","扩展阶段","稳态阶段","复盘阶段"],
+    }
+
 INSPECTION_SOURCES=frozenset({"semantic_model","semantic_deterministic","technical_browser"})
 INSPECTION_SOURCE_PRIORITY={"semantic_model":0,"semantic_deterministic":1,"technical_browser":2}
 
@@ -909,16 +925,23 @@ class TaskService:
             model_name=self.generator.model
             claim_bindings=assert_claims_bound(text,ledger_value,"叙事")
         else:
-            payload={"task_id":task_id,"task_card":view["task_card"],"prompt":prompt,"scope":scope,"claim_ledger":ledger_value}
+            numeric_policy=narrative_numeric_policy(ledger_value)
+            payload={"task_id":task_id,"task_card":view["task_card"],"prompt":prompt,"scope":scope,"claim_ledger":ledger_value,"narrative_numeric_policy":numeric_policy}
             for attempt in range(1,3):
                 generated=self.generator.generate("narrative",payload,skill=skill["content"])
                 text=generated["text"]; model_name=generated.get("model","unknown")
                 try:
-                    claim_bindings=assert_claims_bound(text,ledger_value,"叙事")
+                    claim_bindings=assert_claims_bound(text,ledger_value,"叙事",allow_disclosed_assumptions=False)
                     break
                 except ValidationError as exc:
                     if attempt==2: raise
-                    payload={**payload,"semantic_correction":{"attempt":attempt,"error":exc.message,"rule":"只允许 Claim Ledger 已绑定事实；无来源内容必须标记为假设/建议/待确认"}}
+                    evidence=audit_claims(text,ledger_value,allow_disclosed_assumptions=False)
+                    payload={**payload,"semantic_correction":{
+                        "attempt":attempt,
+                        "error":exc.message,
+                        "forbidden_values":[item["value"] for item in evidence["unbound"]],
+                        "rule":"删除全部未绑定量化值；不得改标为假设、建议、示例或待确认。阶段改用无数字名称，仅保留 narrative_numeric_policy.allowed_claims 中的原始量化事实。",
+                    }}
         version=len(self.versions(task_id,"narrative"))+1; content_hash=digest(text.encode())
         model=NarrativeDocument.parse({"document_id":f"narrative-{content_hash[:16]}","task_id":task_id,"version":version,"markdown":text,"content_hash":content_hash,"created_at":now(),"schema_version":"1.0"})
         metadata={"parent":prior,"action":"generate" if not prior else "regenerate","scope":scope,"summary":"生成整稿叙事结构","model":model_name,"skill":{"action":"narrative","version":skill["version"],"hash":digest(skill["content"].encode()),"included":["narrative"],"trimmed":["outline","html","inspection"]},"input_snapshot_hash":view["snapshot_hash"],"claim_ledger_hash":ledger["hash"],"claim_bindings":claim_bindings["bindings"],"unbound_claim_count":0}

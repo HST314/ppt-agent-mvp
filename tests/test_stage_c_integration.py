@@ -63,6 +63,40 @@ class StageCIntegrationTests(unittest.TestCase):
             self.assertEqual(len(candidate["candidate"]["slides"]),1)
             self.assertFalse(diagnostics[0]["metadata"]["public_error_exposes_candidate"])
 
+    def test_narrative_retries_disclosed_invented_stage_numbers_with_strict_allowlist(self):
+        with tempfile.TemporaryDirectory() as root:
+            client=ScriptedClient(
+                '{"markdown":"# 叙事结构\\n\\n建议第 4 周完成启动，第 8 周扩展，阶段资源占比 45%（待确认）。"}',
+                '{"markdown":"# 叙事结构\\n\\n项目按启动阶段、扩展阶段与稳态阶段推进，总周期 12 周。"}',
+            )
+            svc=service(root,client); svc.create("task","manual")
+            svc.import_input("task",{"goal":"扩容汇报","audience":"管理层","topic":"AI 客服试点","项目周期":"12 周"})
+
+            narrative=svc.generate_narrative("task")["narrative"]
+
+            self.assertIn("总周期 12 周",narrative["markdown"])
+            self.assertNotIn("45%",narrative["markdown"])
+            self.assertEqual(len(client.inputs),2)
+            initial=json.loads(client.inputs[0]["input"][1]["content"])
+            allowed={item["value"].replace(" ","") for item in initial["narrative_numeric_policy"]["allowed_claims"]}
+            self.assertIn("12周",allowed)
+            correction=json.loads(client.inputs[1]["input"][1]["content"])["semantic_correction"]
+            self.assertEqual({value.replace(" ","") for value in correction["forbidden_values"]},{"4周","8周","45%"})
+            self.assertIn("不得改标为假设",correction["rule"])
+
+    def test_narrative_invented_stage_numbers_remain_fail_closed_after_retry(self):
+        with tempfile.TemporaryDirectory() as root:
+            bad='{"markdown":"# 叙事结构\\n\\n建议第 3 周完成启动，第 6 周扩展（均待确认）。"}'
+            client=ScriptedClient(bad,bad)
+            svc=service(root,client); svc.create("task","manual")
+            svc.import_input("task",{"goal":"扩容汇报","audience":"管理层","topic":"AI 客服试点","项目周期":"12 周"})
+
+            with self.assertRaisesRegex(ValidationError,"未绑定事实"):
+                svc.generate_narrative("task")
+
+            self.assertEqual(len(client.inputs),2)
+            self.assertFalse(svc.versions("task","narrative"))
+
     def test_semantic_outline_correction_is_bounded_to_one_retry(self):
         with tempfile.TemporaryDirectory() as root:
             client=ScriptedClient('{"markdown":"# 叙事结构"}',outline_response(1),outline_response(1))

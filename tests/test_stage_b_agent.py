@@ -169,7 +169,7 @@ class StageBAgentTests(unittest.TestCase):
         self.assertEqual(client.inputs[2]["tool_choice"],{"type":"function","name":"list_skill_files"})
         self.assertIsNone(client.inputs[2]["response_schema"])
         self.assertEqual(client.inputs[3]["tool_choice"],"none")
-        self.assertEqual(client.inputs[3]["response_schema"],STAGE_OUTPUT_SCHEMAS["narrative"])
+        self.assertEqual(client.inputs[3]["response_schema"],STAGE_PROVIDER_SCHEMAS["narrative"])
         self.assertIn("function_call_output",str(client.inputs[3]["input"]))
         self.assertEqual(gateway.last_probe_audit["probe_id"],"runtime-probe-test")
         self.assertEqual([event["status"] for event in gateway.last_probe_audit["events"]],["started","succeeded"]*3)
@@ -586,6 +586,32 @@ class StageBAgentTests(unittest.TestCase):
         turn = OpenAIResponsesClient(config, sdk_client=sdk).create(input=[],tools=TOOLS,tool_choice=choice)
         self.assertEqual(turn.tool_calls[0].name, "read_skill_file")
         self.assertEqual(requests[0]["tool_choice"],choice)
+
+    def test_narrative_recovers_empty_markdown_from_responses_message_content(self):
+        sdk = SimpleNamespace(); sdk.responses = sdk; sdk.calls = 0; sdk.requests = []
+        def create(**kwargs):
+            sdk.calls += 1; sdk.requests.append(kwargs)
+            markdown = "" if sdk.calls == 1 else "# 已恢复叙事"
+            return SimpleNamespace(
+                output_text="",
+                id=f"r-{sdk.calls}",
+                output=[SimpleNamespace(
+                    type="message",
+                    content=[SimpleNamespace(type="output_text", text=json.dumps({"markdown":markdown},ensure_ascii=False))],
+                )],
+            )
+        sdk.create = create
+        config = SimpleNamespace(model="m", api_key="k", base_url="https://example.com", timeout_seconds=1, structured_output="prompt")
+        client = OpenAIResponsesClient(config, sdk_client=sdk)
+
+        result = AgentRuntime(client, SkillRuntime.builtin()).run("narrative", {})
+
+        self.assertEqual(result.value, {"markdown":"# 已恢复叙事"})
+        self.assertEqual(sdk.calls, 2)
+        correction = next(item for item in result.audit if item.get("event") == "schema_correction")
+        self.assertEqual(correction["reason"], "schema_validation")
+        self.assertIn("长度不足", str(sdk.requests[1]["input"]))
+        self.assertEqual(sdk.requests[1]["tool_choice"], "none")
 
     def test_client_classifies_http_failures_and_only_audits_safe_metadata(self):
         expected = {
