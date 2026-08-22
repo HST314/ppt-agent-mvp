@@ -199,7 +199,7 @@ class P2VisualOfflineTests(unittest.TestCase):
         self.assertEqual(player.count("assets/motion.min.js"), 1)
         self.assertTrue(profile["passed"], profile)
         self.assertEqual(profile["measurements"]["motion_script_references"], 1)
-        self.assertLessEqual(profile["measurements"]["player_javascript_bytes"], 4096)
+        self.assertLessEqual(profile["measurements"]["player_javascript_bytes"], 16 * 1024)
         self.assertEqual(profile["optimizations"]["slide_state_updates"], "O(1) previous/current mutation")
 
     def test_query_and_fragment_runtime_duplicates_fail_counting_and_delivery_gate(self):

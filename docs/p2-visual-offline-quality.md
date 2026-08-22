@@ -17,8 +17,8 @@
 交付包生成 `offline-performance.json`，并在发布前校验：
 
 - Motion runtime 引用不超过 1 次；offline player 引用恰好 1 次。
-- offline player JavaScript 不超过 4 KiB。
-- 离线 runtime JavaScript 不超过 70 KiB。
+- offline player JavaScript 不超过 16 KiB（包含后续加入的演示动效、索引视图与低功耗模式）。
+- 离线 runtime JavaScript 不超过 80 KiB。
 - `index.html + runtime JavaScript` 不超过 256 KiB。
 - 翻页仅更新前一页和当前页，状态变更复杂度为 O(1)。
 - resize 使用 `requestAnimationFrame` 合并，页面固有尺寸按 slide 缓存。

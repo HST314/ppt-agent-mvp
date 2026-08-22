@@ -125,7 +125,7 @@ class P0HybridInspectionBrowserGate(unittest.TestCase):
         fragment = (
             '<section class="slide light" id="slide-1" data-slide-id="slide-1" data-layout="S11">'
             '<h1 data-element-id="title">真实 CSSOM 门禁</h1>'
-            '<div class="pipeline-section"><div class="pipeline">阶段一</div></div>'
+            '<div class="ghost-layout-section"><div class="ghost-layout">阶段一</div></div>'
             '</section>'
         )
         html = f'<!doctype html><html><head><style>{locked_template("swiss")["style"]}</style></head><body>{fragment}</body></html>'
@@ -136,7 +136,7 @@ class P0HybridInspectionBrowserGate(unittest.TestCase):
         self.assertTrue(evidence["available"])
         self.assertFalse(evidence["passed"])
         undefined = {item["evidence"] for item in evidence["issues"] if item["code"] == "undefined_layout_class"}
-        self.assertTrue(any("class=.pipeline-section" in item for item in undefined), evidence["issues"])
+        self.assertTrue(any("class=.ghost-layout-section" in item for item in undefined), evidence["issues"])
         self.assertTrue(any("matched_css_rule=0" in item for item in undefined))
 
 

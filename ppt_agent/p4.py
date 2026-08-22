@@ -14,7 +14,7 @@ SLIDE = re.compile(r"^## \[([A-Za-z0-9_-]+)\]\s*(.*?)(?=^## \[|\Z)", re.M | re.S
 
 # 允许的展示性 HTML 标签（包含语义化容器、排版、图文与 SVG）
 ALLOWED_TAGS = {
-    "html", "head", "meta", "style", "body", "section", "aside", "div", "header", "footer", "main", "nav", "article",
+    "html", "head", "meta", "title", "style", "body", "section", "aside", "div", "header", "footer", "main", "nav", "article",
     "h1", "h2", "h3", "h4", "h5", "h6", "p", "small", "span", "strong", "b", "em", "i", "u", "s", "sub", "sup",
     "blockquote", "cite", "q", "mark", "code", "pre", "hr", "br",
     "figure", "figcaption",
@@ -123,28 +123,92 @@ MAX_IMAGE_REFERENCES = 30
 CSS_URL = re.compile(r"url\s*\(\s*(?:(['\"])(.*?)\1|([^)]*))\s*\)", re.I | re.S)
 
 LOCKED_TEMPLATE_PATH = "assets/template.html"
+# 生成页标题兜底规则不得覆盖模板自己的展示级字号类,否则整稿标题被压平
+EDITORIAL_TITLE_GUARD = ":not(.display,.display-zh,.h1-zh,.h2-zh,.h3-zh,.h-hero,.h-xl,.h-sub,.h-md)"
+SWISS_TITLE_GUARD = ":not(.h-hero,.h-hero-zh,.h-xl,.h-xl-zh,.h-md,.h-sub)"
+# 模板展示类按 vw 设计(100vw 全屏页);生成页是固定 1280×720 画布,
+# vw 只在 1280px 视口偶然成立。这里把各类钉到 1280 等效 px,保证任意视口与
+# 离线缩放播放器中几何确定;主标题对 18px lead/正文保持 ≥8:1 的字号对比。
 EDITORIAL_TEMPLATE_OVERRIDES = """
 html,body{width:100%;height:auto;min-height:100%;overflow:auto;background:var(--ink)}
 body{display:block;padding:24px 0}
 .slide{box-sizing:border-box;width:1280px;height:720px;min-width:1280px;min-height:720px;flex:none;margin:0 auto 24px;overflow:hidden;background:var(--paper);color:var(--ink)}
 .slide.light{background:var(--paper);color:var(--ink)}
 .slide.dark{background:var(--ink);color:var(--paper)}
-.slide>h1,.slide>h2,.slide [data-element-id="title"]{font-family:var(--serif-zh);font-size:52px;line-height:1.12;font-weight:700}
+.slide>h1GUARD,.slide>h2GUARD,.slide [data-element-id="title"]GUARD{font-family:var(--serif-zh);font-size:52px;line-height:1.12;font-weight:700}
+.slide .display{font-size:152px}
+.slide .display-zh{font-size:148px}
+.slide .h-hero{font-size:148px}
+.slide .h1-zh{font-size:59px}
+.slide .h2-zh{font-size:41px}
+.slide .h3-zh{font-size:24px}
+.slide .h-xl{font-size:79px}
+.slide .h-sub{font-size:40px}
+.slide .h-md{font-size:29px}
+.slide .lead{font-size:18px}
+.slide .big-num{font-size:128px}
+.slide .mid-num{font-size:70px}
+.slide .ghost{font-size:435px}
+.slide .rowline .k{font-size:18px}
+.slide .rowline .v{font-size:16px}
+.slide .rowline .m{font-size:14px}
+.slide .pipeline-label{font-size:14px}
+.slide .step-nb{font-size:14px}
+.slide .step-title{font-size:18px}
+.slide .step-desc{font-size:16px}
 .slide p,.slide li,.slide td,.slide th{font-family:var(--sans-zh);font-size:24px;line-height:1.5}
 .slide small{font-size:16px;line-height:1.4}
-""".strip()
+.slide :focus-visible{outline:2px solid currentColor;outline-offset:2px}
+@media (prefers-reduced-motion:reduce){.slide [data-anim]{opacity:1!important;transform:none!important}}
+""".strip().replace("GUARD", EDITORIAL_TITLE_GUARD)
 SWISS_TEMPLATE_OVERRIDES = """
 html,body{width:100%;height:auto;min-height:100%;overflow:auto;background:var(--paper)}
 body{display:block;padding:24px 0}
 #deck{position:static;width:100%;height:auto;display:block;transform:none!important}
 #nav,#hint,canvas.bg{display:none!important}
 .slide{box-sizing:border-box;width:1280px;height:720px;min-width:1280px;min-height:720px;flex:none;margin:0 auto 24px;overflow:hidden}
-.slide>h1,.slide>h2,.slide [data-element-id="title"]{font-family:var(--sans),var(--sans-zh);font-size:52px;line-height:1.08;font-weight:300}
+.slide>h1GUARD,.slide>h2GUARD,.slide [data-element-id="title"]GUARD{font-family:var(--sans),var(--sans-zh);font-size:52px;line-height:1.08;font-weight:300}
+.slide .h-hero{font-size:152px}
+.slide .h-hero-zh{font-size:148px}
+.slide .h-xl{font-size:77px}
+.slide .h-xl-zh{font-size:64px}
+.slide .h-md{font-size:33px}
+.slide .h-sub{font-size:28px}
+.slide .lead{font-size:18px}
+.slide .num-mega,.slide .name-mega{font-size:115px}
+.slide .kpi-hero{font-size:282px}
+.slide .kpi-big{font-size:141px}
+.slide .kpi-mid{font-size:77px}
+.slide .kpi-thin{font-size:179px}
+.slide .kpi-thin-sm{font-size:72px}
+.slide .rowline .k{font-size:18px}
+.slide .rowline .v{font-size:16px}
+.slide .rowline .m{font-size:14px}
+.slide .pipeline-label{font-size:14px}
+.slide .step-nb{font-size:14px}
+.slide .step-title{font-size:18px}
+.slide .step-desc{font-size:16px}
+.slide .step-meta{font-size:14px}
 .slide p,.slide li,.slide td,.slide th{font-family:var(--sans),var(--sans-zh);font-size:24px;line-height:1.45}
 .slide small{font-size:16px;line-height:1.4}
-""".strip()
+.slide :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.slide.dark :focus-visible,.slide.accent :focus-visible{outline-color:currentColor}
+@media (prefers-reduced-motion:reduce){.slide [data-anim]{opacity:1!important;transform:none!important}}
+""".strip().replace("GUARD", SWISS_TITLE_GUARD)
 # Backwards-compatible constant retained for code importing the v1 name.
 LOCKED_TEMPLATE_OVERRIDES = EDITORIAL_TEMPLATE_OVERRIDES
+
+# 锁定模板的主题/品牌变量(两个风格的并集)。模型只允许消费 var(--*),
+# 禁止在内联 style 里重定义,否则单主题(如 Swiss 的 IKB)会被局部篡改。
+# 注意:只约束内联样式;锁定模板自身 :root 定义走 <style> 块路径,不受影响。
+LOCKED_THEME_TOKENS = frozenset({
+    "--accent", "--accent-rgb", "--accent-on", "--accent-bright",
+    "--ink", "--ink-rgb", "--ink-tint", "--paper", "--paper-rgb", "--paper-tint",
+    "--grey-1", "--grey-2", "--grey-3",
+    "--text-primary", "--text-secondary", "--text-helper", "--text-placeholder", "--text-on-color",
+    "--border-subtle", "--border-strong",
+    "--sans", "--sans-zh", "--serif-en", "--serif-body-en", "--serif-zh", "--mono",
+})
 
 
 @lru_cache(maxsize=4)
@@ -177,6 +241,26 @@ def locked_template(style_id: str = "editorial") -> dict[str, str]:
     }
 
 
+_H1_TITLE = re.compile(r"<h1\b[^>]*>([\s\S]*?)</h1\s*>", re.I)
+_MARKED_TITLE = re.compile(
+    r"<([a-z0-9]+)\b[^>]*\bdata-element-id\s*=\s*(['\"])title\2[^>]*>([\s\S]*?)</\1\s*>",
+    re.I,
+)
+
+
+def _deck_title(sections) -> str:
+    """Derive the document title from the first slide heading (fallback 演示文稿)."""
+    for fragment in sections:
+        match = _H1_TITLE.search(fragment) or _MARKED_TITLE.search(fragment)
+        if not match:
+            continue
+        inner = match.group(1) if match.re is _H1_TITLE else match.group(3)
+        text = " ".join(re.sub(r"<[^>]+>", "", html.unescape(inner)).split())
+        if text:
+            return text
+    return "演示文稿"
+
+
 def assemble_locked_template(sections, rules=None, design_contract=None, contract_hash=None) -> str:
     """Assemble validated slide fragments into the locked, script-free shell."""
     if design_contract is not None:
@@ -192,6 +276,7 @@ def assemble_locked_template(sections, rules=None, design_contract=None, contrac
     source = (
         '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        + f"<title>{html.escape(_deck_title(sections))}</title>"
         + (f'<meta name="design-contract" content="{contract_hash}">' if design_contract else "")
         + f'<meta name="ppt-template" content="{provenance}"><style>{template["style"]}</style>'
         + f'</head><body><aside hidden data-global-rules="{rule_text}" data-template="{provenance}"></aside>'
@@ -410,19 +495,19 @@ def _canonical(value: str) -> str:
     return "".join(result)
 
 
-def _validate_css(css: str) -> list[str]:
+def _validate_css(css: str, inline: bool = False) -> list[str]:
     css = re.sub(r"/\*.*?\*/", "", _canonical(css), flags=re.S)
-    
+
     # 外部 URL 只允许出现在背景图片 url() 中；其余主动加载规则仍禁止。
     if re.search(r"@\s*(?:import|font-face|charset|namespace)\b", css, re.I):
         raise ValidationError("CSS 包含规则或任务外资源")
-        
+
     # 检查 CSS 函数是否在安全白名单中
     functions = {name.lower() for name in re.findall(r"([_a-zA-Z-][_a-zA-Z0-9-]*)\s*\(", css)}
     unallowed = functions - SAFE_CSS_FUNCTIONS
     if unallowed:
         raise ValidationError(f"CSS 包含不允许的函数: {', '.join(sorted(unallowed))}")
-        
+
     # 检查 CSS 属性
     urls = []
     for block in re.findall(r"\{([^{}]*)\}", css, re.S) or [css]:
@@ -436,6 +521,9 @@ def _validate_css(css: str) -> list[str]:
             # 允许 CSS 变量 (--*) 以及白名单属性
             if not (prop.startswith("--") or prop in CSS_PROPERTIES):
                 raise ValidationError(f"CSS 属性不在白名单: {prop}")
+            # 内联样式不得重定义锁定主题变量(布局级变量如 --cols 仍允许)
+            if inline and prop in LOCKED_THEME_TOKENS:
+                raise ValidationError(f"内联样式禁止覆盖锁定主题变量: {prop}")
             declaration_urls = _css_urls(value)
             if declaration_urls and prop not in {"background", "background-image"}:
                 raise ValidationError("CSS url() 仅允许用于背景图片")
@@ -494,7 +582,7 @@ class _SafeHtmlParser(HTMLParser):
 
         if "style" in values:
             try:
-                self._record_images(_validate_css(values["style"]))
+                self._record_images(_validate_css(values["style"], inline=True))
             except ValidationError as exc:
                 self.errors.append(str(exc))
         if tag == "style":

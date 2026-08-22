@@ -460,13 +460,23 @@ def offline_player(deck_html: str) -> str:
     head = """<style id="offline-player-style">
 body.offline-player{overflow:hidden}.offline-player .slide{display:none;margin:0 auto}
 .offline-player .slide[aria-hidden="false"]{display:block;position:fixed;left:50%;top:var(--offline-center-y,50%);margin:0;transform:translate(-50%,-50%) scale(var(--offline-scale,1));transform-origin:center}
-#offline-controls{position:fixed;z-index:1000;left:50%;right:auto;bottom:max(12px,env(safe-area-inset-bottom));transform:translateX(-50%);display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:12px;background:#111827e8;color:#fff;font:14px system-ui;box-shadow:0 4px 18px #0006}
+#offline-controls{position:fixed;z-index:2147483647;left:50%;right:auto;bottom:max(12px,env(safe-area-inset-bottom));transform:translateX(-50%);display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:12px;background:#111827e8;color:#fff;font:14px system-ui;box-shadow:0 4px 18px #0006}
 #offline-controls button{min-width:44px;min-height:44px;border:1px solid #ffffff55;border-radius:8px;background:#ffffff18;color:#fff;font:inherit;cursor:pointer;touch-action:manipulation}
 #offline-controls button:active{background:#ffffff2e}#offline-controls button:focus-visible{outline:3px solid #fff;outline-offset:2px}
 #offline-controls button:disabled{opacity:.35;cursor:not-allowed}#offline-page{min-width:64px;text-align:center}
+#offline-hint{position:fixed;z-index:2147483646;left:50%;bottom:calc(max(12px,env(safe-area-inset-bottom)) + 64px);transform:translateX(-50%);font:12px system-ui;letter-spacing:.06em;color:#ffffffb3;background:#11182799;padding:4px 10px;border-radius:8px;pointer-events:none;white-space:nowrap}
+#overview{position:fixed;inset:0;z-index:2147483647;background:#0b0f19f2;overflow-y:auto;padding:24px;display:none}
+#overview.open{display:block}
+#overview .offline-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:16px;max-width:1200px;margin:0 auto}
+#overview .offline-card{cursor:pointer;border-radius:8px;overflow:hidden;border:2px solid #ffffff26;background:#000;transition:border-color .2s}
+#overview .offline-card.current{border-color:#fffffff0}
+#overview .offline-card:hover{border-color:#ffffffa6}
+#overview .offline-thumb{position:relative;width:100%;aspect-ratio:16/9;overflow:hidden;pointer-events:none}
+#overview .offline-num{padding:6px 10px;font:12px system-ui;letter-spacing:.12em;color:#ffffffb3}
 </style>"""
     motion = "" if _script_reference_count(deck_html,"assets/motion.min.js") else '<script src="assets/motion.min.js"></script>\n'
     body = """<nav id="offline-controls" aria-label="幻灯片导航"><button id="offline-prev" type="button" aria-label="上一页">&#8592;</button><output id="offline-page" aria-live="polite"></output><button id="offline-next" type="button" aria-label="下一页">&#8594;</button></nav>
+<div id="offline-hint" aria-hidden="true"></div>
 %s<script src="assets/offline-player.js"></script>""" % motion
     lower = deck_html.lower()
     position = lower.rfind("</head>")
@@ -490,8 +500,8 @@ def offline_performance(index_html: str, assets: dict[str, bytes]) -> dict:
     budgets = {
         "motion_script_references_max": 1,
         "player_script_references": 1,
-        "player_javascript_bytes_max": 4096,
-        "runtime_javascript_bytes_max": 70 * 1024,
+        "player_javascript_bytes_max": 16 * 1024,
+        "runtime_javascript_bytes_max": 80 * 1024,
         "runtime_shell_bytes_max": 256 * 1024,
     }
     measurements = {
