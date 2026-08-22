@@ -90,6 +90,8 @@ class GatewayError(DomainError):
                 "provider_request_id_sha256",
                 "attempts",
                 "retryable",
+                "transport_phase",
+                "result_certainty",
             }
             and value is not None
         }

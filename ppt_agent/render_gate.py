@@ -6,7 +6,7 @@ import re
 from html.parser import HTMLParser
 from typing import Any
 
-from .claim_ledger import audit_html_claims, validate_claim_ledger
+from .claim_ledger import audit_html_claims, audit_html_claims_by_slide, validate_claim_ledger
 from .design_contract import validate_design_contract
 from .errors import ValidationError
 
@@ -130,6 +130,8 @@ def run_post_render_gate(
     claim_ledger: dict[str, Any],
     claim_ledger_hash: str,
     required_claim_ids: list[str] | tuple[str, ...] | set[str] | None = None,
+    required_claim_ids_by_slide: dict[str, list[str]] | None = None,
+    html_by_slide: dict[str, str] | None = None,
     browser_inspector=None,
     overflow_autofit: dict[str, Any] | None = None,
     canonical_validation: dict[str, Any] | None = None,
@@ -137,6 +139,13 @@ def run_post_render_gate(
     validate_claim_ledger(claim_ledger)
     structure = inspect_contract(html_text, expected_slide_ids, contract, contract_hash)
     claims = audit_html_claims(html_text, claim_ledger, required_claim_ids=required_claim_ids)
+    page_claims = None
+    if required_claim_ids_by_slide is not None:
+        if html_by_slide is None:
+            raise ValidationError("逐页 required claim 门禁缺少页面片段")
+        if list(required_claim_ids_by_slide) != expected_slide_ids or list(html_by_slide) != expected_slide_ids:
+            raise ValidationError("逐页 required claim 门禁顺序与预期页面不一致")
+        page_claims = audit_html_claims_by_slide(html_by_slide, claim_ledger, required_claim_ids_by_slide)
     browser = None
     browser_blockers = []
     if browser_inspector is not None:
@@ -156,7 +165,8 @@ def run_post_render_gate(
         } for item in claims["unbound"]],
         *[{
             "source": "claim_ledger", "code": "missing_required_claim", "evidence": item["value"],
-        } for item in claims["missing_required"]],
+            **({"slide_id": item["slide_id"]} if item.get("slide_id") else {}),
+        } for item in (page_claims or claims)["missing_required"]],
         *([] if canonical_validation is None or canonical_validation.get("passed") else [{
             "source": "canonical_validator",
             "code": "canonical_validation_failed",
@@ -195,11 +205,23 @@ def run_post_render_gate(
             "binding_count": claims["binding_count"],
             "unbound_count": claims["unbound_count"],
             "unbound": claims["unbound"],
-            "required_count": claims["required_count"],
-            "covered_required_count": claims["covered_required_count"],
+            "required_count": (page_claims or claims)["required_count"],
+            "covered_required_count": (page_claims or claims)["covered_required_count"],
             "covered_required_claim_ids": claims["covered_required_claim_ids"],
-            "missing_required_count": claims["missing_required_count"],
-            "missing_required": claims["missing_required"],
+            "missing_required_count": (page_claims or claims)["missing_required_count"],
+            "missing_required": (page_claims or claims)["missing_required"],
+            "required_claim_ids_by_slide": required_claim_ids_by_slide,
+            "page_coverage": None if page_claims is None else {
+                slide_id: {
+                    "required_count": page["required_count"],
+                    "covered_required_count": page["covered_required_count"],
+                    "covered_required_claim_ids": page["covered_required_claim_ids"],
+                    "missing_required_count": page["missing_required_count"],
+                    "missing_required": page["missing_required"],
+                    "text_hash": page["text_hash"],
+                }
+                for slide_id, page in page_claims["pages"].items()
+            },
             "text_hash": claims["text_hash"],
         },
         "canonical_validator": canonical_validation,

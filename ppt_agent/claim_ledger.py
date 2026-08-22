@@ -283,6 +283,52 @@ def audit_html_claims(
     return audit_claims("\n\u241e\n".join(parser.text), ledger, required_claim_ids=required_claim_ids)
 
 
+def audit_html_claims_by_slide(
+    html_by_slide: dict[str, str],
+    ledger: dict[str, Any],
+    required_claim_ids_by_slide: dict[str, list[str]],
+) -> dict[str, Any]:
+    """Audit each slide against the claims assigned by the frozen outline.
+
+    Batch-wide coverage is insufficient for generation: a model can move a
+    budget or duration to another page and still make the concatenated DOM
+    appear complete.  This boundary keeps page placement authoritative while
+    reusing the same visible-text rules that exclude styles, scripts, hidden
+    nodes and metadata.
+    """
+    validate_claim_ledger(ledger)
+    if set(html_by_slide) != set(required_claim_ids_by_slide):
+        raise ValidationError("逐页 required claim 自检范围与页面片段不一致")
+    known_ids = {claim["claim_id"] for claim in ledger["claims"]}
+    pages: dict[str, dict[str, Any]] = {}
+    missing: list[dict[str, Any]] = []
+    unbound: list[dict[str, Any]] = []
+    required_count = 0
+    covered_count = 0
+    for slide_id, html_text in html_by_slide.items():
+        required_ids = required_claim_ids_by_slide.get(slide_id)
+        if not isinstance(required_ids, list) or len(required_ids) != len(set(required_ids)):
+            raise ValidationError("逐页 required claim 映射格式无效或包含重复项")
+        if not set(required_ids).issubset(known_ids):
+            raise ValidationError("逐页 required claim 映射包含未知 claim")
+        page = audit_html_claims(html_text, ledger, required_claim_ids=required_ids)
+        pages[slide_id] = page
+        required_count += page["required_count"]
+        covered_count += page["covered_required_count"]
+        missing.extend({"slide_id": slide_id, **claim} for claim in page["missing_required"])
+        unbound.extend({"slide_id": slide_id, **claim} for claim in page["unbound"])
+    return {
+        "passed": not missing and not unbound,
+        "pages": pages,
+        "required_count": required_count,
+        "covered_required_count": covered_count,
+        "missing_required": missing,
+        "missing_required_count": len(missing),
+        "unbound": unbound,
+        "unbound_count": len(unbound),
+    }
+
+
 def assert_claims_bound(
     text: str,
     ledger: dict[str, Any],

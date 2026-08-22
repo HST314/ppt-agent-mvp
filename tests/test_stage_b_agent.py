@@ -668,7 +668,9 @@ class StageBAgentTests(unittest.TestCase):
                 self.assertEqual(caught.exception.code, code)
                 self.assertEqual(caught.exception.safe_audit_details()["category"], category)
                 if code != "gateway_error":
-                    self.assertEqual(caught.exception.safe_audit_details()["attempts"], 2 if code == "model_timeout" else 1)
+                    self.assertEqual(caught.exception.safe_audit_details()["attempts"], 1)
+                    self.assertEqual(caught.exception.safe_audit_details()["transport_phase"], "unknown")
+                    self.assertEqual(caught.exception.safe_audit_details()["result_certainty"], "unknown")
                 self.assertNotIn("raw sdk secret", json.dumps(caught.exception.public()))
 
     def test_capability_probe_identity_ignores_stage_budgets_but_not_credentials(self):
@@ -689,21 +691,77 @@ class StageBAgentTests(unittest.TestCase):
         serialized=json.dumps({"generation":generation.capability_probe_key(),"inspection":inspection.capability_probe_key()})
         self.assertNotIn("secret-key",serialized)
 
-    def test_client_retries_a_timeout_once_then_returns_the_result(self):
+    def test_client_does_not_replay_a_wrapper_only_timeout_with_unknown_result(self):
+        config = SimpleNamespace(model="m", api_key="secret-key", base_url="https://example.com", timeout_seconds=1)
+        request = httpx.Request("POST", "https://provider.example/v1/responses")
+        sdk = SimpleNamespace(); sdk.responses = sdk; sdk.calls = 0
+        def create(**_kwargs):
+            sdk.calls += 1
+            raise APITimeoutError(request=request)
+        sdk.create = create
+
+        with self.assertRaises(GatewayUnknownResult) as caught:
+            OpenAIResponsesClient(config, sdk_client=sdk).create(input=[])
+
+        self.assertEqual(caught.exception.code,"model_timeout")
+        self.assertEqual(sdk.calls,1)
+
+    def test_client_retries_only_a_proven_pre_dispatch_connection_failure(self):
         config = SimpleNamespace(model="m", api_key="secret-key", base_url="https://example.com", timeout_seconds=1)
         request = httpx.Request("POST", "https://provider.example/v1/responses")
         sdk = SimpleNamespace(); sdk.responses = sdk; sdk.calls = 0
         def create(**_kwargs):
             sdk.calls += 1
             if sdk.calls == 1:
-                raise APITimeoutError(request=request)
+                failure=APIConnectionError(request=request)
+                failure.__cause__=httpx.ConnectError("connect failed",request=request)
+                raise failure
             return SimpleNamespace(output_text="recovered", id="r", output=[])
         sdk.create = create
 
-        turn = OpenAIResponsesClient(config, sdk_client=sdk).create(input=[])
+        turn=OpenAIResponsesClient(config,sdk_client=sdk).create(input=[])
 
-        self.assertEqual(turn.text, "recovered")
-        self.assertEqual(sdk.calls, 2)
+        self.assertEqual(turn.text,"recovered")
+        self.assertEqual(sdk.calls,2)
+
+    def test_exhausted_pre_dispatch_failures_are_known_unsent_and_retryable(self):
+        config = SimpleNamespace(model="m", api_key="secret-key", base_url="https://example.com", timeout_seconds=1)
+        request = httpx.Request("POST", "https://provider.example/v1/responses")
+        sdk = SimpleNamespace(); sdk.responses = sdk; sdk.calls = 0
+        def create(**_kwargs):
+            sdk.calls += 1
+            failure=APIConnectionError(request=request)
+            failure.__cause__=httpx.ConnectError("connect failed",request=request)
+            raise failure
+        sdk.create=create
+
+        with self.assertRaises(GatewayError) as caught:
+            OpenAIResponsesClient(config,sdk_client=sdk).create(input=[])
+
+        self.assertNotIsInstance(caught.exception,GatewayUnknownResult)
+        self.assertEqual(caught.exception.code,"model_connection_unavailable")
+        self.assertTrue(caught.exception.retryable)
+        self.assertEqual(caught.exception.safe_audit_details()["transport_phase"],"pre_dispatch")
+        self.assertEqual(caught.exception.safe_audit_details()["result_certainty"],"not_sent")
+        self.assertEqual(sdk.calls,2)
+
+    def test_client_never_replays_a_read_failure_after_dispatch(self):
+        config=SimpleNamespace(model="m",api_key="secret-key",base_url="https://example.com",timeout_seconds=1)
+        request=httpx.Request("POST","https://provider.example/v1/responses")
+        sdk=SimpleNamespace(); sdk.responses=sdk; sdk.calls=0
+        def create(**_kwargs):
+            sdk.calls+=1
+            failure=APIConnectionError(request=request)
+            failure.__cause__=httpx.ReadError("read failed",request=request)
+            raise failure
+        sdk.create=create
+
+        with self.assertRaises(GatewayUnknownResult) as caught:
+            OpenAIResponsesClient(config,sdk_client=sdk).create(input=[])
+
+        self.assertEqual(caught.exception.code,"model_connection_error")
+        self.assertEqual(caught.exception.safe_audit_details()["result_certainty"],"unknown")
+        self.assertEqual(sdk.calls,1)
 
     def test_outline_skill_view_hides_rendering_only_references(self):
         skill = SkillRuntime.builtin()

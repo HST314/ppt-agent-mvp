@@ -7,6 +7,7 @@ from typing import Protocol
 from .errors import GatewayError, GatewayUnknownResult, ValidationError
 from .agent_runtime import AgentRuntime, STAGE_OUTPUT_SCHEMAS, STAGE_PROVIDER_SCHEMAS, _extract_json_object, normalize_rendering_output
 from .audit import current_agent_audit_context
+from .claim_ledger import audit_html_claims_by_slide
 from .p4 import assemble_locked_template
 from .skill_runtime import SkillRuntime
 
@@ -18,6 +19,13 @@ class SkillLoader(Protocol):
     def load(self, action:str)->dict: ...
 class HtmlBuilder(Protocol):
     def build(self, outline:str, **context)->str: ...
+
+class BoundaryCheckedHtml(str):
+    """String-compatible builder result carrying the server-consumed self-check."""
+    def __new__(cls,value,boundary):
+        result=super().__new__(cls,value)
+        result.builder_boundary=boundary
+        return result
 
 @dataclass
 class FakeSkillLoader:
@@ -320,17 +328,34 @@ class AgentGateway:
         expected = list(context.get("slide_ids") or [])
         value = self._run(stage, {"outline": outline, **context})
         slides = normalize_rendering_output(value, expected)["slides"]
-        
+        boundary=None
+        required_by_slide=context.get("required_claims_by_slide")
+        if required_by_slide is not None:
+            ledger=context.get("claim_ledger")
+            if not isinstance(ledger,dict) or list(required_by_slide) != expected:
+                raise ValidationError("Builder 逐页 required claim 边界输入无效")
+            aggregate_ids={item.get("claim_id") for item in context.get("required_claims_verbatim",[]) if isinstance(item,dict)}
+            mapped_ids={item.get("claim_id") for items in required_by_slide.values() for item in items if isinstance(item,dict)}
+            if aggregate_ids != mapped_ids:
+                raise ValidationError("Builder required claim 汇总与逐页映射不一致")
+            ids_by_slide={slide_id:[item["claim_id"] for item in required_by_slide[slide_id]] for slide_id in expected}
+            boundary=audit_html_claims_by_slide(
+                {item["slide_id"]:item["html"] for item in slides},
+                ledger,
+                ids_by_slide,
+            )
+
         fragments = []
         for item in slides:
             fragments.append(item["html"])
 
-        return assemble_locked_template(
+        assembled=assemble_locked_template(
             fragments,
             context.get("rules", []),
             context.get("design_contract"),
             context.get("design_contract_hash"),
         )
+        return BoundaryCheckedHtml(assembled,boundary) if boundary is not None else assembled
     
     def inspect(self, original_outline, html, *, browser_evidence=None):
         value = self._run("inspection", {

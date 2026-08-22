@@ -6,6 +6,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 
 from ppt_agent.agent_runtime import AgentRuntime
+from ppt_agent.claim_ledger import build_claim_ledger
 from ppt_agent.design_contract import validate_design_contract
 from ppt_agent.errors import GatewayError, ValidationError
 from ppt_agent.gateways import AgentGateway
@@ -71,6 +72,44 @@ class RequiredClaimRetryBuilder:
         required=context["required_claims_verbatim"]
         if required and (self.always_bad or len(self.calls)==1):
             html=html.replace(required[0]["value"],"冻结事实遗漏")
+        return html
+
+
+class MisplacedRequiredClaimBuilder:
+    def __init__(self, *, always_bad=False):
+        self.always_bad=always_bad; self.calls=[]
+
+    def build(self, outline, **context):
+        self.calls.append(dict(context))
+        html=render(
+            outline,context["slide_ids"],context.get("rules"),context.get("exceptions"),
+            context.get("assets"),context.get("design_contract"),context.get("design_contract_hash"),
+        )
+        if not (self.always_bad or len(self.calls)==1):
+            return html
+        mapped=context["required_claims_by_slide"]
+        target=next(slide_id for slide_id,claims in mapped.items() if claims)
+        other=next(slide_id for slide_id in context["slide_ids"] if slide_id!=target)
+        value=mapped[target][0]["value"]
+        fragments=TaskService._slide_fragments(html)
+        fragments[target]=fragments[target].replace(value,"冻结事实错页")
+        fragments[other]=fragments[other].replace("</section>",f"<p>{value}</p></section>",1)
+        return TaskService._replace_slide_fragments(html,fragments)
+
+
+class ReportedClaimRetryBuilder:
+    def __init__(self):
+        self.calls=[]
+
+    def build(self,outline,**context):
+        self.calls.append(dict(context))
+        html=render(
+            outline,context["slide_ids"],context.get("rules"),context.get("exceptions"),
+            context.get("assets"),context.get("design_contract"),context.get("design_contract_hash"),
+        )
+        if len(self.calls)==1:
+            for value in ("12 周","80 万元"):
+                html=html.replace(value,"冻结事实遗漏")
         return html
 
 
@@ -234,7 +273,95 @@ class P0GenerationRefactorTests(unittest.TestCase):
             self.assertEqual(correction["reason"],"missing_required_claims")
             self.assertEqual(correction["required_claims_verbatim"],required)
             self.assertEqual(correction["missing_required_claims_verbatim"],required)
+            self.assertEqual(correction["required_claims_by_slide"],builder.calls[0]["required_claims_by_slide"])
             self.assertEqual(sample["metadata"]["locked_theme_generation"],{"attempts":2,"retry_count":1,"max_attempts":2})
+
+    def test_sample_claim_on_wrong_page_is_corrected_from_page_mapping(self):
+        with tempfile.TemporaryDirectory() as root:
+            builder=MisplacedRequiredClaimBuilder()
+            svc=TaskService(WorkspaceStore(root),builder=builder); svc.create("task","manual")
+            svc.import_input("task",{"goal":"批准预算","audience":"管理层","topic":"扩容方案","页数":3,"总预算":"80 万元"})
+            svc.generate_narrative("task"); svc.confirm_narrative("task")
+            svc.generate_outline("task"); svc.confirm_outline("task")
+            svc.select_samples("task",["slide-1","slide-2","slide-3"])
+
+            sample=svc.generate_sample("task")["sample"]
+
+            self.assertEqual(len(builder.calls),2)
+            correction=builder.calls[1]["semantic_correction"]
+            missing_pages={slide_id for slide_id,claims in correction["missing_required_claims_by_slide"].items() if claims}
+            self.assertEqual(len(missing_pages),1)
+            self.assertEqual(sample["metadata"]["post_render_gate"]["claims"]["missing_required_count"],0)
+            self.assertIsNotNone(sample["metadata"]["post_render_gate"]["claims"]["page_coverage"])
+
+    def test_reported_duration_and_budget_omissions_keep_their_target_pages_in_correction(self):
+        with tempfile.TemporaryDirectory() as root:
+            builder=ReportedClaimRetryBuilder()
+            svc=TaskService(WorkspaceStore(root),builder=builder); svc.create("task","manual")
+            svc.import_input("task",{
+                "goal":"批准预算","audience":"管理层","topic":"扩容方案","页数":3,
+                "实施周期":"12 周","总预算":"80 万元",
+            })
+            svc.generate_narrative("task"); svc.confirm_narrative("task")
+            svc.generate_outline("task"); svc.confirm_outline("task")
+            svc.select_samples("task",["slide-1","slide-2","slide-3"])
+
+            sample=svc.generate_sample("task")["sample"]
+
+            correction=builder.calls[1]["semantic_correction"]
+            self.assertEqual({item["value"] for item in correction["missing_required_claims_verbatim"]},{"12 周","80 万元"})
+            mapped_missing={
+                item["value"]:slide_id
+                for slide_id,items in correction["missing_required_claims_by_slide"].items()
+                for item in items
+            }
+            self.assertEqual(set(mapped_missing),{"12 周","80 万元"})
+            for value,slide_id in mapped_missing.items():
+                self.assertIn(value,{item["value"] for item in correction["required_claims_by_slide"][slide_id]})
+            self.assertEqual(sample["metadata"]["post_render_gate"]["claims"]["missing_required_count"],0)
+
+    def test_persistent_wrong_page_claim_is_fail_closed_with_page_evidence(self):
+        with tempfile.TemporaryDirectory() as root:
+            builder=MisplacedRequiredClaimBuilder(always_bad=True)
+            svc=TaskService(WorkspaceStore(root),builder=builder); svc.create("task","manual")
+            svc.import_input("task",{"goal":"批准预算","audience":"管理层","topic":"扩容方案","页数":3,"总预算":"80 万元"})
+            svc.generate_narrative("task"); svc.confirm_narrative("task")
+            svc.generate_outline("task"); svc.confirm_outline("task")
+            svc.select_samples("task",["slide-1","slide-2","slide-3"])
+
+            with self.assertRaisesRegex(ValidationError,"missing_required_claim"):
+                svc.generate_sample("task")
+
+            self.assertFalse(svc.versions("task","sample"))
+            record=svc.versions("task","post-render-gate-evidence")[-1]
+            evidence=json.loads(svc.version("task",record["hash"]))
+            self.assertEqual(evidence["claims"]["missing_required_count"],1)
+            self.assertTrue(evidence["claims"]["missing_required"][0]["slide_id"].startswith("slide-"))
+
+    def test_agent_builder_exposes_page_visible_claim_boundary_self_check(self):
+        ledger=build_claim_ledger(
+            task_id="boundary",input_snapshot_hash="a"*64,
+            source_binding={"总预算":"80 万元"},created_at="2026-08-22T00:00:00+00:00",
+        )
+        claim={key:ledger["claims"][0][key] for key in ("claim_id","kind","value")}
+        slides=[
+            {"slide_id":"slide-1","html":'<section class="slide" id="slide-1" data-slide-id="slide-1"><p>预算待补</p></section>'},
+            {"slide_id":"slide-2","html":'<section class="slide" id="slide-2" data-slide-id="slide-2"><p>80 万元</p></section>'},
+        ]
+        client=RecordingClient([
+            ModelTurn(None,"skill",(ModelToolCall("read_skill_file",'{"path":"references/design-pack-v1.md"}',"c1"),)),
+            ModelTurn(json.dumps({"slides":slides},ensure_ascii=False),"render"),
+        ])
+        gateway=AgentGateway(client,skill=SkillRuntime.builtin(),max_steps=4,max_tool_calls=4,max_provider_calls=4)
+
+        html=gateway.build(
+            "## [slide-1] 预算\n## [slide-2] 总结",action="sample",slide_ids=["slide-1","slide-2"],
+            claim_ledger=ledger,required_claims_verbatim=[claim],
+            required_claims_by_slide={"slide-1":[claim],"slide-2":[]},
+        )
+
+        self.assertEqual(html.builder_boundary["missing_required_count"],1)
+        self.assertEqual(html.builder_boundary["missing_required"][0]["slide_id"],"slide-1")
 
     def test_persistent_sample_required_claim_omission_remains_fail_closed(self):
         with tempfile.TemporaryDirectory() as root:

@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+import httpx
 from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 
 from .config import ModelConfig
@@ -63,7 +64,7 @@ class ResponsesModelClient(Protocol):
 
 
 class OpenAIResponsesClient:
-    """Narrow Responses API adapter with one bounded timeout retry.
+    """Narrow Responses API adapter with one bounded pre-dispatch retry.
 
     `structured_output` controls how stage schemas reach the provider:
     - ``json_schema``: always send ``text.format`` (strict provider enforcement).
@@ -139,7 +140,7 @@ class OpenAIResponsesClient:
         use_format = bool(response_schema) and self.structured_output != "prompt" and not self._text_format_unsupported
         empty_attempts = 0
         empty_shapes: list[dict[str, Any]] = []
-        timeout_attempts = 0
+        transport_attempts = 0
         budget = provider_call_budget
         if budget is None and provider_call_limit is not None:
             budget = ProviderCallBudget(provider_call_limit)
@@ -176,12 +177,17 @@ class OpenAIResponsesClient:
             monitor.start()
             try:
                 response = request_client.responses.create(**request)
-            except (APITimeoutError, TimeoutError, socket.timeout) as exc:
+            except (APITimeoutError, APIConnectionError, httpx.TransportError, TimeoutError, socket.timeout, ConnectionError, OSError) as exc:
                 checkpoint()
-                timeout_attempts += 1
-                if timeout_attempts <= 1:
+                transport_attempts += 1
+                transport = self._classify_transport(exc)
+                # Retry only when the exception chain proves that no request
+                # reached the provider (DNS, pool acquisition or connect).
+                # Read/write/protocol failures and wrapper-only SDK errors have
+                # an unknown result and must never be replayed blindly.
+                if transport["replay_safe"] and transport_attempts <= 1:
                     continue
-                raise self._transport_error(exc, "timeout", attempts=timeout_attempts) from exc
+                raise self._transport_error(exc, attempts=transport_attempts, **transport) from exc
             except APIStatusError as exc:
                 checkpoint()
                 format_rejection = self._format_rejection(exc) if use_format else None
@@ -190,9 +196,6 @@ class OpenAIResponsesClient:
                     use_format = False
                     continue
                 raise self._status_error(exc) from exc
-            except (APIConnectionError, ConnectionError, OSError) as exc:
-                checkpoint()
-                raise self._transport_error(exc, "connection") from exc
             except Exception as exc:
                 checkpoint()
                 raise GatewayError(
@@ -394,17 +397,63 @@ class OpenAIResponsesClient:
         )
 
     @staticmethod
-    def _transport_error(exc: Exception, category: str, *, attempts: int = 1) -> GatewayUnknownResult:
-        timeout = category == "timeout"
+    def _classify_transport(exc: Exception) -> dict[str, Any]:
+        chain=[]; current: BaseException | None=exc
+        while current is not None and current not in chain and len(chain)<12:
+            chain.append(current)
+            current=current.__cause__ or current.__context__
+        pre_dispatch=any(isinstance(item,(
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.PoolTimeout,
+            socket.gaierror,
+            ConnectionRefusedError,
+        )) for item in chain)
+        timeout=any(isinstance(item,(APITimeoutError,TimeoutError,socket.timeout,httpx.TimeoutException)) for item in chain)
+        return {
+            "category":"timeout" if timeout else "connection",
+            "transport_phase":"pre_dispatch" if pre_dispatch else "unknown",
+            "result_certainty":"not_sent" if pre_dispatch else "unknown",
+            "replay_safe":pre_dispatch,
+        }
+
+    @staticmethod
+    def _transport_error(
+        exc: Exception,
+        category: str,
+        transport_phase: str,
+        result_certainty: str,
+        replay_safe: bool,
+        *,
+        attempts: int = 1,
+    ) -> GatewayError:
+        if replay_safe:
+            return GatewayError(
+                "模型连接尚未建立，请稍后重试",
+                code="model_connection_unavailable",
+                status=503,
+                retryable=True,
+                audit_details={
+                    "category":category,
+                    "sdk_exception_type":type(exc).__name__,
+                    "attempts":attempts,
+                    "retryable":True,
+                    "transport_phase":transport_phase,
+                    "result_certainty":result_certainty,
+                },
+            )
+        timeout=category=="timeout"
         return GatewayUnknownResult(
             "模型请求超时，结果可能未知；请先核对供应商记录" if timeout else "模型连接中断，结果可能未知；请先核对供应商记录",
             code="model_timeout" if timeout else "model_connection_error",
             retryable=False,
             audit_details={
-                "category": category,
-                "sdk_exception_type": type(exc).__name__,
-                "attempts": attempts,
-                "retryable": False,
+                "category":category,
+                "sdk_exception_type":type(exc).__name__,
+                "attempts":attempts,
+                "retryable":False,
+                "transport_phase":transport_phase,
+                "result_certainty":result_certainty,
             },
         )
 
