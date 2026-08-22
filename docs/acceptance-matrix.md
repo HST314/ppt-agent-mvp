@@ -27,7 +27,7 @@
 
 | 发布项 | 结论 | 可复验证据 | 遗留限制 |
 |---|---|---|---|
-| 真实 Gateway、必读分阶段 Skill 与锁定模板 | 通过 | `tests/test_p8_gateways.py`、`tests/test_p0_generation_refactor.py`、`tests/e2e/test_audit_regressions.py` | CI 使用确定性 fake；真实模型需显式配置 |
+| 真实 Gateway、SKILL.md 首读与渐进式 Skill 工具 | 通过 | `tests/test_skill_progressive_protocol.py`、`tests/test_p8_gateways.py`、`tests/test_p0_generation_refactor.py`、`tests/e2e/test_audit_regressions.py` | 可选脚本失败仅 advisory；CI 使用确定性 fake，真实模型需显式配置 |
 | 安全、资源授权与大小边界 | 通过 | `tests/test_p8_release.py`、`tests/test_p4.py` | 单请求 2 MiB；单资源 16 MiB |
 | 动作级可观测性 | 通过 | `tests/test_p8_release.py`；JSON `action_metric` | 指标由部署环境采集聚合 |
 | 运维与恢复 | 通过 | `docs/runbook.md`、`tests/e2e/test_ac_15_17_delivery.py` | 文件工作区需由部署方纳入备份 |

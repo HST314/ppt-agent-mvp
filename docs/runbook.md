@@ -22,14 +22,14 @@ python -m uvicorn main_front:app --host 127.0.0.1 --port 8000
 ### Job 与 SSE 恢复
 
 - 浏览器刷新后会查询 `/v1/tasks/{task_id}/jobs?status=active`，并从持久化的 `job_id ↔ intent storage key` 映射恢复清理责任；终态会同时清理 intent 与映射，下一次同参操作会生成新幂等键。
-- 工作台通过 `/v1/jobs/{job_id}/event-history` 恢复最多 500 条持久化事件，并按 `(job_id, seq)` 去重；实时 SSE 与轮询都从最后已接收序号续传。执行详情显示 Agent 步数、provider 请求、只读工具调用、阶段剩余时间与脱敏 Agent 审计；终态 Job 的用时固定在 `finished_at`。
+- 工作台通过 `/v1/jobs/{job_id}/event-history` 恢复最多 500 条持久化事件，并按 `(job_id, seq)` 去重；实时 SSE 与轮询都从最后已接收序号续传。执行详情显示 Agent 步数、provider 请求、Skill 工具调用、阶段剩余时间与脱敏 Agent 审计；成功工具事件只展示工具名和合法相对路径，不展示正文、stdin 或参数；终态 Job 的用时固定在 `finished_at`。
 - SSE 断开后先执行有界指数退避重连；连续失败才降级轮询。轮询期间继续进行有限 SSE 恢复探测，成功后以 `after=last_seq` 续传并停止轮询；恢复连接再次断开时立即重启轮询，再消耗剩余探测次数，达到探测上限后保持轮询到终态。
 - 每个任务同时只允许一个写业务状态的活动 Job。相同 `idempotency_key` 与相同请求返回原 Job；同 key 不同请求返回 409。
 - 排队 Job 在服务重启后可重新调度；运行中或已请求取消但结果未知的 Job 会标记为 `interrupted`，必须由用户发起新的明确尝试。
 - 活动 Job 不清理。MVP 终态 Job 至少保留 7 天；当前版本由运维在备份后按 `finished_at` 清理任务目录内的终态 `jobs/*.json` 及同名事件文件，不得清理活动状态。
 - SSE 事件与 Job 错误只包含步骤、诊断 ID、`agent_audit_id` 和业务版本引用，不能写入完整 Prompt、客户资料、密钥或模型推理。按任务导出脱敏审计使用 `GET /v1/tasks/{task_id}/agent-audits`，可用 `job_id` 查询参数收窄；按 Job 导出使用 `GET /v1/jobs/{job_id}/agent-audits`。关联审计同时镜像到任务目录的 `agent-audit.jsonl`，因此任务目录归档会自带该任务审计。工具错误码区分 `invalid_arguments`、`path_not_in_lock`、`quota_exceeded`、`unauthorized_tool` 与其余校验错误。
 
-仓库默认 `config/ppt-agent.yaml` 使用真实 `openai_responses` Gateway；配置只保存模型名与环境变量名称，秘密值只放 `.env`。设置页保存会原子更新该全局 YAML 的 `clarification`、`jobs` 与 `review`，不会在 `PPT_AGENT_DATA` 下创建设置文件。`request_timeout_seconds` 必须小于 `run_timeout_seconds`，`job_timeout_seconds` 又必须严格大于 Agent 运行预算。规划阶段使用全局 30 步、40 次只读工具和 8 次 provider 请求；样品独立使用 8 步/4 工具/6 provider、最多 2 轮探索并预留最后 2 次请求；全稿独立使用 12 步/8 工具/10 provider、最多 3 轮探索并预留最后 2 次请求。样品/全稿必须成功读取版本化 `references/design-pack-v1.md`，随后由服务端使用哈希锁定的 `assets/template.html` 静态样式层组装 1280×720 公共壳；未读必需文件直接失败。检查必须成功读取 `references/checklist.md`，并接收 Chromium DOM 测量；模型问题与浏览器问题由服务端合并，浏览器不可用、越界、滚动溢出、坏图或其他 blocker 都不能被模型的 `passed=true` 覆盖。检查报告元数据保留浏览器版本、视口、问题数和证据哈希。检查模型未配置时只有显式 `fallback_to_generation: true` 才允许回退。
+仓库默认 `config/ppt-agent.yaml` 使用真实 `openai_responses` Gateway；配置只保存模型名与环境变量名称，秘密值只放 `.env`。设置页保存会原子更新该全局 YAML 的 `clarification`、`jobs` 与 `review`，不会在 `PPT_AGENT_DATA` 下创建设置文件。`request_timeout_seconds` 必须小于 `run_timeout_seconds`，`job_timeout_seconds` 又必须严格大于 Agent 运行预算。规划阶段使用全局 30 步、40 次 Skill 工具和 8 次 provider 请求；样品独立使用 8 步/4 工具/6 provider、最多 2 轮探索并预留最后 2 次请求；全稿独立使用 12 步/8 工具/10 provider、最多 3 轮探索并预留最后 2 次请求。除澄清外，各阶段首先强制读取快照中的 `SKILL.md`，之后才开放通用的 `list_skill_files`、`read_skill_file`、`get_asset_info` 与可选 `run_skill_script`。脚本只支持快照 `scripts/` 内的受支持类型，在 Bubblewrap 隔离环境中无网络、无模型凭据执行，只能写临时目录；参数、stdin、超时与输出大小受限，运行失败只返回 advisory。检查仍接收 Chromium DOM 测量；模型问题与浏览器问题由服务端合并，浏览器不可用、越界、滚动溢出、坏图或其他 blocker 都不能被模型的 `passed=true` 覆盖。检查报告元数据保留浏览器版本、视口、问题数和证据哈希。检查模型未配置时只有显式 `fallback_to_generation: true` 才允许回退。
 
 任务分支通过 `branches.json` 和分支检查点/事件头保存，版本与资源继续使用共享的内容寻址存储。Job 创建时绑定 `branch_id + head_revision + parent_hash`；存在活动 Job 时禁止切换分支。历史阶段只读，继续编辑应从顶部创作进度节点派生新分支。
 
@@ -69,6 +69,7 @@ python3 scripts/verify_offline_delivery.py .ppt-agent-data/tasks/<task-id>/deliv
 - `gateway_error`：无法进一步分类的 SDK/HTTP 故障；根据诊断 ID 检查运行日志，确认原因后再操作。
 - `probe_invalid_output` / `probe_tool_call_missing` / `probe_tool_round_failed` / `probe_tool_final_invalid_output` / `probe_step_limit`：分别表示严格 Schema 失败、未执行强制工具调用、工具结果回传失败、工具调用后最终 Schema 输出失败或步数边界未满足。结合 `failed_check`、`probe_phase`、`terminal_reason`、`tool_calls`、`underlying_code` 与 `probe_id` 查询 `/v1/runtime/probes`，确认模型能力与端点配置后再重新检测。
 - Skill 校验失败：检查 `skills.root` / `skills.active` 是否指向标准 Skill 目录，确认 `SKILL.md` frontmatter、路径边界、普通文件类型和软链接限制；运行时完整性以目录内容摘要为准，不要求 `SKILL_LOCK.json`。
+- Skill 脚本 advisory：`sandbox_unavailable` / `interpreter_unavailable` 表示部署环境缺少 Bubblewrap 或对应解释器；`script_timeout` / `script_output_limit` / `script_nonzero_exit` 都不会阻断 Job。不要把脚本 stdin、参数或输出全文复制到状态日志；按脱敏审计中的 advisory code 排查即可。
 - 自检出现 `render_unavailable`：确认已执行 `python3 -m playwright install chromium` 且系统共享库齐全；修复后重新执行检查，禁止人工把缺失浏览器当作通过。
 - 离线校验失败：按错误中的 missing/extra/changed 或 URL 文件修复源交付并重新确认，禁止手改已发布目录。
 - 浏览器门禁 skipped：安装锁定 Playwright/Chromium 及系统共享库后重跑，不能把跳过当成功。

@@ -94,7 +94,7 @@ class P0HybridInspectionTests(unittest.TestCase):
         client = ScriptedClient([
             ModelTurn(None, "skill", (ModelToolCall(
                 "read_skill_file",
-                '{"path":"references/checklist.md"}',
+                '{"path":"SKILL.md"}',
                 "checklist-call",
             ),)),
             ModelTurn('{"passed":true,"issues":[]}', "final"),
@@ -108,12 +108,12 @@ class P0HybridInspectionTests(unittest.TestCase):
         self.assertEqual(first["tool_choice"], {"type":"function", "name":"read_skill_file"})
         self.assertEqual(
             first["tools"][0]["parameters"]["properties"]["path"]["enum"],
-            ["references/checklist.md"],
+            ["SKILL.md"],
         )
         self.assertIn('"browser_evidence"', first["input"][1]["content"])
         self.assertEqual(
             gateway.runtime.last_audit[-1]["applied_skill_files"],
-            ["references/checklist.md"],
+            ["SKILL.md"],
         )
 
     def test_model_green_is_overridden_by_browser_blocker_and_evidence_is_persisted(self):

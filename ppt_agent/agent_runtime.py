@@ -13,25 +13,9 @@ from .skill_runtime import SkillRuntime
 
 
 STAGES = {"clarification", "narrative", "outline", "sample", "deck", "inspection"}
-PLANNING_STAGES = frozenset({"narrative", "outline", "inspection"})
+SKILL_STAGES = frozenset(STAGES - {"clarification"})
 RENDERING_STAGES = frozenset({"sample", "deck"})
-# Temporary stage policy retained by the Agent protocol until task 2 replaces
-# it with mandatory SKILL.md-first progressive discovery.  It deliberately
-# lives outside the generic SkillRuntime and falls back to the whole standard
-# directory when an alternate Skill does not carry these legacy file names.
-LEGACY_STAGE_FILES = {
-    "narrative": frozenset({"references/planning-summary.md"}),
-    "outline": frozenset({"references/planning-summary.md"}),
-    "sample": frozenset({"references/design-pack-v1.md"}),
-    "deck": frozenset({"references/design-pack-v1.md"}),
-    "inspection": frozenset({"SKILL.md", "references/checklist.md"}),
-}
-REQUIRED_STAGE_FILES = {
-    "sample": frozenset({"references/design-pack-v1.md"}),
-    "deck": frozenset({"references/design-pack-v1.md"}),
-    "inspection": frozenset({"references/checklist.md"}),
-}
-MAX_PLANNING_FILE_READS = 1
+SKILL_ENTRY = "SKILL.md"
 DATA_IMAGE = "data:image/"
 STAGE_PROMPTS = {
     "clarification": (
@@ -50,7 +34,7 @@ STAGE_PROMPTS = {
         "任务主题、目标和受众的 value 分别逐字写入正文，不得缩写、改写或省略；用至少两个有实质正文的二级章节表达"
         "核心论点与页面推进逻辑；不得返回分析请求、待办或元说明。若输入包含 semantic_correction，必须逐字复制其中"
         "required_context_verbatim 的每个 value 后再提交完整叙事。"
-        "按需最多读取 1 个当前阶段已列出的规划摘要，不要重复读取。"
+        "先完整读取当前 Skill 的 SKILL.md，再按其中指引按需读取必要资源；不要一次性读取整个 Skill，也不要重复读取。"
     ),
     "outline": (
         "根据已确认叙事生成结构化逐页大纲；不要自行编写页面 ID，也不要返回 markdown 字段。"
@@ -61,8 +45,7 @@ STAGE_PROMPTS = {
         "所有事实、数字、日期、实体与承诺必须能在冻结任务卡中找到依据；不得沿用叙事中的无依据新增值，"
         "不得输出 XX、TBD、[必填]、X 月 X 日等占位符。"
         "若输入包含 semantic_correction，须依据其中的具体错误修正并重新提交完整 slides。"
-        "按需最多读取 1 个当前阶段已列出的规划摘要，禁止尝试读取布局、主题、图片或 HTML 模板文件；"
-        "读取后立即提交大纲 JSON，不要重复读取。"
+        "先完整读取当前 Skill 的 SKILL.md，再按其中指引按需读取必要资源；读取已经足够时立即提交大纲 JSON，不要重复读取。"
     ),
     "sample": "仅为外层状态机指定的样品页生成 section 片段，不得生成公共模板或扩展到全稿；必须完整应用版本化 Generation Contract 中的事实、主题、布局、组件与动效约束。输入中的 required_claims_by_slide 是逐页冻结事实映射：每个 value 必须逐字出现在对应 slide 的可见正文，出现在其他页、隐藏节点、样式、脚本或元数据均不算覆盖；required_claim_slots_by_slide 是服务端预分配的逐页可见事实槽位，每个 slot_id 对应的 value 必须原样写进同页真实布局骨架；required_claims_verbatim 是本批去重汇总，不得合并、改写或遗漏。layout_capacity_by_slide 是逐页可读容量硬边界：超预算时压缩正文、减少卡片/行项目、切换高容量布局或拆页，不得靠隐藏内容、裁切或突破 minimum_body_font_px。输入中的 locked_theme_policy 是硬约束：section 根节点及全部后代的 inline style 都不得声明 forbidden_inline_tokens 中的锁定主题变量，只能消费模板已有的 var(--*) 或使用 DesignContract 指定的主题 class。每项 html 必须严格以 <section class=\"slide\" id=\"给定ID\" data-slide-id=\"给定ID\"> 开始并以 </section> 结束。若输入包含 semantic_correction，必须逐页修复 missing_required_claims_by_slide、canonical_blockers、browser_blockers、capacity_blockers 或指出的锁定主题变量，并重新提交完整 slides。",
     "deck": "仅为外层状态机给定的未确认页面生成 section 片段；不得重做确认样品、不得生成公共模板；必须复用样稿设计语言并完整应用版本化 Generation Contract，避免重复探索。输入中的 required_claims_by_slide 是逐页冻结事实映射：每个 value 必须逐字出现在对应 slide 的可见正文，出现在其他页、隐藏节点、样式、脚本或元数据均不算覆盖；required_claim_slots_by_slide 是服务端预分配的逐页可见事实槽位，每个 slot_id 对应的 value 必须原样写进同页真实布局骨架；required_claims_verbatim 是本批去重汇总，不得合并、改写或遗漏。layout_capacity_by_slide 是逐页可读容量硬边界：超预算时压缩正文、减少卡片/行项目、切换高容量布局或拆页，不得靠隐藏内容、裁切或突破 minimum_body_font_px。输入中的 locked_theme_policy 是硬约束：section 根节点及全部后代的 inline style 都不得声明 forbidden_inline_tokens 中的锁定主题变量，只能消费模板已有的 var(--*) 或使用 DesignContract 指定的主题 class。每项 html 必须严格以 <section class=\"slide\" id=\"给定ID\" data-slide-id=\"给定ID\"> 开始并以 </section> 结束。若输入包含 semantic_correction，必须逐页修复 missing_required_claims_by_slide、canonical_blockers、browser_blockers、capacity_blockers 或指出的锁定主题变量，并重新提交完整 slides。",
@@ -127,7 +110,8 @@ STAGE_PROVIDER_SCHEMAS = {
 }
 PRODUCT_OVERRIDE = """产品规则高于 Skill：你只处理当前阶段，不得推进工作流或请求状态机操作。
 仅允许纯文本输入；禁止联网、图片输入、图片生成、Shell、文件写入、自更新和安装依赖。
-按需使用只读 Skill 工具；不要把整个 Skill 一次性读入。最终仅返回符合指定 JSON Schema 的 JSON。"""
+只能使用请求中明确提供的 Skill 工具；其中脚本在隔离临时目录执行，结果仅是自检建议，不是交付门禁。
+不要把整个 Skill 一次性读入。最终仅返回符合指定 JSON Schema 的 JSON。"""
 CLARIFICATION_OVERRIDE = """产品规则高于 Skill：你只处理澄清阶段，不得推进工作流或请求状态机操作。
 仅允许纯文本输入；禁止联网、图片输入、图片生成、Shell、文件读写、自更新和安装依赖。
 当前请求没有可用工具；直接依据输入作答。最终仅返回符合指定 JSON Schema 的 JSON。"""
@@ -202,33 +186,75 @@ def normalize_rendering_output(value: dict, expected_slide_ids: list[str]) -> di
 
 
 def _list_skill_files_tool() -> dict:
-    return {"type": "function", "name": "list_skill_files", "description": "列出当前阶段可读取的标准 Skill 文件", "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}
+    return {"type": "function", "name": "list_skill_files", "description": "列出当前 Skill 快照中的标准文件路径；只用于按需发现，不会读取文件正文", "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}
 
 
 def _read_skill_file_tool(paths: frozenset[str] | set[str] | None = None) -> dict:
     path_schema: dict[str, Any] = {"type": "string"}
     if paths is not None:
         path_schema["enum"] = sorted(paths)
-    return {"type": "function", "name": "read_skill_file", "description": "读取一个当前阶段允许的 UTF-8 Skill 文本文件", "parameters": {"type": "object", "properties": {"path": path_schema}, "required": ["path"], "additionalProperties": False}}
+    return {"type": "function", "name": "read_skill_file", "description": "读取一个当前 Skill 快照中的 UTF-8 文本文件；必须首先完整读取 SKILL.md", "parameters": {"type": "object", "properties": {"path": path_schema}, "required": ["path"], "additionalProperties": False}}
 
 
-def _get_asset_info_tool() -> dict:
-    return {"type": "function", "name": "get_asset_info", "description": "读取一个 Skill asset 的元数据，不读取二进制内容", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": False}}
+def _get_asset_info_tool(paths: frozenset[str] | set[str] | None = None) -> dict:
+    path_schema: dict[str, Any] = {"type": "string"}
+    if paths is not None:
+        path_schema["enum"] = sorted(paths)
+    return {"type": "function", "name": "get_asset_info", "description": "读取一个 Skill asset 的元数据，不读取二进制正文", "parameters": {"type": "object", "properties": {"path": path_schema}, "required": ["path"], "additionalProperties": False}}
 
 
-TOOLS = [_list_skill_files_tool(), _read_skill_file_tool(), _get_asset_info_tool()]
+def _run_skill_script_tool(paths: frozenset[str] | set[str] | None = None) -> dict:
+    path_schema: dict[str, Any] = {"type": "string"}
+    if paths is not None:
+        path_schema["enum"] = sorted(paths)
+    return {
+        "type": "function",
+        "name": "run_skill_script",
+        "description": "可选运行一个 Skill 自检脚本；无网络、无模型凭据、只能写临时目录，失败或超时仅返回 advisory",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": path_schema,
+                "args": {"type": "array", "items": {"type": "string"}},
+                "stdin": {"type": "string"},
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    }
 
 
-def _tools_for_stage(stage: str, stage_files: frozenset[str] | None) -> list[dict]:
+TOOLS = [_list_skill_files_tool(), _read_skill_file_tool(), _get_asset_info_tool(), _run_skill_script_tool()]
+
+
+def _tools_for_stage(
+    stage: str,
+    skill: SkillRuntime,
+    *,
+    entry_read: bool,
+    remaining_text_files: frozenset[str] | None = None,
+) -> list[dict]:
     if stage == "clarification":
         return []
-    if stage in PLANNING_STAGES:
-        allowed = stage_files or frozenset()
-        return [_list_skill_files_tool(), *([_read_skill_file_tool(allowed)] if allowed else [])]
-    if stage in RENDERING_STAGES:
-        allowed = stage_files or frozenset()
-        return [_read_skill_file_tool(allowed)] if allowed else []
-    return TOOLS
+    if not entry_read:
+        return [_read_skill_file_tool(frozenset({SKILL_ENTRY}))]
+    text_files = remaining_text_files
+    if text_files is None:
+        text_files = frozenset(
+            path for path in skill.manifest
+            if PurePosixPath(path).suffix.lower() in skill.TEXT_SUFFIXES
+        )
+    assets = frozenset(path for path in skill.manifest if path.startswith("assets/"))
+    scripts = frozenset(
+        path for path in skill.manifest
+        if path.startswith("scripts/") and PurePosixPath(path).suffix.lower() in skill.SCRIPT_SUFFIXES
+    )
+    return [
+        _list_skill_files_tool(),
+        *([_read_skill_file_tool(text_files)] if text_files else []),
+        *([_get_asset_info_tool(assets)] if assets else []),
+        *([_run_skill_script_tool(scripts)] if scripts else []),
+    ]
 
 
 @dataclass(frozen=True)
@@ -239,7 +265,7 @@ class AgentResult:
 
 
 class AgentRuntime:
-    def __init__(self, client, skill: SkillRuntime, *, max_steps: int = 12, timeout_seconds: float = 60, clock=time.monotonic, max_output_bytes: int = 1024 * 1024, max_tool_calls: int = 24, max_provider_calls: int = 8, max_schema_corrections: int = 1, max_tool_error_rounds: int = 2, max_exploration_rounds: int = 1, max_unique_files: int = 4, max_skill_bytes: int = 128 * 1024, reserved_final_calls: int = 1):
+    def __init__(self, client, skill: SkillRuntime, *, max_steps: int = 12, timeout_seconds: float = 60, clock=time.monotonic, max_output_bytes: int = 1024 * 1024, max_tool_calls: int = 24, max_provider_calls: int = 8, max_schema_corrections: int = 1, max_tool_error_rounds: int = 2, max_exploration_rounds: int | None = None, max_unique_files: int = 4, max_skill_bytes: int = 128 * 1024, reserved_final_calls: int = 1):
         self.client, self.skill = client, skill
         self.max_steps, self.timeout_seconds, self.clock = max_steps, timeout_seconds, clock
         self.max_output_bytes, self.max_tool_calls = max_output_bytes, max_tool_calls
@@ -252,6 +278,8 @@ class AgentRuntime:
             raise ValidationError("工具错误轮次必须是 1 到 3 的整数")
         self.max_schema_corrections = max_schema_corrections
         self.max_tool_error_rounds = max_tool_error_rounds
+        if max_exploration_rounds is None:
+            max_exploration_rounds = min(3, max_provider_calls - reserved_final_calls)
         limits = {
             "探索轮次": (max_exploration_rounds, 0, 10),
             "唯一文件数": (max_unique_files, 1, 20),
@@ -285,25 +313,15 @@ class AgentRuntime:
         if not isinstance(payload, dict):
             raise ValidationError("Agent 输入无效")
         payload = self._text_only(payload)
-        preferred_stage_files = LEGACY_STAGE_FILES.get(stage)
         available_text_files = frozenset(
             name
             for name in self.skill.manifest
             if PurePosixPath(name).suffix.lower() in self.skill.TEXT_SUFFIXES
         )
-        stage_files = (
-            preferred_stage_files
-            if preferred_stage_files is not None and preferred_stage_files.issubset(self.skill.manifest)
-            else available_text_files
-        )
-        required_files = (
-            REQUIRED_STAGE_FILES.get(stage, frozenset()).intersection(self.skill.manifest)
-            if stage_files == preferred_stage_files
-            else frozenset()
-        )
-        if stage_files is not None and not required_files.issubset(stage_files):
-            raise ValidationError("阶段必读 Skill 文件不在当前快照")
-        stage_tools = _tools_for_stage(stage, stage_files)
+        if stage in SKILL_STAGES and SKILL_ENTRY not in available_text_files:
+            raise ValidationError("当前 Skill 快照缺少 UTF-8 入口文件 SKILL.md")
+        allowed_skill_files = frozenset(self.skill.manifest)
+        stage_tools = _tools_for_stage(stage, self.skill, entry_read=stage == "clarification")
         override = CLARIFICATION_OVERRIDE if stage == "clarification" else PRODUCT_OVERRIDE
         started, audit, tool_count, tool_error_rounds, schema_corrections = self.clock(), [], 0, 0, 0
         active_step = 0
@@ -332,12 +350,12 @@ class AgentRuntime:
         exploration_rounds, repeated_read_count, skill_bytes = 0, 0, 0
         force_final_output = False
         tool_error_corrections, recovery_active = 0, False
+        entry_protocol_corrections = 0
         remaining_paths: frozenset[str] | None = None
         input_json=json.dumps(payload,ensure_ascii=False,sort_keys=True,separators=(",",":"))
-        stage_file_contract = json.dumps(sorted(stage_files) if stage_files is not None else ["*"])
-        tool_contract = self._stage_tool_contract(stage, stage_files, required_files)
+        tool_contract = self._stage_tool_contract(stage, self.skill)
         tool_schema_contract = json.dumps(stage_tools, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        audit.append({"event": "run", "stage": stage, "skill": self.skill.skill_name, "skill_version": self.skill.skill_version, "skill_snapshot_sha256": self.skill.snapshot.digest, "input_sha256": hashlib.sha256(input_json.encode()).hexdigest(), "config_sha256": hashlib.sha256((STAGE_PROMPTS[stage]+override+stage_file_contract+tool_contract+tool_schema_contract).encode()).hexdigest(), "stage_files": sorted(stage_files or ()), "required_skill_files": sorted(required_files), "max_exploration_rounds": self.max_exploration_rounds, "max_unique_files": self.max_unique_files, "max_skill_bytes": self.max_skill_bytes, "reserved_final_calls": self.reserved_final_calls})
+        audit.append({"event": "run", "stage": stage, "skill": self.skill.skill_name, "skill_description_sha256": hashlib.sha256(self.skill.skill_description.encode()).hexdigest(), "skill_version": self.skill.skill_version, "skill_snapshot_sha256": self.skill.snapshot.digest, "input_sha256": hashlib.sha256(input_json.encode()).hexdigest(), "config_sha256": hashlib.sha256((STAGE_PROMPTS[stage]+override+tool_contract+tool_schema_contract).encode()).hexdigest(), "skill_entry": SKILL_ENTRY if stage in SKILL_STAGES else None, "max_exploration_rounds": self.max_exploration_rounds, "max_unique_files": self.max_unique_files, "max_skill_bytes": self.max_skill_bytes, "reserved_final_calls": self.reserved_final_calls})
         def probe_phase(reason: str) -> str:
             if stage == "clarification":
                 return "strict_json_schema"
@@ -361,6 +379,7 @@ class AgentRuntime:
                 "cumulative_skill_bytes": skill_bytes,
                 "unique_skill_files": len(successful_read_paths),
                 "applied_skill_files": sorted(successful_read_paths),
+                "skill_entry_read": SKILL_ENTRY in successful_read_paths,
                 "repeated_skill_reads": repeated_read_count,
             }
             if phase:
@@ -386,7 +405,7 @@ class AgentRuntime:
             probe_instruction = (
                 "\n这是启动能力探测：请返回空 questions 数组。"
                 if stage == "clarification"
-                else "\n这是启动能力探测：必须先调用一次 list_skill_files，收到工具结果后再提交符合 Schema 的 JSON。"
+                else "\n这是启动能力探测：必须先调用 read_skill_file 完整读取 SKILL.md，收到工具结果后再提交符合 Schema 的 JSON。"
             )
         conversation: list[Any] = [{"role": "system", "content": f"当前阶段：{stage}\n阶段目标：{STAGE_PROMPTS[stage]}\n{override}\n{tool_contract}{probe_instruction}\n{_output_contract(local_schema)}"}, {"role": "user", "content": input_json}]
         effective_round_budget = min(self.max_steps, self.max_provider_calls)
@@ -399,20 +418,23 @@ class AgentRuntime:
             checkpoint()
             try:
                 tool_choice = None
-                dynamic_files = stage_files
-                if stage in RENDERING_STAGES and stage_files is not None:
-                    dynamic_files = frozenset(stage_files - successful_read_paths)
-                request_tools = _tools_for_stage(stage, dynamic_files)
-                request_allowed_files = dynamic_files
-                missing_required = frozenset(required_files - successful_read_paths)
-                if missing_required and not capability_probe:
-                    request_tools = [_read_skill_file_tool(missing_required)]
-                    request_allowed_files = missing_required
+                entry_read = SKILL_ENTRY in successful_read_paths
+                remaining_text_files = frozenset(available_text_files - successful_read_paths)
+                request_tools = _tools_for_stage(
+                    stage,
+                    self.skill,
+                    entry_read=entry_read,
+                    remaining_text_files=remaining_text_files,
+                )
+                request_allowed_files = allowed_skill_files
+                missing_entry = stage in SKILL_STAGES and not entry_read
+                if missing_entry and not capability_probe:
+                    request_tools = [_read_skill_file_tool(frozenset({SKILL_ENTRY}))]
                     tool_choice = {"type": "function", "name": "read_skill_file"}
                 elif (
                     force_final_output
                     or provider_call_budget.claimed >= self.max_provider_calls - self.reserved_final_calls
-                    or (stage in (RENDERING_STAGES | PLANNING_STAGES) and not recovery_active and (
+                    or (stage in SKILL_STAGES and not recovery_active and (
                         exploration_rounds >= self.max_exploration_rounds
                         or successful_read_count >= self.max_unique_files
                         or skill_bytes >= self.max_skill_bytes
@@ -422,20 +444,20 @@ class AgentRuntime:
                     request_allowed_files = frozenset()
                     tool_choice = "none"
                     force_final_output = True
-                if recovery_active and not force_final_output and not missing_required:
-                    request_tools = self._recovery_tools(stage, stage_files, remaining_paths)
-                    if stage in PLANNING_STAGES:
-                        # The same immutable path set drives the recovery request
-                        # schema and the dispatch-time authorization below.
-                        request_allowed_files = remaining_paths or frozenset()
+                if recovery_active and not force_final_output and not missing_entry:
+                    request_tools = self._recovery_tools(
+                        stage,
+                        self.skill,
+                        remaining_paths,
+                    )
                     if not request_tools:
                         tool_choice = "none"
                 if not request_tools:
                     tool_choice = "none"
                 if capability_probe and stage != "clarification":
-                    tool_choice = {"type": "function", "name": "list_skill_files"} if tool_count == 0 else "none"
+                    tool_choice = {"type": "function", "name": "read_skill_file"} if tool_count == 0 else "none"
                 request_schema = None if (
-                    missing_required and not capability_probe
+                    missing_entry and not capability_probe
                     or capability_probe and stage != "clarification" and tool_count == 0
                 ) else provider_schema
                 if step == convergence_step:
@@ -522,21 +544,16 @@ class AgentRuntime:
             if turn.tool_calls:
                 if not stage_tools:
                     fail("澄清阶段不允许工具调用", "unauthorized_tool")
-                if capability_probe and tool_count == 0 and (len(turn.tool_calls) != 1 or turn.tool_calls[0].name != "list_skill_files"):
+                if capability_probe and tool_count == 0 and (
+                    len(turn.tool_calls) != 1
+                    or turn.tool_calls[0].name != "read_skill_file"
+                ):
                     fail("模型未按要求完成确定性工具调用", "capability_probe_failed")
                 exploration_rounds += 1
                 successful_calls, failed_calls = 0, 0
                 request_tool_names = {tool["name"] for tool in request_tools}
                 for call in turn.tool_calls:
                     checkpoint()
-                    progress("skill_loading", f"调用只读 Skill：{call.name}", {
-                        **metrics(),
-                        "tool_calls": tool_count + 1,
-                        "tool_name": call.name,
-                    })
-                    tool_count += 1
-                    if tool_count > self.max_tool_calls:
-                        fail("Agent 工具调用超过上限", "tool_call_limit")
                     error = None
                     try:
                         args = json.loads(call.arguments or "{}")
@@ -545,16 +562,23 @@ class AgentRuntime:
                         args, error = {}, {"ok": False, "error": {"code": "invalid_arguments", "message": str(exc)}}
                     requested_path = args.get("path") if isinstance(args, dict) else None
                     normalized_path = self.skill.normalize_tool_path(requested_path) if isinstance(requested_path, str) else None
+                    progress("skill_loading", f"调用 Skill 工具：{call.name}", {
+                        **metrics(),
+                        "tool_calls": tool_count + 1,
+                        "tool_name": call.name,
+                    })
+                    tool_count += 1
+                    if tool_count > self.max_tool_calls:
+                        fail("Agent 工具调用超过上限", "tool_call_limit")
                     repeated = call.name == "read_skill_file" and normalized_path in successful_read_paths
-                    read_limit = MAX_PLANNING_FILE_READS if stage in PLANNING_STAGES else self.max_unique_files
                     if error is None and repeated:
                         repeated_read_count += 1
                         result = {"ok": True, "path": normalized_path, "already_read": True, "cached": True, "bytes": 0, "sha256": successful_read_digests.get(normalized_path), "message": "该文件已读取；请复用已有上下文并直接提交最终 JSON"}
                         force_final_output = True
                     elif error is None and call.name not in request_tool_names:
                         result = {"ok": False, "error": {"code": "unauthorized_tool", "message": "当前轮次未授权该工具；请使用已提供的工具或直接提交最终 JSON"}}
-                    elif error is None and call.name == "read_skill_file" and successful_read_count >= read_limit:
-                        result = {"ok": False, "error": {"code": "quota_exceeded", "message": f"当前阶段最多读取 {read_limit} 个 Skill 文件；请直接提交最终 JSON"}}
+                    elif error is None and call.name == "read_skill_file" and successful_read_count >= self.max_unique_files:
+                        result = {"ok": False, "error": {"code": "quota_exceeded", "message": f"当前阶段最多读取 {self.max_unique_files} 个 Skill 文件；请直接提交最终 JSON"}}
                     else:
                         try:
                             result = error or self.skill.dispatch(call.name, args, allowed_files=request_allowed_files)
@@ -573,11 +597,13 @@ class AgentRuntime:
                                     successful_read_digests[result["path"]] = result["sha256"]
                             if isinstance(result.get("bytes"), int):
                                 skill_bytes += result["bytes"]
-                    audit.append({"step": step, "event": "tool_error" if failed else "tool", "tool": call.name, "error_code": result.get("error", {}).get("code") if failed else None, "call_id_sha256": hashlib.sha256((call.call_id or "").encode()).hexdigest(), "requested_path_sha256": hashlib.sha256(requested_path.encode()).hexdigest() if isinstance(requested_path, str) and requested_path else None, "path": result.get("path"), "file_sha256": result.get("sha256"), "result_bytes": result.get("bytes", 0), "repeated": repeated, "cumulative_skill_bytes": skill_bytes, "unique_skill_files": len(successful_read_paths), "result_sha256": hashlib.sha256(json.dumps(result, sort_keys=True, ensure_ascii=False).encode()).hexdigest()})
+                    audit.append({"step": step, "event": "tool_error" if failed else "tool", "tool": call.name, "error_code": result.get("error", {}).get("code") if failed else None, "advisory_code": result.get("advisory", {}).get("code") if isinstance(result.get("advisory"), dict) else None, "script_succeeded": result.get("script_succeeded") if call.name == "run_skill_script" else None, "call_id_sha256": hashlib.sha256((call.call_id or "").encode()).hexdigest(), "requested_path_sha256": hashlib.sha256(requested_path.encode()).hexdigest() if isinstance(requested_path, str) and requested_path else None, "path": result.get("path"), "file_sha256": result.get("sha256"), "result_bytes": result.get("bytes", result.get("output_bytes", 0)), "repeated": repeated, "cumulative_skill_bytes": skill_bytes, "unique_skill_files": len(successful_read_paths), "result_sha256": hashlib.sha256(json.dumps(result, sort_keys=True, ensure_ascii=False).encode()).hexdigest()})
+                    completed_path = result.get("path")
+                    completed_label = f"{call.name} · {completed_path}" if completed_path else call.name
                     progress(
                         "skill_completed",
-                        f"只读 Skill 调用{'失败' if failed else '完成'}：{call.name}",
-                        {**metrics(), "tool_name": call.name, "tool_failed": failed},
+                        f"Skill 工具{'失败' if failed else '完成'}：{completed_label}",
+                        {**metrics(), "tool_name": call.name, "tool_path": completed_path, "tool_failed": failed},
                     )
                     conversation.append({"type": "function_call", "name": call.name, "arguments": call.arguments, "call_id": call.call_id})
                     conversation.append({"type": "function_call_output", "call_id": call.call_id, "output": json.dumps(result, ensure_ascii=False)})
@@ -586,8 +612,7 @@ class AgentRuntime:
                     recovery_active = True
                 if recovery_active:
                     remaining_paths = self._remaining_paths(
-                        stage,
-                        stage_files,
+                        available_text_files,
                         successful_read_paths,
                         successful_read_count,
                         self.max_unique_files,
@@ -600,24 +625,28 @@ class AgentRuntime:
                     if tool_error_rounds >= self.max_tool_error_rounds:
                         fail("阶段工具契约连续不满足，生成已停止", "tool_error_limit")
                 if recovery_active:
-                    missing_required = frozenset(required_files - successful_read_paths)
-                    instruction = (
-                        "当前阶段尚未应用必读 Skill 文件："
-                        + "、".join(sorted(missing_required))
-                        + "。下一轮必须调用 read_skill_file 读取其中一个合法路径，不能直接提交最终结果。"
-                        if missing_required
-                        else self._tool_recovery_instruction(stage, remaining_paths)
-                    )
+                    instruction = self._tool_recovery_instruction(remaining_paths)
                     conversation.append({"role": "user", "content": instruction})
                     audit.append({"step": step, "event": "tool_recovery_instruction", "attempt": tool_error_corrections})
-                elif required_files.issubset(successful_read_paths) and successful_read_paths:
-                    conversation.append({"role": "user", "content": "当前阶段必需或选定的 Skill 文件已读取完成。请复用已有上下文，不要重复读取；下一轮直接提交符合 Schema 的最终 JSON。"})
-                    force_final_output = True
+                if stage in SKILL_STAGES and SKILL_ENTRY not in successful_read_paths:
+                    if entry_protocol_corrections >= 1:
+                        fail("模型在一次协议纠正后仍未读取 SKILL.md", "skill_entry_not_read")
+                    entry_protocol_corrections += 1
+                    conversation.append({"role": "user", "content": "Skill 工具协议纠正（仅此一次）：提交最终结果或读取其他资源前，必须先调用 read_skill_file 完整读取 SKILL.md。"})
+                    audit.append({"step": step, "event": "skill_entry_protocol_correction", "attempt": entry_protocol_corrections})
                 continue
             if capability_probe and stage != "clarification" and tool_count == 0:
                 fail("模型忽略了强制工具调用要求", "capability_probe_failed")
-            if required_files - successful_read_paths:
-                fail("模型未读取当前阶段必需的锁定 Skill 文件", "required_skill_not_read")
+            if stage in SKILL_STAGES and SKILL_ENTRY not in successful_read_paths:
+                if entry_protocol_corrections >= 1:
+                    fail("模型在一次协议纠正后仍未读取 SKILL.md", "skill_entry_not_read")
+                entry_protocol_corrections += 1
+                conversation.extend([
+                    {"role": "assistant", "content": turn.text or ""},
+                    {"role": "user", "content": "Skill 工具协议纠正（仅此一次）：必须先调用 read_skill_file 完整读取 SKILL.md，再根据文档指引按需读取资源或提交最终 JSON。"},
+                ])
+                audit.append({"step": step, "event": "skill_entry_protocol_correction", "attempt": entry_protocol_corrections})
+                continue
             progress("validating_output", "校验模型输出与阶段 Schema", metrics())
             try:
                 value = _extract_json_object(turn.text or "")
@@ -660,9 +689,14 @@ class AgentRuntime:
                         force_final_output = True
                         continue
                     fail(exc.message, "invalid_output", exc)
-            if capability_probe and stage != "clarification" and not any(item.get("event") == "tool" for item in audit):
+            if capability_probe and stage != "clarification" and not any(
+                item.get("event") == "tool"
+                and item.get("tool") == "read_skill_file"
+                and item.get("path") == SKILL_ENTRY
+                for item in audit
+            ):
                 fail("模型未完成工具能力探测", "capability_probe_failed")
-            audit.append({"event": "terminal", "reason": "success", "tool_calls": tool_count, "provider_calls": provider_call_budget.claimed, "exploration_rounds": exploration_rounds, "cumulative_skill_bytes": skill_bytes, "unique_skill_files": len(successful_read_paths), "applied_skill_files": sorted(successful_read_paths), "repeated_skill_reads": repeated_read_count})
+            audit.append({"event": "terminal", "reason": "success", "tool_calls": tool_count, "provider_calls": provider_call_budget.claimed, "exploration_rounds": exploration_rounds, "cumulative_skill_bytes": skill_bytes, "unique_skill_files": len(successful_read_paths), "applied_skill_files": sorted(successful_read_paths), "skill_entry_read": SKILL_ENTRY in successful_read_paths, "repeated_skill_reads": repeated_read_count})
             progress("agent_completed", "Agent 已提交有效阶段结果", metrics())
             self.last_audit = tuple(audit)
             return AgentResult(value, self.last_audit, turn.response_id)
@@ -681,7 +715,7 @@ class AgentRuntime:
                 "invalid_output": "agent_invalid_output",
                 "incomplete_after_tool_error": "agent_incomplete_after_tool_error",
                 "unauthorized_tool": "agent_unauthorized_tool",
-                "required_skill_not_read": "agent_required_skill_missing",
+                "skill_entry_not_read": "agent_skill_entry_missing",
             }.get(reason, "gateway_error")
         if reason == "invalid_output":
             return "probe_tool_final_invalid_output" if tool_calls > 0 else "probe_invalid_output"
@@ -700,69 +734,49 @@ class AgentRuntime:
     @staticmethod
     def _stage_tool_contract(
         stage: str,
-        stage_files: frozenset[str] | None,
-        required_files: frozenset[str] | None = None,
+        skill: SkillRuntime,
     ) -> str:
         if stage == "clarification":
             return "工具契约：本阶段没有可用工具，请直接提交最终 JSON。"
-        if stage in PLANNING_STAGES:
-            allowed = "、".join(sorted(stage_files or ())) or "（无）"
-            required = "、".join(sorted(required_files or ()))
-            return (
-                "工具契约：本阶段仅提供 list_skill_files 与 read_skill_file，不提供 get_asset_info；"
-                f"read_skill_file.path 只允许：{allowed}。最多成功读取 {MAX_PLANNING_FILE_READS} 个文件；"
-                + (f"提交最终 JSON 前必须成功读取：{required}。" if required else "不需要读取时请直接提交最终 JSON。")
-            )
-        if stage in RENDERING_STAGES:
-            allowed = "、".join(sorted(stage_files or ())) or "（无）"
-            return (
-                f"工具契约：最小但完整的 Generation Contract 快照文件清单为：{allowed}。"
-                "无需先调用 list_skill_files；提交最终 JSON 前必须读取该 Generation Contract；read_skill_file.path 只能从该清单选择，已读路径不会再次返回正文。"
-                "达到探索、唯一文件或字节预算后工具会被移除，必须提交最终 JSON。"
-            )
-        return "工具契约：仅可使用当前请求中提供的只读 Skill 工具；也可以不调用工具直接提交最终 JSON。"
+        return (
+            f"Skill 发现：名称={json.dumps(skill.skill_name, ensure_ascii=False)}；"
+            f"描述={json.dumps(skill.skill_description, ensure_ascii=False)}。"
+            "工具协议：必须首先调用 read_skill_file 完整读取 SKILL.md；"
+            "随后依据 SKILL.md 中的相对路径，按需使用 list_skill_files、read_skill_file、"
+            "get_asset_info 或可选的 run_skill_script。不要一次性读取全部资源或重复读取。"
+            "run_skill_script 的成功、失败与超时都只是自检建议，不决定任务或交付是否成功。"
+            "若没有读取入口文件，协议只纠正一次；达到探索、文件、字节或模型请求预算后必须提交最终 JSON。"
+        )
 
     @staticmethod
     def _recovery_tools(
         stage: str,
-        stage_files: frozenset[str] | None,
+        skill: SkillRuntime,
         remaining_paths: frozenset[str] | None,
     ) -> list[dict]:
-        if stage in RENDERING_STAGES:
-            return [_read_skill_file_tool(remaining_paths)] if remaining_paths else []
-        if stage not in PLANNING_STAGES:
-            return _tools_for_stage(stage, stage_files)
+        del stage, skill
         return [_read_skill_file_tool(remaining_paths)] if remaining_paths else []
 
     @staticmethod
     def _remaining_paths(
-        stage: str,
-        stage_files: frozenset[str] | None,
+        available_text_files: frozenset[str],
         successful_read_paths: set[str],
         successful_read_count: int,
         max_unique_files: int = 4,
     ) -> frozenset[str] | None:
-        if stage in RENDERING_STAGES:
-            if successful_read_count >= max_unique_files:
-                return frozenset()
-            return frozenset((stage_files or frozenset()) - successful_read_paths)
-        if stage not in PLANNING_STAGES:
-            return None
-        if successful_read_count >= MAX_PLANNING_FILE_READS:
+        if successful_read_count >= max_unique_files:
             return frozenset()
-        return frozenset((stage_files or frozenset()) - successful_read_paths)
+        return frozenset(available_text_files - successful_read_paths)
 
     @staticmethod
-    def _tool_recovery_instruction(stage: str, remaining_paths: frozenset[str] | None) -> str:
-        if stage in PLANNING_STAGES and remaining_paths:
+    def _tool_recovery_instruction(remaining_paths: frozenset[str] | None) -> str:
+        if remaining_paths:
             allowed = "、".join(sorted(remaining_paths))
             return (
                 "当前处于受限恢复轮。如仍需读取，只能调用 read_skill_file，"
                 f"且 path 必须从以下合法路径选择：{allowed}；否则请不要调用工具，直接提交符合 Schema 的最终 JSON。"
             )
-        if stage in PLANNING_STAGES:
-            return "当前受限恢复轮已无剩余合法读取路径。下一轮不得调用工具，请直接提交符合 Schema 的最终 JSON。"
-        return "上轮工具调用未通过当前阶段契约。下一轮不要重复无效调用；请仅使用当前可用工具的合法参数，或直接提交符合 Schema 的最终 JSON。"
+        return "当前受限恢复轮已无剩余合法读取路径。下一轮不得调用工具，请直接提交符合 Schema 的最终 JSON。"
 
     @staticmethod
     def _tool_error_code(name: str, message: str) -> str:

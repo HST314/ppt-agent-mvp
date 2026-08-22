@@ -64,7 +64,7 @@ GENERATION_OPERATIONS = {
 }
 METRIC_KEYS = {
     "stage", "agent_step", "max_steps", "provider_calls", "max_provider_calls",
-    "tool_calls", "max_tool_calls", "tool_name", "tool_failed",
+    "tool_calls", "max_tool_calls", "tool_name", "tool_path", "tool_failed",
 }
 EVENT_LOCK_TIMEOUT_SECONDS = 10
 EVENT_PERSISTENCE_ERRORS = (

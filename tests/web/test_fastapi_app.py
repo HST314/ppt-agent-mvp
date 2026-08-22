@@ -170,7 +170,7 @@ class FastAPIAppTests(unittest.TestCase):
                     3: SimpleNamespace(
                         output_text="",
                         id="provider-tool-id",
-                        output=[SimpleNamespace(type="function_call", name="list_skill_files", arguments="{}", call_id="provider-call-id")],
+                        output=[SimpleNamespace(type="function_call", name="read_skill_file", arguments='{"path":"SKILL.md"}', call_id="provider-call-id")],
                     ),
                     4: SimpleNamespace(output_text='{"markdown":"probe-ok"}', id="provider-final-id", output=[]),
                 }
@@ -246,7 +246,7 @@ class FastAPIAppTests(unittest.TestCase):
                     return SimpleNamespace(
                         output_text="",
                         id="provider-tool-id",
-                        output=[SimpleNamespace(type="function_call", name="list_skill_files", arguments="{}", call_id="provider-call-id")],
+                        output=[SimpleNamespace(type="function_call", name="read_skill_file", arguments='{"path":"SKILL.md"}', call_id="provider-call-id")],
                     )
                 return SimpleNamespace(output_text="not-json", id=f"provider-invalid-{self.calls}", output=[])
 

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 from .errors import GatewayError, GatewayUnknownResult, ValidationError
-from .agent_runtime import AgentRuntime, LEGACY_STAGE_FILES, STAGE_OUTPUT_SCHEMAS, STAGE_PROVIDER_SCHEMAS, _extract_json_object, normalize_rendering_output
+from .agent_runtime import AgentRuntime, STAGE_OUTPUT_SCHEMAS, STAGE_PROVIDER_SCHEMAS, _extract_json_object, normalize_rendering_output
 from .audit import current_agent_audit_context
 from .claim_ledger import audit_html_claims_by_slide
 from .p4 import assemble_locked_template
@@ -309,7 +309,7 @@ class AgentGateway:
                 max_tool_calls=self.max_tool_calls,
                 max_provider_calls=self.max_provider_calls,
                 timeout_seconds=self.run_timeout_seconds,
-            ).run("narrative", {"capability_probe": "list_skill_files_then_return_markdown"}, capability_probe=True)
+            ).run("narrative", {"capability_probe": "read_skill_entry_then_return_markdown"}, capability_probe=True)
             if not any(event.get("event") == "tool" for event in tools.audit):
                 raise GatewayError("模型未完成强制工具调用",code="probe_tool_call_missing")
             record(check,"succeeded",response_id_sha256=hashlib.sha256((tools.response_id or "").encode()).hexdigest())
@@ -398,15 +398,12 @@ class LockedSkillMetadataLoader:
     def load(self, action):
         if action not in {"narrative", "outline", "sample", "deck", "inspection"}: raise ValidationError("Skill action 不在允许列表")
         skill=self.skill_factory()
-        preferred=LEGACY_STAGE_FILES.get(action, frozenset())
-        files=sorted(name for name in preferred if name in skill.manifest)
-        if not files and "SKILL.md" in skill.manifest:
-            files=["SKILL.md"]
-        if action in {"sample","deck"} and "assets/template.html" in skill.manifest:
-            files.append("assets/template.html")
+        files=["SKILL.md"]
         file_hashes={name:skill.manifest[name] for name in files}
         return {
             "action":action,
+            "name":skill.skill_name,
+            "description":skill.skill_description,
             "version":skill.skill_version,
             "content":json.dumps(file_hashes,sort_keys=True,separators=(",",":")),
             "files":files,

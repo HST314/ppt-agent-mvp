@@ -136,7 +136,7 @@ class FrontendAssetTests(unittest.TestCase):
         self.assertNotIn("onEvent", heartbeat_branch)
         for token in ("job-panel__business-step", "job-panel__elapsed", "job-panel__deadline", "job-panel__transport", "job-panel__cancel-feedback"):
             self.assertIn(token, app)
-        for token in ("Agent 步数", "模型请求", "只读工具调用", "执行详情", "技术审计", "jobEventHistory", "jobAgentAudits"):
+        for token in ("Agent 步数", "模型请求", "Skill 工具调用", "执行详情", "技术审计", "jobEventHistory", "jobAgentAudits"):
             self.assertIn(token, app + (FRONTEND / "static/js/api.js").read_text())
         self.assertIn("`${event.job_id}:${event.seq}`", app)
         self.assertIn('"storage-error"', tracker + app)

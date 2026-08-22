@@ -127,7 +127,7 @@ class P0FaultInjectionGate(unittest.TestCase):
             jobs.close()
 
     def test_real_business_checkpoints_are_emitted(self):
-        calls = [ModelToolCall("list_skill_files", "{}", "c1")]
+        calls = [ModelToolCall("read_skill_file", '{"path":"SKILL.md"}', "c1")]
         client = Client([ModelTurn(None, "r1", calls), ModelTurn('{"markdown":"ok"}', "r2")])
         seen = []
         with execution_scope(lambda: False, time.monotonic() + 1, lambda step, message, details: seen.append((step, details))):

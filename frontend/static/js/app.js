@@ -1,11 +1,11 @@
-import { api, ApiError } from "./api.js?v=2026.08.22.110501195536";
-import { JobTracker } from "./job-tracker.js?v=2026.08.22.110501195536";
-import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.22.110501195536";
-import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.22.110501195536";
-import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.22.110501195536";
-import { inlineError, setBusy } from "./components/index.js?v=2026.08.22.110501195536";
-import { renderStage } from "./stages/index.js?v=2026.08.22.110501195536";
-import { setVersionMatchGuard } from "./stages/shared.js?v=2026.08.22.110501195536";
+import { api, ApiError } from "./api.js?v=2026.08.22.130610852096";
+import { JobTracker } from "./job-tracker.js?v=2026.08.22.130610852096";
+import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.22.130610852096";
+import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.22.130610852096";
+import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.22.130610852096";
+import { inlineError, setBusy } from "./components/index.js?v=2026.08.22.130610852096";
+import { renderStage } from "./stages/index.js?v=2026.08.22.130610852096";
+import { setVersionMatchGuard } from "./stages/shared.js?v=2026.08.22.130610852096";
 
 const app = document.getElementById("app");
 const APP_BUILD = document.querySelector('meta[name="app-build"]')?.content || "unknown";
@@ -669,7 +669,7 @@ function jobPanel(job, { detailed = false } = {}) {
       ]),
       metricItem("Agent 步数", budgetLabel(metrics.agent_step, metrics.max_steps)),
       metricItem("模型请求", budgetLabel(metrics.provider_calls, metrics.max_provider_calls)),
-      metricItem("只读工具调用", budgetLabel(metrics.tool_calls, metrics.max_tool_calls)),
+      metricItem("Skill 工具调用", budgetLabel(metrics.tool_calls, metrics.max_tool_calls)),
     ]) : element("p", { className: "field__hint", text: `${job.branch_id ? `分支 ${job.branch_id} · ` : ""}${job.started_at ? `已运行 ${formatDuration(elapsedSeconds(job.started_at, job.finished_at))}` : "等待执行资源"}` }),
     job.status === "cancellation_requested" || job.cancellation_requested ? element("p", {
       className: "job-panel__cancel-feedback",
@@ -757,8 +757,8 @@ function stepLabel(step) {
     provider_request: "模型请求已发送",
     provider_response: "模型响应已返回",
     waiting_model: "等待模型响应",
-    skill_loading: "只读工具调用开始",
-    skill_completed: "只读工具调用完成",
+    skill_loading: "Skill 工具调用开始",
+    skill_completed: "Skill 工具调用完成",
     validating_output: "校验结构化输出",
     validating_html: "校验 HTML",
     saving_result: "保存业务结果",
@@ -1072,7 +1072,7 @@ function jobBusinessStep(job) {
     provider_request: "模型请求已发送，等待响应",
     provider_response: "模型响应已返回，正在处理",
     skill_loading: "正在读取 Skill 与任务资料",
-    skill_completed: "只读工具调用已完成",
+    skill_completed: "Skill 工具调用已完成",
     validating_output: "正在校验模型输出与阶段 Schema",
     validating_html: "正在校验 HTML 与页面结构",
     saving_result: "正在保存版本与业务状态",

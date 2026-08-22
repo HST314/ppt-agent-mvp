@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import httpx
 from openai import APIConnectionError, APIStatusError, APITimeoutError
 
-from ppt_agent.agent_runtime import AgentRuntime, LEGACY_STAGE_FILES, STAGE_OUTPUT_SCHEMAS, STAGE_PROVIDER_SCHEMAS, STAGE_PROMPTS, TOOLS
+from ppt_agent.agent_runtime import AgentRuntime, STAGE_OUTPUT_SCHEMAS, STAGE_PROVIDER_SCHEMAS, STAGE_PROMPTS, TOOLS
 from ppt_agent.errors import GatewayError, GatewayUnknownResult, ValidationError
 from ppt_agent.gateways import AgentGateway
 from ppt_agent.model_clients import ModelToolCall, ModelTurn, OpenAIResponsesClient
@@ -19,6 +19,10 @@ from ppt_agent.skill_runtime import SkillRuntime
 SCHEMA = {"name": "answer", "schema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"], "additionalProperties": False}}
 OUTLINE_VALUE = {"slides": [{"title": "完成", "purpose": "验证契约", "content_markdown": "- 内容", "resource_uris": []}]}
 OUTLINE_JSON = json.dumps(OUTLINE_VALUE, ensure_ascii=False)
+
+
+def skill_entry_turn(call_id="skill-entry"):
+    return ModelTurn(None, call_id, (ModelToolCall("read_skill_file", '{"path":"SKILL.md"}', call_id),))
 
 
 class ScriptedClient:
@@ -97,24 +101,21 @@ class StageBSkillTests(unittest.TestCase):
 class StageBAgentTests(unittest.TestCase):
     def test_invalid_tool_call_can_be_corrected_by_model(self):
         calls = [ModelToolCall("read_skill_file", '{"path":"../secret"}', "bad")]
-        client = ScriptedClient([ModelTurn(None, "r1", calls), ModelTurn('{"markdown":"已纠正"}', "r2")])
+        client = ScriptedClient([ModelTurn(None, "r1", calls), skill_entry_turn(), ModelTurn('{"markdown":"已纠正"}', "r2")])
         result = AgentRuntime(client, SkillRuntime.builtin()).run("narrative", {})
         self.assertEqual(result.value["markdown"], "已纠正")
         self.assertEqual(result.audit[2]["event"], "tool_error")
         self.assertIn("path_not_in_lock", str(client.inputs[1]["input"]))
         self.assertIn("只能调用 read_skill_file", str(client.inputs[1]["input"]))
         self.assertEqual([tool["name"] for tool in client.inputs[1]["tools"]], ["read_skill_file"])
-        self.assertEqual(
-            client.inputs[1]["tools"][0]["parameters"]["properties"]["path"]["enum"],
-            ["references/planning-summary.md"],
-        )
+        self.assertIn("SKILL.md", client.inputs[1]["tools"][0]["parameters"]["properties"]["path"]["enum"])
 
     def test_tool_audit_records_requested_path_hash_and_normalized_path(self):
         requested = "guizang-ppt/references/planning-summary.md"
         calls = [ModelToolCall("read_skill_file", json.dumps({"path":requested}), "c1")]
-        client = ScriptedClient([ModelTurn(None, "r1", calls), ModelTurn('{"markdown":"ok"}', "r2")])
+        client = ScriptedClient([skill_entry_turn(), ModelTurn(None, "r1", calls), ModelTurn('{"markdown":"ok"}', "r2")])
         result = AgentRuntime(client, SkillRuntime.builtin()).run("narrative", {})
-        tool_event = next(e for e in result.audit if e.get("event") == "tool")
+        tool_event = next(e for e in result.audit if e.get("path") == "references/planning-summary.md")
         self.assertEqual(tool_event["requested_path_sha256"], hashlib.sha256(requested.encode()).hexdigest())
         self.assertEqual(tool_event["path"], "references/planning-summary.md")
 
@@ -132,11 +133,11 @@ class StageBAgentTests(unittest.TestCase):
 
     def test_tool_error_budget_counts_complete_model_rounds(self):
         bad_calls=tuple(ModelToolCall("read_skill_file",'{"path":"../secret"}',f"bad-{index}") for index in range(3))
-        recovered=ScriptedClient([ModelTurn(None,"r1",bad_calls),ModelTurn('{"markdown":"已恢复"}',"r2")])
+        recovered=ScriptedClient([ModelTurn(None,"r1",bad_calls),skill_entry_turn(),ModelTurn('{"markdown":"已恢复"}',"r2")])
         result=AgentRuntime(recovered,SkillRuntime.builtin()).run("narrative",{})
         self.assertEqual(result.value,{"markdown":"已恢复"})
-        feedback=str(recovered.inputs[1]["input"])
-        self.assertEqual(feedback.count("function_call_output"),3)
+        feedback=recovered.inputs[1]["input"]
+        self.assertEqual(sum(item.get("type") == "function_call_output" and str(item.get("call_id", "")).startswith("bad-") for item in feedback),3)
         self.assertEqual(sum(item.get("event")=="tool_error" for item in result.audit),3)
         self.assertEqual(sum(item.get("event")=="tool_error_round" for item in result.audit),1)
 
@@ -152,7 +153,7 @@ class StageBAgentTests(unittest.TestCase):
         client=ScriptedClient([
             ModelTurn("OK","basic"),
             ModelTurn(OUTLINE_JSON,"outline-schema"),
-            ModelTurn(None,"tools",(ModelToolCall("list_skill_files","{}","probe-call"),)),
+            skill_entry_turn("probe-call"),
             ModelTurn('{"markdown":"probe-ok"}',"final"),
         ])
         gateway=AgentGateway(client,skill=SkillRuntime.builtin())
@@ -162,9 +163,9 @@ class StageBAgentTests(unittest.TestCase):
         self.assertIsNone(client.inputs[0]["response_schema"])
         self.assertEqual(client.inputs[1]["tools"],[])
         self.assertEqual(client.inputs[1]["response_schema"],STAGE_PROVIDER_SCHEMAS["outline"])
-        self.assertEqual([tool["name"] for tool in client.inputs[2]["tools"]],["list_skill_files","read_skill_file"])
-        self.assertEqual(client.inputs[2]["tools"][1]["parameters"]["properties"]["path"]["enum"],["references/planning-summary.md"])
-        self.assertEqual(client.inputs[2]["tool_choice"],{"type":"function","name":"list_skill_files"})
+        self.assertEqual([tool["name"] for tool in client.inputs[2]["tools"]],["read_skill_file"])
+        self.assertEqual(client.inputs[2]["tools"][0]["parameters"]["properties"]["path"]["enum"],["SKILL.md"])
+        self.assertEqual(client.inputs[2]["tool_choice"],{"type":"function","name":"read_skill_file"})
         self.assertIsNone(client.inputs[2]["response_schema"])
         self.assertEqual(client.inputs[3]["tool_choice"],"none")
         self.assertEqual(client.inputs[3]["response_schema"],STAGE_PROVIDER_SCHEMAS["narrative"])
@@ -176,7 +177,7 @@ class StageBAgentTests(unittest.TestCase):
         turns=[
             ModelTurn("OK","basic"),
             ModelTurn(OUTLINE_JSON,"schema"),
-            ModelTurn(None,"tools",(ModelToolCall("list_skill_files","{}","probe-call"),)),
+            skill_entry_turn("probe-call"),
             ModelTurn('{"markdown":"probe-ok"}',"final"),
         ]
 
@@ -246,7 +247,7 @@ class StageBAgentTests(unittest.TestCase):
         final_invalid=AgentGateway(ScriptedClient([
             ModelTurn("OK","basic"),
             ModelTurn(OUTLINE_JSON,"strict"),
-            ModelTurn(None,"tool",(ModelToolCall("list_skill_files","{}","call"),)),
+            skill_entry_turn("call"),
             ModelTurn("not-json","bad-final"),
             ModelTurn("still-not-json","bad-final-again"),
         ]),skill=SkillRuntime.builtin())
@@ -262,7 +263,7 @@ class StageBAgentTests(unittest.TestCase):
         rejected=AgentGateway(ScriptedClient([
             ModelTurn("OK","basic"),
             ModelTurn(OUTLINE_JSON,"strict"),
-            ModelTurn(None,"tool",(ModelToolCall("list_skill_files","{}","call"),)),
+            skill_entry_turn("call"),
             GatewayError("provider rejected tool output",code="model_request_invalid"),
         ]),skill=SkillRuntime.builtin())
         original_create=rejected.client.create
@@ -279,7 +280,7 @@ class StageBAgentTests(unittest.TestCase):
         self.assertEqual(caught.exception.tool_calls,1)
 
         bad_calls=(ModelToolCall("shell","{}","bad"),)
-        first_call=(ModelToolCall("list_skill_files","{}","first"),)
+        first_call=(ModelToolCall("read_skill_file",'{"path":"SKILL.md"}',"first"),)
         broken=AgentGateway(ScriptedClient([ModelTurn("OK","basic"),ModelTurn(OUTLINE_JSON,"strict"),ModelTurn(None,"first",first_call),ModelTurn(None,"bad-1",bad_calls),ModelTurn(None,"bad-2",bad_calls)]),skill=SkillRuntime.builtin())
         with self.assertRaises(GatewayError) as caught:
             broken.probe_capabilities(probe_id="runtime-probe-broken-tools")
@@ -302,14 +303,14 @@ class StageBAgentTests(unittest.TestCase):
         self.assertEqual(AgentRuntime._tool_error_code("read_skill_file","Skill 累计读取超过上限"),"quota_exceeded")
     def test_tool_loop_schema_and_secret_free_audit(self):
         client = ScriptedClient([
-            ModelTurn(None, "r1", (ModelToolCall("read_skill_file", json.dumps({"path": "references/planning-summary.md"}), "c1"),)),
+            skill_entry_turn("c1"),
             ModelTurn('{"text":"done"}', "r2"),
         ])
         client.turns[-1] = ModelTurn(OUTLINE_JSON, "r2")
         result = AgentRuntime(client, SkillRuntime.builtin()).run("outline", {"topic": "secret-topic"})
         self.assertEqual(result.value, OUTLINE_VALUE); self.assertEqual([x["event"] for x in result.audit], ["run", "model", "tool", "model", "terminal"])
         self.assertNotIn("secret-topic", json.dumps(result.audit)); self.assertNotIn("content", json.dumps(result.audit))
-        self.assertIn("function_call_output", str(client.inputs[1]["input"])); self.assertEqual([tool["name"] for tool in client.inputs[0]["tools"]], ["list_skill_files", "read_skill_file"])
+        self.assertIn("function_call_output", str(client.inputs[1]["input"])); self.assertEqual([tool["name"] for tool in client.inputs[0]["tools"]], ["read_skill_file"])
         system = client.inputs[0]["input"][0]["content"]
         for denied in ("联网", "图片", "Shell", "文件写入", "自更新"):
             self.assertIn(denied, system)
@@ -323,28 +324,27 @@ class StageBAgentTests(unittest.TestCase):
         }
         for stage, final in finals.items():
             with self.subTest(stage=stage):
-                path = "references/checklist.md" if stage == "inspection" else "references/planning-summary.md"
                 client = ScriptedClient([
-                    ModelTurn(None, "tool", (ModelToolCall("read_skill_file", json.dumps({"path":path}), "call"),)),
+                    skill_entry_turn("call"),
                     ModelTurn(final, "final"),
                 ])
                 AgentRuntime(client, SkillRuntime.builtin()).run(stage, {})
                 tools = client.inputs[0]["tools"]
-                expected_names = ["read_skill_file"] if stage == "inspection" else ["list_skill_files", "read_skill_file"]
-                self.assertEqual([tool["name"] for tool in tools], expected_names)
-                self.assertNotIn("get_asset_info", [tool["name"] for tool in tools])
+                self.assertEqual([tool["name"] for tool in tools], ["read_skill_file"])
                 self.assertEqual(
                     tools[-1]["parameters"]["properties"]["path"]["enum"],
-                    ["references/checklist.md"] if stage == "inspection" else ["references/planning-summary.md"],
+                    ["SKILL.md"],
                 )
                 system = client.inputs[0]["input"][0]["content"]
-                self.assertIn(path, system)
-                self.assertIn("最多成功读取 1 个文件", system)
+                self.assertIn("Skill 发现", system)
+                self.assertIn("必须首先调用 read_skill_file 完整读取 SKILL.md", system)
+                followup_names = {tool["name"] for tool in client.inputs[1]["tools"]}
+                self.assertEqual(followup_names, {"list_skill_files", "read_skill_file", "get_asset_info", "run_skill_script"})
 
     def test_planning_stage_reads_one_summary_and_idempotently_deduplicates_it(self):
         calls = (
-            ModelToolCall("read_skill_file", '{"path":"references/planning-summary.md"}', "one"),
-            ModelToolCall("read_skill_file", '{"path":"references/planning-summary.md"}', "two"),
+            ModelToolCall("read_skill_file", '{"path":"SKILL.md"}', "one"),
+            ModelToolCall("read_skill_file", '{"path":"SKILL.md"}', "two"),
         )
         client = ScriptedClient([ModelTurn(None, "tools", calls), ModelTurn(OUTLINE_JSON, "final")])
 
@@ -361,6 +361,7 @@ class StageBAgentTests(unittest.TestCase):
     def test_planning_stage_rejects_a_hidden_asset_tool(self):
         client = ScriptedClient([
             ModelTurn(None, "asset", (ModelToolCall("get_asset_info", '{"path":"assets/template.html"}', "asset-call"),)),
+            skill_entry_turn(),
             ModelTurn('{"markdown":"recovered"}', "final"),
         ])
 
@@ -370,13 +371,14 @@ class StageBAgentTests(unittest.TestCase):
         tool_error = next(item for item in result.audit if item.get("event") == "tool_error")
         self.assertEqual(tool_error["error_code"], "unauthorized_tool")
         self.assertEqual([tool["name"] for tool in client.inputs[1]["tools"]], ["read_skill_file"])
+        self.assertIn("SKILL.md", client.inputs[1]["tools"][0]["parameters"]["properties"]["path"]["enum"])
 
     def test_mixed_tool_batch_recovery_uses_one_remaining_path_contract(self):
         first_batch = (
-            ModelToolCall("read_skill_file", '{"path":"references/planning-summary.md"}', "initial-read"),
+            ModelToolCall("read_skill_file", '{"path":"SKILL.md"}', "initial-read"),
             ModelToolCall("get_asset_info", '{"path":"assets/template.html"}', "hidden-tool"),
         )
-        recovery_batch = (ModelToolCall("read_skill_file", '{"path":"references/planning-summary.md"}', "duplicate-read"),)
+        recovery_batch = (ModelToolCall("read_skill_file", '{"path":"references/planning-summary.md"}', "recovery-read"),)
         client = ScriptedClient([
             ModelTurn(None, "mixed", first_batch),
             ModelTurn(None, "recovery", recovery_batch),
@@ -386,54 +388,38 @@ class StageBAgentTests(unittest.TestCase):
         result = AgentRuntime(client, SkillRuntime.builtin()).run("outline", {})
 
         recovery_tools = client.inputs[1]["tools"]
-        self.assertEqual(recovery_tools, [])
-        self.assertEqual(client.inputs[1]["tool_choice"], "none")
+        self.assertEqual([tool["name"] for tool in recovery_tools], ["read_skill_file"])
+        self.assertIsNone(client.inputs[1]["tool_choice"])
         recovery_prompts = [
             item["content"] for item in client.inputs[1]["input"]
             if item.get("role") == "user" and "受限恢复轮" in item.get("content", "")
         ]
         recovery_prompt = recovery_prompts[0]
-        self.assertIn("已无剩余合法读取路径", recovery_prompt)
+        self.assertIn("references/planning-summary.md", recovery_prompt)
         second_round = [item for item in result.audit if item.get("step") == 2 and item.get("event") in {"tool", "tool_error"}]
         self.assertEqual(
             [(item["event"], item.get("error_code"), item.get("path")) for item in second_round],
             [("tool", None, "references/planning-summary.md")],
         )
-        self.assertEqual(client.inputs[2]["tools"], [])
-        self.assertEqual(client.inputs[2]["tool_choice"], "none")
-        self.assertIn("已无剩余合法读取路径", recovery_prompts[-1])
+        self.assertEqual([tool["name"] for tool in client.inputs[2]["tools"]], ["read_skill_file"])
+        self.assertIsNone(client.inputs[2]["tool_choice"])
+        self.assertNotIn("references/planning-summary.md", recovery_prompts[-1])
 
-    def test_mixed_batch_keeps_recovery_restricted_until_stable_failure(self):
-        first_batch = (
+    def test_duplicate_entry_read_is_cached_and_forces_final_output(self):
+        duplicate = (
             ModelToolCall("read_skill_file", '{"path":"SKILL.md"}', "initial-read"),
-            ModelToolCall("get_asset_info", '{"path":"assets/template.html"}', "hidden-tool"),
+            ModelToolCall("read_skill_file", '{"path":"SKILL.md"}', "duplicate"),
         )
-        duplicate = (ModelToolCall("read_skill_file", '{"path":"SKILL.md"}', "duplicate"),)
-        client = ScriptedClient([
-            ModelTurn(None, "mixed", first_batch),
-            ModelTurn(None, "recovery-1", duplicate),
-            ModelTurn(None, "recovery-2", duplicate),
-        ])
-
-        with self.assertRaises(GatewayError) as caught:
-            AgentRuntime(client, SkillRuntime.builtin()).run("outline", {})
-
-        self.assertEqual(caught.exception.code, "stage_tool_contract_error")
-        self.assertEqual(caught.exception.audit[-1]["reason"], "tool_error_limit")
-        for request in client.inputs[1:]:
-            self.assertEqual(
-                request["tools"][0]["parameters"]["properties"]["path"]["enum"],
-                ["references/planning-summary.md"],
-            )
-        recovery_errors = [
-            item for item in caught.exception.audit
-            if item.get("step") in {2, 3} and item.get("event") == "tool_error"
-        ]
-        self.assertEqual([item["error_code"] for item in recovery_errors], ["path_not_in_lock"])
+        client = ScriptedClient([ModelTurn(None, "mixed", duplicate), ModelTurn(OUTLINE_JSON, "final")])
+        result = AgentRuntime(client, SkillRuntime.builtin()).run("outline", {})
+        self.assertEqual(result.value, OUTLINE_VALUE)
+        self.assertEqual(client.inputs[1]["tools"], [])
+        self.assertEqual(client.inputs[1]["tool_choice"], "none")
+        self.assertEqual(result.audit[-1]["repeated_skill_reads"], 1)
 
     def test_image_content_is_removed_from_every_nested_model_input(self):
         client = ScriptedClient([
-            ModelTurn(None,"skill",(ModelToolCall("read_skill_file",'{"path":"references/design-pack-v1.md"}',"skill-call"),)),
+            skill_entry_turn("skill-call"),
             ModelTurn('{"slides":[{"slide_id":"slide-1","html":"<section class=\\"slide\\" id=\\"slide-1\\" data-slide-id=\\"slide-1\\"><p>ok</p></section>"}]}', "r"),
         ])
         result = AgentRuntime(client, SkillRuntime.builtin()).run("deck", {
@@ -460,19 +446,21 @@ class StageBAgentTests(unittest.TestCase):
             self.assertNotIn(keyword, provider)
 
         client = ScriptedClient([
+            skill_entry_turn(),
             ModelTurn('{"slides":[]}', "empty"),
             ModelTurn(OUTLINE_JSON, "fixed"),
         ])
         result = AgentRuntime(client, SkillRuntime.builtin()).run("outline", {})
         self.assertEqual(result.value, OUTLINE_VALUE)
-        self.assertEqual(client.inputs[0]["response_schema"], STAGE_PROVIDER_SCHEMAS["outline"])
+        self.assertIsNone(client.inputs[0]["response_schema"])
+        self.assertEqual(client.inputs[1]["response_schema"], STAGE_PROVIDER_SCHEMAS["outline"])
         self.assertEqual(sum(item.get("event") == "schema_correction" for item in result.audit), 1)
 
-        compatible = ScriptedClient([ModelTurn(OUTLINE_JSON, "compatible")])
+        compatible = ScriptedClient([skill_entry_turn(), ModelTurn(OUTLINE_JSON, "compatible")])
         AgentRuntime(compatible, SkillRuntime.builtin()).run(
             "outline", {}, response_schema=STAGE_OUTPUT_SCHEMAS["outline"]
         )
-        self.assertEqual(compatible.inputs[0]["response_schema"], STAGE_PROVIDER_SCHEMAS["outline"])
+        self.assertEqual(compatible.inputs[1]["response_schema"], STAGE_PROVIDER_SCHEMAS["outline"])
 
     def test_invalid_stage_tool_output_and_limits_fail_closed(self):
         with self.assertRaises(ValidationError): AgentRuntime(ScriptedClient([]), SkillRuntime.builtin()).run("publish", {})
@@ -502,7 +490,7 @@ class StageBAgentTests(unittest.TestCase):
     def test_rendering_fragment_failure_gets_one_bounded_semantic_correction(self):
         bad=json.dumps({"slides":[{"slide_id":"slide-1","html":"<html><body>wrong shell</body></html>"}]})
         fixed=json.dumps({"slides":[{"slide_id":"slide-1","html":"```html\n<section class=\"slide\"><h1>ok</h1></section>\n```"}]})
-        skill_turn=ModelTurn(None,"skill",(ModelToolCall("read_skill_file",'{"path":"references/design-pack-v1.md"}',"skill-call"),))
+        skill_turn=skill_entry_turn("skill-call")
         client=ScriptedClient([skill_turn,ModelTurn(bad,"bad"),ModelTurn(fixed,"fixed")])
         result=AgentRuntime(client,SkillRuntime.builtin()).run("sample",{"slide_ids":["slide-1"]})
         fragment=result.value["slides"][0]["html"]
@@ -530,14 +518,14 @@ class StageBAgentTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             AgentRuntime(ScriptedClient([]), SkillRuntime.builtin()).run("deck", {}, response_schema=SCHEMA)
         arbitrary = ScriptedClient([
-            ModelTurn(None,"skill",(ModelToolCall("read_skill_file",'{"path":"references/checklist.md"}',"skill-call"),)),
+            skill_entry_turn("skill-call"),
             ModelTurn('{"passed":false,"issues":[{"arbitrary_secret_field":"x"}]}', "secret-response"),
         ])
         runtime = AgentRuntime(arbitrary, SkillRuntime.builtin(), max_schema_corrections=0)
         with self.assertRaises(GatewayError) as caught: runtime.run("inspection", {})
         self.assertEqual(caught.exception.audit[-1]["reason"], "invalid_output")
         self.assertNotIn("secret-response", json.dumps(caught.exception.audit))
-        huge = AgentRuntime(ScriptedClient([ModelTurn(json.dumps({"slides":[{"title":"t","purpose":"p","content_markdown":"x"*100,"resource_uris":[]}]}), "r")]), SkillRuntime.builtin(), max_output_bytes=32)
+        huge = AgentRuntime(ScriptedClient([skill_entry_turn(), ModelTurn(json.dumps({"slides":[{"title":"t","purpose":"p","content_markdown":"x"*100,"resource_uris":[]}]}), "r")]), SkillRuntime.builtin(), max_output_bytes=32)
         with self.assertRaises(GatewayError) as caught: huge.run("outline", {})
         self.assertEqual(caught.exception.audit[-1]["reason"], "output_limit")
         calls = tuple(ModelToolCall("list_skill_files", "{}", f"secret-{i}") for i in range(2))
@@ -546,7 +534,7 @@ class StageBAgentTests(unittest.TestCase):
         self.assertEqual(caught.exception.audit[-1]["reason"], "tool_call_limit")
 
         ticks = iter([0, 0, 2])
-        timed = AgentRuntime(ScriptedClient([ModelTurn(OUTLINE_JSON, "r")]), SkillRuntime.builtin(), timeout_seconds=1, clock=lambda: next(ticks))
+        timed = AgentRuntime(ScriptedClient([skill_entry_turn(), ModelTurn(OUTLINE_JSON, "r")]), SkillRuntime.builtin(), timeout_seconds=1, clock=lambda: next(ticks))
         with self.assertRaises(GatewayError) as caught: timed.run("outline", {})
         self.assertEqual(caught.exception.audit[-1]["reason"], "deadline_exceeded")
 
@@ -589,7 +577,13 @@ class StageBAgentTests(unittest.TestCase):
         sdk = SimpleNamespace(); sdk.responses = sdk; sdk.calls = 0; sdk.requests = []
         def create(**kwargs):
             sdk.calls += 1; sdk.requests.append(kwargs)
-            markdown = "" if sdk.calls == 1 else "# 已恢复叙事"
+            if sdk.calls == 1:
+                return SimpleNamespace(
+                    output_text="",
+                    id="r-entry",
+                    output=[SimpleNamespace(type="function_call", name="read_skill_file", arguments='{"path":"SKILL.md"}', call_id="entry")],
+                )
+            markdown = "" if sdk.calls == 2 else "# 已恢复叙事"
             return SimpleNamespace(
                 output_text="",
                 id=f"r-{sdk.calls}",
@@ -605,11 +599,11 @@ class StageBAgentTests(unittest.TestCase):
         result = AgentRuntime(client, SkillRuntime.builtin()).run("narrative", {})
 
         self.assertEqual(result.value, {"markdown":"# 已恢复叙事"})
-        self.assertEqual(sdk.calls, 2)
+        self.assertEqual(sdk.calls, 3)
         correction = next(item for item in result.audit if item.get("event") == "schema_correction")
         self.assertEqual(correction["reason"], "schema_validation")
-        self.assertIn("长度不足", str(sdk.requests[1]["input"]))
-        self.assertEqual(sdk.requests[1]["tool_choice"], "none")
+        self.assertIn("长度不足", str(sdk.requests[2]["input"]))
+        self.assertEqual(sdk.requests[2]["tool_choice"], "none")
 
     def test_client_classifies_http_failures_and_only_audits_safe_metadata(self):
         expected = {
@@ -761,13 +755,12 @@ class StageBAgentTests(unittest.TestCase):
         self.assertEqual(caught.exception.safe_audit_details()["result_certainty"],"unknown")
         self.assertEqual(sdk.calls,1)
 
-    def test_outline_skill_view_hides_rendering_only_references(self):
+    def test_request_snapshot_can_limit_visible_skill_files(self):
         skill = SkillRuntime.builtin()
-        allowed = LEGACY_STAGE_FILES["outline"]
-        self.assertEqual(skill.list_skill_files(allowed_files=allowed)["files"], ["references/planning-summary.md"])
+        allowed = frozenset({"SKILL.md"})
+        self.assertEqual(skill.list_skill_files(allowed_files=allowed)["files"], ["SKILL.md"])
         with self.assertRaises(ValidationError):
             skill.dispatch("read_skill_file", {"path": "references/themes.md"}, allowed_files=allowed)
-        self.assertEqual(LEGACY_STAGE_FILES["deck"],frozenset({"references/design-pack-v1.md"}))
 
     def test_client_structured_output_modes_control_text_format(self):
         schema = {"name": "narrative", "strict": True, "schema": {"type": "object"}}
@@ -848,12 +841,12 @@ class StageBAgentTests(unittest.TestCase):
     def test_runtime_parses_fenced_and_prose_wrapped_json(self):
         for text in ('```json\n{"markdown":"fenced"}\n```', '说明文字 {"markdown":"prose"} 结束'):
             with self.subTest(text=text[:12]):
-                client = ScriptedClient([ModelTurn(text, "r")])
+                client = ScriptedClient([skill_entry_turn(), ModelTurn(text, "r")])
                 result = AgentRuntime(client, SkillRuntime.builtin()).run("narrative", {})
                 self.assertEqual(result.value, {"markdown": "fenced" if "fenced" in text else "prose"})
 
     def test_system_prompt_spells_out_the_output_contract(self):
-        client = ScriptedClient([ModelTurn('{"markdown":"ok"}', "r")])
+        client = ScriptedClient([skill_entry_turn(), ModelTurn('{"markdown":"ok"}', "r")])
         AgentRuntime(client, SkillRuntime.builtin()).run("narrative", {})
         system = client.inputs[0]["input"][0]["content"]
         self.assertIn("输出契约", system)

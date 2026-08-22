@@ -6,7 +6,7 @@ from pathlib import Path
 from ppt_agent.errors import GatewayError, GatewayUnknownResult, ValidationError
 from ppt_agent.audit import bind_agent_audit_context
 from ppt_agent.gateways import AgentGateway, LockedSkillMetadataLoader
-from ppt_agent.model_clients import ModelTurn
+from ppt_agent.model_clients import ModelToolCall, ModelTurn
 from ppt_agent.service import TaskService
 from ppt_agent.skill_runtime import SkillRuntime
 from ppt_agent.store import WorkspaceStore
@@ -14,7 +14,11 @@ from ppt_agent.store import WorkspaceStore
 
 class ScriptedClient:
     def __init__(self, *texts): self.turns = [ModelTurn(text, f"r-{index}") for index, text in enumerate(texts)]; self.inputs=[]
-    def create(self, **kwargs): self.inputs.append(kwargs); return self.turns.pop(0)
+    def create(self, **kwargs):
+        if kwargs.get("tool_choice") == {"type":"function", "name":"read_skill_file"}:
+            return ModelTurn(None, "skill-entry", (ModelToolCall("read_skill_file", '{"path":"SKILL.md"}', "skill-entry"),))
+        self.inputs.append(kwargs)
+        return self.turns.pop(0)
 
 
 class RaisingClient:

@@ -9,7 +9,7 @@ models:
     base_url_env: MODEL_BASE_URL
     # 单次 HTTP 请求超时（秒，1-600）
     request_timeout_seconds: 180
-    # 整轮 Agent 运行预算（10 分钟）覆盖多轮只读 Skill 往返
+    # 整轮 Agent 运行预算（10 分钟）覆盖多轮渐进式 Skill 工具往返
     run_timeout_seconds: 600
     # 外层持久化 Job 必须严格大于 Agent 预算，预留 30 秒校验/保存收尾
     job_timeout_seconds: 630

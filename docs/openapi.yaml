@@ -72,7 +72,7 @@ components:
         cancellation_requested: {type: boolean}
         deadline_seconds: {type: number, minimum: 1}
         deadline_at: {type: [string, 'null'], format: date-time}
-        metrics: {type: [object, 'null'], description: Current secret-free Agent step/provider/Skill budget counters}
+        metrics: {type: [object, 'null'], description: Current secret-free Agent step/provider/Skill budget counters plus tool name and validated relative path}
     Jobs: {type: object, required: [jobs], properties: {jobs: {type: array, items: {$ref: '#/components/schemas/Job'}}}}
     JobEvent:
       type: object

@@ -286,7 +286,12 @@ class SkillConfigAndInjectionTests(unittest.TestCase):
             read_tool = next(tool for tool in client.inputs[0]["tools"] if tool["name"] == "read_skill_file")
             self.assertEqual(
                 read_tool["parameters"]["properties"]["path"]["enum"],
-                ["SKILL.md", "references/completely-different-name.md"],
+                ["SKILL.md"],
+            )
+            second_read_tool = next(tool for tool in client.inputs[1]["tools"] if tool["name"] == "read_skill_file")
+            self.assertEqual(
+                second_read_tool["parameters"]["properties"]["path"]["enum"],
+                ["references/completely-different-name.md"],
             )
 
 

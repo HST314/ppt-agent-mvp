@@ -173,7 +173,7 @@ class P0GenerationRefactorTests(unittest.TestCase):
     def test_sample_exposes_only_read_only_skill_tools_and_server_assembles_public_shell(self):
         fragment='<section class="slide" id="slide-1" data-slide-id="slide-1"><h1>样品</h1></section>'
         client=RecordingClient([
-            ModelTurn(None,"skill",(ModelToolCall("read_skill_file",'{"path":"references/design-pack-v1.md"}',"skill-call"),)),
+            ModelTurn(None,"skill",(ModelToolCall("read_skill_file",'{"path":"SKILL.md"}',"skill-call"),)),
             ModelTurn(json.dumps({"slides":[{"slide_id":"slide-1","html":fragment}]}),"r1"),
         ])
         gateway=AgentGateway(client,skill=SkillRuntime.builtin(),max_steps=100)
@@ -185,43 +185,43 @@ class P0GenerationRefactorTests(unittest.TestCase):
         )
         self.assertEqual(client.inputs[0]["tool_choice"],{"type":"function","name":"read_skill_file"})
         path_schema=client.inputs[0]["tools"][0]["parameters"]["properties"]["path"]
-        self.assertEqual(path_schema["enum"],["references/design-pack-v1.md"])
+        self.assertEqual(path_schema["enum"],["SKILL.md"])
         self.assertNotIn("<!doctype html>",client.inputs[0]["input"][1]["content"])
         self.assertTrue(html.startswith("<!doctype html>"))
         self.assertIn(fragment,html)
         self.assertIn('name="ppt-template"',html)
         self.assertIn('assets/template.html#',html)
         self.assertNotIn('linear-gradient(135deg,#172033,#253858)',html)
-        self.assertEqual(gateway.runtime.last_audit[-1]["applied_skill_files"],["references/design-pack-v1.md"])
+        self.assertEqual(gateway.runtime.last_audit[-1]["applied_skill_files"],["SKILL.md"])
         tool_output=next(item for item in client.inputs[1]["input"] if item.get("type")=="function_call_output")
         contract=json.loads(tool_output["output"])
         self.assertGreaterEqual(contract["bytes"],10000)
         for required_rule in (
-            "不可违反的事实边界",
-            "每批次先冻结微型 DesignContract",
-            "允许的布局 archetype",
-            "动效 contract",
-            "返回前的确定性自检",
+            "references/layouts.md",
+            "references/themes.md",
+            "references/checklist.md",
+            "scripts/validate-swiss-deck.mjs",
         ):
             self.assertIn(required_rule,contract["content"])
-        self.assertIn("最小但完整的 Generation Contract",client.inputs[0]["input"][0]["content"])
+        self.assertIn("必须首先调用 read_skill_file 完整读取 SKILL.md",client.inputs[0]["input"][0]["content"])
 
     def test_sample_cannot_finish_without_applying_required_design_pack(self):
         fragment='<section class="slide" id="slide-1" data-slide-id="slide-1"><h1>样品</h1></section>'
-        client=RecordingClient([ModelTurn(json.dumps({"slides":[{"slide_id":"slide-1","html":fragment}]}),"r1")])
+        early=ModelTurn(json.dumps({"slides":[{"slide_id":"slide-1","html":fragment}]}),"r1")
+        client=RecordingClient([early,early])
 
         with self.assertRaises(GatewayError) as caught:
             AgentRuntime(client,SkillRuntime.builtin()).run("sample",{"slide_ids":["slide-1"]})
 
-        self.assertEqual(caught.exception.code,"agent_required_skill_missing")
+        self.assertEqual(caught.exception.code,"agent_skill_entry_missing")
         self.assertEqual(caught.exception.audit[-1]["unique_skill_files"],0)
 
     def test_sample_reads_complete_contract_once_and_deduplicates_same_round(self):
         fragment='<section class="slide" id="slide-1" data-slide-id="slide-1"><h1>样品</h1></section>'
         client=RecordingClient([
             ModelTurn(None,"r1",(
-                ModelToolCall("read_skill_file",'{"path":"references/design-pack-v1.md"}',"c1"),
-                ModelToolCall("read_skill_file",'{"path":"references/design-pack-v1.md"}',"c2"),
+                ModelToolCall("read_skill_file",'{"path":"SKILL.md"}',"c1"),
+                ModelToolCall("read_skill_file",'{"path":"SKILL.md"}',"c2"),
             )),
             ModelTurn(json.dumps({"slides":[{"slide_id":"slide-1","html":fragment}]}),"r2"),
         ])
@@ -245,8 +245,8 @@ class P0GenerationRefactorTests(unittest.TestCase):
     def test_sample_cross_round_duplicate_is_cached_without_error_recovery(self):
         fragment='<section class="slide" id="slide-1" data-slide-id="slide-1"><h1>样品</h1></section>'
         client=RecordingClient([
-            ModelTurn(None,"r1",(ModelToolCall("read_skill_file",'{"path":"references/design-pack-v1.md"}',"c1"),)),
-            ModelTurn(None,"r2",(ModelToolCall("read_skill_file",'{"path":"references/design-pack-v1.md"}',"c2"),)),
+            ModelTurn(None,"r1",(ModelToolCall("read_skill_file",'{"path":"SKILL.md"}',"c1"),)),
+            ModelTurn(None,"r2",(ModelToolCall("read_skill_file",'{"path":"SKILL.md"}',"c2"),)),
             ModelTurn(json.dumps({"slides":[{"slide_id":"slide-1","html":fragment}]}),"r3"),
         ])
         gateway=AgentGateway(client,skill=SkillRuntime.builtin(),max_steps=30,max_tool_calls=40,max_provider_calls=8)
@@ -254,7 +254,8 @@ class P0GenerationRefactorTests(unittest.TestCase):
         html=gateway.build("## [slide-1] 样品",action="sample",slide_ids=["slide-1"])
 
         self.assertTrue(html.startswith("<!doctype html>"))
-        self.assertEqual(client.inputs[1]["tool_choice"],"none")
+        self.assertIsNone(client.inputs[1]["tool_choice"])
+        self.assertEqual(client.inputs[2]["tool_choice"],"none")
         cached_outputs=[
             item for item in client.inputs[2]["input"]
             if item.get("type")=="function_call_output" and '"cached": true' in item.get("output","")
@@ -417,7 +418,7 @@ class P0GenerationRefactorTests(unittest.TestCase):
             {"slide_id":"slide-2","html":'<section class="slide" id="slide-2" data-slide-id="slide-2"><p>80 万元</p></section>'},
         ]
         client=RecordingClient([
-            ModelTurn(None,"skill",(ModelToolCall("read_skill_file",'{"path":"references/design-pack-v1.md"}',"c1"),)),
+            ModelTurn(None,"skill",(ModelToolCall("read_skill_file",'{"path":"SKILL.md"}',"c1"),)),
             ModelTurn(json.dumps({"slides":slides},ensure_ascii=False),"render"),
         ])
         gateway=AgentGateway(client,skill=SkillRuntime.builtin(),max_steps=4,max_tool_calls=4,max_provider_calls=4)
@@ -500,7 +501,7 @@ class P0GenerationRefactorTests(unittest.TestCase):
                 self.assert_batch(payload["slide_ids"],contract)
                 if kwargs.get("tool_choice") != "none":
                     return ModelTurn(None,"skill",(
-                        ModelToolCall("read_skill_file",'{"path":"references/design-pack-v1.md"}',f"skill-{len(self.contracts)}"),
+                        ModelToolCall("read_skill_file",'{"path":"SKILL.md"}',f"skill-{len(self.contracts)}"),
                     ))
                 self.contracts.append(contract)
                 self.contract_hashes.append(payload["design_contract_hash"])
@@ -616,6 +617,9 @@ class P0GenerationRefactorTests(unittest.TestCase):
             def create(self,**kwargs):
                 serialized=json.dumps(kwargs["input"])
                 task="task-a" if "task-a" in serialized else "task-b"
+                if kwargs.get("tool_choice") == {"type":"function", "name":"read_skill_file"}:
+                    call=type("Call",(),{"type":"function_call","name":"read_skill_file","arguments":'{"path":"SKILL.md"}',"call_id":f"{task}-skill"})()
+                    return type("Response",(),{"output_text":"","output":[call],"id":f"{task}-skill"})()
                 with self.lock:
                     self.calls[task]+=1; attempt=self.calls[task]
                 if task == "task-a" and attempt == 1:
@@ -634,7 +638,7 @@ class P0GenerationRefactorTests(unittest.TestCase):
         config=type("Config",(),{"model":"m","api_key":"k","base_url":"https://example.com","timeout_seconds":3,"structured_output":"prompt"})()
         sdk=SDK(); client=OpenAIResponsesClient(config,sdk_client=sdk)
         def run(task):
-            return AgentRuntime(client,SkillRuntime.builtin(),max_provider_calls=2).run("narrative",{"task":task})
+            return AgentRuntime(client,SkillRuntime.builtin(),max_provider_calls=3).run("narrative",{"task":task})
         with ThreadPoolExecutor(max_workers=2) as pool:
             future_a=pool.submit(run,"task-a")
             self.assertTrue(sdk.a_empty.wait(2))
