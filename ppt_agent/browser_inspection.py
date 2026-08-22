@@ -50,11 +50,11 @@ def _visual_quality(slides: list[dict]) -> tuple[dict, list[dict]]:
         role = str(slide.get("visual_role") or "content")
         coverage = max(0.0, min(1.0, float(slide.get("content_coverage") or 0)))
         balance = max(0.0, min(1.0, float(slide.get("balance_offset") or 0)))
-        minimum = 0.08 if role in {"hero", "cover", "closing"} else 0.14
+        minimum = 0.08 if role in {"cover", "closing"} else 0.14
         coverage_score = min(100.0, coverage / minimum * 100.0) if coverage < minimum else 100.0
         if coverage > 0.82:
             coverage_score = max(55.0, 100.0 - (coverage - 0.82) * 250.0)
-        balance_floor = 0.32 if role in {"hero", "cover", "closing"} else 0.24
+        balance_floor = 0.32 if role in {"cover", "closing"} else 0.24
         balance_score = 100.0 if balance <= balance_floor else max(35.0, 100.0 - (balance - balance_floor) * 180.0)
         score = round(coverage_score * 0.58 + balance_score * 0.42, 1)
         metrics.append({
@@ -78,7 +78,7 @@ def _visual_quality(slides: list[dict]) -> tuple[dict, list[dict]]:
                 evidence=f"meaningful coverage={coverage:.1%}; advisory minimum={minimum:.0%}; role={role}",
                 suggestion="扩大核心视觉或信息组，收紧无意图空白；若为刻意留白，请在人工审核中确认",
             ))
-        imbalance_limit = 0.56 if role in {"hero", "cover", "closing"} else 0.46
+        imbalance_limit = 0.56 if role in {"cover", "closing"} else 0.46
         if balance > imbalance_limit:
             issues.append(_issue(
                 "visual_imbalance",
@@ -111,7 +111,7 @@ def _visual_quality(slides: list[dict]) -> tuple[dict, list[dict]]:
             "整稿缺少可辨识的主题节奏变化",
             severity="warning",
             evidence=f"distinct rendered themes={unique_themes}; slides={slide_count}",
-            suggestion="按 DesignContract 核对 hero、light、dark 或 accent 页面节奏；单主题是明确设计决策时可人工确认",
+            suggestion="结合已确认 DesignIntent 核对页面节奏；单一视觉节奏若是明确设计决策可由人工确认",
         ))
     composition_score = sum(item["score"] for item in metrics) / slide_count if slide_count else 0.0
     overall = round(composition_score * 0.65 + diversity_score * 0.2 + theme_score * 0.15, 1)
@@ -230,16 +230,6 @@ class ChromiumDeckInspector:
                     slides = page.eval_on_selector_all(
                         ".slide",
                         """slides => {
-                        const selectors = [];
-                        const collectRules = rules => {
-                            for (const rule of [...(rules || [])]) {
-                                if (rule.selectorText && rule.style && rule.style.length) selectors.push(rule.selectorText);
-                                if (rule.cssRules) collectRules(rule.cssRules);
-                            }
-                        };
-                        for (const sheet of [...document.styleSheets]) {
-                            try { collectRules(sheet.cssRules); } catch (_) { /* generated decks use same-origin inline CSS */ }
-                        }
                         return slides.map((slide, slideIndex) => {
                             const rect = slide.getBoundingClientRect();
                             const visible = element => {
@@ -361,51 +351,6 @@ class ChromiumDeckInspector:
                             const brokenImages = [...slide.querySelectorAll('img')]
                                 .filter(image => !image.complete || image.naturalWidth === 0)
                                 .map((image, index) => label(image, descendants.indexOf(image) >= 0 ? descendants.indexOf(image) : index));
-                            const classElements = [slide, ...slide.querySelectorAll('[class]')];
-                            const undefinedClasses = [];
-                            const seenClasses = new Set();
-                            const semanticMeta = document.querySelector('meta[name="ppt-semantic-classes"]');
-                            const semanticClasses = new Set([
-                                'slide',
-                                ...(semanticMeta ? semanticMeta.content.split(/\s+/).filter(Boolean) : ['light', 'dark', 'grey', 'accent', 'hero', 'split']),
-                            ]);
-                            for (const element of classElements) {
-                                for (const className of [...element.classList]) {
-                                    if (seenClasses.has(className) || /^lucide(?:-|$)/.test(className)) continue;
-                                    seenClasses.add(className);
-                                    const token = `.${CSS.escape(className)}`;
-                                    const owners = [...slide.getElementsByClassName(className)];
-                                    if (slide.classList.contains(className)) owners.unshift(slide);
-                                    const defined = selectors.some(selector => {
-                                        if (!selector.includes(token)) return false;
-                                        return owners.some(owner => {
-                                            try {
-                                                if (owner.matches(selector)) return true;
-                                                // A semantic class can own the ancestor compound of a
-                                                // descendant rule, e.g. `.slide.split .canvas-card`.
-                                                // In that case the owner cannot match the full selector;
-                                                // require the complete selector to match a real element in
-                                                // this owner's subtree instead of treating the class as
-                                                // undefined (or globally trusting a token-only CSS rule).
-                                                return [...document.querySelectorAll(selector)].some(
-                                                    matched => matched === owner || owner.contains(matched)
-                                                );
-                                            } catch (_) { return false; }
-                                        });
-                                    });
-                                    if (!defined) {
-                                        undefinedClasses.push({
-                                            class_name: className,
-                                            element_id: label(element, descendants.indexOf(element)),
-                                            selector: selectorFor(element),
-                                        });
-                                    }
-                                }
-                            }
-                            const layoutMeaningful = descendants.filter(element =>
-                                (element.innerText || '').trim() || element.matches('img,svg,canvas,table'));
-                            const contentTop = layoutMeaningful.length ? Math.min(...layoutMeaningful.map(element => element.getBoundingClientRect().top - rect.top)) : 0;
-                            const contentBottom = layoutMeaningful.length ? Math.max(...layoutMeaningful.map(element => element.getBoundingClientRect().bottom - rect.top)) : 0;
                             const ownText = element => [...element.childNodes].some(node => node.nodeType === Node.TEXT_NODE && (node.textContent || '').trim());
                             const meaningful = descendants.filter(element => {
                                 const box = element.getBoundingClientRect();
@@ -448,8 +393,8 @@ class ChromiumDeckInspector:
                             const background = getComputedStyle(slide).backgroundColor;
                             const rgb = (background.match(/[\d.]+/g) || []).slice(0, 3).map(Number);
                             const luminance = rgb.length === 3 ? (rgb[0] * .2126 + rgb[1] * .7152 + rgb[2] * .0722) : 255;
-                            const theme = slide.classList.contains('accent') ? 'accent' : slide.classList.contains('dark') || luminance < 80 ? 'dark' : slide.classList.contains('grey') ? 'grey' : 'light';
-                            const visualRole = slide.getAttribute('data-visual-role') || (slide.classList.contains('hero') ? 'hero' : slideIndex === 0 ? 'cover' : slideIndex === slides.length - 1 ? 'closing' : 'content');
+                            const theme = luminance < 80 ? 'dark' : 'light';
+                            const visualRole = slide.getAttribute('data-visual-role') || (slideIndex === 0 ? 'cover' : slideIndex === slides.length - 1 ? 'closing' : 'content');
                             return {
                                 slide_id: slide.getAttribute('data-slide-id') || slide.id || '',
                                 index: slideIndex,
@@ -463,7 +408,7 @@ class ChromiumDeckInspector:
                                 small_text: smallText,
                                 broken_images: brokenImages.slice(0, 8),
                                 visual_role: visualRole,
-                                layout_id: slide.getAttribute('data-layout') || '',
+                                layout_id: '',
                                 theme,
                                 content_coverage: contentCoverage,
                                 content_bounds_coverage: boundsCoverage,
@@ -471,14 +416,10 @@ class ChromiumDeckInspector:
                                 meaningful_element_count: meaningful.length,
                                 geometry_signature: geometrySignature,
                                 layout_validation: {
-                                    layout_id: slide.getAttribute('data-layout') || '',
-                                    css_rule_count: selectors.length,
-                                    used_class_count: seenClasses.size,
-                                    undefined_classes: undefinedClasses.slice(0, 20),
-                                    registered_semantic_classes: [...semanticClasses].sort(),
-                                    content_top: Math.round(contentTop),
-                                    content_bottom: Math.round(contentBottom),
-                                    active_height_ratio: rect.height ? Number(((contentBottom - contentTop) / rect.height).toFixed(4)) : 0,
+                                    applicable: false,
+                                    layout_id: '',
+                                    undefined_classes: [],
+                                    registered_semantic_classes: [],
                                 },
                             };
                         });
@@ -566,7 +507,7 @@ class ChromiumDeckInspector:
                     "页面没有按 1280×720 画布渲染",
                     slide_id=slide_id,
                     evidence=f"rendered={width:.1f}x{height:.1f}px; expected=1280x720px",
-                    suggestion="使用锁定模板的固定画布，不要覆盖 slide 宽高",
+                    suggestion="遵守 PresentationTechnicalContract 的固定画布，不要覆盖 slide 宽高",
                 ))
             if int(slide.get("text_length") or 0) == 0 and int(slide.get("visual_count") or 0) == 0:
                 issues.append(_issue(
@@ -595,7 +536,7 @@ class ChromiumDeckInspector:
                     slide_id=slide_id,
                     element_id=str(title.get("element_id") or "title"),
                     evidence=f"computed font-size={size:.1f}px; minimum={MIN_TITLE_PX:.0f}px",
-                    suggestion="使用锁定模板标题类或将标题字号提高到至少 32px",
+                    suggestion="依据已确认 DesignIntent 将标题字号提高到至少 32px",
                 ))
             covered_scroll = [item for item in slide.get("scrolling") or [] if item.get("covered_by")]
             for item in slide.get("overflows") or []:
@@ -662,20 +603,5 @@ class ChromiumDeckInspector:
                     element_id=str(element_id),
                     evidence="image.complete=false 或 naturalWidth=0",
                     suggestion="检查冻结资源、媒体类型与图片内容",
-                ))
-            layout = slide.get("layout_validation") or {}
-            for item in layout.get("undefined_classes") or []:
-                issues.append(_issue(
-                    "undefined_layout_class",
-                    "页面使用了没有任何实际 CSS 规则命中的布局类",
-                    slide_id=slide_id,
-                    element_id=str(item.get("element_id") or item.get("class_name") or "layout"),
-                    evidence=(
-                        f"layout={layout.get('layout_id') or 'unregistered'}; "
-                        f"class=.{item.get('class_name')}; matched_css_rule=0; "
-                        f"active_height_ratio={float(layout.get('active_height_ratio') or 0):.4f}"
-                    ),
-                    suggestion="只使用锁定模板已定义的布局骨架和类名，或先在受控模板中补齐对应 CSS",
-                    selector=str(item.get("selector") or ""),
                 ))
         return issues

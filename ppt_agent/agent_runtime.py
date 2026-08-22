@@ -9,6 +9,7 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from .errors import GatewayError, ValidationError
+from .design_contract import validate_design_intent, validate_shared_design_assets
 from .skill_runtime import SkillRuntime
 
 
@@ -47,14 +48,47 @@ STAGE_PROMPTS = {
         "若输入包含 semantic_correction，须依据其中的具体错误修正并重新提交完整 slides。"
         "先完整读取当前 Skill 的 SKILL.md，再按其中指引按需读取必要资源；读取已经足够时立即提交大纲 JSON，不要重复读取。"
     ),
-    "sample": "仅为外层状态机指定的样品页生成 section 片段，不得生成公共模板或扩展到全稿；必须完整应用版本化 Generation Contract 中的事实、主题、布局、组件与动效约束。输入中的 required_claims_by_slide 是逐页冻结事实映射：每个 value 必须逐字出现在对应 slide 的可见正文，出现在其他页、隐藏节点、样式、脚本或元数据均不算覆盖；required_claim_slots_by_slide 是服务端预分配的逐页可见事实槽位，每个 slot_id 对应的 value 必须原样写进同页真实布局骨架；required_claims_verbatim 是本批去重汇总，不得合并、改写或遗漏。layout_capacity_by_slide 是逐页可读容量硬边界：超预算时压缩正文、减少卡片/行项目、切换高容量布局或拆页，不得靠隐藏内容、裁切或突破 minimum_body_font_px。输入中的 locked_theme_policy 是硬约束：section 根节点及全部后代的 inline style 都不得声明 forbidden_inline_tokens 中的锁定主题变量，只能消费模板已有的 var(--*) 或使用 DesignContract 指定的主题 class。每项 html 必须严格以 <section class=\"slide\" id=\"给定ID\" data-slide-id=\"给定ID\"> 开始并以 </section> 结束。若输入包含 semantic_correction，必须逐页修复 missing_required_claims_by_slide、canonical_blockers、browser_blockers、capacity_blockers 或指出的锁定主题变量，并重新提交完整 slides。",
-    "deck": "仅为外层状态机给定的未确认页面生成 section 片段；不得重做确认样品、不得生成公共模板；必须复用样稿设计语言并完整应用版本化 Generation Contract，避免重复探索。输入中的 required_claims_by_slide 是逐页冻结事实映射：每个 value 必须逐字出现在对应 slide 的可见正文，出现在其他页、隐藏节点、样式、脚本或元数据均不算覆盖；required_claim_slots_by_slide 是服务端预分配的逐页可见事实槽位，每个 slot_id 对应的 value 必须原样写进同页真实布局骨架；required_claims_verbatim 是本批去重汇总，不得合并、改写或遗漏。layout_capacity_by_slide 是逐页可读容量硬边界：超预算时压缩正文、减少卡片/行项目、切换高容量布局或拆页，不得靠隐藏内容、裁切或突破 minimum_body_font_px。输入中的 locked_theme_policy 是硬约束：section 根节点及全部后代的 inline style 都不得声明 forbidden_inline_tokens 中的锁定主题变量，只能消费模板已有的 var(--*) 或使用 DesignContract 指定的主题 class。每项 html 必须严格以 <section class=\"slide\" id=\"给定ID\" data-slide-id=\"给定ID\"> 开始并以 </section> 结束。若输入包含 semantic_correction，必须逐页修复 missing_required_claims_by_slide、canonical_blockers、browser_blockers、capacity_blockers 或指出的锁定主题变量，并重新提交完整 slides。",
+    "sample": (
+        "只为外层状态机指定的代表页生成 section 片段，不得扩展到全稿。先依据已读取的当前 Skill 与页面内容形成"
+        "DesignIntent，说明风格、配色、排版、布局原则及理由，并把跨页复用的 CSS 放入 shared_assets.css。"
+        "PresentationTechnicalContract 只规定画布、页面 ID、资源、安全与交付边界，不规定风格、class 或布局。"
+        "required_claims_by_slide 中每个 value 必须逐字出现在对应页面的可见正文。每项 html 必须是单个 class 包含 slide、"
+        "id 与 data-slide-id 均等于给定 ID 的 section；不要生成 html/head/body/style/script。可主动调用 Skill 自检工具并"
+        "自行修正审美问题，其建议不属于框架门禁。若输入包含 technical_correction，只修复其中明确的 Schema、页面集合、"
+        "资源、安全或渲染错误后重新提交完整结果。"
+    ),
+    "deck": (
+        "只为外层状态机给定的未确认页面生成 section 片段，不得重做确认样品或生成公共 shell。必须复用输入中的"
+        "confirmed_design_intent 与 confirmed_shared_assets，保持样品已确认的配色、排版、间距、组件语言与共享 CSS；"
+        "不要重新探索另一套设计语言。PresentationTechnicalContract 只规定通用技术边界。required_claims_by_slide 中"
+        "每个 value 必须逐字出现在对应页面的可见正文。每项 html 必须是单个 class 包含 slide、id 与 data-slide-id 均"
+        "等于给定 ID 的 section；不要生成 html/head/body/style/script。若输入包含 technical_correction，只修复其中明确"
+        "的 Schema、页面集合、资源、安全或渲染错误后重新提交完整结果。"
+    ),
     "inspection": "独立检查大纲与 HTML；必须逐项应用检查清单并结合 browser_evidence 中的 Chromium 渲染测量，仅报告有证据的问题，不得直接修改产物。浏览器证据不可用或包含问题时不得返回 passed=true。",
 }
 
 
 def _object_schema(properties: dict, required: list[str]) -> dict:
     return {"type": "object", "properties": properties, "required": required, "additionalProperties": False}
+
+
+_DESIGN_INTENT_SCHEMA = _object_schema({
+    "style_summary": {"type": "string", "minLength": 1},
+    "color_strategy": {"type": "string", "minLength": 1},
+    "typography_strategy": {"type": "string", "minLength": 1},
+    "layout_principles": {"type": "array", "minItems": 1, "uniqueItems": True, "items": {"type": "string", "minLength": 1}},
+    "rationale": {"type": "string", "minLength": 1},
+}, ["style_summary", "color_strategy", "typography_strategy", "layout_principles", "rationale"])
+_SHARED_ASSETS_SCHEMA = _object_schema({"css": {"type": "string"}}, ["css"])
+_SLIDES_SCHEMA = {"type": "array", "minItems": 1, "items": _object_schema({
+    "slide_id": {"type": "string"}, "html": {"type": "string"},
+}, ["slide_id", "html"])}
+_RENDERING_SCHEMA = _object_schema({
+    "slides": _SLIDES_SCHEMA,
+    "design_intent": _DESIGN_INTENT_SCHEMA,
+    "shared_assets": _SHARED_ASSETS_SCHEMA,
+}, ["slides", "design_intent", "shared_assets"])
 
 
 # These schemas are the complete local contract.  They intentionally include
@@ -77,8 +111,8 @@ STAGE_OUTPUT_SCHEMAS = {
             "resource_uris": {"type": "array", "uniqueItems": True, "items": {"type": "string"}},
         }, ["title", "purpose", "content_markdown", "resource_uris"]),
     }}, ["slides"])},
-    "sample": {"name": "sample_slides", "strict": True, "schema": _object_schema({"slides": {"type":"array","minItems":1,"items":_object_schema({"slide_id":{"type":"string"},"html":{"type":"string"}},["slide_id","html"])}}, ["slides"])},
-    "deck": {"name": "deck_slides", "strict": True, "schema": _object_schema({"slides": {"type":"array","minItems":1,"items":_object_schema({"slide_id":{"type":"string"},"html":{"type":"string"}},["slide_id","html"])}}, ["slides"])},
+    "sample": {"name": "sample_slides", "strict": True, "schema": _RENDERING_SCHEMA},
+    "deck": {"name": "deck_slides", "strict": True, "schema": _RENDERING_SCHEMA},
     "inspection": {"name": "inspection", "strict": True, "schema": _object_schema({"passed": {"type": "boolean"}, "issues": {"type": "array", "items": _object_schema({
         "issue_id": {"type": "string"}, "severity": {"type": "string", "enum": ["warning", "blocker"]},
         "level": {"type": "string", "enum": ["element", "slide", "deck"]}, "code": {"type": "string"},
@@ -182,7 +216,11 @@ def normalize_rendering_output(value: dict, expected_slide_ids: list[str]) -> di
         if not data_id_match:
             fragment = re.sub(r'^<section\b', f'<section data-slide-id="{slide_id}"', fragment, count=1, flags=re.I)
         normalized.append({**item, "html": fragment})
-    return {**value, "slides": normalized}
+    return {
+        "slides": normalized,
+        "design_intent": validate_design_intent(value.get("design_intent")),
+        "shared_assets": validate_shared_design_assets(value.get("shared_assets")),
+    }
 
 
 def _list_skill_files_tool() -> dict:
@@ -660,6 +698,33 @@ class AgentRuntime:
                 fail("Agent 最终输出不是有效 JSON", "invalid_output", exc)
             if not isinstance(value, dict):
                 fail("Agent 最终输出必须为 JSON object", "invalid_output")
+            if stage in RENDERING_STAGES and payload.get("slide_ids"):
+                try:
+                    # Normalize before Schema validation so older providers that
+                    # omit the newly explicit design fields remain compatible.
+                    # Deck responses inherit the exact confirmed sample design;
+                    # sample responses receive deterministic defaults.
+                    if "design_intent" not in value and payload.get("confirmed_design_intent") is not None:
+                        value["design_intent"] = payload["confirmed_design_intent"]
+                    if "shared_assets" not in value and payload.get("confirmed_shared_assets") is not None:
+                        value["shared_assets"] = payload["confirmed_shared_assets"]
+                    value = normalize_rendering_output(value, list(payload.get("slide_ids") or []))
+                except GatewayError as exc:
+                    if schema_corrections < self.max_schema_corrections:
+                        schema_corrections += 1
+                        audit.append({"step": step, "event": "technical_correction", "reason": "html_fragment_contract", "attempt": schema_corrections})
+                        conversation.extend([
+                            {"role": "assistant", "content": turn.text or ""},
+                            {"role": "user", "content": (
+                                f"technical_correction：{exc.message}。请重新提交完整 slides、design_intent 与 shared_assets；"
+                                "每项 html 必须且只能是对应页面的单个 <section class=\"slide\" "
+                                "id=\"给定ID\" data-slide-id=\"给定ID\">...</section> 片段，"
+                                "不得包含 html/body 外壳、额外页面或解释文字。"
+                            )},
+                        ])
+                        force_final_output = True
+                        continue
+                    fail(exc.message, "invalid_output", exc)
             try:
                 self._validate_schema(value, local_schema.get("schema", local_schema), "output")
             except GatewayError as exc:
@@ -670,25 +735,6 @@ class AgentRuntime:
                     force_final_output = True
                     continue
                 fail(exc.message, "invalid_output", exc)
-            if stage in RENDERING_STAGES and payload.get("slide_ids"):
-                try:
-                    value = normalize_rendering_output(value, list(payload.get("slide_ids") or []))
-                except GatewayError as exc:
-                    if schema_corrections < self.max_schema_corrections:
-                        schema_corrections += 1
-                        audit.append({"step": step, "event": "semantic_correction", "reason": "html_fragment_contract", "attempt": schema_corrections})
-                        conversation.extend([
-                            {"role": "assistant", "content": turn.text or ""},
-                            {"role": "user", "content": (
-                                f"semantic_correction：{exc.message}。请重新提交完整 slides；"
-                                "每项 html 必须且只能是对应页面的单个 <section class=\"slide\" "
-                                "id=\"给定ID\" data-slide-id=\"给定ID\">...</section> 片段，"
-                                "不得包含 html/body 外壳、额外页面或解释文字。"
-                            )},
-                        ])
-                        force_final_output = True
-                        continue
-                    fail(exc.message, "invalid_output", exc)
             if capability_probe and stage != "clarification" and not any(
                 item.get("event") == "tool"
                 and item.get("tool") == "read_skill_file"

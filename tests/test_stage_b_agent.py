@@ -423,6 +423,7 @@ class StageBAgentTests(unittest.TestCase):
             ModelTurn('{"slides":[{"slide_id":"slide-1","html":"<section class=\\"slide\\" id=\\"slide-1\\" data-slide-id=\\"slide-1\\"><p>ok</p></section>"}]}', "r"),
         ])
         result = AgentRuntime(client, SkillRuntime.builtin()).run("deck", {
+            "slide_ids":["slide-1"],
             "assets":{"resources://hero.png":"data:image/png;base64,SECRETBYTES"},
             "items":["ok", " DATA:IMAGE/JPEG;BASE64,MORESECRET"],
         })
@@ -487,7 +488,7 @@ class StageBAgentTests(unittest.TestCase):
         self.assertEqual(caught.exception.audit[-1]["reason"], "invalid_output")
         self.assertEqual(len(exhausted.inputs), 2)
 
-    def test_rendering_fragment_failure_gets_one_bounded_semantic_correction(self):
+    def test_rendering_fragment_failure_gets_one_bounded_technical_correction(self):
         bad=json.dumps({"slides":[{"slide_id":"slide-1","html":"<html><body>wrong shell</body></html>"}]})
         fixed=json.dumps({"slides":[{"slide_id":"slide-1","html":"```html\n<section class=\"slide\"><h1>ok</h1></section>\n```"}]})
         skill_turn=skill_entry_turn("skill-call")
@@ -495,8 +496,8 @@ class StageBAgentTests(unittest.TestCase):
         result=AgentRuntime(client,SkillRuntime.builtin()).run("sample",{"slide_ids":["slide-1"]})
         fragment=result.value["slides"][0]["html"]
         self.assertTrue(fragment.startswith('<section data-slide-id="slide-1" id="slide-1" class="slide">'))
-        self.assertEqual(sum(item.get("event")=="semantic_correction" for item in result.audit),1)
-        self.assertIn("semantic_correction",str(client.inputs[2]["input"]))
+        self.assertEqual(sum(item.get("event")=="technical_correction" for item in result.audit),1)
+        self.assertIn("technical_correction",str(client.inputs[2]["input"]))
         self.assertEqual(client.inputs[2]["tool_choice"],"none")
 
         exhausted=ScriptedClient([skill_turn,ModelTurn(bad,"bad-1"),ModelTurn(bad,"bad-2")])

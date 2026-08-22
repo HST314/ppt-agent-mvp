@@ -4,14 +4,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from ppt_agent.canonical_validator import run_canonical_validator
 from ppt_agent.claim_ledger import assert_claims_bound, audit_claims, audit_html_claims, build_claim_ledger
-from ppt_agent.design_contract import TemplateRegistry, build_design_contract
+from ppt_agent.design_contract import build_presentation_technical_contract
 from ppt_agent.errors import ConflictError, ValidationError
-from ppt_agent.layout_structure import run_layout_structure_validator
 from ppt_agent.overflow_autofit import MAX_CASCADE_ROUNDS
 from ppt_agent.p2 import canonical, digest, now
-from ppt_agent.p4 import apply_design_contract, assemble_locked_template, render
+from ppt_agent.p4 import assemble_presentation, render
 from ppt_agent.render_gate import canonical_post_render_evidence, post_render_evidence_hash
 from ppt_agent.service import TaskService
 from ppt_agent.store import WorkspaceStore
@@ -130,45 +128,22 @@ class ContractLedgerGateTests(unittest.TestCase):
         service.confirm_sample(task_id)
         return service.generate_deck(task_id)["deck"]
 
-    def test_real_registry_selects_hash_locked_swiss_template(self):
-        registry = TemplateRegistry()
-        selected = registry.select({"constraints": {"风格": "Style B 瑞士国际主义"}})
-
-        self.assertEqual(selected.style_id, "swiss")
-        self.assertEqual(selected.asset_path, "assets/template-swiss.html")
-        self.assertEqual(len(selected.allowed_layouts), 22)
-        self.assertEqual(selected.template_hash, registry.skill.manifest[selected.asset_path])
-        self.assertEqual(set(selected.semantic_classes),{"light","grey","dark","accent","split","hero"})
-
-    def test_editorial_contract_uses_only_registered_real_semantic_classes(self):
-        contract=build_design_contract(
-            task_id="semantic",task_card={"topic":"运营复盘"},input_snapshot_hash="a"*64,
-            outline_hash="b"*64,slide_ids=["slide-1","slide-2"],created_at=now(),
-        )
-
-        self.assertEqual(contract["slide_contracts"][0]["theme"],"dark")
-        self.assertNotIn("hero-dark",json.dumps(contract,ensure_ascii=False))
-        self.assertEqual(contract["semantic_classes"],["light","dark","hero"])
-
-    def test_swiss_body_title_alignment_is_normalized_but_cover_center_is_preserved(self):
-        contract=build_design_contract(
-            task_id="canonical-normalize",task_card={"constraints":{"风格":"Style B 瑞士"}},
-            input_snapshot_hash="c"*64,outline_hash="d"*64,
-            slide_ids=["slide-1","slide-2","slide-3"],created_at=now(),
+    def test_presentation_technical_contract_and_assembler_are_design_agnostic(self):
+        contract=build_presentation_technical_contract(
+            task_id="technical",input_snapshot_hash="a"*64,
+            outline_hash="b"*64,slide_ids=["slide-1"],created_at=now(),
         )
         contract_hash=digest(canonical(contract))
-        fragments=[
-            '<section class="slide" id="slide-1" data-slide-id="slide-1"><div class="cover-row"><h1 style="text-align:center">封面</h1><p>封面摘要</p></div></section>',
-            '<section class="slide" id="slide-2" data-slide-id="slide-2"><div class="timeline-v"><h1 style="text-align:center;align-self:center">正文</h1><p>正文摘要</p><div class="kpi-row-4"></div></div></section>',
-            '<section class="slide" id="slide-3" data-slide-id="slide-3"><div class="split-half"><div class="half"><h1>结尾</h1></div><div class="half"><p>行动建议</p></div></div></section>',
-        ]
-        html=assemble_locked_template(fragments,design_contract=contract,contract_hash=contract_hash)
-        html=apply_design_contract(html,contract,contract_hash)
+        fragment='<section class="slide radial-story" id="slide-1" data-slide-id="slide-1"><h1>任意视觉语言</h1></section>'
+        html=assemble_presentation(
+            [fragment],technical_contract=contract,contract_hash=contract_hash,
+            shared_assets={"css":".radial-story{display:grid;background:conic-gradient(#fff,#ddd)}"},
+        )
 
-        self.assertIn('style="text-align:center"',html)
-        self.assertIn('style="text-align:left;align-self:flex-start"',html)
-        validation=run_canonical_validator(html,"swiss")
-        self.assertTrue(validation["passed"],validation)
+        self.assertEqual(contract["contract_type"],"presentation_technical_contract")
+        self.assertNotIn("layout",json.dumps(contract,ensure_ascii=False).lower())
+        self.assertIn("radial-story",html)
+        self.assertIn('name="presentation-technical-contract"',html)
 
     def test_claim_ledger_binds_source_and_accepts_only_auditable_derivation(self):
         ledger = build_claim_ledger(
@@ -357,83 +332,6 @@ class ContractLedgerGateTests(unittest.TestCase):
         self.assertEqual(result["unbound_count"], 1)
         self.assertEqual(result["unbound"][0]["normalized_value"], "80万")
 
-    def test_hash_locked_canonical_validator_accepts_registered_and_rejects_missing_layout(self):
-        valid = run_canonical_validator(
-            '<!doctype html><html><body><section class="slide accent" data-layout="S01">'
-            '<canvas class="ascii-bg"></canvas><h1>标题</h1></section></body></html>',
-            "swiss",
-        )
-        invalid = run_canonical_validator(
-            '<!doctype html><html><body><section class="slide"><h1>标题</h1></section></body></html>',
-            "swiss",
-        )
-
-        self.assertTrue(valid["passed"], valid)
-        self.assertRegex(valid["script_hash"], r"^[0-9a-f]{64}$")
-        self.assertFalse(invalid["passed"])
-        self.assertIn("missing data-layout", " ".join(invalid["errors"]))
-
-    def test_layout_structure_signatures_reject_number_only_compliance(self):
-        fake_s04 = (
-            '<!doctype html><section class="slide" data-layout="S04">'
-            '<div class="frame grid-3">' + '<div class="stat-card">预算</div>' * 5 + '</div></section>'
-        )
-        fake_s06 = (
-            '<!doctype html><section class="slide" data-layout="S06">'
-            '<div class="pipeline">' + '<div class="step">阶段</div>' * 3 + '</div></section>'
-        )
-
-        s04 = run_layout_structure_validator(fake_s04, "swiss")
-        s06 = run_layout_structure_validator(fake_s06, "swiss")
-
-        self.assertFalse(s04["passed"])
-        self.assertIn(".sub-grid-3-2 | .cell-6", " ".join(s04["errors"]))
-        self.assertFalse(s06["passed"])
-        self.assertIn(".kpi-tower-row", " ".join(s06["errors"]))
-
-    def test_layout_structure_signatures_accept_real_s04_s06_and_s10_skeletons(self):
-        html = """<!doctype html><html><body>
-<section class="slide" data-layout="S04"><div class="sub-grid-3-2">
-  <div></div><div></div><div></div><div></div><div></div><div></div>
-</div></section>
-<section class="slide" data-layout="S06"><div class="kpi-tower-row">
-  <div><div class="bar-tower"></div></div><div><div class="bar-tower"></div></div>
-  <div><div class="bar-tower"></div></div><div><div class="bar-tower"></div></div>
-</div></section>
-<section class="slide split" data-layout="S10"><div class="split-half">
-  <div class="half"></div><div class="half"></div>
-</div></section>
-</body></html>"""
-
-        result = run_layout_structure_validator(html, "swiss")
-
-        self.assertTrue(result["passed"], result)
-        self.assertEqual(result["matched_slide_count"], 3)
-
-    def test_swiss_design_contract_selects_layout_from_content_shape(self):
-        slide_ids = [f"slide-{index}" for index in range(1, 6)]
-        blocks = {
-            "slide-1": "## [slide-1] 封面\n- 决策方案",
-            "slide-2": "## [slide-2] 预算构成\n- 软件 36 万元\n- 服务 24 万元\n- 实施 12 万元\n- 培训 8 万元\n- 总预算 80 万元",
-            "slide-3": "## [slide-3] 实施路线图\n- 准备阶段\n- 试点阶段\n- 推广阶段",
-            "slide-4": "## [slide-4] 关键 KPI\n- 响应时间 -42%\n- 满意度 4.2→4.6\n- 转接率 -18%\n- 节省 36 万元",
-            "slide-5": "## [slide-5] 收束\n- 决策请求",
-        }
-        contract = build_design_contract(
-            task_id="shape",
-            task_card={"constraints": {"风格": "Style B 瑞士"}},
-            input_snapshot_hash="a" * 64,
-            outline_hash="b" * 64,
-            slide_ids=slide_ids,
-            created_at=now(),
-            outline_blocks=blocks,
-        )
-        layouts = {item["slide_id"]: item["layout_id"] for item in contract["slide_contracts"]}
-
-        self.assertEqual(layouts["slide-2"], "S20")
-        self.assertEqual(layouts["slide-3"], "S05")
-        self.assertEqual(layouts["slide-4"], "S06")
-
     def test_contract_and_ledger_hashes_survive_every_delivery_stage(self):
         with tempfile.TemporaryDirectory() as root:
             service = self._service(root)
@@ -443,7 +341,9 @@ class ContractLedgerGateTests(unittest.TestCase):
             contract = service.design_contract_view("task")
             ledger = service.claim_ledger_view("task")
 
-            self.assertEqual(contract["style_id"], "swiss")
+            self.assertEqual(contract["contract_type"], "presentation_technical_contract")
+            self.assertEqual(contract["slide_ids"], ["slide-1", "slide-2", "slide-3", "slide-4"])
+            self.assertEqual(sample["metadata"]["presentation_technical_contract_hash"], contract["hash"])
             self.assertEqual(sample["metadata"]["design_contract_hash"], contract["hash"])
             self.assertEqual(sample["metadata"]["claim_ledger_hash"], ledger["hash"])
             service.confirm_sample("task")
@@ -451,7 +351,7 @@ class ContractLedgerGateTests(unittest.TestCase):
             gate = deck["metadata"]["post_render_gate"]
             self.assertEqual(gate["blocker_count"], 0)
             self.assertEqual(gate["geometry"]["overflow_count"], 0)
-            self.assertEqual(gate["layout"]["layout_registration_percent"], 100)
+            self.assertEqual(gate["layout"]["technical_binding_percent"], 100)
             self.assertEqual(gate["claims"]["unbound_count"], 0)
             self.assertEqual(canonical_post_render_evidence(gate), service.version("task", gate["evidence_hash"]))
             self.assertIn(gate["evidence_hash"], {item["hash"] for item in service.versions("task", "post-render-gate-evidence")})
@@ -466,7 +366,7 @@ class ContractLedgerGateTests(unittest.TestCase):
             delivery_record = service.versions("task", "delivery")[-1]
             self.assertEqual(delivery_record["metadata"]["design_contract_hash"], contract["hash"])
             self.assertEqual(delivery_record["metadata"]["claim_ledger_hash"], ledger["hash"])
-            self.assertIn("design-contract.json", delivery["files"])
+            self.assertIn("presentation-technical-contract.json", delivery["files"])
             self.assertIn("claim-ledger.json", delivery["files"])
             self.assertIn("post-render-gate-evidence.json", delivery["files"])
             delivery_root = service.store.delivery_root("task", delivery["delivery_id"])
@@ -596,26 +496,7 @@ class ContractLedgerGateTests(unittest.TestCase):
 
             self.assertFalse(service.versions("task", "sample"))
 
-    def test_server_claim_materialization_does_not_bypass_structure_gate(self):
-        with tempfile.TemporaryDirectory() as root:
-            service = self._service(root)
-            self._to_outline(service)
-            service.select_samples("task", ["slide-1", "slide-3"])
-            service.generate_sample("task")
-            service.confirm_sample("task")
-            service.builder = ClaimDroppingBuilder()
-
-            with self.assertRaisesRegex(ValidationError, "渲染后硬门禁未通过"):
-                service.generate_deck("task")
-
-            self.assertFalse(service.versions("task", "deck"))
-            failure = next(item for item in service.versions("task", "post-render-gate-evidence") if item["metadata"]["passed"] is False)
-            evidence = json.loads(service.version("task", failure["hash"]))
-            self.assertEqual(evidence["claims"]["missing_required_count"], 0)
-            self.assertEqual(evidence["claims"]["unbound_count"], 0)
-            self.assertFalse(evidence["canonical_validator"]["structural_signatures"]["passed"])
-
-    def test_swiss_missing_facts_are_materialized_without_weakening_structure_gate(self):
+    def test_missing_facts_are_materialized_without_adding_a_style_gate(self):
         with tempfile.TemporaryDirectory() as root:
             service = self._service(root)
             self._to_outline(service)
@@ -625,13 +506,13 @@ class ContractLedgerGateTests(unittest.TestCase):
 
             sample = service.generate_sample("task")["sample"]
 
-            generation = sample["metadata"]["locked_theme_generation"]
+            generation = sample["metadata"]["generation"]
             self.assertEqual(len(builder.calls), 2)
             self.assertGreater(generation["server_claim_materialization"]["materialized_count"], 0)
             self.assertEqual(sample["metadata"]["post_render_gate"]["claims"]["missing_required_count"], 0)
             signatures = sample["metadata"]["post_render_gate"]["canonical_validator"]["structural_signatures"]
-            self.assertTrue(signatures["passed"], signatures)
-            self.assertEqual(sample["metadata"]["post_render_gate"]["layout"]["structural_signature_percent"], 100)
+            self.assertFalse(signatures["applicable"])
+            self.assertEqual(sample["metadata"]["post_render_gate"]["layout"]["technical_binding_percent"], 100)
 
     def test_stale_automatic_sample_selection_is_refreshed_on_generation(self):
         with tempfile.TemporaryDirectory() as root:

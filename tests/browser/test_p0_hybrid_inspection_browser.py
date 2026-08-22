@@ -121,7 +121,7 @@ class P0HybridInspectionBrowserGate(unittest.TestCase):
         self.assertTrue(all(item["severity"] == "warning" for item in evidence["issues"]))
         self.assertTrue(evidence["passed"], "advisory warnings must not fail the technical hard gate")
 
-    def test_undefined_layout_class_is_blocked_from_real_cssom_evidence(self):
+    def test_agent_owned_class_names_are_not_a_framework_blocker(self):
         fragment = (
             '<section class="slide light" id="slide-1" data-slide-id="slide-1" data-layout="S11">'
             '<h1 data-element-id="title">真实 CSSOM 门禁</h1>'
@@ -134,12 +134,10 @@ class P0HybridInspectionBrowserGate(unittest.TestCase):
         evidence = ChromiumDeckInspector().inspect(html, ["slide-1"])
 
         self.assertTrue(evidence["available"])
-        self.assertFalse(evidence["passed"])
-        undefined = {item["evidence"] for item in evidence["issues"] if item["code"] == "undefined_layout_class"}
-        self.assertTrue(any("class=.ghost-layout-section" in item for item in undefined), evidence["issues"])
-        self.assertTrue(any("matched_css_rule=0" in item for item in undefined))
+        self.assertTrue(evidence["passed"], evidence["issues"])
+        self.assertFalse(any(item["code"] == "undefined_layout_class" for item in evidence["issues"]))
 
-    def test_ancestor_semantic_class_defined_by_real_descendant_rule_passes(self):
+    def test_agent_dom_vocabulary_is_outside_the_technical_measurement(self):
         fragment = (
             '<section class="slide split" id="slide-1" data-slide-id="slide-1" data-layout="S10">'
             '<div class="canvas-card"><div class="split-half">'
@@ -152,10 +150,9 @@ class P0HybridInspectionBrowserGate(unittest.TestCase):
         evidence = ChromiumDeckInspector().inspect(html, ["slide-1"])
 
         self.assertTrue(evidence["available"], evidence["issues"])
-        undefined = [item for item in evidence["issues"] if item["code"] == "undefined_layout_class"]
-        self.assertFalse(any("class=.split" in item["evidence"] for item in undefined), evidence["issues"])
+        self.assertFalse(evidence["slides"][0]["layout_validation"]["applicable"])
 
-    def test_ancestor_class_without_a_real_subtree_match_remains_blocked(self):
+    def test_unused_agent_class_does_not_fail_the_technical_gate(self):
         fragment = (
             '<section class="slide missing-class" id="slide-1" data-slide-id="slide-1" data-layout="S10">'
             '<h1 data-element-id="title">缺失后代</h1><p>真实内容</p></section>'
@@ -169,10 +166,10 @@ class P0HybridInspectionBrowserGate(unittest.TestCase):
 
         evidence = ChromiumDeckInspector().inspect(html, ["slide-1"])
 
-        undefined = [item for item in evidence["issues"] if item["code"] == "undefined_layout_class"]
-        self.assertTrue(any("class=.missing-class" in item["evidence"] for item in undefined), evidence["issues"])
+        self.assertTrue(evidence["passed"], evidence["issues"])
+        self.assertFalse(any(item["code"] == "undefined_layout_class" for item in evidence["issues"]))
 
-    def test_swiss_body_zh_is_a_real_locked_cssom_class(self):
+    def test_agent_body_class_is_not_interpreted_by_the_framework(self):
         fragment = (
             '<section class="slide light" id="slide-1" data-slide-id="slide-1" data-layout="S07">'
             '<h1 data-element-id="title">正文词汇一致性</h1>'
@@ -184,10 +181,9 @@ class P0HybridInspectionBrowserGate(unittest.TestCase):
         evidence = ChromiumDeckInspector().inspect(html, ["slide-1"])
 
         self.assertTrue(evidence["available"], evidence["issues"])
-        undefined = [item for item in evidence["issues"] if item["code"] == "undefined_layout_class"]
-        self.assertFalse(undefined, evidence["issues"])
+        self.assertEqual(evidence["slides"][0]["layout_validation"]["undefined_classes"], [])
 
-    def test_editorial_hero_dark_semantics_are_backed_by_real_css_rules(self):
+    def test_agent_semantic_meta_does_not_create_framework_style_rules(self):
         fragment = (
             '<section class="slide hero dark" id="slide-1" data-slide-id="slide-1" data-layout="A01">'
             '<h1 data-element-id="title">运营复盘</h1><p class="body-zh">决策摘要</p></section>'
@@ -196,9 +192,8 @@ class P0HybridInspectionBrowserGate(unittest.TestCase):
 
         evidence = ChromiumDeckInspector().inspect(html, ["slide-1"])
 
-        undefined = [item for item in evidence["issues"] if item["code"] == "undefined_layout_class"]
-        self.assertFalse(undefined, evidence["issues"])
-        self.assertIn("hero", evidence["slides"][0]["layout_validation"]["registered_semantic_classes"])
+        self.assertTrue(evidence["passed"], evidence["issues"])
+        self.assertEqual(evidence["slides"][0]["layout_validation"]["registered_semantic_classes"], [])
 
 
 if __name__ == "__main__":

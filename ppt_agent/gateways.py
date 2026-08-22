@@ -8,7 +8,8 @@ from .errors import GatewayError, GatewayUnknownResult, ValidationError
 from .agent_runtime import AgentRuntime, STAGE_OUTPUT_SCHEMAS, STAGE_PROVIDER_SCHEMAS, _extract_json_object, normalize_rendering_output
 from .audit import current_agent_audit_context
 from .claim_ledger import audit_html_claims_by_slide
-from .p4 import assemble_locked_template
+from .design_contract import validate_design_intent, validate_shared_design_assets
+from .p4 import assemble_presentation
 from .skill_runtime import ActiveSkillResolver, SkillRuntime
 
 class GenerationGateway(Protocol):
@@ -22,9 +23,11 @@ class HtmlBuilder(Protocol):
 
 class BoundaryCheckedHtml(str):
     """String-compatible builder result carrying the server-consumed self-check."""
-    def __new__(cls,value,boundary):
+    def __new__(cls,value,boundary=None,*,design_intent=None,shared_assets=None):
         result=super().__new__(cls,value)
         result.builder_boundary=boundary
+        result.design_intent=validate_design_intent(design_intent)
+        result.shared_assets=validate_shared_design_assets(shared_assets)
         return result
 
 @dataclass
@@ -45,6 +48,16 @@ class FakeInspectionGateway:
 @dataclass
 class FakeHtmlBuilder:
     version:str="fake-builder-1"
+    # The deterministic demo adapter stands in for an Agent and therefore
+    # owns its visual direction; the generic assembler remains style-free.
+    design_intent={
+        "style_summary":"清晰的本地演示基线",
+        "color_strategy":"深色画布上的白色页面",
+        "typography_strategy":"系统无衬线字体与大号标题",
+        "layout_principles":["统一安全边距","清晰内容层级"],
+        "rationale":"为无模型测试和本地演示提供可读输出",
+    }
+    shared_assets={"css":"body{background:#111827;font-family:Arial,sans-serif;padding:24px 0}.slide{margin-bottom:24px;background:#fff;color:#111827;padding:56px 64px}.slide h1,.slide h2,.slide [data-element-id=\"title\"]{font-size:52px;line-height:1.12}.slide p,.slide li{font-size:24px;line-height:1.45}"}
     def build(self,outline,**context): return f"<!doctype html><html><body>{outline}</body></html>"
 
 class DirectorySkillLoader:
@@ -337,8 +350,36 @@ class AgentGateway:
             raise ValidationError("Agent HTML 阶段无效")
         stage = "deck" if action == "inspection" else action
         expected = list(context.get("slide_ids") or [])
-        value = self._run(stage, {"outline": outline, **context})
-        slides = normalize_rendering_output(value, expected)["slides"]
+        technical_contract = context.get("presentation_technical_contract") or context.get("design_contract")
+        technical_contract_hash = context.get("presentation_technical_contract_hash") or context.get("design_contract_hash")
+        agent_context = {
+            key: item
+            for key, item in context.items()
+            if key not in {"design_contract", "design_contract_hash"}
+        }
+        agent_context["presentation_technical_contract"] = technical_contract
+        agent_context["presentation_technical_contract_hash"] = technical_contract_hash
+        value = self._run(stage, {"outline": outline, **agent_context})
+        rendering = normalize_rendering_output(value, expected)
+        slides = rendering["slides"]
+        design_intent = rendering["design_intent"]
+        shared_assets = rendering["shared_assets"]
+        confirmed_intent = context.get("confirmed_design_intent")
+        confirmed_assets = context.get("confirmed_shared_assets")
+        if confirmed_intent is None and "design_intent" not in value and context.get("design_intent") is not None:
+            design_intent = validate_design_intent(context["design_intent"])
+        if confirmed_assets is None and "shared_assets" not in value and context.get("shared_assets") is not None:
+            shared_assets = validate_shared_design_assets(context["shared_assets"])
+        if confirmed_intent is not None:
+            confirmed_intent = validate_design_intent(confirmed_intent)
+            if "design_intent" in value and design_intent != confirmed_intent:
+                raise GatewayError("全稿输出未复用已确认 DesignIntent")
+            design_intent = confirmed_intent
+        if confirmed_assets is not None:
+            confirmed_assets = validate_shared_design_assets(confirmed_assets)
+            if "shared_assets" in value and shared_assets != confirmed_assets:
+                raise GatewayError("全稿输出未复用已确认共享设计资产")
+            shared_assets = confirmed_assets
         boundary=None
         required_by_slide=context.get("required_claims_by_slide")
         if required_by_slide is not None:
@@ -360,13 +401,20 @@ class AgentGateway:
         for item in slides:
             fragments.append(item["html"])
 
-        assembled=assemble_locked_template(
+        assembled=assemble_presentation(
             fragments,
             context.get("rules", []),
-            context.get("design_contract"),
-            context.get("design_contract_hash"),
+            technical_contract,
+            technical_contract_hash,
+            design_intent=design_intent,
+            shared_assets=shared_assets,
         )
-        return BoundaryCheckedHtml(assembled,boundary) if boundary is not None else assembled
+        return BoundaryCheckedHtml(
+            assembled,
+            boundary,
+            design_intent=design_intent,
+            shared_assets=shared_assets,
+        )
     
     def inspect(self, original_outline, html, *, browser_evidence=None):
         value = self._run("inspection", {

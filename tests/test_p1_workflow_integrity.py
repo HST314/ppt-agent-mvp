@@ -133,18 +133,10 @@ class RepresentativeSampleTests(unittest.TestCase):
 ## [slide-4] 收尾
 - 谢谢
 """
-        contracts = [
-            {"slide_id": "slide-1", "visual_role": "cover", "layout_id": "S01"},
-            {"slide_id": "slide-2", "visual_role": "body", "layout_id": "S08"},
-            {"slide_id": "slide-3", "visual_role": "body", "layout_id": "S08"},
-            {"slide_id": "slide-4", "visual_role": "closing", "layout_id": "S22"},
-        ]
-        selected, reasons = recommend(markdown, 2, contracts)
+        selected, reasons = recommend(markdown, 2)
         self.assertEqual(selected, ["slide-1", "slide-2"])
-        self.assertIn("封面/hero", reasons["slide-1"])
+        self.assertIn("代表开场页", reasons["slide-1"])
         self.assertIn("density=", reasons["slide-2"])
-        with self.assertRaisesRegex(ValidationError, "页面范围不完整"):
-            recommend(markdown, 2, contracts[:-1])
 
     def test_workflow_persists_strategy_and_rejects_tampered_contract_before_selection(self):
         with tempfile.TemporaryDirectory() as root:
@@ -162,7 +154,7 @@ class RepresentativeSampleTests(unittest.TestCase):
             contract = service.design_contract_view("tampered")
             path = Path(root) / "tampered" / "artifacts" / contract["hash"]
             value = json.loads(path.read_bytes())
-            value["slide_contracts"].pop()
+            value["slide_ids"].pop()
             path.write_bytes(canonical(value))
             with self.assertRaises(ValidationError):
                 service.select_samples("tampered")

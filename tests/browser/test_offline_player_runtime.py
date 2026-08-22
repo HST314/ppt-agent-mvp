@@ -38,7 +38,10 @@ SLIDES = [
 
 
 def build_player(root: Path, deck_html: str | None = None) -> Path:
-    deck = deck_html if deck_html is not None else assemble_locked_template(SLIDES)
+    deck = deck_html if deck_html is not None else assemble_locked_template(
+        SLIDES,
+        shared_assets={"css": ".slide [data-element-id=\"title\"]{font-size:52px}.slide .h-hero{font-size:148px}.slide .lead{font-size:18px}"},
+    )
     (root / "index.html").write_text(offline_player(deck), encoding="utf-8")
     for relative, data in offline_assets().items():
         target = root / relative
@@ -118,7 +121,7 @@ class OfflinePlayerRuntimeGate(unittest.TestCase):
                 return {hero: size('#s1 .h-hero'), lead: size('#s1 .lead'), plain: size('#s3 [data-element-id="title"]')};
             }"""
         )
-        # 默认 editorial 样式的 .h-hero 服务端 pin 为 148px（swiss 152px 由单测覆盖）
+        # 展示字号来自 Agent 返回的共享 CSS，公共 shell 不重写它。
         self.assertEqual(sizes["hero"], 148.0)
         self.assertEqual(sizes["lead"], 18.0)
         self.assertGreaterEqual(sizes["hero"] / sizes["lead"], 8.0)

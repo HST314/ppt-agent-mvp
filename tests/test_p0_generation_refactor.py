@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from ppt_agent.agent_runtime import AgentRuntime
 from ppt_agent.claim_ledger import build_claim_ledger
-from ppt_agent.design_contract import validate_design_contract
+from ppt_agent.design_contract import validate_presentation_technical_contract
 from ppt_agent.errors import GatewayError, ValidationError
 from ppt_agent.gateways import AgentGateway
 from ppt_agent.model_clients import ModelToolCall, ModelTurn
@@ -121,7 +121,7 @@ class GeometryCorrectionBuilder:
             outline,context["slide_ids"],context.get("rules"),context.get("exceptions"),
             context.get("assets"),context.get("design_contract"),context.get("design_contract_hash"),
         )
-        if context.get("semantic_correction",{}).get("reason")!="browser_render_blockers":
+        if context.get("technical_correction",{}).get("reason")!="browser_render_blockers":
             return html.replace("<section ",'<section data-needs-layout-correction="true" ',1)
         return html
 
@@ -160,11 +160,11 @@ class P0GenerationRefactorTests(unittest.TestCase):
             sample=svc.generate_sample("geometry")["sample"]
 
             self.assertEqual(len(builder.calls),2)
-            correction=builder.calls[1]["semantic_correction"]
+            correction=builder.calls[1]["technical_correction"]
             self.assertEqual(correction["reason"],"browser_render_blockers")
             blocker=correction["browser_blockers"][0]
             self.assertEqual(blocker["geometry"]["scroll_height"],613)
-            generation=sample["metadata"]["locked_theme_generation"]
+            generation=sample["metadata"]["generation"]
             attempts=[json.loads(svc.version("geometry",item)) for item in generation["attempt_evidence_hashes"]]
             self.assertEqual([item["status"] for item in attempts],["correction_required","accepted"])
             self.assertEqual(attempts[1]["parent_attempt_id"],generation["attempt_evidence_hashes"][0])
@@ -189,8 +189,9 @@ class P0GenerationRefactorTests(unittest.TestCase):
         self.assertNotIn("<!doctype html>",client.inputs[0]["input"][1]["content"])
         self.assertTrue(html.startswith("<!doctype html>"))
         self.assertIn(fragment,html)
-        self.assertIn('name="ppt-template"',html)
-        self.assertIn('assets/template.html#',html)
+        self.assertIn('name="design-intent"',html)
+        self.assertIn('--presentation-width:1280px',html)
+        self.assertNotIn('data-layout=',html)
         self.assertNotIn('linear-gradient(135deg,#172033,#253858)',html)
         self.assertEqual(gateway.runtime.last_audit[-1]["applied_skill_files"],["SKILL.md"])
         tool_output=next(item for item in client.inputs[1]["input"] if item.get("type")=="function_call_output")
@@ -279,7 +280,7 @@ class P0GenerationRefactorTests(unittest.TestCase):
             self.assertEqual(candidate["metadata"]["inspection_status"],"pending")
             self.assertFalse(svc.versions("task","inspection"))
 
-    def test_sample_locked_theme_override_is_corrected_once_in_same_job(self):
+    def test_sample_accepts_agent_owned_custom_css_variables_without_retry(self):
         with tempfile.TemporaryDirectory() as root:
             builder=LockedThemeRetryBuilder()
             svc=TaskService(WorkspaceStore(root),builder=builder); svc.create("task","manual")
@@ -290,17 +291,17 @@ class P0GenerationRefactorTests(unittest.TestCase):
 
             sample=svc.generate_sample("task")["sample"]
 
-            self.assertEqual(len(builder.calls),2)
+            self.assertEqual(len(builder.calls),1)
             self.assertEqual(builder.calls[0]["generation_attempt"],1)
-            self.assertIn("--ink",builder.calls[0]["locked_theme_policy"]["forbidden_inline_tokens"])
-            self.assertEqual(builder.calls[1]["semantic_correction"]["reason"],"locked_theme_variable_override")
-            generation=sample["metadata"]["locked_theme_generation"]
-            self.assertEqual({key:generation[key] for key in ("attempts","retry_count","max_attempts")},{"attempts":2,"retry_count":1,"max_attempts":2})
-            self.assertEqual(len(generation["attempt_evidence_hashes"]),2)
-            self.assertEqual(len(generation["correction_evidence_hashes"]),1)
+            self.assertNotIn("locked_theme_policy",builder.calls[0])
+            generation=sample["metadata"]["generation"]
+            self.assertEqual({key:generation[key] for key in ("attempts","retry_count","max_attempts")},{"attempts":1,"retry_count":0,"max_attempts":2})
+            self.assertEqual(len(generation["attempt_evidence_hashes"]),1)
+            self.assertEqual(len(generation["correction_evidence_hashes"]),0)
+            self.assertIn("--ink:#fff",sample["html"])
             self.assertEqual(len(svc.versions("task","sample")),1)
 
-    def test_persistent_sample_locked_theme_override_remains_fail_closed(self):
+    def test_sample_does_not_treat_skill_design_tokens_as_framework_errors(self):
         with tempfile.TemporaryDirectory() as root:
             builder=LockedThemeRetryBuilder(always_bad=True)
             svc=TaskService(WorkspaceStore(root),builder=builder); svc.create("task","manual")
@@ -309,11 +310,10 @@ class P0GenerationRefactorTests(unittest.TestCase):
             svc.generate_outline("task"); svc.confirm_outline("task")
             svc.select_samples("task",["slide-1"])
 
-            with self.assertRaisesRegex(ValidationError,"锁定主题变量"):
-                svc.generate_sample("task")
+            sample=svc.generate_sample("task")["sample"]
 
-            self.assertEqual(len(builder.calls),2)
-            self.assertFalse(svc.versions("task","sample"))
+            self.assertEqual(len(builder.calls),1)
+            self.assertIn("--ink:#fff",sample["html"])
 
     def test_sample_missing_required_claim_is_corrected_once_in_same_job(self):
         with tempfile.TemporaryDirectory() as root:
@@ -329,12 +329,12 @@ class P0GenerationRefactorTests(unittest.TestCase):
             self.assertEqual(len(builder.calls),2)
             required=builder.calls[0]["required_claims_verbatim"]
             self.assertEqual({item["value"] for item in required},{"80 万元"})
-            correction=builder.calls[1]["semantic_correction"]
+            correction=builder.calls[1]["technical_correction"]
             self.assertEqual(correction["reason"],"missing_required_claims")
             self.assertEqual(correction["required_claims_verbatim"],required)
             self.assertEqual(correction["missing_required_claims_verbatim"],required)
             self.assertEqual(correction["required_claims_by_slide"],builder.calls[0]["required_claims_by_slide"])
-            generation=sample["metadata"]["locked_theme_generation"]
+            generation=sample["metadata"]["generation"]
             self.assertEqual({key:generation[key] for key in ("attempts","retry_count","max_attempts")},{"attempts":2,"retry_count":1,"max_attempts":2})
             attempts=[json.loads(svc.version("task",item)) for item in generation["attempt_evidence_hashes"]]
             correction_evidence=json.loads(svc.version("task",generation["correction_evidence_hashes"][0]))
@@ -356,7 +356,7 @@ class P0GenerationRefactorTests(unittest.TestCase):
             sample=svc.generate_sample("task")["sample"]
 
             self.assertEqual(len(builder.calls),2)
-            correction=builder.calls[1]["semantic_correction"]
+            correction=builder.calls[1]["technical_correction"]
             missing_pages={slide_id for slide_id,claims in correction["missing_required_claims_by_slide"].items() if claims}
             self.assertEqual(len(missing_pages),1)
             self.assertEqual(sample["metadata"]["post_render_gate"]["claims"]["missing_required_count"],0)
@@ -376,7 +376,7 @@ class P0GenerationRefactorTests(unittest.TestCase):
 
             sample=svc.generate_sample("task")["sample"]
 
-            correction=builder.calls[1]["semantic_correction"]
+            correction=builder.calls[1]["technical_correction"]
             self.assertEqual({item["value"] for item in correction["missing_required_claims_verbatim"]},{"12 周","80 万元"})
             mapped_missing={
                 item["value"]:slide_id
@@ -399,7 +399,7 @@ class P0GenerationRefactorTests(unittest.TestCase):
 
             sample=svc.generate_sample("task")["sample"]
 
-            materialization=sample["metadata"]["locked_theme_generation"]["server_claim_materialization"]
+            materialization=sample["metadata"]["generation"]["server_claim_materialization"]
             self.assertEqual(materialization["materialized_count"],1)
             self.assertEqual(materialization["placements"][0]["slide_id"],next(
                 slide_id for slide_id,claims in builder.calls[0]["required_claims_by_slide"].items() if claims
@@ -444,17 +444,17 @@ class P0GenerationRefactorTests(unittest.TestCase):
             sample=svc.generate_sample("task")["sample"]
 
             self.assertEqual(len(builder.calls),2)
-            slots=builder.calls[0]["required_claim_slots_by_slide"]
+            slots=builder.calls[0]["required_claims_by_slide"]
             self.assertEqual(
                 {claim["value"] for claims in slots.values() for claim in claims},
                 {"80 万元"},
             )
-            materialization=sample["metadata"]["locked_theme_generation"]["server_claim_materialization"]
+            materialization=sample["metadata"]["generation"]["server_claim_materialization"]
             self.assertEqual(materialization["materialized_count"],1)
             self.assertEqual(sample["metadata"]["post_render_gate"]["claims"]["missing_required_count"],0)
             self.assertIn('data-server-materialized="true">80 万元</span>',sample["html"])
 
-    def test_deck_batch_locked_theme_override_is_corrected_once_in_same_job(self):
+    def test_deck_batch_accepts_confirmed_design_tokens_without_retry(self):
         with tempfile.TemporaryDirectory() as root:
             svc=TaskService(WorkspaceStore(root)); svc.create("task","manual")
             svc.import_input("task",{"goal":"发布","audience":"客户","topic":"方案","页数":3})
@@ -465,16 +465,15 @@ class P0GenerationRefactorTests(unittest.TestCase):
 
             deck=svc.generate_deck("task")["deck"]
 
-            self.assertEqual(len(builder.calls),2)
-            self.assertEqual(builder.calls[1]["semantic_correction"]["reason"],"locked_theme_variable_override")
-            batch=deck["metadata"]["locked_theme_generation_batches"][0]
+            self.assertEqual(len(builder.calls),1)
+            batch=deck["metadata"]["generation_batches"][0]
             self.assertEqual({key:batch[key] for key in ("slide_ids","attempts","retry_count","max_attempts")},{
-                "slide_ids":["slide-2","slide-3"],"attempts":2,"retry_count":1,"max_attempts":2,
+                "slide_ids":["slide-2","slide-3"],"attempts":1,"retry_count":0,"max_attempts":2,
             })
-            self.assertEqual(len(batch["attempt_evidence_hashes"]),2)
-            self.assertEqual(len(batch["correction_evidence_hashes"]),1)
+            self.assertEqual(len(batch["attempt_evidence_hashes"]),1)
+            self.assertEqual(len(batch["correction_evidence_hashes"]),0)
 
-    def test_persistent_deck_locked_theme_override_remains_fail_closed(self):
+    def test_deck_has_no_framework_owned_style_token_rejection(self):
         with tempfile.TemporaryDirectory() as root:
             svc=TaskService(WorkspaceStore(root)); svc.create("task","manual")
             svc.import_input("task",{"goal":"发布","audience":"客户","topic":"方案","页数":3})
@@ -483,11 +482,10 @@ class P0GenerationRefactorTests(unittest.TestCase):
             svc.select_samples("task",["slide-1"]); svc.generate_sample("task"); svc.confirm_sample("task")
             builder=LockedThemeRetryBuilder(always_bad=True); svc.builder=builder
 
-            with self.assertRaisesRegex(ValidationError,"锁定主题变量"):
-                svc.generate_deck("task")
+            deck=svc.generate_deck("task")["deck"]
 
-            self.assertEqual(len(builder.calls),2)
-            self.assertFalse(svc.versions("task","deck"))
+            self.assertEqual(len(builder.calls),1)
+            self.assertIn("--ink:#fff",deck["html"])
 
     def test_production_agent_builder_receives_valid_scoped_contract_per_batch(self):
         class ContractAwareClient:
@@ -497,14 +495,14 @@ class P0GenerationRefactorTests(unittest.TestCase):
 
             def create(self, **kwargs):
                 payload=json.loads(kwargs["input"][1]["content"])
-                contract=validate_design_contract(payload["design_contract"])
+                contract=validate_presentation_technical_contract(payload["presentation_technical_contract"])
                 self.assert_batch(payload["slide_ids"],contract)
                 if kwargs.get("tool_choice") != "none":
                     return ModelTurn(None,"skill",(
                         ModelToolCall("read_skill_file",'{"path":"SKILL.md"}',f"skill-{len(self.contracts)}"),
                     ))
                 self.contracts.append(contract)
-                self.contract_hashes.append(payload["design_contract_hash"])
+                self.contract_hashes.append(payload["presentation_technical_contract_hash"])
                 slides=[{
                     "slide_id":slide_id,
                     "html":f'<section class="slide" id="{slide_id}" data-slide-id="{slide_id}"><h1>{slide_id}</h1><p>已生成内容</p></section>',
@@ -513,8 +511,8 @@ class P0GenerationRefactorTests(unittest.TestCase):
 
             @staticmethod
             def assert_batch(slide_ids, contract):
-                if [item["slide_id"] for item in contract["slide_contracts"]] != slide_ids:
-                    raise AssertionError("batch DesignContract did not match requested slides")
+                if contract["slide_ids"] != slide_ids:
+                    raise AssertionError("batch PresentationTechnicalContract did not match requested slides")
 
         with tempfile.TemporaryDirectory() as root:
             svc=TaskService(WorkspaceStore(root)); svc.create("task","manual")
@@ -529,7 +527,7 @@ class P0GenerationRefactorTests(unittest.TestCase):
             deck=svc.generate_deck("task")["deck"]
 
             self.assertEqual(
-                [[item["slide_id"] for item in contract["slide_contracts"]] for contract in client.contracts],
+                [contract["slide_ids"] for contract in client.contracts],
                 [["slide-1","slide-3","slide-4"],["slide-5","slide-6","slide-8"]],
             )
             self.assertTrue(all(contract["contract_id"] != full_contract["contract_id"] for contract in client.contracts))

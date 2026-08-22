@@ -4,7 +4,7 @@
 
 独立检查在锁定 Chromium 的 1280×720、`reduced-motion` 环境中为每页生成 WebP 截图。截图使用 SHA-256 内容寻址，逐页绑定 deck hash、slide id、媒体类型和字节数；检查报告、终稿、离线包均会复算。截图缺失、篡改或顺序错配会使检查 evidence 失效，并在写入交付事实前失败。
 
-视觉评分为 0–100 分的辅助 QA，不替代 DesignContract、Claim Ledger、overflow 等硬门禁：
+视觉评分为 0–100 分的辅助 QA，不替代 PresentationTechnicalContract、Claim Ledger、overflow 等硬门禁：
 
 - 65% 逐页构图：有效视觉内容覆盖率与视觉重心偏移。
 - 20% 布局多样性：按元素角色和空间分桶生成构图签名。

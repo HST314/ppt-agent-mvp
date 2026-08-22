@@ -1,15 +1,19 @@
 from __future__ import annotations
 
-import base64, binascii, hashlib, html, re
+import base64, binascii, hashlib, html, json, re
 from functools import lru_cache
 from html.parser import HTMLParser
 from pathlib import PurePosixPath
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
-from .design_contract import TemplateRegistry, validate_design_contract
+from .design_contract import (
+    default_design_intent,
+    validate_design_intent,
+    validate_presentation_technical_contract,
+    validate_shared_design_assets,
+)
 from .errors import ValidationError
-from .skill_runtime import SkillRuntime
 
 SLIDE = re.compile(r"^## \[([A-Za-z0-9_-]+)\]\s*(.*?)(?=^## \[|\Z)", re.M | re.S)
 
@@ -79,7 +83,7 @@ CSS_PROPERTIES = {
     # 视觉效果
     "transform", "transform-origin", "transition", "transition-property", "transition-duration", "transition-timing-function",
     "object-fit", "object-position", "cursor", "pointer-events", "user-select",
-    "mix-blend-mode", "filter", "backdrop-filter", "-webkit-backdrop-filter",
+    "mix-blend-mode", "filter", "backdrop-filter", "-webkit-backdrop-filter", "color-scheme",
     "box-decoration-break", "-webkit-box-decoration-break",
     "mask-image", "mask-repeat", "mask-size", "-webkit-mask-image", "-webkit-mask-repeat", "-webkit-mask-size",
     "-webkit-font-smoothing", "text-rendering", "will-change", "content", "animation",
@@ -123,139 +127,32 @@ MAX_DATA_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_IMAGE_REFERENCES = 30
 CSS_URL = re.compile(r"url\s*\(\s*(?:(['\"])(.*?)\1|([^)]*))\s*\)", re.I | re.S)
 
-LOCKED_TEMPLATE_PATH = "assets/template.html"
-# 生成页标题兜底规则不得覆盖模板自己的展示级字号类,否则整稿标题被压平
-EDITORIAL_TITLE_GUARD = ":not(.display,.display-zh,.h1-zh,.h2-zh,.h3-zh,.h-hero,.h-xl,.h-sub,.h-md)"
-SWISS_TITLE_GUARD = ":not(.h-hero,.h-hero-zh,.h-xl,.h-xl-zh,.h-md,.h-sub)"
-# 模板展示类按 vw 设计(100vw 全屏页);生成页是固定 1280×720 画布,
-# vw 只在 1280px 视口偶然成立。这里把各类钉到 1280 等效 px,保证任意视口与
-# 离线缩放播放器中几何确定;主标题对 18px lead/正文保持 ≥8:1 的字号对比。
-EDITORIAL_TEMPLATE_OVERRIDES = """
-html,body{width:100%;height:auto;min-height:100%;overflow:auto;background:var(--ink)}
-body{display:block;padding:24px 0}
-.slide{box-sizing:border-box;width:1280px;height:720px;min-width:1280px;min-height:720px;flex:none;margin:0 auto 24px;overflow:hidden;background:var(--paper);color:var(--ink)}
-.slide.light{background:var(--paper);color:var(--ink)}
-.slide.dark{background:var(--ink);color:var(--paper)}
-.slide>h1GUARD,.slide>h2GUARD,.slide [data-element-id="title"]GUARD{font-family:var(--serif-zh);font-size:52px;line-height:1.12;font-weight:700}
-.slide .display{font-size:152px}
-.slide .display-zh{font-size:148px}
-.slide .h-hero{font-size:148px}
-.slide .h1-zh{font-size:59px}
-.slide .h2-zh{font-size:41px}
-.slide .h3-zh{font-size:24px}
-.slide .h-xl{font-size:79px}
-.slide .h-sub{font-size:40px}
-.slide .h-md{font-size:29px}
-.slide .lead{font-size:18px}
-.slide .big-num{font-size:128px}
-.slide .mid-num{font-size:70px}
-.slide .ghost{font-size:435px}
-.slide .rowline .k{font-size:18px}
-.slide .rowline .v{font-size:16px}
-.slide .rowline .m{font-size:14px}
-.slide .pipeline-label{font-size:14px}
-.slide .step-nb{font-size:14px}
-.slide .step-title{font-size:18px}
-.slide .step-desc{font-size:16px}
-.slide p,.slide li,.slide td,.slide th{font-family:var(--sans-zh);font-size:24px;line-height:1.5}
-.slide small{font-size:16px;line-height:1.4}
-.slide .required-claim-slot{position:absolute;left:5vw;right:5vw;bottom:4.4vh;z-index:3;display:flex;flex-wrap:wrap;gap:8px 16px;padding:8px 12px;background:var(--paper);border-top:2px solid var(--accent)}
-.slide.dark .required-claim-slot,.slide.accent .required-claim-slot{background:var(--ink)}
-.slide .required-claim-row{display:flex;align-items:baseline;gap:8px;min-width:0}
-.slide .required-claim-value{font-family:var(--sans-zh);font-size:18px;line-height:1.3;font-weight:500}
-.slide :focus-visible{outline:2px solid currentColor;outline-offset:2px}
-@media (prefers-reduced-motion:reduce){.slide [data-anim]{opacity:1!important;transform:none!important}}
-""".strip().replace("GUARD", EDITORIAL_TITLE_GUARD)
-SWISS_TEMPLATE_OVERRIDES = """
-html,body{width:100%;height:auto;min-height:100%;overflow:auto;background:var(--paper)}
-body{display:block;padding:24px 0}
-#deck{position:static;width:100%;height:auto;display:block;transform:none!important}
-#nav,#hint,canvas.bg{display:none!important}
-.slide{box-sizing:border-box;width:1280px;height:720px;min-width:1280px;min-height:720px;flex:none;margin:0 auto 24px;overflow:hidden}
-.slide>h1GUARD,.slide>h2GUARD,.slide [data-element-id="title"]GUARD{font-family:var(--sans),var(--sans-zh);font-size:52px;line-height:1.08;font-weight:300}
-.slide .h-hero{font-size:152px}
-.slide .h-hero-zh{font-size:148px}
-.slide .h-xl{font-size:77px}
-.slide .h-xl-zh{font-size:64px}
-.slide .h-md{font-size:33px}
-.slide .h-sub{font-size:28px}
-.slide .lead{font-size:18px}
-.slide .num-mega,.slide .name-mega{font-size:115px}
-.slide .kpi-hero{font-size:282px}
-.slide .kpi-big{font-size:141px}
-.slide .kpi-mid{font-size:77px}
-.slide .kpi-thin{font-size:179px}
-.slide .kpi-thin-sm{font-size:72px}
-.slide .rowline .k{font-size:18px}
-.slide .rowline .v{font-size:16px}
-.slide .rowline .m{font-size:14px}
-.slide .pipeline-label{font-size:14px}
-.slide .step-nb{font-size:14px}
-.slide .step-title{font-size:18px}
-.slide .step-desc{font-size:16px}
-.slide .step-meta{font-size:14px}
-.slide p,.slide li,.slide td,.slide th{font-family:var(--sans),var(--sans-zh);font-size:24px;line-height:1.45}
-.slide small{font-size:16px;line-height:1.4}
-.slide .cell,.slide .cell-6,.slide .sub-card-stack,.slide .sub-card,
-.slide .kpi-tower-row,.slide .tower-col,.slide .duo-half,.slide .tl-h-node,
-.slide .manifesto-top,.slide .ink-banner-full,.slide .three-forces,.slide .hero-ink-col,.slide .force-card,
-.slide .loop-diagram,.slide .loop-steps,.slide .loop-svg,.slide .matrix-fill,.slide .matrix-cell,.slide .hero-stat-bottom,
-.slide .brief-grid,.slide .brief-card,.slide .system-diagram,.slide .sys-svg,.slide .sys-label,
-.slide .why-now-grid,.slide .why-col,.slide .why-num-bottom,.slide .four-cards,.slide .fc-col,
-.slide .stacked-ledger,.slide .tech-spec,.slide .spec-title-col,.slide .spec-kpi-grid,.slide .spec-bars,.slide .bar-vert,
-.slide .image-hero,.slide .hero-img-wrap,.slide .hero-overlay-block,.slide .hero-stats{min-width:0}
-.slide .required-claim-slot{position:absolute;left:5vw;right:5vw;bottom:4.4vh;z-index:3;display:flex;flex-wrap:wrap;gap:8px 16px;padding:8px 12px;background:var(--paper);border-top:2px solid var(--accent)}
-.slide.dark .required-claim-slot,.slide.accent .required-claim-slot{background:var(--ink)}
-.slide .required-claim-row{display:flex;align-items:baseline;gap:8px;min-width:0}
-.slide .required-claim-value{font-family:var(--sans),var(--sans-zh);font-size:18px;line-height:1.3;font-weight:500}
-.slide :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.slide.dark :focus-visible,.slide.accent :focus-visible{outline-color:currentColor}
-@media (prefers-reduced-motion:reduce){.slide [data-anim]{opacity:1!important;transform:none!important}}
-""".strip().replace("GUARD", SWISS_TITLE_GUARD)
-# Backwards-compatible constant retained for code importing the v1 name.
-LOCKED_TEMPLATE_OVERRIDES = EDITORIAL_TEMPLATE_OVERRIDES
-
-# 锁定模板的主题/品牌变量(两个风格的并集)。模型只允许消费 var(--*),
-# 禁止在内联 style 里重定义,否则单主题(如 Swiss 的 IKB)会被局部篡改。
-# 注意:只约束内联样式;锁定模板自身 :root 定义走 <style> 块路径,不受影响。
-LOCKED_THEME_TOKENS = frozenset({
-    "--accent", "--accent-rgb", "--accent-on", "--accent-bright",
-    "--ink", "--ink-rgb", "--ink-tint", "--paper", "--paper-rgb", "--paper-tint",
-    "--grey-1", "--grey-2", "--grey-3",
-    "--text-primary", "--text-secondary", "--text-helper", "--text-placeholder", "--text-on-color",
-    "--border-subtle", "--border-strong",
-    "--sans", "--sans-zh", "--serif-en", "--serif-body-en", "--serif-zh", "--mono",
-})
+GENERIC_SHELL_CSS = """
+:root{--presentation-width:1280px;--presentation-height:720px}
+*{box-sizing:border-box}
+html,body{width:100%;min-height:100%;margin:0}
+body{display:block}
+.slide{position:relative;width:var(--presentation-width);height:var(--presentation-height);min-width:var(--presentation-width);min-height:var(--presentation-height);margin:0 auto;overflow:hidden}
+:where(.slide img){max-width:100%;max-height:100%}
+:where(.slide :focus-visible){outline:2px solid currentColor;outline-offset:2px}
+@media (prefers-reduced-motion:reduce){:where(.slide [data-anim]){opacity:1!important;transform:none!important}}
+""".strip()
 
 
-@lru_cache(maxsize=4)
-def locked_template(style_id: str = "editorial") -> dict[str, Any]:
-    """Load the inert style layer from the hash-locked built-in template.
+@lru_cache(maxsize=1)
+def locked_template(style_id: str = "generic") -> dict[str, Any]:
+    """Compatibility accessor for the service-owned canvas shell.
 
-    The active scripts, external font links and example slides in the source
-    template never enter a generated deck.  Only its single locked ``style``
-    block is used, followed by fixed 1280x720 service-owned canvas overrides.
+    The argument is intentionally ignored: presentation style is supplied by
+    the Agent as shared CSS, never selected by framework code.
     """
-    skill = SkillRuntime.builtin()
-    registry = TemplateRegistry(skill)
-    record = registry.resolve(style_id)
-    source = skill.read_locked_text(record.asset_path)
-    blocks = re.findall(r"<style(?:\s[^>]*)?>([\s\S]*?)</style\s*>", source, re.I)
-    if len(blocks) != 1 or not blocks[0].strip():
-        raise ValidationError("锁定 PPT 模板必须包含唯一非空 style 块")
-    # The Swiss source uses one inline SVG mask for a decorative cross hatch.
-    # Generated HTML deliberately keeps the stricter no-SVG-data-URL boundary;
-    # omit that non-essential decoration from the inert server-owned style.
-    style = re.sub(r"(?:-webkit-)?mask-image\s*:\s*url\([\s\S]*?\)\s*;", "", blocks[0], flags=re.I)
     return {
-        "skill": skill.skill_name,
-        "version": skill.skill_version,
-        "template_id": record.template_id,
-        "style_id": record.style_id,
-        "path": record.asset_path,
-        "sha256": record.template_hash,
-        "semantic_classes": list(record.semantic_classes),
-        "style": style.strip() + "\n" + (SWISS_TEMPLATE_OVERRIDES if style_id == "swiss" else EDITORIAL_TEMPLATE_OVERRIDES),
+        "template_id": "generic-presentation-shell",
+        "style_id": "generic",
+        "path": "service-owned",
+        "sha256": hashlib.sha256(GENERIC_SHELL_CSS.encode()).hexdigest(),
+        "semantic_classes": [],
+        "style": GENERIC_SHELL_CSS,
     }
 
 
@@ -279,30 +176,57 @@ def _deck_title(sections) -> str:
     return "演示文稿"
 
 
-def assemble_locked_template(sections, rules=None, design_contract=None, contract_hash=None) -> str:
-    """Assemble validated slide fragments into the locked, script-free shell."""
-    if design_contract is not None:
-        validate_design_contract(design_contract)
+def assemble_presentation(
+    sections,
+    rules=None,
+    technical_contract=None,
+    contract_hash=None,
+    *,
+    design_intent=None,
+    shared_assets=None,
+) -> str:
+    """Assemble slide fragments with service canvas CSS and Agent shared CSS."""
+    if technical_contract is not None:
+        validate_presentation_technical_contract(technical_contract)
         if not isinstance(contract_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", contract_hash):
-            raise ValidationError("DesignContract hash 无效")
-    template = locked_template(design_contract["style_id"] if design_contract else "editorial")
+            raise ValidationError("PresentationTechnicalContract hash 无效")
+    intent = validate_design_intent(design_intent)
+    assets = validate_shared_design_assets(shared_assets)
+    if assets["css"]:
+        for reference in _validate_css(assets["css"]):
+            validate_image_url(reference)
     rule_text = " · ".join(html.escape(str(item), quote=True) for item in (rules or []))
-    provenance = html.escape(
-        f"{template['skill']}@{template['version']}:{template['template_id']}:{template['path']}#{template['sha256']}",
-        quote=True,
-    )
+    intent_hash = hashlib.sha256(
+        json.dumps(intent, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     source = (
         '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
         + f"<title>{html.escape(_deck_title(sections))}</title>"
-        + (f'<meta name="design-contract" content="{contract_hash}">' if design_contract else "")
-        + f'<meta name="ppt-semantic-classes" content="{html.escape(" ".join(template["semantic_classes"]), quote=True)}">'
-        + f'<meta name="ppt-template" content="{provenance}"><style>{template["style"]}</style>'
-        + f'</head><body><aside hidden data-global-rules="{rule_text}" data-template="{provenance}"></aside>'
+        + (f'<meta name="presentation-technical-contract" content="{contract_hash}">' if technical_contract else "")
+        + f'<meta name="design-intent" content="{intent_hash}">'
+        + f"<style>{GENERIC_SHELL_CSS}\n{assets['css']}</style>"
+        + f'</head><body><aside hidden data-global-rules="{rule_text}" data-design-intent="{intent_hash}"></aside>'
         + "".join(sections)
         + "</body></html>"
     )
-    return apply_design_contract(source, design_contract, contract_hash) if design_contract else source
+    return (
+        apply_presentation_technical_contract(source, technical_contract, contract_hash)
+        if technical_contract
+        else source
+    )
+
+
+def assemble_locked_template(sections, rules=None, design_contract=None, contract_hash=None, **context) -> str:
+    """Compatibility wrapper for callers migrating to ``assemble_presentation``."""
+    return assemble_presentation(
+        sections,
+        rules,
+        design_contract,
+        contract_hash,
+        design_intent=context.get("design_intent"),
+        shared_assets=context.get("shared_assets"),
+    )
 
 
 def _set_attribute(tag: str, name: str, value: str) -> str:
@@ -314,81 +238,32 @@ def _set_attribute(tag: str, name: str, value: str) -> str:
     return tag[:-1] + replacement + ">"
 
 
-_SWISS_STATEMENT_LAYOUTS = {"S01", "S03", "S09", "S10", "SWISS-COVER-ASCII", "SWISS-CLOSING-ASCII"}
-
-
-def _normalize_locked_canonical_fragment(fragment: str, item: dict[str, object], style_id: str) -> str:
-    """Apply only unambiguous locked-template repairs at the trusted boundary.
-
-    Swiss body-page title alignment is a template invariant, not a creative
-    choice.  The upstream canonical validator intentionally rejects any
-    ``text-align:center``/``align-self:center`` declaration in the title-area
-    prefix.  Normalizing exactly those declarations keeps statement/cover
-    layouts untouched and avoids spending a probabilistic model correction on
-    a deterministic rule.
-    """
-    if style_id != "swiss" or str(item.get("layout_id")) in _SWISS_STATEMENT_LAYOUTS:
-        return fragment
-    prefix, suffix = fragment[:1800], fragment[1800:]
-    prefix = re.sub(r"(?i)(text-align\s*:\s*)center\b", r"\1left", prefix)
-    prefix = re.sub(r"(?i)(align-self\s*:\s*)center\b", r"\1flex-start", prefix)
-    return prefix + suffix
-
-
-def _contract_fragment(
-    fragment: str,
-    item: dict[str, object],
-    contract_hash: str,
-    style_id: str,
-    semantic_classes: set[str],
-) -> str:
+def _contract_fragment(fragment: str, slide_id: str, contract_hash: str) -> str:
     opening = re.match(r"<section\b[^>]*>", fragment, re.I)
     if not opening:
-        raise ValidationError("DesignContract 页面不是 section 片段")
+        raise ValidationError("PresentationTechnicalContract 页面不是 section 片段")
     tag = opening.group(0)
     classes_match = re.search(r"\bclass\s*=\s*(['\"])(.*?)\1", tag, re.I | re.S)
     classes = classes_match.group(2).split() if classes_match else []
-    visual_classes = [str(item["theme"])]
-    if item.get("animation_recipe") == "hero" and "hero" in semantic_classes:
-        visual_classes.append("hero")
-    for name in ("slide", *visual_classes):
-        if name and name not in classes:
-            classes.append(name)
+    if "slide" not in classes:
+        classes.insert(0, "slide")
     for name, value in (
         ("class", " ".join(classes)),
-        ("data-layout", str(item["layout_id"])),
-        ("data-animate", str(item["animation_recipe"])),
+        ("id", slide_id),
+        ("data-slide-id", slide_id),
         ("data-contract-hash", contract_hash),
     ):
         tag = _set_attribute(tag, name, value)
-    fragment = tag + fragment[opening.end():]
-    fragment = _normalize_locked_canonical_fragment(fragment, item, style_id)
-    marker_count = len(re.findall(r"\bdata-anim(?:\s*=|\s|>)", fragment, re.I))
-    needed = max(0, int(item["minimum_animation_markers"]) - marker_count)
-    if needed:
-        candidates = list(re.finditer(r"<(?:h1|h2|h3|p|div|ul|ol|table|svg)\b[^>]*>", fragment, re.I))
-        offset = 0
-        for index, match in enumerate(candidates[:needed]):
-            original = match.group(0)
-            if re.search(r"\bdata-anim(?:\s*=|\s|>)", original, re.I):
-                continue
-            replacement = original[:-1] + f' data-anim="contract-{index + 1}">'
-            start, end = match.start() + offset, match.end() + offset
-            fragment = fragment[:start] + replacement + fragment[end:]
-            offset += len(replacement) - len(original)
-        marker_count = len(re.findall(r"\bdata-anim(?:\s*=|\s|>)", fragment, re.I))
-        if marker_count < int(item["minimum_animation_markers"]):
-            raise ValidationError("DesignContract 页面缺少可登记的动效元素")
-    return fragment
+    return tag + fragment[opening.end():]
 
 
-def apply_design_contract(html_text: str, design_contract: dict | None, contract_hash: str | None) -> str:
-    """Bind server-owned template/layout facts to every generated slide."""
-    if design_contract is None:
+def apply_presentation_technical_contract(html_text: str, technical_contract: dict | None, contract_hash: str | None) -> str:
+    """Bind only page identity and the technical contract hash to slides."""
+    if technical_contract is None:
         return html_text
-    validate_design_contract(design_contract)
+    validate_presentation_technical_contract(technical_contract)
     if not isinstance(contract_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", contract_hash):
-        raise ValidationError("DesignContract hash 无效")
+        raise ValidationError("PresentationTechnicalContract hash 无效")
     fragments = {}
     # Local import avoids a dependency on TaskService's fragment helper.
     tag_re = re.compile(r"<section\b[^>]*>|</section\s*>", re.I)
@@ -406,37 +281,24 @@ def apply_design_contract(html_text: str, design_contract: dict | None, contract
         classes = re.search(r"\bclass\s*=\s*(['\"])(.*?)\1", tag, re.I | re.S)
         is_slide = bool(classes and "slide" in classes.group(2).split())
         stack.append((match.start(), identifier.group(2) if is_slide and identifier and not stack else None))
-    expected = {item["slide_id"]: item for item in design_contract["slide_contracts"]}
+    expected = set(technical_contract["slide_ids"])
     if not fragments or not set(fragments).issubset(expected):
-        raise ValidationError("DesignContract 与 HTML 页面范围不一致")
+        raise ValidationError("PresentationTechnicalContract 与 HTML 页面范围不一致")
     for slide_id, (start, end, fragment) in sorted(fragments.items(), key=lambda pair: pair[1][0], reverse=True):
-        replacement = _contract_fragment(
-            fragment,
-            expected[slide_id],
-            contract_hash,
-            str(design_contract["style_id"]),
-            set(design_contract["semantic_classes"]),
-        )
+        replacement = _contract_fragment(fragment, slide_id, contract_hash)
         html_text = html_text[:start] + replacement + html_text[end:]
-    meta = f'<meta name="design-contract" content="{contract_hash}">'
-    if re.search(r'<meta\b[^>]*name=["\']design-contract["\'][^>]*>', html_text, re.I):
-        html_text = re.sub(r'<meta\b[^>]*name=["\']design-contract["\'][^>]*>', meta, html_text, count=1, flags=re.I)
-    else:
-        html_text = re.sub(r"<head\b[^>]*>", lambda match: match.group(0) + meta, html_text, count=1, flags=re.I)
-    semantic_meta = '<meta name="ppt-semantic-classes" content="' + html.escape(
-        " ".join(design_contract["semantic_classes"]), quote=True,
-    ) + '">'
-    if re.search(r'<meta\b[^>]*name=["\']ppt-semantic-classes["\'][^>]*>', html_text, re.I):
-        html_text = re.sub(
-            r'<meta\b[^>]*name=["\']ppt-semantic-classes["\'][^>]*>',
-            semantic_meta,
-            html_text,
-            count=1,
-            flags=re.I,
-        )
-    else:
-        html_text = re.sub(r"<head\b[^>]*>", lambda match: match.group(0) + semantic_meta, html_text, count=1, flags=re.I)
+    for name in ("presentation-technical-contract",):
+        meta = f'<meta name="{name}" content="{contract_hash}">'
+        pattern = rf'<meta\b[^>]*name=["\']{re.escape(name)}["\'][^>]*>'
+        if re.search(pattern, html_text, re.I):
+            html_text = re.sub(pattern, meta, html_text, count=1, flags=re.I)
+        else:
+            html_text = re.sub(r"<head\b[^>]*>", lambda match: match.group(0) + meta, html_text, count=1, flags=re.I)
     return html_text
+
+
+def apply_design_contract(html_text: str, design_contract: dict | None, contract_hash: str | None) -> str:
+    return apply_presentation_technical_contract(html_text, design_contract, contract_hash)
 
 
 def _decoded_url(value: str) -> str:
@@ -590,9 +452,6 @@ def _validate_css(css: str, inline: bool = False) -> list[str]:
             # 允许 CSS 变量 (--*) 以及白名单属性
             if not (prop.startswith("--") or prop in CSS_PROPERTIES):
                 raise ValidationError(f"CSS 属性不在白名单: {prop}")
-            # 内联样式不得重定义锁定主题变量(布局级变量如 --cols 仍允许)
-            if inline and prop in LOCKED_THEME_TOKENS:
-                raise ValidationError(f"内联样式禁止覆盖锁定主题变量: {prop}")
             declaration_urls = _css_urls(value)
             if declaration_urls and prop not in {"background", "background-image"}:
                 raise ValidationError("CSS url() 仅允许用于背景图片")
@@ -714,27 +573,14 @@ def recommend(
     slide_contracts: list[dict] | None = None,
     required_targets: list[dict[str, str]] | None = None,
 ):
-    """Choose a representative, diverse sample instead of the longest pages.
-
-    A two-page automatic sample always contains the visual cover/hero and the
-    strongest information-bearing non-cover page.  Additional slots are filled
-    greedily for layout, role and resource diversity.  The score is deliberately
-    deterministic so a frozen outline and DesignContract always produce the same
-    selection and auditable reasons.
-    """
+    """Choose deterministic representative pages from content characteristics."""
     slides = [(m.group(1), m.group(2)) for m in SLIDE.finditer(markdown)]
     if not slides:
         raise ValidationError("逐页大纲不包含有效页面")
     count = max(1, min(count, len(slides)))
-    contracts = {item.get("slide_id"): item for item in (slide_contracts or []) if isinstance(item, dict)}
-    if slide_contracts is not None and (len(contracts) != len(slides) or set(contracts) != {sid for sid, _ in slides}):
-        raise ValidationError("样品推荐所用 DesignContract 页面范围不完整或重复")
-
     candidates = []
     for index, (slide_id, body) in enumerate(slides):
-        contract = contracts.get(slide_id, {})
-        role = str(contract.get("visual_role") or ("cover" if index == 0 else "closing" if index == len(slides) - 1 else "body"))
-        layout = str(contract.get("layout_id") or "unregistered")
+        role = "cover" if index == 0 else "closing" if index == len(slides) - 1 else "body"
         resource_count = len(re.findall(r"resources://[A-Za-z0-9_.\-/]+", body))
         structural_count = len(re.findall(r"(?m)^\s*(?:[-*+]\s|\d+[.)]\s|\|)", body))
         numeric_count = len(re.findall(r"(?<![A-Za-z])\d+(?:\.\d+)?%?", body))
@@ -745,13 +591,12 @@ def recommend(
             "index": index,
             "slide_id": slide_id,
             "role": role,
-            "layout": layout,
             "density": density,
             "resource_count": resource_count,
             "decision_count": decision_count,
         })
 
-    cover = next((item for item in candidates if item["role"] in {"cover", "hero"}), candidates[0])
+    cover = next((item for item in candidates if item["role"] == "cover"), candidates[0])
     required_targets = list(required_targets or [])
     target_ids = [item.get("slide_id") for item in required_targets]
     if len(target_ids) != len(set(target_ids)) or any(slide_id not in {item["slide_id"] for item in candidates} for slide_id in target_ids):
@@ -763,7 +608,6 @@ def recommend(
         selected = [cover]
     while len(selected) < count:
         selected_ids = {item["slide_id"] for item in selected}
-        selected_layouts = {item["layout"] for item in selected}
         selected_roles = {item["role"] for item in selected}
         selected_resource_roles = {bool(item["resource_count"]) for item in selected}
         remaining = [item for item in candidates if item["slide_id"] not in selected_ids]
@@ -773,7 +617,6 @@ def recommend(
             remaining,
             key=lambda item: (
                 -(item["density"]
-                  + (180 if item["layout"] not in selected_layouts else 0)
                   + (140 if item["role"] not in selected_roles else 0)
                   + (100 if bool(item["resource_count"]) not in selected_resource_roles else 0)
                   + (80 if item["decision_count"] else 0)
@@ -788,13 +631,13 @@ def recommend(
     for item in chosen:
         target = next((target for target in required_targets if target["slide_id"] == item["slide_id"]), None)
         if target:
-            reasons[item["slide_id"]] = f"场景必选目标页；role={target['role']}；basis={target['basis']}；layout_id={item['layout']}"
+            reasons[item["slide_id"]] = f"场景必选目标页；role={target['role']}；basis={target['basis']}"
         elif item["slide_id"] == cover["slide_id"]:
-            reasons[item["slide_id"]] = f"代表封面/hero；visual_role={item['role']}；layout_id={item['layout']}"
+            reasons[item["slide_id"]] = f"代表开场页；content_role={item['role']}"
         else:
             resource_role = "有资源" if item["resource_count"] else "无资源"
             reasons[item["slide_id"]] = (
-                f"高信息与版式多样性；visual_role={item['role']}；layout_id={item['layout']}；"
+                f"高信息与内容多样性；content_role={item['role']}；"
                 f"density={item['density']}；resource_role={resource_role}"
             )
     return [item["slide_id"] for item in chosen], reasons
@@ -845,15 +688,21 @@ def infer_scope(prompt: str, slide_id=None, element_id=None, requested=None):
     }
 
 
-def render(markdown: str, slide_ids: list[str], rules=None, exceptions=None, assets=None, design_contract=None, contract_hash=None):
+def render(
+    markdown: str,
+    slide_ids: list[str],
+    rules=None,
+    exceptions=None,
+    assets=None,
+    design_contract=None,
+    contract_hash=None,
+    *,
+    design_intent=None,
+    shared_assets=None,
+):
     blocks = {m.group(1): m.group(2).strip() for m in SLIDE.finditer(markdown)}
     rules = rules or []
     exceptions = exceptions or {}
-    contracts = {
-        item["slide_id"]: item
-        for item in (design_contract or {}).get("slide_contracts", [])
-        if isinstance(item, dict)
-    }
     sections = []
     for sid in slide_ids:
         text = blocks[sid]
@@ -867,51 +716,15 @@ def render(markdown: str, slide_ids: list[str], rules=None, exceptions=None, ass
                 raise ValidationError("大纲引用不属于当前冻结资源清单")
             images.append(f'<img data-element-id="resource" src="{html.escape(assets[uri], quote=True)}" alt="{html.escape(alt, quote=True)}">')
         content = f'<h1 data-element-id="title">{title}</h1><div data-element-id="body">{body}</div>{"".join(images)}{note}'
-        layout_id = str(contracts.get(sid, {}).get("layout_id") or "")
-        sections.append(_deterministic_layout_fragment(sid, layout_id, content))
-    return assemble_locked_template(sections, rules, design_contract, contract_hash)
-
-
-def _repeated(class_name: str, count: int, content: str, *, child: str = "") -> str:
-    items = []
-    for index in range(count):
-        inner = content if index == 0 else f'<span aria-hidden="true">{index + 1:02d}</span>'
-        items.append(f'<div class="{class_name}">{inner}{child}</div>')
-    return "".join(items)
-
-
-def _deterministic_layout_fragment(slide_id: str, layout_id: str, content: str) -> str:
-    """Render test/fallback content in the same registered skeletons as production."""
-    root_classes = "slide split" if layout_id == "S10" else "slide"
-    bar_tower = '<div class="bar-tower"></div>'
-    bar_fill = '<div class="bar-fill"></div>'
-    ledger_num = '<span class="ledger-num">—</span>'
-    skeletons = {
-        "S01": f'<div class="canvas-card"><canvas class="ascii-bg" aria-hidden="true"></canvas>{content}</div>',
-        "S02": f'<div class="timeline-v"><div class="tl-node">{content}</div></div><div class="kpi-row-4"></div>',
-        "S03": f'<div class="h-statement">{content}</div>',
-        "S04": f'<div class="sub-grid-3-2">{_repeated("cell", 6, content)}</div>',
-        "S05": f'<div class="stack-row">{_repeated("sub-card", 3, content)}</div>',
-        "S06": f'<div class="kpi-tower-row">{_repeated("tower-col", 4, content, child=bar_tower)}</div>',
-        "S07": f'<div class="h-bar-chart">{_repeated("bar-row", 5, content, child=bar_fill)}</div>',
-        "S08": f'<div class="duo-compare">{_repeated("duo-half", 2, content)}</div>',
-        "S09": f'<div class="dot-mat">{content}</div>',
-        "S10": f'<div class="canvas-card"><div class="split-half">{_repeated("half", 2, content)}</div></div>',
-        "S11": f'<div class="timeline-h">{_repeated("tl-h-node", 4, content)}</div>',
-        "S12": f'<div class="manifesto-top">{content}</div><div class="ink-banner-full">结论</div>',
-        "S13": f'<div class="three-forces"><div class="hero-ink-col">{content}</div>{_repeated("force-card", 3, "要点")}</div>',
-        "S14": f'<div class="loop-diagram"><div class="loop-steps">{content}</div><div class="loop-svg"></div></div>',
-        "S15": f'<div class="matrix-fill">{_repeated("matrix-cell", 8, content)}</div><div class="hero-stat-bottom">总览</div>',
-        "S16": f'<div class="brief-grid">{_repeated("brief-card", 6, content)}</div>',
-        "S17": f'<div class="system-diagram"><div class="sys-svg">{content}</div>{_repeated("sys-label", 3, "层级")}</div>',
-        "S18": f'<div class="why-now-grid">{_repeated("why-col", 3, content)}</div><div class="why-num-bottom">01</div>',
-        "S19": f'<div class="four-cards">{_repeated("fc-col", 4, content)}</div>',
-        "S20": f'<div class="stacked-ledger">{_repeated("ledger-row", 4, content, child=ledger_num)}</div>',
-        "S21": f'<div class="tech-spec"><div class="spec-title-col">{content}</div><div class="spec-kpi-grid"></div><div class="spec-bars">{_repeated("bar-vert", 9, "")}</div></div>',
-        "S22": f'<div class="image-hero"><div class="hero-img-wrap">{content}</div><div class="hero-overlay-block">案例</div><div class="hero-stats"></div></div>',
-    }
-    inner = skeletons.get(layout_id, content)
-    return f'<section class="{root_classes}" id="{slide_id}" data-slide-id="{slide_id}">{inner}</section>'
+        sections.append(f'<section class="slide" id="{sid}" data-slide-id="{sid}">{content}</section>')
+    return assemble_presentation(
+        sections,
+        rules,
+        design_contract,
+        contract_hash,
+        design_intent=design_intent,
+        shared_assets=shared_assets,
+    )
 
 
 def _class_element_spans(fragment: str, class_name: str) -> list[tuple[int, int]]:
@@ -964,14 +777,6 @@ def materialize_required_claim_slots(
 
     evidence = []
     replacements = []
-    slot_class_by_layout = {
-        "S01": "canvas-card", "S02": "tl-node", "S03": "h-statement", "S04": "cell",
-        "S05": "sub-card", "S06": "tower-col", "S07": "bar-row", "S08": "duo-half",
-        "S09": "dot-mat", "S10": "half", "S11": "tl-h-node", "S12": "manifesto-top",
-        "S13": "force-card", "S14": "loop-steps", "S15": "matrix-cell", "S16": "brief-card",
-        "S17": "sys-label", "S18": "why-col", "S19": "fc-col", "S20": "ledger-row",
-        "S21": "spec-title-col", "S22": "hero-stats",
-    }
     for slide_id, claims in missing_claims_by_slide.items():
         if not claims:
             continue
@@ -986,32 +791,17 @@ def materialize_required_claim_slots(
             )
             for claim in claims
         ]
-        slot_class = slot_class_by_layout.get(layout_by_slide.get(slide_id, ""), "")
-        hosts = _class_element_spans(fragment, slot_class) if slot_class else []
-        inserted = bool(hosts)
-        if inserted:
-            by_closing: dict[int, list[str]] = {}
-            for index, value in enumerate(values):
-                closing = hosts[index % len(hosts)][1]
-                by_closing.setdefault(closing, []).append(value)
-            for closing, host_values in sorted(by_closing.items(), reverse=True):
-                fragment = fragment[:closing] + "".join(host_values) + fragment[closing:]
-        if not inserted:
-            rows = "".join(
-                f'<span class="required-claim-row">{value}</span>'
-                for value in values
-            )
-            slot = f'<div class="required-claim-slot" data-element-id="required-claim-slot">{rows}</div>'
-            closing = fragment.lower().rfind("</section")
-            if closing < 0:
-                raise ValidationError("确定性事实槽位页面边界无效")
-            fragment = fragment[:closing] + slot + fragment[closing:]
+        rows = "".join(f'<span class="required-claim-row">{value}</span>' for value in values)
+        slot = f'<div class="required-claim-slot" data-element-id="required-claim-slot">{rows}</div>'
+        closing = fragment.lower().rfind("</section")
+        if closing < 0:
+            raise ValidationError("确定性事实槽位页面边界无效")
+        fragment = fragment[:closing] + slot + fragment[closing:]
         replacements.append((start, end, fragment))
         evidence.extend({
             "slide_id": slide_id,
             "claim_id": claim["claim_id"],
-            "layout_id": layout_by_slide.get(slide_id, ""),
-            "slot": slot_class if inserted else "required-claim-slot",
+            "slot": "required-claim-slot",
         } for claim in claims)
     for start, end, fragment in sorted(replacements, reverse=True):
         html_text = html_text[:start] + fragment + html_text[end:]
