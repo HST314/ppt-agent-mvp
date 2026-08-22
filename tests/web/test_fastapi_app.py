@@ -359,7 +359,11 @@ class FastAPIAppTests(unittest.TestCase):
                 client.post("/v1/tasks",json={"task_id":"unready","mode":"manual"})
                 imported=client.post("/v1/tasks/unready/input",json={"source":{"topic":"新品"}})
                 self.assertEqual(imported.status_code,200)
-                error=imported.json()["clarification"]["error"]
+                body=imported.json()
+                error=body["clarification"]["error"]
+                self.assertEqual(body["clarification"]["status"],"waiting_for_runtime")
+                self.assertEqual(body["state"]["waiting_reason"],"waiting_for_runtime")
+                self.assertEqual(body["state"]["required_action"],"continue_clarification")
                 self.assertEqual(error["code"],"runtime_unavailable")
                 self.assertEqual(error["runtime_error_code"],"model_authentication_failed")
                 self.assertEqual(error["failed_check"],"capability_contract")
@@ -375,6 +379,7 @@ class FastAPIAppTests(unittest.TestCase):
                 self.assertNotEqual(retry.json()["error"]["diagnostic_id"],error["diagnostic_id"])
                 self.assertEqual(retry.json()["error"]["probe_id"],error["probe_id"])
                 self.assertEqual(client.get("/v1/tasks/unready/jobs").json()["jobs"],[])
+                self.assertEqual(client.get("/v1/tasks/unready/input").json()["clarification"]["status"],"waiting_for_runtime")
                 fallback=client.post("/v1/tasks/unready/clarifications/fallback",json={"confirm":True})
                 self.assertEqual(fallback.status_code,200)
                 self.assertEqual(fallback.json()["question_source"],"fallback")

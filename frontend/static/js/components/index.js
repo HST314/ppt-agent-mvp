@@ -1,4 +1,4 @@
-import { badge, button, element, icon } from "../shell.js?v=2026.08.21.115749201866";
+import { badge, button, element, icon } from "../shell.js?v=2026.08.22.110501195536";
 
 export { badge, button, element, icon };
 

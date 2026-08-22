@@ -133,14 +133,14 @@ async def import_input(task_id: str, request: Request, service: TaskService = De
         try:
             job,_=jobs.create(task_id,"clarification.generate",{},f"clarification-{result['snapshot_hash']}"); result["clarification"]["job_id"]=job["job_id"]
         except RuntimeUnavailableError as error:
-            result["clarification"]=service.fail_clarification_for_runtime(task_id,error)
+            result["clarification"]=service.wait_clarification_for_runtime(task_id,error)
             result["state"]=service.get(task_id)
     return result
 
 @router.post("/tasks/{task_id}/clarifications/retry")
 async def retry_clarification(task_id: str, request: Request, service: TaskService = Depends(task_service), jobs: JobService = Depends(job_service)):
     body=await json_body(request); exact(body,{"idempotency_key"},{"idempotency_key"})
-    if service.input_view(task_id).get("clarification",{}).get("status")!="failed": raise ConflictError("仅失败的澄清生成可重试")
+    if service.input_view(task_id).get("clarification",{}).get("status") not in {"failed","waiting_for_runtime"}: raise ConflictError("仅失败或等待运行时的澄清生成可继续")
     job,_=jobs.create(task_id,"clarification.generate",{},body["idempotency_key"]); return job
 
 @router.post("/tasks/{task_id}/clarifications/fallback")
@@ -158,8 +158,8 @@ def _enqueue_next_clarification_round(task_id: str, result: dict, service: TaskS
         job, _ = jobs.create(task_id, "clarification.generate", {}, f"clarification-round-{result['clarification_hash'][:16]}")
         result["job_id"] = job["job_id"]
     except RuntimeUnavailableError as error:
-        failed = service.fail_clarification_for_runtime(task_id, error)
-        result.update({"status": failed["status"], "error": failed.get("error"), "state": service.get(task_id)})
+        waiting = service.wait_clarification_for_runtime(task_id, error)
+        result.update({"status": waiting["status"], "error": waiting.get("error"), "state": service.get(task_id)})
     return result
 
 

@@ -95,7 +95,7 @@ class P0HybridInspectionBrowserGate(unittest.TestCase):
         )
         html = (
             '<!doctype html><html><head><style>*{box-sizing:border-box}body{margin:0}'
-            '.slide{width:1280px;height:720px;position:relative;background:#fff;overflow:hidden}'
+            '.slide.light{width:1280px;height:720px;position:relative;background:#fff;overflow:hidden}'
             'h1{position:absolute;left:40px;top:32px;font-size:40px}'
             'p{position:absolute;left:40px;top:100px;font-size:18px}'
             f'</style></head><body>{slides}</body></html>'

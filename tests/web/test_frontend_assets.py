@@ -84,6 +84,7 @@ class FrontendAssetTests(unittest.TestCase):
         self.assertIn('runtimeFetch("/livez"', api)
         self.assertIn('runtimeFetch(recheck ? "/v1/runtime/recheck" : "/v1/runtime/status"', api)
         self.assertIn("runtimeFetch", api)
+        self.assertIn("timeout: recheck ? 90_000 : 8_000", api)
         self.assertIn("backendReachable: true, runtimeReady: null", api)
         for label in ("浏览器在线", "后端可达", "模型可用", "模型不可用"):
             self.assertIn(label, app)
@@ -99,6 +100,9 @@ class FrontendAssetTests(unittest.TestCase):
         self.assertIn("model_upstream_unavailable", input_stage)
         self.assertIn("Agent 审计 ID", input_stage)
         self.assertIn("复制探测 ID", input_stage)
+        self.assertIn("waiting_for_runtime", input_stage)
+        self.assertIn("继续生成澄清问题", input_stage)
+        self.assertIn("模型恢复探测中", app)
         self.assertIn('role: "alert"', input_stage)
         for label in ("失败阶段", "工具调用数", "底层错误"):
             self.assertIn(label, app + input_stage)

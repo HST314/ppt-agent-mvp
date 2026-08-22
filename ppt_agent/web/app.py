@@ -39,7 +39,10 @@ def create_app(
             coordinator.initialize_recovery()
             bootstrap["recovery"]="ready"
             capabilities=service.initialize_runtime()
-            bootstrap["runtime"]="ready" if capabilities.get("ready") else "unavailable"
+            # Startup completion and provider capability are separate signals.
+            # A later background probe can recover capability without mutating
+            # this one-shot bootstrap state.
+            bootstrap["runtime"]="ready"
             if capabilities.get("ready") and not shutdown.is_set(): coordinator.resume_recovered_queued()
         except Exception:
             pending="recovery" if bootstrap["recovery"]=="starting" else "runtime"
@@ -71,7 +74,6 @@ def create_app(
         statuses=set(bootstrap.values())
         if "failed" in statuses: return "failed"
         if "starting" in statuses: return "starting"
-        if "unavailable" in statuses: return "unavailable"
         return "ready"
 
     def runtime_payload():
@@ -135,7 +137,7 @@ def create_app(
     @app.post("/v1/runtime/recheck", tags=["runtime"])
     def recheck_runtime():
         capabilities=service.initialize_runtime()
-        bootstrap["runtime"]="ready" if capabilities.get("ready") else "unavailable"
+        bootstrap["runtime"]="ready"
         return runtime_payload()
 
     @app.get("/v1/runtime/probes", tags=["runtime"])

@@ -1,11 +1,11 @@
-import { api, ApiError } from "./api.js?v=2026.08.21.115749201866";
-import { JobTracker } from "./job-tracker.js?v=2026.08.21.115749201866";
-import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.21.115749201866";
-import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.21.115749201866";
-import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.21.115749201866";
-import { inlineError, setBusy } from "./components/index.js?v=2026.08.21.115749201866";
-import { renderStage } from "./stages/index.js?v=2026.08.21.115749201866";
-import { setVersionMatchGuard } from "./stages/shared.js?v=2026.08.21.115749201866";
+import { api, ApiError } from "./api.js?v=2026.08.22.110501195536";
+import { JobTracker } from "./job-tracker.js?v=2026.08.22.110501195536";
+import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.22.110501195536";
+import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.22.110501195536";
+import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.22.110501195536";
+import { inlineError, setBusy } from "./components/index.js?v=2026.08.22.110501195536";
+import { renderStage } from "./stages/index.js?v=2026.08.22.110501195536";
+import { setVersionMatchGuard } from "./stages/shared.js?v=2026.08.22.110501195536";
 
 const app = document.getElementById("app");
 const APP_BUILD = document.querySelector('meta[name="app-build"]')?.content || "unknown";
@@ -179,6 +179,8 @@ function renderRuntimeBadges(group) {
   } else if (runtimeState.runtimeReady === true) {
     modelLabel = "模型可用";
     modelTone = "success";
+  } else if (runtimeState.health?.model_capabilities?.status === "recovering") {
+    modelLabel = "模型恢复探测中";
   } else if (runtimeState.runtimeReady === false) {
     modelLabel = "模型不可用";
     modelTone = "danger";
@@ -204,7 +206,7 @@ function renderRuntimeBadges(group) {
 }
 
 async function refreshRuntimeStatus(recheck = false) {
-  if (runtimeProbe && !recheck) return runtimeProbe;
+  if (runtimeProbe) return runtimeProbe;
   if (!navigator.onLine) {
     runtimeState = { browserOnline: false, backendReachable: false, runtimeReady: false, health: null };
     updateRuntimeUI();

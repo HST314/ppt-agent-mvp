@@ -11,7 +11,7 @@ from .canonical_validator import run_canonical_validator
 from .content_inspection import inspect_content_quality
 from .design_contract import build_design_contract, scope_design_contract, validate_design_contract
 from .diagnostics import log_exception_chain
-from .errors import ConflictError, GatewayError, NotFoundError, RuntimeUnavailableError, ValidationError
+from .errors import ConflictError, GatewayError, GatewayUnknownResult, NotFoundError, RuntimeUnavailableError, ValidationError
 from .fsm import TaskState, transition
 from .gateways import FakeGenerationGateway, FakeHtmlBuilder, FakeInspectionGateway, FakeSkillLoader
 from .generation_preflight import hard_browser_blockers, inspect_layout_capacity, layout_capacity_policy, structured_canonical_blockers
@@ -415,7 +415,17 @@ class TaskService:
         safe={key:public[key] for key in ("code","diagnostic_id","retryable","retry_after_seconds","agent_audit_id") if key in public}
         with self._runtime_guard:
             current=self._runtime_capabilities
-            self._runtime_capabilities={**current,"checked":True,"ready":False,"status":"unavailable","error":safe,"checked_at":utcnow()}
+            self._runtime_capabilities={
+                **current,
+                "checked":True,
+                "ready":False,
+                # An unknown result belongs to the failed Job and must not be
+                # replayed.  Global capability is instead re-established by a
+                # separate pure probe scheduled by JobService.
+                "status":"recovering" if isinstance(error,GatewayUnknownResult) else "unavailable",
+                "error":safe,
+                "checked_at":utcnow(),
+            }
     def record_runtime_success(self):
         with self._runtime_guard:
             if self._runtime_capabilities.get("ready"):
@@ -610,7 +620,7 @@ class TaskService:
         # artifact is explicitly bound to this snapshot's raw input.
         clarification_versions={v["hash"]:v for v in self.versions(task_id,"clarification")}
         for event in reversed(events[input_event_index+1:]):
-            if event["action"] not in {"answer_clarification","clarification_generate","clarification_failed","clarification_fallback"}: continue
+            if event["action"] not in {"answer_clarification","clarification_generate","clarification_failed","clarification_wait_runtime","clarification_fallback"}: continue
             candidate=event["result"]["clarification_hash"]
             record=clarification_versions.get(candidate)
             if record and record["metadata"].get("input_hash")==meta["raw_source_hash"]:
@@ -653,8 +663,8 @@ class TaskService:
     def recover_clarification_failure(self,task_id,error):
         """Normalize deadline/persistence/provider failures to one retry state."""
         view=self.input_view(task_id)
-        if (view.get("state",{}).get("waiting_reason")=="clarification_failed"
-            and view.get("clarification",{}).get("status")=="failed"):
+        if (view.get("state",{}).get("waiting_reason") in {"clarification_failed","waiting_for_runtime"}
+            and view.get("clarification",{}).get("status") in {"failed","waiting_for_runtime"}):
             return view["clarification"]
         code = "clarification_infrastructure_failure"
         if error.__class__.__name__ == "ExecutionDeadlineExceeded": code = "stage_deadline_exceeded"
@@ -667,6 +677,16 @@ class TaskService:
         view=self.input_view(task_id)
         public=error.public()["error"] if hasattr(error,"public") else {"code":"runtime_unavailable","message":"模型运行时尚未就绪","diagnostic_id":hashlib.sha256(f"{task_id}:runtime".encode()).hexdigest()[:24]}
         return self._record_clarification(task_id,view,[],"failed",None,public,"clarification_failed")
+    def wait_clarification_for_runtime(self,task_id,error):
+        """Keep the frozen input resumable when no model request was admitted.
+
+        This state is deliberately different from a failed/unknown provider
+        request: no model boundary was crossed, so recovery may safely create a
+        fresh clarification Job after readiness succeeds.
+        """
+        view=self.input_view(task_id)
+        public=error.public()["error"] if hasattr(error,"public") else {"code":"runtime_unavailable","message":"模型运行时尚未就绪","diagnostic_id":hashlib.sha256(f"{task_id}:runtime".encode()).hexdigest()[:24]}
+        return self._record_clarification(task_id,view,[],"waiting_for_runtime",None,public,"clarification_wait_runtime")
     def _validate_model_questions(self,questions,card,*,max_questions=5,asked_field_paths=()):
         """校验模型问题，返回 (有效问题列表, 被过滤的重复字段数)。
 
@@ -692,7 +712,14 @@ class TaskService:
         if error: meta["error"]=error
         if extra: meta.update(extra)
         artifact=ClarificationSet.parse({"clarification_id":f"clarification-{digest(canonical(meta))[:16]}","task_id":task_id,"questions":tuple(q["prompt"] for q in questions),"assumptions":tuple(),"confirmed":status=="ready" and not questions,"schema_version":"1.0"}); ch=self.store.put_version(task_id,"clarification",canonical(artifact.to_dict()),meta)
-        state=TaskState.parse(self.get(task_id)); failed=status=="failed"; new=TaskState(**{**state.__dict__,"status":state.status.WAITING_FOR_USER if failed or questions else state.status.READY,"waiting_reason":"clarification_failed" if failed else "missing_required_input" if questions else None,"required_action":"retry_clarification" if failed else "answer_clarifications" if questions else None,"revision":state.revision+1})
+        state=TaskState.parse(self.get(task_id)); failed=status=="failed"; waiting_runtime=status=="waiting_for_runtime"
+        new=TaskState(**{
+            **state.__dict__,
+            "status":state.status.WAITING_FOR_USER if failed or waiting_runtime or questions else state.status.READY,
+            "waiting_reason":"clarification_failed" if failed else "waiting_for_runtime" if waiting_runtime else "missing_required_input" if questions else None,
+            "required_action":"retry_clarification" if failed else "continue_clarification" if waiting_runtime else "answer_clarifications" if questions else None,
+            "revision":state.revision+1,
+        })
         event={"event_id":hashlib.sha256(f"{task_id}:{action}:{ch}".encode()).hexdigest()[:24],"command_id":f"{action}-{ch[:16]}","action":action,"actor":"system" if action!="clarification_fallback" else "user","request_hash":meta["input_hash"],"at":utcnow(),"from":state.to_dict(),"to":new.to_dict(),"result":{"clarification_hash":ch,"snapshot_hash":view["snapshot_hash"],"input_hash":meta["input_hash"]}}
         self.store.commit(task_id,new.to_dict(),event); return {"clarification_hash":ch,**meta,"confirmed":artifact.confirmed}
     def _freeze_task_card(self,task_id,merged,clarification_hash):

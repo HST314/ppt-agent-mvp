@@ -122,6 +122,7 @@ async function runtimeStatus(recheck = false) {
   try {
     const { response: ready, data: readyData } = await runtimeFetch(recheck ? "/v1/runtime/recheck" : "/v1/runtime/status", {
       method: recheck ? "POST" : "GET",
+      timeout: recheck ? 90_000 : 8_000,
     });
     return { backendReachable: true, runtimeReady: readyData.runtime_ready === true, live: liveData, ready: readyData };
   } catch (_error) {
@@ -131,15 +132,15 @@ async function runtimeStatus(recheck = false) {
   }
 }
 
-async function runtimeFetch(path, options = {}) {
+async function runtimeFetch(path, { timeout = 8_000, ...options } = {}) {
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort("timeout"), 8000);
+  const timeoutHandle = window.setTimeout(() => controller.abort("timeout"), timeout);
   try {
     const response = await fetch(path, { ...options, signal: controller.signal, cache: "no-store" });
     const data = await response.json().catch(() => ({}));
     return { response, data };
   } finally {
-    window.clearTimeout(timeout);
+    window.clearTimeout(timeoutHandle);
   }
 }
 

@@ -1,6 +1,6 @@
-import { api } from "../api.js?v=2026.08.21.115749201866";
-import { badge, button, confirmationDialog, element, field, metadataList, shortHash } from "../components/index.js?v=2026.08.21.115749201866";
-import { actionMessage, invalidationNotice, runAction, section, stageGrid } from "./shared.js?v=2026.08.21.115749201866";
+import { api } from "../api.js?v=2026.08.22.110501195536";
+import { badge, button, confirmationDialog, element, field, metadataList, shortHash } from "../components/index.js?v=2026.08.22.110501195536";
+import { actionMessage, invalidationNotice, runAction, section, stageGrid } from "./shared.js?v=2026.08.22.110501195536";
 
 const FIELD_LABELS = { goal: "演示目标", audience: "主要受众", topic: "核心主题" };
 const WARNING_LABELS = {
@@ -133,6 +133,8 @@ function clarificationStage(view, context) {
     }));
   } else if (status === "generating") {
     primary.push(clarificationGenerating(activeJob, clarification));
+  } else if (status === "waiting_for_runtime") {
+    primary.push(clarificationWaitingForRuntime(clarification, context));
   } else if (status === "failed") {
     primary.push(clarificationFailed(clarification, context));
   } else if (status !== "ready") {
@@ -274,6 +276,45 @@ function clarificationFailed(clarification, context) {
   ], { description: "模型失败后流程保持关闭，不会静默切换为固定问题。" });
 }
 
+function clarificationWaitingForRuntime(clarification, context) {
+  const error = clarification.error || {};
+  const message = actionMessage();
+  const resume = button("继续生成澄清问题", { kind: "primary", mutates: true, requiresRuntime: true, onClick: () => {
+    context.retryClarification({ buttonNode: resume, region: message });
+  } });
+  const fallback = button("使用系统兜底问题", { kind: "secondary", mutates: true, onClick: () => {
+    confirmationDialog({
+      title: "确认使用系统兜底问题？",
+      description: "已冻结的任务资料会保留，但澄清问题将来自确定性缺口检查，不是模型阅读后的结果。",
+      confirmLabel: "确认使用兜底问题",
+      onConfirm: () => runAction({
+        buttonNode: fallback,
+        region: message,
+        busyLabel: "正在启用兜底问题…",
+        action: () => api.useFallbackClarification(context.taskId),
+        success: "已按你的明确确认启用系统兜底问题。",
+        refresh: context.refresh,
+      }),
+    });
+  } });
+  return section("等待模型运行时恢复", [
+    element("div", { className: "notice notice--warning", role: "status" }, [
+      badge("资料已冻结", "warning"),
+      element("p", { text: "模型请求尚未入队，当前任务不会被标记为生成失败。运行时探测恢复后可直接继续，无需新建任务或重新导入资料。" }),
+      metadataList([
+        error.runtime_error_code ? ["运行时错误", error.runtime_error_code] : null,
+        error.failed_check ? ["失败检查", runtimeCheckLabel(error.failed_check)] : null,
+        error.probe_id ? ["探测 ID", error.probe_id] : null,
+      ].filter(Boolean)),
+      error.probe_id ? copyValueButton("复制探测 ID", error.probe_id) : null,
+    ]),
+    element("div", { className: "clarification-failure-actions" }, [resume, fallback]),
+    element("p", { className: "field__hint", text: clarificationRecoveryAdvice(error) }),
+    element("p", { className: "field__hint", text: "系统会对未知传输故障做独立能力探测，但不会重放结果未知的旧 Job。" }),
+    message,
+  ], { description: "运行时门禁在模型边界前关闭，冻结输入和资源清单保持不变。" });
+}
+
 function clarificationRecoveryAdvice(error) {
   const code = error.code || "clarification_generation_failed";
   const cause = error.runtime_error_code || code;
@@ -328,6 +369,7 @@ function copyValueButton(label, value) {
 
 function clarificationStatusBadge(status, clarification) {
   if (status === "generating") return badge("模型生成中", "primary");
+  if (status === "waiting_for_runtime") return badge("等待模型恢复", "warning");
   if (status === "failed") return badge("生成失败", "danger");
   return badge(clarification.confirmed ? "澄清已确认" : "等待回答", clarification.confirmed ? "success" : "warning");
 }

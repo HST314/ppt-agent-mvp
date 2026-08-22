@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from ppt_agent.errors import ConflictError, GatewayError, RuntimeUnavailableError
+from ppt_agent.errors import ConflictError, GatewayError, GatewayUnknownResult, RuntimeUnavailableError
 from ppt_agent.execution import ExecutionDeadlineExceeded, progress
 from ppt_agent.service import TaskService
 from ppt_agent.store import WorkspaceStore
@@ -212,7 +212,7 @@ class JobServiceTests(unittest.TestCase):
             self.assertEqual(len(executor.calls), 1)
             recovered.close()
 
-    def test_queued_clarification_closes_when_runtime_degrades_before_execution(self):
+    def test_queued_clarification_waits_when_runtime_degrades_before_execution(self):
         with tempfile.TemporaryDirectory() as root:
             service = TaskService(WorkspaceStore(root))
             service.create("clarification-gated")
@@ -230,8 +230,11 @@ class JobServiceTests(unittest.TestCase):
             function, args = executor.calls.pop(0)
             function(*args)
             clarification = service.input_view("clarification-gated")["clarification"]
-            self.assertEqual(clarification["status"], "failed")
+            self.assertEqual(clarification["status"], "waiting_for_runtime")
             self.assertEqual(clarification["error"]["code"], "runtime_unavailable")
+            state=service.get("clarification-gated")
+            self.assertEqual(state["waiting_reason"],"waiting_for_runtime")
+            self.assertEqual(state["required_action"],"continue_clarification")
             # 落入本任务记录的运行时错误换发本任务自己的诊断 ID，且不引用
             # 其他任务的 Agent 审计，避免跨任务错误污染。
             self.assertNotEqual(clarification["error"]["diagnostic_id"], failure.diagnostic_id)
@@ -258,6 +261,53 @@ class JobServiceTests(unittest.TestCase):
                 service = TaskService(WorkspaceStore(root))
                 service.record_runtime_failure(GatewayError("服务降级", code=code))
                 self.assertFalse(service.runtime_health()["ready"])
+        with tempfile.TemporaryDirectory() as root:
+            service=TaskService(WorkspaceStore(root))
+            service.record_runtime_failure(GatewayUnknownResult("结果未知",code="model_timeout"))
+            self.assertEqual(service.runtime_health()["status"],"recovering")
+
+    def test_unknown_job_is_not_replayed_and_pure_probe_recovers_runtime(self):
+        class ProbeGateway:
+            model="recovering-model"
+            def __init__(self): self.probe_calls=0
+            def set_audit_sink(self,_sink): pass
+            def probe_capabilities(self,probe_id=None):
+                self.probe_calls+=1
+                return {"basic_response":True,"strict_json_schema":True,"tool_round_trip":True}
+
+        class UnknownNarrativeService(TaskService):
+            def __init__(self,store,gateway):
+                super().__init__(store,generator=gateway)
+                self.narrative_calls=0
+            def generate_narrative(self,task_id,prompt=None,scope="all"):
+                self.narrative_calls+=1
+                raise GatewayUnknownResult(
+                    "模型请求结果未知",
+                    code="model_timeout",
+                    audit_details={"transport_phase":"unknown","result_certainty":"unknown"},
+                )
+
+        with tempfile.TemporaryDirectory() as root:
+            gateway=ProbeGateway()
+            service=UnknownNarrativeService(WorkspaceStore(root),gateway)
+            service.initialize_runtime()
+            service.create("unknown")
+            service.command("unknown","to-clarification","advance")
+            service.command("unknown","to-narrative","advance")
+            jobs=JobService(service,runtime_recovery_delays=(0,))
+            try:
+                created,_=jobs.create("unknown","narrative.generate",{},"unknown-key")
+                deadline=time.monotonic()+3
+                while time.monotonic()<deadline:
+                    if jobs.get(created["job_id"])["status"]=="failed" and service.runtime_health().get("ready"):
+                        break
+                    time.sleep(.01)
+                self.assertEqual(jobs.get(created["job_id"])["status"],"failed")
+                self.assertTrue(service.runtime_health()["ready"])
+                self.assertEqual(service.narrative_calls,1)
+                self.assertEqual(gateway.probe_calls,2)
+            finally:
+                jobs.close()
 
     def test_runtime_gate_reissues_diagnostic_and_drops_foreign_audit(self):
         with tempfile.TemporaryDirectory() as root:

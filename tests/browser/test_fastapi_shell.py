@@ -406,8 +406,8 @@ class FastAPIShellBrowserGate(unittest.TestCase):
 
         page.get_by_label("任务卡内容").fill("核心主题：新品发布")
         page.get_by_role("button", name="导入并冻结资料").click()
-        page.get_by_role("heading", name="问题生成失败").wait_for()
-        retry = page.get_by_role("button", name="重新生成问题")
+        page.get_by_role("heading", name="等待模型运行时恢复").wait_for()
+        retry = page.get_by_role("button", name="继续生成澄清问题")
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline and not retry.is_disabled():
             time.sleep(0.01)

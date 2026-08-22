@@ -16,7 +16,7 @@ from typing import Any
 import portalocker
 
 from ..audit import bind_agent_audit_context
-from ..errors import ConflictError, GatewayError, NotFoundError, RuntimeUnavailableError, ValidationError
+from ..errors import ConflictError, GatewayError, GatewayUnknownResult, NotFoundError, RuntimeUnavailableError, ValidationError
 from ..execution import ExecutionCancelled, ExecutionDeadlineExceeded, execution_scope
 
 
@@ -106,7 +106,15 @@ class JobService:
     execution metadata and references needed to refresh the business view.
     """
 
-    def __init__(self, service, *, executor: ThreadPoolExecutor | None = None, defer_queued_recovery: bool = False, defer_recovery_scan: bool = False):
+    def __init__(
+        self,
+        service,
+        *,
+        executor: ThreadPoolExecutor | None = None,
+        defer_queued_recovery: bool = False,
+        defer_recovery_scan: bool = False,
+        runtime_recovery_delays: tuple[float, ...] = (0.25, 1, 4, 16, 30, 30),
+    ):
         self.service = service
         self.store = service.store
         self.operation_budgets = dict(OPERATION_BUDGET_SECONDS)
@@ -129,6 +137,10 @@ class JobService:
         self._recovered_queued: list[tuple[str, str]] = []
         self._recovery_initialized=False
         self._recovery_complete=False
+        self._runtime_recovery_delays=runtime_recovery_delays
+        self._runtime_recovery_stop=threading.Event()
+        self._runtime_recovery_guard=threading.Lock()
+        self._runtime_recovery_thread: threading.Thread | None=None
         if not defer_recovery_scan:
             self.initialize_recovery()
         if not defer_queued_recovery and self._recovery_complete:
@@ -157,7 +169,39 @@ class JobService:
             self._recovery_complete=True
 
     def close(self) -> None:
+        self._runtime_recovery_stop.set()
+        thread=self._runtime_recovery_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=0.25)
         self.executor.shutdown(wait=False, cancel_futures=False)
+
+    def schedule_runtime_recovery(self) -> None:
+        """Probe capability after an unknown Job without replaying that Job."""
+        if not self._runtime_recovery_delays or self._runtime_recovery_stop.is_set():
+            return
+        with self._runtime_recovery_guard:
+            if self._runtime_recovery_thread is not None and self._runtime_recovery_thread.is_alive():
+                return
+            self._runtime_recovery_thread=threading.Thread(
+                target=self._recover_runtime,
+                name="ppt-runtime-recovery",
+                daemon=True,
+            )
+            self._runtime_recovery_thread.start()
+
+    def _recover_runtime(self) -> None:
+        for delay in self._runtime_recovery_delays:
+            if self._runtime_recovery_stop.wait(delay):
+                return
+            if self.service.runtime_health().get("ready"):
+                return
+            try:
+                capabilities=self.service.initialize_runtime()
+            except Exception:
+                logging.exception("background runtime capability probe failed")
+                continue
+            if capabilities.get("ready"):
+                return
 
     def _root(self, task_id: str) -> Path:
         task_root = self.store._task(task_id)
@@ -683,7 +727,7 @@ class JobService:
                         self.service.require_runtime_ready()
                 except RuntimeUnavailableError as error:
                     if record["operation"] == "clarification.generate":
-                        self.service.fail_clarification_for_runtime(task_id, error)
+                        self.service.wait_clarification_for_runtime(task_id, error)
                     raise
                 with bind_agent_audit_context(task_id=task_id, job_id=job_id):
                     result = self._invoke(record["operation"], task_id, record["payload"])
@@ -718,6 +762,8 @@ class JobService:
         except Exception as error:
             if isinstance(error, GatewayError):
                 self.service.record_runtime_failure(error)
+                if isinstance(error,GatewayUnknownResult):
+                    self.schedule_runtime_recovery()
             if record.get("operation") == "clarification.generate":
                 try:
                     # Recovery is deliberately outside the expired execution
