@@ -164,7 +164,7 @@ class RepresentativeSampleTests(unittest.TestCase):
 class StateAndEvidenceIntegrityTests(unittest.TestCase):
     def test_blocker_state_is_derived_across_disposition_staleness_reinspection_and_delivery(self):
         with tempfile.TemporaryDirectory() as root:
-            service = TaskService(WorkspaceStore(root), inspector=BlockingInspector())
+            service = TaskService(WorkspaceStore(root), inspector=BlockingInspector(), browser_inspector=DuplicateBrowserEvidence())
             prepare_deck(service)
             inspected = service.run_inspection("task", 0)
             self.assertFalse(inspected["state"]["blockers_resolved"])
@@ -180,6 +180,7 @@ class StateAndEvidenceIntegrityTests(unittest.TestCase):
             self.assertFalse(stale["state"]["blockers_resolved"])
 
             service.inspector = PassingInspector()
+            service.browser_inspector = None
             fresh = service.run_inspection("task", 0)
             self.assertTrue(fresh["state"]["blockers_resolved"])
             self.assertTrue(fresh["evidence_trace"]["valid"])

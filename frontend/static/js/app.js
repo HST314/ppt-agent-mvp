@@ -1,11 +1,11 @@
-import { api, ApiError } from "./api.js?v=2026.08.22.130610852096";
-import { JobTracker } from "./job-tracker.js?v=2026.08.22.130610852096";
-import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.22.130610852096";
-import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.22.130610852096";
-import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.22.130610852096";
-import { inlineError, setBusy } from "./components/index.js?v=2026.08.22.130610852096";
-import { renderStage } from "./stages/index.js?v=2026.08.22.130610852096";
-import { setVersionMatchGuard } from "./stages/shared.js?v=2026.08.22.130610852096";
+import { api, ApiError } from "./api.js?v=2026.08.22.144845041702";
+import { JobTracker } from "./job-tracker.js?v=2026.08.22.144845041702";
+import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.22.144845041702";
+import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.22.144845041702";
+import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.22.144845041702";
+import { inlineError, setBusy } from "./components/index.js?v=2026.08.22.144845041702";
+import { renderStage } from "./stages/index.js?v=2026.08.22.144845041702";
+import { setVersionMatchGuard } from "./stages/shared.js?v=2026.08.22.144845041702";
 
 const app = document.getElementById("app");
 const APP_BUILD = document.querySelector('meta[name="app-build"]')?.content || "unknown";

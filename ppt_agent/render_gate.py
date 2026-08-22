@@ -11,8 +11,26 @@ from .design_contract import validate_presentation_technical_contract
 from .errors import ValidationError
 
 
-_OVERFLOW_CODES = {"content_out_of_bounds", "element_scroll_overflow", "canvas_size", "slide_sequence_mismatch"}
-_HARD_BROWSER_CODES = _OVERFLOW_CODES | {"render_unavailable", "invalid_measurement", "empty_slide", "broken_image", "missing_title", "title_too_small", "text_too_small"}
+TECHNICAL_GATE_SCHEMA_VERSION = "2.0"
+OVERFLOW_CODES = frozenset({
+    "content_out_of_bounds",
+    "slide_scroll_overflow",
+    "element_scroll_overflow",
+    "canvas_size",
+    "slide_sequence_mismatch",
+})
+TECHNICAL_BROWSER_BLOCKER_CODES = OVERFLOW_CODES | frozenset({
+    "render_unavailable",
+    "invalid_measurement",
+    "empty_slide",
+    "broken_image",
+})
+TECHNICAL_CONTRACT_BLOCKER_CODES = frozenset({
+    "contract_slide_sequence",
+    "contract_hash_mismatch",
+    "slide_contract_hash_mismatch",
+})
+TECHNICAL_GATE_BLOCKER_CODES = TECHNICAL_BROWSER_BLOCKER_CODES | TECHNICAL_CONTRACT_BLOCKER_CODES
 
 
 def canonical_post_render_evidence(evidence: dict[str, Any]) -> bytes:
@@ -96,142 +114,253 @@ def inspect_contract(html_text: str, expected_slide_ids: list[str], contract: di
     }
 
 
-def run_post_render_gate(
-    html_text: str,
-    *,
-    expected_slide_ids: list[str],
-    contract: dict[str, Any],
-    contract_hash: str,
-    claim_ledger: dict[str, Any],
-    claim_ledger_hash: str,
-    required_claim_ids: list[str] | tuple[str, ...] | set[str] | None = None,
-    required_claim_ids_by_slide: dict[str, list[str]] | None = None,
-    html_by_slide: dict[str, str] | None = None,
-    browser_inspector=None,
-    overflow_autofit: dict[str, Any] | None = None,
-    canonical_validation: dict[str, Any] | None = None,
-    generation_attempt_evidence_hashes: list[str] | tuple[str, ...] | None = None,
-) -> dict[str, Any]:
-    validate_claim_ledger(claim_ledger)
-    structure = inspect_contract(html_text, expected_slide_ids, contract, contract_hash)
-    structural_signatures = (canonical_validation or {}).get("structural_signatures") or {}
-    if structural_signatures.get("applicable"):
-        checked = int(structural_signatures.get("checked_slide_count") or 0)
-        matched = int(structural_signatures.get("matched_slide_count") or 0)
-        structure = {
-            **structure,
-            "structural_signature_checked_count": checked,
-            "structural_signature_matched_count": matched,
-            "structural_signature_percent": round(matched * 100 / checked, 2) if checked else 0,
-        }
-    claims = audit_html_claims(html_text, claim_ledger, required_claim_ids=required_claim_ids)
-    page_claims = None
-    if required_claim_ids_by_slide is not None:
-        if html_by_slide is None:
-            raise ValidationError("逐页 required claim 门禁缺少页面片段")
-        if list(required_claim_ids_by_slide) != expected_slide_ids or list(html_by_slide) != expected_slide_ids:
-            raise ValidationError("逐页 required claim 门禁顺序与预期页面不一致")
-        page_claims = audit_html_claims_by_slide(html_by_slide, claim_ledger, required_claim_ids_by_slide)
-    browser = None
-    browser_blockers = []
-    if browser_inspector is not None:
-        browser = browser_inspector.inspect(html_text, expected_slide_ids)
-        for issue in browser.get("issues", []) if isinstance(browser, dict) else []:
-            if issue.get("severity") == "blocker" or issue.get("code") in _HARD_BROWSER_CODES:
-                browser_blockers.append(issue)
-        if not isinstance(browser, dict) or not browser.get("available"):
-            if not any(item.get("code") == "render_unavailable" for item in browser_blockers):
-                browser_blockers.append({"code": "render_unavailable", "severity": "blocker", "evidence": "Chromium 未返回可用测量"})
-        elif not browser.get("passed") and not browser_blockers:
-            browser_blockers.append({"code": "invalid_measurement", "severity": "blocker", "evidence": "Chromium 测量失败但未返回问题"})
-    blockers = [
-        *[{"source": "design_contract", **item} for item in structure["issues"]],
-        *[{
-            "source": "claim_ledger", "code": "unbound_claim", "evidence": item["value"],
-        } for item in claims["unbound"]],
-        *[{
-            "source": "claim_ledger", "code": "missing_required_claim", "evidence": item["value"],
-            **({"slide_id": item["slide_id"]} if item.get("slide_id") else {}),
-        } for item in (page_claims or claims)["missing_required"]],
-        *([] if canonical_validation is None or canonical_validation.get("passed") else [{
-            "source": "canonical_validator",
-            "code": "canonical_validation_failed",
-            "evidence": "; ".join(canonical_validation.get("errors", [])[:5]) or "canonical validator 未通过",
-        }]),
-        *[{"source": "chromium", **item} for item in browser_blockers],
-    ]
-    overflow = [item for item in browser_blockers if item.get("code") in _OVERFLOW_CODES]
-    autofit = None if overflow_autofit is None else dict(overflow_autofit)
-    if autofit is not None:
-        # The final post-render Chromium inspection is the authoritative
-        # terminal state.  The bounded autofit loop can apply its last rule
-        # at the round limit and return before its bookkeeping observes the
-        # now-green document.  Promote that exact green state only when no
-        # deterministic target remains; a real residual overflow always
-        # stays fail-closed.
-        terminal_geometry_green = (
-            isinstance(browser, dict)
-            and bool(browser.get("available"))
-            and bool(browser.get("passed"))
-            and not browser_blockers
-        )
-        if terminal_geometry_green and autofit.get("remaining") == []:
-            autofit["converged"] = True
-        elif overflow:
-            autofit["converged"] = False
-    evidence = {
-        "passed": not blockers,
-        "blocker_count": len(blockers),
-        "blockers": blockers,
-        "presentation_technical_contract_hash": contract_hash,
-        # Compatibility alias for persisted records created before the
-        # PresentationTechnicalContract split.
-        "design_contract_hash": contract_hash,
-        "claim_ledger_hash": claim_ledger_hash,
-        "rendered_html_hash": hashlib.sha256(html_text.encode()).hexdigest(),
-        "layout": structure,
-        "claims": {
-            "binding_count": claims["binding_count"],
-            "unbound_count": claims["unbound_count"],
-            "unbound": claims["unbound"],
-            "required_count": (page_claims or claims)["required_count"],
-            "covered_required_count": (page_claims or claims)["covered_required_count"],
-            "covered_required_claim_ids": claims["covered_required_claim_ids"],
-            "missing_required_count": (page_claims or claims)["missing_required_count"],
-            "missing_required": (page_claims or claims)["missing_required"],
-            "required_claim_ids_by_slide": required_claim_ids_by_slide,
-            "page_coverage": None if page_claims is None else {
-                slide_id: {
-                    "required_count": page["required_count"],
-                    "covered_required_count": page["covered_required_count"],
-                    "covered_required_claim_ids": page["covered_required_claim_ids"],
-                    "missing_required_count": page["missing_required_count"],
-                    "missing_required": page["missing_required"],
-                    "text_hash": page["text_hash"],
+class TechnicalGate:
+    """The only authority which may turn presentation findings into blockers.
+
+    Design, content, canonical DOM and Skill-owned findings remain auditable,
+    but only the explicit technical code sets above can stop generation or
+    delivery.  Keeping the classifier here prevents adapters from promoting a
+    subjective finding merely by labelling it ``severity=blocker``.
+    """
+
+    schema_version = TECHNICAL_GATE_SCHEMA_VERSION
+    blocker_codes = TECHNICAL_GATE_BLOCKER_CODES
+    browser_blocker_codes = TECHNICAL_BROWSER_BLOCKER_CODES
+
+    @classmethod
+    def is_browser_blocker(cls, issue: Any) -> bool:
+        return isinstance(issue, dict) and issue.get("code") in cls.browser_blocker_codes
+
+    @classmethod
+    def is_inspection_blocker(cls, issue: Any) -> bool:
+        if not isinstance(issue, dict) or issue.get("code") not in cls.browser_blocker_codes:
+            return False
+        sources = issue.get("sources")
+        if not isinstance(sources, (list, tuple, set)):
+            sources = [issue.get("source")]
+        return "technical_browser" in sources
+
+    @classmethod
+    def normalize_inspection_severity(cls, issue: dict[str, Any]) -> str:
+        return "blocker" if cls.is_inspection_blocker(issue) else "warning"
+
+    @staticmethod
+    def validate_candidate_html(html_text: str, expected_slide_ids: list[str], allowed_assets=()) -> str:
+        """Apply the canonical HTML/schema/resource/safety validator."""
+        from .p4 import validate_html
+
+        return validate_html(html_text, expected_slide_ids, allowed_assets)
+
+    @classmethod
+    def browser_blockers(cls, evidence: Any) -> list[dict[str, Any]]:
+        issues = evidence.get("issues", []) if isinstance(evidence, dict) else []
+        issues = issues if isinstance(issues, list) else []
+        blockers = [dict(item) for item in issues if cls.is_browser_blocker(item)]
+        if not isinstance(evidence, dict) or not evidence.get("available"):
+            if not any(item.get("code") == "render_unavailable" for item in blockers):
+                blockers.append({
+                    "code": "render_unavailable",
+                    "severity": "blocker",
+                    "evidence": "Chromium 未返回可用测量",
+                })
+        elif not evidence.get("passed") and not blockers and not issues:
+            blockers.append({
+                "code": "invalid_measurement",
+                "severity": "blocker",
+                "evidence": "Chromium 测量失败且未返回可分类证据",
+            })
+        return blockers
+
+    @classmethod
+    def evaluate(
+        cls,
+        html_text: str,
+        *,
+        expected_slide_ids: list[str],
+        contract: dict[str, Any],
+        contract_hash: str,
+        claim_ledger: dict[str, Any],
+        claim_ledger_hash: str,
+        required_claim_ids: list[str] | tuple[str, ...] | set[str] | None = None,
+        required_claim_ids_by_slide: dict[str, list[str]] | None = None,
+        html_by_slide: dict[str, str] | None = None,
+        browser_inspector=None,
+        overflow_autofit: dict[str, Any] | None = None,
+        canonical_validation: dict[str, Any] | None = None,
+        generation_attempt_evidence_hashes: list[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, Any]:
+        validate_claim_ledger(claim_ledger)
+        structure = inspect_contract(html_text, expected_slide_ids, contract, contract_hash)
+        structural_signatures = (canonical_validation or {}).get("structural_signatures") or {}
+        if structural_signatures.get("applicable"):
+            checked = int(structural_signatures.get("checked_slide_count") or 0)
+            matched = int(structural_signatures.get("matched_slide_count") or 0)
+            structure = {
+                **structure,
+                "structural_signature_checked_count": checked,
+                "structural_signature_matched_count": matched,
+                "structural_signature_percent": round(matched * 100 / checked, 2) if checked else 0,
+            }
+        claims = audit_html_claims(html_text, claim_ledger, required_claim_ids=required_claim_ids)
+        page_claims = None
+        if required_claim_ids_by_slide is not None:
+            if html_by_slide is None:
+                raise ValidationError("逐页 required claim 检查缺少页面片段")
+            if list(required_claim_ids_by_slide) != expected_slide_ids or list(html_by_slide) != expected_slide_ids:
+                raise ValidationError("逐页 required claim 检查顺序与预期页面不一致")
+            page_claims = audit_html_claims_by_slide(html_by_slide, claim_ledger, required_claim_ids_by_slide)
+
+        browser = None
+        if browser_inspector is not None:
+            try:
+                browser = browser_inspector.inspect(html_text, expected_slide_ids)
+            except Exception:
+                browser = {
+                    "available": False,
+                    "passed": False,
+                    "issues": [{
+                        "code": "render_unavailable",
+                        "severity": "blocker",
+                        "evidence": "Chromium 渲染检查异常终止",
+                    }],
                 }
-                for slide_id, page in page_claims["pages"].items()
+        browser_blockers = [] if browser_inspector is None else cls.browser_blockers(browser)
+        browser_issues = browser.get("issues", []) if isinstance(browser, dict) and isinstance(browser.get("issues"), list) else []
+
+        blockers = [
+            *[{"source": "presentation_technical_contract", **item} for item in structure["issues"]],
+            *[{"source": "chromium", **item, "severity": "blocker"} for item in browser_blockers],
+        ]
+        advisories = [
+            *[{
+                "source": "claim_ledger",
+                "category": "content_quality",
+                "severity": "warning",
+                "code": "unbound_claim",
+                "evidence": item["value"],
+            } for item in claims["unbound"]],
+            *[{
+                "source": "claim_ledger",
+                "category": "content_quality",
+                "severity": "warning",
+                "code": "missing_required_claim",
+                "evidence": item["value"],
+                **({"slide_id": item["slide_id"]} if item.get("slide_id") else {}),
+            } for item in (page_claims or claims)["missing_required"]],
+            *[{
+                "source": "chromium",
+                "category": "visual_quality",
+                **item,
+                "severity": "warning",
+            } for item in browser_issues if not cls.is_browser_blocker(item)],
+        ]
+        if canonical_validation is not None and (
+            canonical_validation.get("passed") is False
+            or structural_signatures.get("applicable")
+        ):
+            advisories.append({
+                "source": "canonical_validator",
+                "category": "skill_or_dom_guidance",
+                "severity": "warning",
+                "code": "canonical_validation_advisory",
+                "evidence": "; ".join(str(item) for item in canonical_validation.get("errors", [])[:5])
+                or "canonical/DOM 检查结果仅供参考",
+            })
+
+        overflow = [item for item in browser_blockers if item.get("code") in OVERFLOW_CODES]
+        autofit = None if overflow_autofit is None else dict(overflow_autofit)
+        if autofit is not None:
+            # The final Chromium inspection is authoritative.  A real
+            # residual overflow stays fail-closed; advisory findings do not
+            # prevent an otherwise green terminal geometry state.
+            terminal_geometry_green = (
+                isinstance(browser, dict)
+                and bool(browser.get("available"))
+                and not browser_blockers
+            )
+            if terminal_geometry_green and autofit.get("remaining") == []:
+                autofit["converged"] = True
+            elif overflow:
+                autofit["converged"] = False
+        evidence = {
+            "gate_type": "technical_gate",
+            "schema_version": cls.schema_version,
+            "hard_blocker_codes": sorted(cls.blocker_codes),
+            "passed": not blockers,
+            "blocker_count": len(blockers),
+            "blockers": blockers,
+            "advisory_count": len(advisories),
+            "advisories": advisories,
+            "presentation_technical_contract_hash": contract_hash,
+            # Compatibility alias for persisted records created before the
+            # PresentationTechnicalContract split.
+            "design_contract_hash": contract_hash,
+            "claim_ledger_hash": claim_ledger_hash,
+            "rendered_html_hash": hashlib.sha256(html_text.encode()).hexdigest(),
+            "layout": structure,
+            "claims": {
+                "advisory": True,
+                "binding_count": claims["binding_count"],
+                "unbound_count": claims["unbound_count"],
+                "unbound": claims["unbound"],
+                "required_count": (page_claims or claims)["required_count"],
+                "covered_required_count": (page_claims or claims)["covered_required_count"],
+                "covered_required_claim_ids": claims["covered_required_claim_ids"],
+                "missing_required_count": (page_claims or claims)["missing_required_count"],
+                "missing_required": (page_claims or claims)["missing_required"],
+                "required_claim_ids_by_slide": required_claim_ids_by_slide,
+                "page_coverage": None if page_claims is None else {
+                    slide_id: {
+                        "required_count": page["required_count"],
+                        "covered_required_count": page["covered_required_count"],
+                        "covered_required_claim_ids": page["covered_required_claim_ids"],
+                        "missing_required_count": page["missing_required_count"],
+                        "missing_required": page["missing_required"],
+                        "text_hash": page["text_hash"],
+                    }
+                    for slide_id, page in page_claims["pages"].items()
+                },
+                "text_hash": claims["text_hash"],
             },
-            "text_hash": claims["text_hash"],
-        },
-        "canonical_validator": canonical_validation,
-        "generation_attempt_evidence_hashes": list(generation_attempt_evidence_hashes or ()),
-        "geometry": {
-            "available": browser is not None and bool(browser.get("available")),
-            "passed": None if browser is None else bool(browser.get("passed")) and not browser_blockers,
-            "overflow_count": len(overflow),
-            "blocker_count": len(browser_blockers),
-            "engine": None if browser is None else browser.get("engine"),
-            "engine_version": None if browser is None else browser.get("engine_version"),
-            "viewport": None if browser is None else browser.get("viewport"),
-        },
-        "overflow_autofit": autofit,
-    }
-    return seal_post_render_evidence(evidence)
+            "canonical_validator": None if canonical_validation is None else {
+                **canonical_validation,
+                "advisory": True,
+            },
+            "generation_attempt_evidence_hashes": list(generation_attempt_evidence_hashes or ()),
+            "geometry": {
+                "available": browser is not None and bool(browser.get("available")),
+                "passed": None if browser is None else bool(browser.get("available")) and not browser_blockers,
+                "overflow_count": len(overflow),
+                "blocker_count": len(browser_blockers),
+                "engine": None if browser is None else browser.get("engine"),
+                "engine_version": None if browser is None else browser.get("engine_version"),
+                "viewport": None if browser is None else browser.get("viewport"),
+            },
+            "overflow_autofit": autofit,
+        }
+        return seal_post_render_evidence(evidence)
+
+    @classmethod
+    def enforce(cls, *args, **kwargs) -> dict[str, Any]:
+        evidence = cls.evaluate(*args, **kwargs)
+        if evidence["blockers"]:
+            summary = "；".join(f"{item.get('code')}:{item.get('evidence', '')}" for item in evidence["blockers"][:5])
+            raise ValidationError(f"TechnicalGate 未通过：{summary}")
+        return evidence
+
+    @staticmethod
+    def verify_delivery_package(root):
+        """Run the canonical offline package completeness and safety check."""
+        from .offline import verify_delivery
+
+        return verify_delivery(root)
+
+
+def run_post_render_gate(*args, **kwargs) -> dict[str, Any]:
+    """Compatibility wrapper for callers using the pre-refactor API name."""
+    return TechnicalGate.evaluate(*args, **kwargs)
 
 
 def enforce_post_render_gate(*args, **kwargs) -> dict[str, Any]:
-    evidence = run_post_render_gate(*args, **kwargs)
-    if evidence["blockers"]:
-        summary = "；".join(f"{item.get('code')}:{item.get('evidence', '')}" for item in evidence["blockers"][:5])
-        raise ValidationError(f"渲染后硬门禁未通过：{summary}")
-    return evidence
+    """Compatibility wrapper for callers using the pre-refactor API name."""
+    return TechnicalGate.enforce(*args, **kwargs)

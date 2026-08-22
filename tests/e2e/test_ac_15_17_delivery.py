@@ -19,6 +19,12 @@ class BlockingInspector:
         return {"passed":False,"issues":[{"issue_id":"overflow","severity":"blocker","level":"element","code":"overflow","message":"元素溢出","slide_id":"slide-1","element_id":"title","evidence":"超出边界","suggestion":"缩小字号"}],"model":"fixture"}
 
 
+class TechnicalBlockingBrowserInspector:
+    enforce_on_generation=False
+    def inspect(self,html,slide_ids):
+        return {"available":True,"passed":False,"engine":"chromium","engine_version":"test","viewport":{"width":1280,"height":720},"slides":[],"issues":[{"issue_id":"browser-overflow","severity":"blocker","level":"element","code":"content_out_of_bounds","message":"元素溢出","slide_id":slide_ids[0],"element_id":"title","evidence":"DOM geometry exceeds slide by 20px","suggestion":"收紧内容"}]}
+
+
 class BlockingBuilder:
     def __init__(self):
         self.started=threading.Event(); self.release=threading.Event()
@@ -36,8 +42,8 @@ class WarningInspector:
 class DeliveryGateTests(unittest.TestCase):
     """发布门禁：无新鲜报告或阻断问题未清零时禁止首次写包；重放保持幂等。"""
 
-    def _drive_to_deck(self, inspector):
-        tmp=tempfile.TemporaryDirectory(); store=WorkspaceStore(tmp.name); svc=TaskService(store,inspector=inspector)
+    def _drive_to_deck(self, inspector, browser_inspector=None):
+        tmp=tempfile.TemporaryDirectory(); store=WorkspaceStore(tmp.name); svc=TaskService(store,inspector=inspector,browser_inspector=browser_inspector)
         self.addCleanup(tmp.cleanup)
         svc.create("task","manual")
         svc.import_input("task",{"goal":"发布","audience":"客户","topic":"方案","页数":3})
@@ -52,7 +58,7 @@ class DeliveryGateTests(unittest.TestCase):
         self.assertEqual(svc.versions("task","delivery"),[])
 
     def test_publish_blocked_with_unresolved_blocker_then_allowed_after_disposition(self):
-        svc=self._drive_to_deck(BlockingInspector())
+        svc=self._drive_to_deck(PassingInspector(),TechnicalBlockingBrowserInspector())
         svc.run_inspection("task",0)
         with self.assertRaises(ConflictError): svc.assert_delivery_gate("task")
         issue=svc.inspection_view("task")["blocking_issues"][0]
@@ -82,7 +88,7 @@ class FinalizeGateTests(unittest.TestCase):
     """定稿门禁：阻断问题未清零时禁止默认定稿；带风险定稿必须显式选择、留痕，且不放松发布门禁。"""
 
     def _drive_to_review_with_blocker(self):
-        tmp=tempfile.TemporaryDirectory(); store=WorkspaceStore(tmp.name); svc=TaskService(store,inspector=BlockingInspector())
+        tmp=tempfile.TemporaryDirectory(); store=WorkspaceStore(tmp.name); svc=TaskService(store,inspector=PassingInspector(),browser_inspector=TechnicalBlockingBrowserInspector())
         self.addCleanup(tmp.cleanup)
         svc.create("task","manual")
         svc.import_input("task",{"goal":"发布","audience":"客户","topic":"方案","页数":3})
@@ -151,7 +157,8 @@ class FinalizeGateTests(unittest.TestCase):
 
     def test_standard_finalize_after_disposition_is_not_labeled_risk(self):
         svc=self._drive_to_review_with_blocker()
-        svc.dispose_issue("task","overflow","waive","演示口径接受该越界")
+        issue=svc.inspection_view("task")["blocking_issues"][0]
+        svc.dispose_issue("task",issue["issue_id"],"waive","演示口径接受该越界")
         deck=svc.deck_view("task")["deck"]
         finalization=svc.finalize_deck("task",deck["hash"],"review")["finalization"]
         self.assertEqual(finalization["finalization_mode"],"standard")

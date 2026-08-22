@@ -28,11 +28,13 @@ class AC12ModesE2E(SampleJourney):
         auto=self.ok("/v1/tasks/journey/inspection/run", {"max_rounds":2})
         self.assertTrue(auto["report"]["passed"]); self.assertEqual(auto["rounds"],0)
 
-    def test_disposition_audit_and_delivery_blocker_gate(self):
+    def test_semantic_disposition_is_advisory_to_delivery_gate(self):
         self.prepare(SequenceInspector())
         result=self.ok("/v1/tasks/journey/inspection/run", {"max_rounds":0})
-        status,raw=self.call("POST","/v1/tasks/journey/inspection/delivery-gate",{})
-        self.assertTrue(status.startswith("409"),raw)
+        gate=self.ok("/v1/tasks/journey/inspection/delivery-gate",{})
+        self.assertTrue(gate["delivery_allowed"])
+        self.assertEqual(result["blocking_issues"],[])
+        self.assertEqual(result["unresolved"][0]["severity"],"warning")
         disposed=self.ok("/v1/tasks/journey/issues/overflow/disposition", {"action":"waive","rationale":"用户接受该版式风险"})
         item=disposed["dispositions"][-1]
         self.assertEqual(item["actor"],"user"); self.assertEqual(item["target_deck_hash"],result["deck"]["hash"])

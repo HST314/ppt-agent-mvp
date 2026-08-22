@@ -142,7 +142,7 @@ class P0HybridInspectionTests(unittest.TestCase):
             self.assertFalse(metadata["browser_evidence"]["passed"])
             self.assertEqual(metadata["browser_evidence"]["issue_count"], 1)
 
-    def test_deterministic_semantic_gate_merges_with_model_and_browser_checks(self):
+    def test_deterministic_semantic_findings_are_advisory_to_delivery(self):
         with tempfile.TemporaryDirectory() as root:
             service = TaskService(
                 WorkspaceStore(root),
@@ -161,9 +161,11 @@ class P0HybridInspectionTests(unittest.TestCase):
 
             placeholders = [item for item in result["report"]["issues"] if item["code"] == "placeholder_token"]
             self.assertGreaterEqual(len(placeholders), 2)
-            self.assertTrue(all(item["severity"] == "blocker" for item in placeholders))
+            self.assertTrue(all(item["severity"] == "warning" for item in placeholders))
             self.assertTrue(all(item["source"] == "semantic_deterministic" for item in placeholders))
-            self.assertFalse(result["delivery_allowed"])
+            self.assertFalse(result["report"]["passed"])
+            self.assertTrue(result["delivery_allowed"])
+            self.assertFalse(result["blocking_issues"])
             metadata = result["report"]["metadata"]
             self.assertTrue(metadata["includes_content_quality"])
             self.assertTrue(metadata["includes_browser_render"])

@@ -18,10 +18,35 @@ from ppt_agent.web import create_app
 class Inspector:
     def inspect(self, outline, html):
         return {"passed": False, "issues": [
-            {"issue_id": "overflow-1", "severity": "blocker", "level": "element", "code": "overflow", "message": "元素溢出", "slide_id": "slide-1", "element_id": "title", "evidence": "越界", "suggestion": "缩小"},
+            {"issue_id": "overflow-1", "severity": "blocker", "level": "element", "code": "content_out_of_bounds", "message": "元素溢出", "slide_id": "slide-1", "element_id": "title", "evidence": "越界", "suggestion": "缩小"},
             {"issue_id": "overflow-2", "severity": "warning", "level": "element", "code": "overflow", "message": "元素溢出", "slide_id": "slide-2", "element_id": "title", "evidence": "越界", "suggestion": "缩小"},
             {"issue_id": "density", "severity": "warning", "level": "slide", "code": "density", "message": "页面过密", "slide_id": "slide-2", "element_id": None, "evidence": "过密", "suggestion": "精简"},
         ]}
+
+
+class TechnicalBrowserInspector:
+    enforce_on_generation = False
+
+    def inspect(self, html, slide_ids):
+        return {
+            "available": True,
+            "passed": False,
+            "engine": "chromium",
+            "engine_version": "test",
+            "viewport": {"width": 1280, "height": 720},
+            "slides": [],
+            "issues": [{
+                "issue_id": "browser-overflow-1",
+                "severity": "blocker",
+                "level": "element",
+                "code": "content_out_of_bounds",
+                "message": "元素溢出",
+                "slide_id": slide_ids[0],
+                "element_id": "title",
+                "evidence": "DOM geometry exceeds slide by 20px",
+                "suggestion": "收紧内容",
+            }],
+        }
 
 
 def free_port():
@@ -32,6 +57,7 @@ def free_port():
 
 class InspectionPageBrowserBase(unittest.TestCase):
     inspector = None
+    browser_inspector = None
 
     @classmethod
     def setUpClass(cls):
@@ -45,7 +71,7 @@ class InspectionPageBrowserBase(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.svc = TaskService(WorkspaceStore(self.tmp.name), inspector=self.inspector)
+        self.svc = TaskService(WorkspaceStore(self.tmp.name), inspector=self.inspector, browser_inspector=self.browser_inspector)
         self.svc.create("task")
         self.svc.import_input("task", {"goal": "发布", "audience": "客户", "topic": "方案", "页数": 3})
         self.svc.generate_narrative("task"); self.svc.confirm_narrative("task")
@@ -76,9 +102,10 @@ class InspectionPageBrowserBase(unittest.TestCase):
 
 class InspectionPageBrowserTests(InspectionPageBrowserBase):
     inspector = Inspector()
+    browser_inspector = TechnicalBrowserInspector()
 
     def test_locate_highlights_preview_and_batch_keeps_same_code(self):
-        group = self.page.locator(".issue-group").filter(has_text="slide-1 · overflow")
+        group = self.page.locator(".issue-group").filter(has_text="slide-1 · content_out_of_bounds")
         group.get_by_role("button", name="定位").click()
         frame = self.page.frame_locator("#deck-preview-frame")
         self.assertEqual(frame.locator('[data-element-id="title"]').first.get_attribute("data-inspection-highlight"), "true")
@@ -117,7 +144,7 @@ class InspectionPageBrowserTests(InspectionPageBrowserBase):
         self.assertEqual(len(ids), 6)
         self.assertEqual(len(ids), len(set(ids)))
         # 可读前缀保留分区与清洗后 slide/code，尾部摘要保证全局唯一。
-        self.assertTrue(any(id_.startswith("group-action-blocker-slide-1-overflow-") for id_ in ids))
+        self.assertTrue(any(id_.startswith("group-action-blocker-slide-1-content_out_of_bounds-") for id_ in ids))
         self.assertTrue(any(id_.startswith("group-action-warning-slide-2-overflow-") for id_ in ids))
         # 每组 label 可达，且按 ID 解析回本组控件而非页面内同 ID 副本。
         for index in range(groups.count()):

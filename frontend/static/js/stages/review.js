@@ -1,7 +1,7 @@
-import { api } from "../api.js?v=2026.08.22.130610852096";
-import { badge, button, confirmationDialog, element, field, metadataList, shortHash, versionTimeline } from "../components/index.js?v=2026.08.22.130610852096";
-import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.22.130610852096";
-import { comparePanel, deckPreview, modificationPanel } from "./deck.js?v=2026.08.22.130610852096";
+import { api } from "../api.js?v=2026.08.22.144845041702";
+import { badge, button, confirmationDialog, element, field, metadataList, shortHash, versionTimeline } from "../components/index.js?v=2026.08.22.144845041702";
+import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.22.144845041702";
+import { comparePanel, deckPreview, modificationPanel } from "./deck.js?v=2026.08.22.144845041702";
 
 export async function render(context) {
   const [view, deckView, settings] = await Promise.all([api.inspection(context.taskId, context.controller), api.deck(context.taskId, context.controller), api.settings(context.controller)]);
@@ -30,8 +30,8 @@ function reviewStage(view, deckView, defaultRounds, context) {
     mutable ? inspectionControls(view, defaultRounds, context) : null,
     mutable && view.deck ? modificationPanel(view.deck, context) : null,
     report?.stale ? section("检查报告已过期", element("div", { className: "notice notice--warning" }, [element("strong", { text: "当前全稿已变化" }), element("p", { text: "旧报告仍可追溯，若需最新质量结论请重新检查；也可以带该状态直接确定终稿。" })])) : null,
-    report ? section("阻断问题", mutable ? issueGroup(blockers, active, context, preview, location) : readOnlyIssueGroup(blockers, active, preview, location), { description: mutable ? `${blockers.length} 项 · 按页面与根因分组；修复、记录处置或带遗留问题确定终稿。` : `${blockers.length} 项；终稿冻结后仅供追溯。` }) : null,
-    report ? section("普通警告", mutable ? issueGroup(warnings, active, context, preview, location) : readOnlyIssueGroup(warnings, active, preview, location), { description: mutable ? `${warnings.length} 项 · 按页面与根因分组；处置可追溯，但不阻断终稿确认。` : `${warnings.length} 项；终稿冻结后仅供追溯。` }) : null,
+    report ? section("技术阻断问题", mutable ? issueGroup(blockers, active, context, preview, location) : readOnlyIssueGroup(blockers, active, preview, location), { description: mutable ? `${blockers.length} 项 · 仅包含 TechnicalGate 认定的渲染、越界、资源或安全失败。` : `${blockers.length} 项；终稿冻结后仅供追溯。` }) : null,
+    report ? section("Advisory 建议", mutable ? issueGroup(warnings, active, context, preview, location) : readOnlyIssueGroup(warnings, active, preview, location), { description: mutable ? `${warnings.length} 项 · canonical/DOM、Skill、字体、视觉与内容检查可追溯，但不改变交付门禁。` : `${warnings.length} 项；终稿冻结后仅供追溯。` }) : null,
     view.deck ? comparePanel(deckView, context) : null,
   ], [
     section("检查摘要", report ? [
@@ -39,7 +39,7 @@ function reviewStage(view, deckView, defaultRounds, context) {
       metadataList([["报告 hash", shortHash(report.hash)], ["候选 hash", shortHash(report.deck_hash)], ["检查范围", report.metadata?.scope || "full"], ["修复轮次", report.metadata?.round ?? 0], ["问题总数", issues.length], ["未处置", view.unresolved?.length || 0], ["证据溯源", view.evidence_trace?.valid ? `完整 · ${view.evidence_trace.reference_count} 条引用` : "缺失或失配"]]),
     ] : [badge("尚未检查", "warning"), element("p", { className: "muted", text: "生成全稿后执行独立检查。" })]),
     visualQualitySummary(report),
-    section("终稿策略", [badge("发布前强制预检", "primary"), element("p", { className: "muted", text: "存在未处置阻断问题时禁止默认定稿，只能显式选择带风险定稿并留痕；未检查、报告过期或仅剩警告时仍可确定终稿并记录状态；发布离线包始终要求新鲜报告且阻断清零。" })]),
+    section("终稿策略", [badge("发布前 TechnicalGate", "primary"), element("p", { className: "muted", text: "只有未处置的技术阻断会禁止默认定稿与发布；canonical/DOM、Skill、字体、配色、留白、布局语义、视觉一致性与内容检查只作为 advisory。首次发布仍要求新鲜、完整且可验证的检查证据。" })]),
     section("全稿版本", [history, historyMessage]),
     section("检查历史", reportHistory(view)),
   ]);
@@ -59,7 +59,7 @@ function visualQualitySummary(report) {
       ["主题节奏", `${Number(quality.theme_rhythm_score).toFixed(1)} / 100`],
       ["稳定截图", `${quality.screenshot_count || 0} 页`],
     ]),
-    element("p", { className: "muted", text: "评分是可复算的辅助 QA；DesignContract、事实与几何门禁仍是发布硬约束。" }),
+    element("p", { className: "muted", text: "评分是可复算的 advisory QA；只有 TechnicalGate 的画布、渲染、越界、资源和安全问题会阻断发布。" }),
   ]);
 }
 

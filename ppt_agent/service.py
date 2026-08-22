@@ -26,9 +26,9 @@ from .p2 import canonical, digest, now, parse_task_card, questions_for, scan_res
 from .schema import ClarificationSet, ResourceManifest, TaskCard, TaskInputSnapshot
 from .schema import NarrativeDocument, SlideOutline, SampleSelection, DeckArtifact
 from .p3 import assert_narrative_quality, changed_slide_ids, narrative_markdown, narrative_quality_evidence, normalize_outline_markdown, outline_markdown, parse_outline, requested_slide_count, structured_outline_markdown
-from .p4 import apply_presentation_technical_contract, assemble_presentation, controlled_assets, infer_scope, materialize_required_claim_slots, recommend, render, required_sample_targets, validate_html
-from .render_gate import canonical_post_render_evidence, post_render_evidence_hash, run_post_render_gate
-from .offline import localize_delivery_html, offline_assets, offline_performance, offline_player, verify_delivery
+from .p4 import apply_presentation_technical_contract, assemble_presentation, controlled_assets, infer_scope, materialize_required_claim_slots, recommend, render, required_sample_targets
+from .render_gate import TechnicalGate, canonical_post_render_evidence, post_render_evidence_hash
+from .offline import localize_delivery_html, offline_assets, offline_performance, offline_player
 from .overflow_autofit import GEOMETRIC_CODES, MAX_CASCADE_ROUNDS, fit_deck_html
 
 def utcnow(): return datetime.now(timezone.utc).isoformat()
@@ -89,8 +89,8 @@ INSPECTION_SOURCES=frozenset({"semantic_model","semantic_deterministic","technic
 INSPECTION_SOURCE_PRIORITY={"semantic_model":0,"semantic_deterministic":1,"technical_browser":2}
 
 def inspection_hard_gate_passed(issues):
-    """Warnings remain reviewable findings without failing the hard gate."""
-    return not any(isinstance(item,dict) and item.get("severity")=="blocker" for item in issues)
+    """Only TechnicalGate-classified browser failures may fail inspection."""
+    return not any(TechnicalGate.is_inspection_blocker(item) for item in issues)
 
 def inspection_semantic_identity(issue):
     """Return the server-owned identity for a finding, independent of source IDs."""
@@ -127,7 +127,7 @@ def merge_inspection_source_issues(source_items):
             candidate={
                 **original,
                 "issue_id":inspection_semantic_issue_id(original),
-                "severity":original.get("severity","warning"),
+                "severity":TechnicalGate.normalize_inspection_severity({**original,"source":source,"sources":[source]}),
                 "level":identity["level"],
                 "code":original.get("code","quality_issue"),
                 "message":original.get("message","发现质量问题"),
@@ -145,7 +145,7 @@ def merge_inspection_source_issues(source_items):
             origin={"source":source,"issue_id":raw_id}
             if origin not in existing["source_issue_ids"]: existing["source_issue_ids"].append(origin)
             existing["sources"]=list(dict.fromkeys([*existing["sources"],source]))
-            if candidate["severity"]=="blocker": existing["severity"]="blocker"
+            existing["severity"]=TechnicalGate.normalize_inspection_severity(existing)
             if INSPECTION_SOURCE_PRIORITY[source]>=INSPECTION_SOURCE_PRIORITY[existing["source"]]:
                 for field in ("code","message","evidence","suggestion"):
                     existing[field]=candidate[field]
@@ -177,6 +177,7 @@ def _clarification_directive(config: ClarificationConfig, round_number: int) -> 
 class TaskService:
     def __init__(self,store,generator=None,inspector=None,skills=None,builder=None,clarifier=None,clarification_config=None,settings_store=None,browser_inspector=None):
         self.store=store; self.generator=generator or FakeGenerationGateway(); self.inspector=inspector or FakeInspectionGateway(); self.skills=skills or FakeSkillLoader(); self.builder=builder or FakeHtmlBuilder(); self.clarifier=clarifier
+        self.technical_gate=TechnicalGate()
         if browser_inspector is False:
             self.browser_inspector=None
         elif browser_inspector is not None:
@@ -942,11 +943,11 @@ class TaskService:
         required_claim_ids=self._required_claim_ids(task_id,slide_ids,contract,ledger)
         required_claim_ids_by_slide=self._required_claim_ids_by_slide(task_id,slide_ids,ledger)
         html_text=apply_presentation_technical_contract(html_text,contract_value,contract_hash)
-        html_text=validate_html(html_text,slide_ids,assets)
+        html_text=self.technical_gate.validate_candidate_html(html_text,slide_ids,assets)
         html_by_slide=self._slide_fragments(html_text)
         canonical_validation={"applicable":False,"passed":True,"errors":[],"structural_signatures":{"applicable":False}}
         browser=self._generation_browser_gate()
-        first=run_post_render_gate(
+        first=self.technical_gate.evaluate(
             html_text,
             expected_slide_ids=slide_ids,
             contract=contract_value,
@@ -964,13 +965,13 @@ class TaskService:
         if browser is not None and first["geometry"]["overflow_count"]:
             fitted=fit_deck_html(html_text,max_rounds=MAX_CASCADE_ROUNDS)
             if fitted.get("available") and fitted.get("rules"):
-                html_text=validate_html(fitted["html"],slide_ids,assets)
+                html_text=self.technical_gate.validate_candidate_html(fitted["html"],slide_ids,assets)
                 html_by_slide=self._slide_fragments(html_text)
                 autofit={
                     "rules":fitted["rules"],"rounds":fitted["rounds"],
                     "converged":fitted["converged"],"remaining":fitted["remaining"],
                 }
-        evidence=run_post_render_gate(
+        evidence=self.technical_gate.evaluate(
             html_text,
             expected_slide_ids=slide_ids,
             contract=contract_value,
@@ -1000,7 +1001,7 @@ class TaskService:
             raise ConflictError("渲染后门禁 evidence 内容寻址持久化失败")
         if evidence["blockers"]:
             summary="；".join(f"{item.get('code')}:{item.get('evidence','')}" for item in evidence["blockers"][:5])
-            raise ValidationError(f"渲染后硬门禁未通过（evidence {evidence_hash[:12]}）：{summary}")
+            raise ValidationError(f"TechnicalGate 渲染后硬门禁未通过（evidence {evidence_hash[:12]}）：{summary}")
         return html_text,evidence
     def _latest_generation_audit_id(self,task_id,action):
         if not hasattr(self.store,"agent_audits"): return ""
@@ -1059,7 +1060,7 @@ class TaskService:
             )
             aggregate_coverage=None; browser_evidence=None; browser_blockers=[]; autofit=None
             try:
-                candidate=validate_html(candidate,slide_ids,assets)
+                candidate=self.technical_gate.validate_candidate_html(candidate,slide_ids,assets)
                 fragments=self._slide_fragments(candidate)
                 candidate=assemble_presentation(
                     [fragments[slide_id] for slide_id in slide_ids],
@@ -1067,7 +1068,7 @@ class TaskService:
                     design_intent=design_intent,
                     shared_assets=shared_assets,
                 )
-                candidate=validate_html(candidate,slide_ids,assets)
+                candidate=self.technical_gate.validate_candidate_html(candidate,slide_ids,assets)
             except ValidationError as exc:
                 validation_error=exc
             if validation_error is None and ledger and required_ids:
@@ -1083,7 +1084,7 @@ class TaskService:
                     fitted=fit_deck_html(candidate,max_rounds=MAX_CASCADE_ROUNDS)
                     autofit={key:fitted.get(key) for key in ("available","rules","rounds","converged","remaining")}
                     if fitted.get("available") and fitted.get("rules"):
-                        fitted_candidate=validate_html(fitted["html"],slide_ids,assets)
+                        fitted_candidate=self.technical_gate.validate_candidate_html(fitted["html"],slide_ids,assets)
                         fitted_browser=browser.inspect(fitted_candidate,slide_ids)
                         fitted_blockers=hard_browser_blockers(fitted_browser)
                         if not fitted_blockers:
@@ -1137,7 +1138,7 @@ class TaskService:
                 aggregate_coverage=None; page_coverage=None
                 browser_evidence=None; browser_blockers=[]; autofit=None
                 try:
-                    candidate=validate_html(candidate,slide_ids,assets)
+                    candidate=self.technical_gate.validate_candidate_html(candidate,slide_ids,assets)
                 except ValidationError as exc:
                     validation_error=exc
                 if validation_error is None and ledger and required_ids:
@@ -1157,7 +1158,7 @@ class TaskService:
                         fitted=fit_deck_html(candidate,max_rounds=MAX_CASCADE_ROUNDS)
                         autofit={key:fitted.get(key) for key in ("available","rules","rounds","converged","remaining")}
                         if fitted.get("available") and fitted.get("rules"):
-                            fitted_candidate=validate_html(fitted["html"],slide_ids,assets)
+                            fitted_candidate=self.technical_gate.validate_candidate_html(fitted["html"],slide_ids,assets)
                             fitted_browser=browser.inspect(fitted_candidate,slide_ids)
                             fitted_blockers=hard_browser_blockers(fitted_browser)
                             if not fitted_blockers:
@@ -1702,11 +1703,11 @@ class TaskService:
                     context={"rules":meta.get("global_rules",[]),"exceptions":meta.get("local_exceptions",{}),"design_contract":batch_contract,"design_contract_hash":contract["hash"],"claim_ledger":ledger_value,"claim_ledger_hash":ledger["hash"],"required_claims_verbatim":required_claims,"required_claims_by_slide":required_claims_by_slide,"confirmed_design_intent":design_intent,"confirmed_shared_assets":shared_assets},
                 )
                 generation_batches.append({"slide_ids":list(batch),**batch_generation})
-                generated.update(self._slide_fragments(validate_html(partial,batch,assets)))
+                generated.update(self._slide_fragments(self.technical_gate.validate_candidate_html(partial,batch,assets)))
             ordered={**generated,**sample_fragments}
             shell=render(data["markdown"],ids,meta.get("global_rules",[]),meta.get("local_exceptions",{}),assets,contract_value,contract["hash"],design_intent=design_intent,shared_assets=shared_assets)
             html_text=self._replace_slide_fragments(shell,ordered)
-        html_text=validate_html(html_text,ids,assets); deck_fragments=self._slide_fragments(html_text)
+        html_text=self.technical_gate.validate_candidate_html(html_text,ids,assets); deck_fragments=self._slide_fragments(html_text)
         # Confirmed fragments are immutable and are merged by the server for
         # every builder implementation, including deterministic test/fallback
         # builders.
@@ -1806,7 +1807,8 @@ class TaskService:
             if any(source not in INSPECTION_SOURCES for source in sources): raise ValidationError("检查问题来源无效")
             source=max(sources,key=lambda value:INSPECTION_SOURCE_PRIORITY[value])
             source_issues=list(item.get("source_issues") or [])
-            normalized.append({"issue_id":inspection_semantic_issue_id(item),"severity":item.get("severity","warning"),"level":level,"code":item.get("code","quality_issue"),"message":item.get("message","发现质量问题"),"slide_id":identity["slide_id"],"element_id":identity["element_id"],"evidence":item.get("evidence",item.get("message","发现质量问题")),"suggestion":item.get("suggestion","请人工检查并修复"),"source":source,"sources":sources,"evidence_refs":evidence_refs,"source_issues":source_issues})
+            normalized_issue={"issue_id":inspection_semantic_issue_id(item),"level":level,"code":item.get("code","quality_issue"),"message":item.get("message","发现质量问题"),"slide_id":identity["slide_id"],"element_id":identity["element_id"],"evidence":item.get("evidence",item.get("message","发现质量问题")),"suggestion":item.get("suggestion","请人工检查并修复"),"source":source,"sources":sources,"evidence_refs":evidence_refs,"source_issues":source_issues}
+            normalized.append({**normalized_issue,"severity":TechnicalGate.normalize_inspection_severity(normalized_issue)})
         return normalized
 
     def _assert_inspection_evidence(self,task_id,report,fail_closed=True):
@@ -1902,6 +1904,8 @@ class TaskService:
         if report_value is not None:
             if report_value.get("issues")!=expected_issues:
                 errors.append("检查报告 issue 集与 evidence payload 双向绑定不一致")
+            # The quality report may remain red and drive bounded Agent
+            # self-correction even when its findings are advisory to delivery.
             expected_passed=inspection_hard_gate_passed(expected_issues) and all(bool(document["payload"].get("passed",inspection_hard_gate_passed(document["payload"].get("issues",[])))) for document in documents.values())
             if report_value.get("passed") is not expected_passed:
                 errors.append("检查报告 passed 与 evidence payload 不一致")
@@ -2031,7 +2035,7 @@ class TaskService:
         )
         combined=merge_inspection_source_issues(sources)
         merged_counts={source:sum(source in item["sources"] for item in combined) for source,_ in sources}
-        browser_passed=True if browser_evidence is None else bool(browser_evidence.get("available")) and inspection_hard_gate_passed(browser_issues)
+        browser_passed=True if browser_evidence is None else not TechnicalGate.browser_blockers(browser_evidence)
         if isinstance(browser_evidence,dict):
             # Reassert the server-owned hard-gate meaning even when a browser
             # adapter reports ``passed=false`` solely because it emitted an
@@ -2180,7 +2184,7 @@ class TaskService:
             html_text=render(outline,list(deck["metadata"]["page_hashes"]),rules,exceptions,assets,contract_value,contract["hash"])
         else:
             html_text=self.builder.build(outline,action="inspection",slide_ids=list(deck["metadata"]["page_hashes"]),assets=assets,previous_html=deck["html"],inspection_report=report,suggestions=suggestions,affected_slide_ids=affected,design_contract=contract_value,design_contract_hash=contract["hash"],claim_ledger=ledger_value,claim_ledger_hash=ledger["hash"])
-        html_text=validate_html(html_text,list(deck["metadata"]["page_hashes"]),assets)
+        html_text=self.technical_gate.validate_candidate_html(html_text,list(deck["metadata"]["page_hashes"]),assets)
         candidate_slides=self._slide_fragments(html_text)
         html_text=self._replace_slide_fragments(deck["html"],{slide_id:candidate_slides[slide_id] for slide_id in affected})
         html_text,gate=self._post_render_gate(task_id,html_text,list(deck["metadata"]["page_hashes"]),contract,ledger,assets)
@@ -2359,16 +2363,17 @@ class TaskService:
         valid=(
             deck["metadata"].get("design_contract_hash")==contract["hash"]
             and deck["metadata"].get("claim_ledger_hash")==ledger["hash"]
+            and gate.get("gate_type") in {None,"technical_gate"}
+            and gate.get("schema_version") in {None,TechnicalGate.schema_version}
             and gate.get("passed") is True
             and gate.get("blocker_count")==0
+            and not gate.get("blockers")
+            and (gate.get("hard_blocker_codes") is None or gate.get("hard_blocker_codes")==sorted(TechnicalGate.blocker_codes))
+            and (gate.get("advisory_count") is None or gate.get("advisory_count")==len(gate.get("advisories",[])))
             and gate.get("layout",{}).get("layout_registration_percent")==100
-            and gate.get("claims",{}).get("unbound_count")==0
-            and gate.get("claims",{}).get("missing_required_count")==0
-            and gate.get("claims",{}).get("covered_required_count")==gate.get("claims",{}).get("required_count")
-            and gate.get("canonical_validator",{}).get("passed") is True
             and gate.get("geometry",{}).get("overflow_count")==0
         )
-        if not valid: raise ConflictError("当前全稿未通过 PresentationTechnicalContract、Claim Ledger 与渲染后硬门禁")
+        if not valid: raise ConflictError("当前全稿未通过 PresentationTechnicalContract 与 TechnicalGate")
         return {"deck":deck,"design_contract":contract,"claim_ledger":ledger,"post_render_gate":gate}
 
     def assert_delivery_gate(self,task_id):
@@ -2495,7 +2500,7 @@ class TaskService:
         if existing_delivery:
             model=DeliveryManifest.parse(json.loads(self.version(task_id,existing_delivery["hash"])))
             published_root=self.store.delivery_root(task_id,delivery_id)
-            verified=verify_delivery(published_root)
+            verified=self.technical_gate.verify_delivery_package(published_root)
             final=self.get(task_id)
             if final["status"]!="completed":
                 final=self.command(task_id,f"confirm-delivery-{existing_delivery['hash'][:16]}","confirm_delivery","user",{"deck_hash":deck_hash,"delivery_hash":existing_delivery["hash"]})
@@ -2528,7 +2533,7 @@ class TaskService:
         except NotFoundError:
             published_root=None
         if published_root is not None:
-            verify_delivery(published_root)
+            self.technical_gate.verify_delivery_package(published_root)
             package=json.loads((published_root/"manifest.json").read_text(encoding="utf-8"))
             if package.get("delivery_id")!=delivery_id or package.get("task_id")!=task_id or package.get("deck_hash")!=deck_hash or package.get("confirmed_at")!=confirmed_at:
                 raise ConflictError("已发布离线包与当前交付事务不一致")
@@ -2620,7 +2625,7 @@ class TaskService:
         hashes={name:digest(content) for name,content in files.items()}
         package_manifest={"delivery_id":delivery_id,"task_id":task_id,"deck_hash":deck_hash,"confirmed_by":"user","confirmed_at":confirmed_at,"files":hashes}
         files["manifest.json"]=canonical(package_manifest); hashes["manifest.json"]=digest(files["manifest.json"])
-        self.store.publish_delivery(task_id,delivery_id,files,verifier=verify_delivery)
+        self.store.publish_delivery(task_id,delivery_id,files,verifier=self.technical_gate.verify_delivery_package)
         model=DeliveryManifest.parse({"delivery_id":delivery_id,"task_id":task_id,"deck_hash":deck_hash,"files":tuple(files),"confirmed_by":"user","confirmed_at":confirmed_at,"schema_version":"1.0"})
         return complete(model,hashes,len(localization_records))
 

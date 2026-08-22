@@ -1,12 +1,12 @@
 const LOADERS = {
-  created: () => import("./input.js?v=2026.08.22.130610852096"),
-  clarification: () => import("./input.js?v=2026.08.22.130610852096"),
-  narrative: () => import("./planning.js?v=2026.08.22.130610852096"),
-  outline: () => import("./planning.js?v=2026.08.22.130610852096"),
-  sample: () => import("./sample.js?v=2026.08.22.130610852096"),
-  deck: () => import("./deck.js?v=2026.08.22.130610852096"),
-  review: () => import("./review.js?v=2026.08.22.130610852096"),
-  delivery: () => import("./delivery.js?v=2026.08.22.130610852096"),
+  created: () => import("./input.js?v=2026.08.22.144845041702"),
+  clarification: () => import("./input.js?v=2026.08.22.144845041702"),
+  narrative: () => import("./planning.js?v=2026.08.22.144845041702"),
+  outline: () => import("./planning.js?v=2026.08.22.144845041702"),
+  sample: () => import("./sample.js?v=2026.08.22.144845041702"),
+  deck: () => import("./deck.js?v=2026.08.22.144845041702"),
+  review: () => import("./review.js?v=2026.08.22.144845041702"),
+  delivery: () => import("./delivery.js?v=2026.08.22.144845041702"),
 };
 
 export async function renderStage(stage, context) {

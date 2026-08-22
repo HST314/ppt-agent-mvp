@@ -35,7 +35,7 @@ class AC10DeckEditE2E(SampleJourney):
         before_outline=len([v for v in self.get_json("/v1/tasks/journey/versions")["versions"] if v["kind"]=="outline"])
         before_deck=self.get_json("/v1/tasks/journey/deck")
         before_events=self.get_json("/v1/tasks/journey/events")["events"]
-        with patch("ppt_agent.service.validate_html",side_effect=RuntimeError("fault injection")):
+        with patch("ppt_agent.render_gate.TechnicalGate.validate_candidate_html",side_effect=RuntimeError("fault injection")):
             status,_=self.call("POST","/v1/tasks/journey/deck/modify",{"prompt":"补充收益","change_type":"content","scope":"page","slide_ids":["slide-2"]})
         self.assertTrue(status.startswith("500"))
         self.assertEqual(len([v for v in self.get_json("/v1/tasks/journey/versions")["versions"] if v["kind"]=="outline"]),before_outline)

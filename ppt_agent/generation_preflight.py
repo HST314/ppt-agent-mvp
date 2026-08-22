@@ -2,19 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-
-_HARD_BROWSER_CODES = {
-    "content_out_of_bounds",
-    "slide_scroll_overflow",
-    "element_scroll_overflow",
-    "render_unavailable",
-    "invalid_measurement",
-    "empty_slide",
-    "broken_image",
-    "missing_title",
-    "title_too_small",
-    "text_too_small",
-}
+from .render_gate import TechnicalGate
 
 
 def layout_capacity_policy(contract: dict[str, Any]) -> dict[str, dict[str, int]]:
@@ -49,21 +37,5 @@ def structured_canonical_blockers(
 
 
 def hard_browser_blockers(evidence: dict[str, Any]) -> list[dict[str, Any]]:
-    """Extract objective rendering failures from browser measurements."""
-    if not isinstance(evidence, dict):
-        return [{"code": "invalid_measurement", "evidence": "浏览器预检未返回对象"}]
-    issues = evidence.get("issues") if isinstance(evidence.get("issues"), list) else []
-    blockers = [
-        item
-        for item in issues
-        if item.get("severity") == "blocker" or item.get("code") in _HARD_BROWSER_CODES
-    ]
-    if not evidence.get("available") and not any(
-        item.get("code") == "render_unavailable" for item in blockers
-    ):
-        blockers.append({"code": "render_unavailable", "evidence": "Chromium 预检不可用"})
-    if evidence.get("available") and not evidence.get("passed") and not blockers:
-        blockers.append(
-            {"code": "invalid_measurement", "evidence": "Chromium 预检失败但没有结构化问题"}
-        )
-    return blockers
+    """Compatibility adapter backed by the single TechnicalGate classifier."""
+    return TechnicalGate.browser_blockers(evidence)

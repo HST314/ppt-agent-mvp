@@ -31,13 +31,14 @@ class FailOnceClarifier:
 
 
 class AuditRegressionTests(SampleJourney):
-    def test_latest_disposition_overrides_older_waiver(self):
+    def test_semantic_disposition_does_not_rewrite_delivery_gate(self):
         self.app.service.generate_sample("journey"); self.app.service.confirm_sample("journey")
         self.app.service.generate_deck("journey"); self.app.service.run_inspection("journey",0)
         waived=self.app.service.dispose_issue("journey","fake-overflow","waive","accepted")
         self.assertTrue(waived["delivery_allowed"])
         deferred=self.app.service.dispose_issue("journey","fake-overflow","defer","")
-        self.assertFalse(deferred["delivery_allowed"])
+        self.assertTrue(deferred["delivery_allowed"])
+        self.assertEqual(deferred["blocking_issues"],[])
 
     def test_completed_state_has_no_waiting_action(self):
         self.app.service.generate_sample("journey"); self.app.service.confirm_sample("journey")

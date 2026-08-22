@@ -15,16 +15,34 @@ from ppt_agent.store import WorkspaceStore
 from ppt_agent.web import create_app
 
 
-class BlockerInspector:
-    def inspect(self, outline, html):
-        return {"passed": False, "issues": [
-            {"issue_id": "overflow-1", "severity": "blocker", "level": "element", "code": "overflow", "message": "元素溢出", "slide_id": "slide-1", "element_id": "title", "evidence": "越界", "suggestion": "缩小"},
-        ]}
-
-
 class PassingInspector:
     def inspect(self, outline, html):
         return {"passed": True, "issues": [], "model": "fixture"}
+
+
+class TechnicalBlockingBrowserInspector:
+    enforce_on_generation = False
+
+    def inspect(self, html, slide_ids):
+        return {
+            "available": True,
+            "passed": False,
+            "engine": "chromium",
+            "engine_version": "test",
+            "viewport": {"width": 1280, "height": 720},
+            "slides": [],
+            "issues": [{
+                "issue_id": "browser-overflow-1",
+                "severity": "blocker",
+                "level": "element",
+                "code": "content_out_of_bounds",
+                "message": "元素溢出",
+                "slide_id": slide_ids[0],
+                "element_id": "title",
+                "evidence": "DOM geometry exceeds slide by 20px",
+                "suggestion": "收紧内容",
+            }],
+        }
 
 
 def free_port():
@@ -35,6 +53,7 @@ def free_port():
 
 class FinalizeGateBrowserBase(unittest.TestCase):
     inspector = None
+    browser_inspector = None
 
     @classmethod
     def setUpClass(cls):
@@ -48,7 +67,7 @@ class FinalizeGateBrowserBase(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.svc = TaskService(WorkspaceStore(self.tmp.name), inspector=self.inspector)
+        self.svc = TaskService(WorkspaceStore(self.tmp.name), inspector=self.inspector, browser_inspector=self.browser_inspector)
         self.svc.create("task")
         self.svc.import_input("task", {"goal": "发布", "audience": "客户", "topic": "方案", "页数": 3})
         self.svc.generate_narrative("task"); self.svc.confirm_narrative("task")
@@ -79,7 +98,8 @@ class FinalizeGateBrowserBase(unittest.TestCase):
 
 
 class FinalizeBlockedBrowserTests(FinalizeGateBrowserBase):
-    inspector = BlockerInspector()
+    inspector = PassingInspector()
+    browser_inspector = TechnicalBlockingBrowserInspector()
 
     def test_default_finalize_is_disabled_and_risk_path_requires_rationale(self):
         finalize = self.page.get_by_role("button", name="确定终稿", exact=True)

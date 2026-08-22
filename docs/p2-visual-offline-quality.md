@@ -4,13 +4,13 @@
 
 独立检查在锁定 Chromium 的 1280×720、`reduced-motion` 环境中为每页生成 WebP 截图。截图使用 SHA-256 内容寻址，逐页绑定 deck hash、slide id、媒体类型和字节数；检查报告、终稿、离线包均会复算。截图缺失、篡改或顺序错配会使检查 evidence 失效，并在写入交付事实前失败。
 
-视觉评分为 0–100 分的辅助 QA，不替代 PresentationTechnicalContract、Claim Ledger、overflow 等硬门禁：
+视觉评分为 0–100 分的辅助 QA，不替代 `TechnicalGate` 对 PresentationTechnicalContract、Chromium 渲染、overflow、资源和交付完整性的客观检查：
 
 - 65% 逐页构图：有效视觉内容覆盖率与视觉重心偏移。
 - 20% 布局多样性：按元素角色和空间分桶生成构图签名。
 - 15% 主题节奏：整稿可辨识的 light / grey / dark / accent 变化。
 
-`excessive_whitespace`、`visual_imbalance`、`repetitive_layout`、`flat_theme_rhythm` 只产生 warning；现有 blocker 与发布语义不变。
+`excessive_whitespace`、`visual_imbalance`、`repetitive_layout`、`flat_theme_rhythm`、字体/标题启发式、canonical/DOM、Claim Ledger 与内容质量只产生 advisory/warning，不改变 `delivery_allowed`。
 
 ## 离线性能预算
 
