@@ -1,16 +1,29 @@
-import { api } from "./api.js?v=2026.08.22.144845041702";
+import { api } from "./api.js?v=2026.08.22.152316565533";
 
 const TERMINAL = new Set(["succeeded", "failed", "cancelled", "interrupted"]);
 const EVENT_TYPES = ["queued", "started", "progress", "checkpoint", "succeeded", "failed", "cancelled", "interrupted", "heartbeat"];
 
 export class JobTracker {
-  constructor({ pollInterval = 1000, maxPollInterval = 16000, maxStreamFailures = 2, reconnectBaseDelay = 250, recoveryInterval = 1000, maxRecoveryAttempts = 3 } = {}) {
+  constructor({
+    pollInterval = 1000,
+    maxPollInterval = 16000,
+    maxStreamFailures = 2,
+    reconnectBaseDelay = 250,
+    recoveryInterval = 1000,
+    maxRecoveryAttempts = 3,
+    terminalReconcileInterval = 250,
+    maxTerminalReconcileInterval = 1000,
+    maxTerminalReconcileAttempts = 8,
+  } = {}) {
     this.pollInterval = pollInterval;
     this.maxPollInterval = maxPollInterval;
     this.maxStreamFailures = maxStreamFailures;
     this.reconnectBaseDelay = reconnectBaseDelay;
     this.recoveryInterval = recoveryInterval;
     this.maxRecoveryAttempts = maxRecoveryAttempts;
+    this.terminalReconcileInterval = terminalReconcileInterval;
+    this.maxTerminalReconcileInterval = maxTerminalReconcileInterval;
+    this.maxTerminalReconcileAttempts = maxTerminalReconcileAttempts;
     this.tracks = new Map();
     this.completed = new Set();
   }
@@ -26,7 +39,7 @@ export class JobTracker {
     const track = {
       job, callbacks, source: null, timer: null, reconnectTimer: null, recoveryTimer: null,
       seq: 0, seen: new Set(), stopped: false, streamFailures: 0, recoveryAttempts: 0,
-      pollFailures: 0, polling: false,
+      pollFailures: 0, polling: false, terminalReconciling: false,
     };
     this.tracks.set(job.job_id, track);
     callbacks.onUpdate?.(job, "initial");
@@ -176,11 +189,61 @@ export class JobTracker {
     return delay;
   }
 
-  finish(track, job) {
-    if (this.completed.has(job.job_id)) return;
+  async finish(track, job) {
+    if (track.stopped || track.terminalReconciling || this.completed.has(job.job_id)) return;
+    track.terminalReconciling = true;
+    track.job = job;
+    track.polling = false;
+    track.source?.close();
+    track.source = null;
+    if (track.timer) window.clearTimeout(track.timer);
+    if (track.reconnectTimer) window.clearTimeout(track.reconnectTimer);
+    if (track.recoveryTimer) window.clearTimeout(track.recoveryTimer);
+    track.timer = null;
+    track.reconnectTimer = null;
+    track.recoveryTimer = null;
+
+    let authoritative = true;
+    let reconcileValue = null;
+    let attempts = 0;
+    if (track.callbacks.onTerminalReconcile) {
+      authoritative = false;
+      while (!track.stopped && attempts < this.maxTerminalReconcileAttempts) {
+        attempts += 1;
+        track.callbacks.onTransport?.("terminal-reconcile", {
+          attempt: attempts,
+          maxAttempts: this.maxTerminalReconcileAttempts,
+          seq: track.seq,
+        });
+        try {
+          const outcome = await track.callbacks.onTerminalReconcile(job, {
+            attempt: attempts,
+            maxAttempts: this.maxTerminalReconcileAttempts,
+          });
+          reconcileValue = outcome;
+          authoritative = outcome !== false && outcome?.ready !== false;
+        } catch (error) {
+          authoritative = false;
+          track.callbacks.onError?.(error, { channel: "terminal-reconcile", attempt: attempts });
+        }
+        if (authoritative || attempts >= this.maxTerminalReconcileAttempts) break;
+        const delay = Math.min(
+          this.terminalReconcileInterval * (2 ** (attempts - 1)),
+          this.maxTerminalReconcileInterval,
+        );
+        await new Promise((resolve) => window.setTimeout(resolve, delay));
+      }
+    }
+    if (track.stopped) return;
+    if (!authoritative) {
+      track.callbacks.onTransport?.("terminal-reconcile-exhausted", {
+        attempts,
+        seq: track.seq,
+      });
+    }
     this.completed.add(job.job_id);
     this.stop(job.job_id);
-    track.callbacks.onComplete?.(job);
+    await track.callbacks.onComplete?.(job, { authoritative, attempts, reconcileValue });
   }
 
   stop(jobId) {

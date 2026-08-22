@@ -42,7 +42,7 @@
 | F1 FastAPI 基础设施 | `ppt_agent/web/app.py`、`ppt_agent/web/routes/tasks.py`、`main_front.py` | `tests/web/test_fastapi_app.py`、原有 `tests/e2e/**` 全量回归 |
 | F2 设计系统与组件 | `frontend/static/css/**`、`frontend/static/js/components/index.js`、`/components` | `tests/web/test_frontend_assets.py`，四档 Chromium 截图/布局验收 |
 | F3 统一应用壳 | `frontend/index.html`、`frontend/static/js/app.js`、`router.js`、`shell.js` | `tests/web/test_fastapi_app.py::FastAPIAppTests::test_health_shell_static_and_retired_legacy_routes`、`tests/browser/test_fastapi_shell.py` |
-| F4 Job/SSE | `ppt_agent/web/jobs.py`、`ppt_agent/web/routes/jobs.py`、`frontend/static/js/job-tracker.js`；短时有界退避后降级轮询，并有限探测 SSE，以最后 `seq` 续传；恢复流二次断开会立即恢复轮询，探测耗尽后仍轮询至终态 | `tests/web/test_jobs.py`、`tests/web/test_fastapi_app.py::FastAPIAppTests::test_job_idempotency_sse_and_terminal_reconciliation`、`tests/browser/test_job_recovery.py`（含初始降级→恢复→二次断流→探测耗尽→轮询终态） |
+| F4 Job/SSE | `ppt_agent/web/jobs.py`、`ppt_agent/web/routes/jobs.py`、`frontend/static/js/job-tracker.js`；短时有界退避后降级轮询，并有限探测 SSE，以最后 `seq` 续传；恢复流二次断开会立即恢复轮询，探测耗尽后仍轮询至终态；checkpoint/终态会重新读取权威 Shell 与当前阶段视图，成功终态达到返回的 revision/artifact 引用后才停止追踪并按浏览器当前路由重绘 | `tests/web/test_jobs.py`、`tests/web/test_fastapi_app.py::FastAPIAppTests::test_job_idempotency_sse_and_terminal_reconciliation`、`tests/browser/test_job_recovery.py`（含初始降级→恢复→二次断流→探测耗尽→轮询终态，以及终态先到、权威视图短暂滞后后同页出现澄清问题卡） |
 | F5 任务/资料与澄清 | `frontend/static/js/stages/input.js` | `tests/browser/test_fastapi_full_journey.py`、P2 API/领域回归 |
 | F6 叙事与大纲 | `frontend/static/js/stages/planning.js` | `tests/browser/test_fastapi_full_journey.py`、P3 回归 |
 | F7 样品 | `frontend/static/js/stages/sample.js`、版本预览端点 | `tests/browser/test_fastapi_full_journey.py`、P4 浏览器回归 |

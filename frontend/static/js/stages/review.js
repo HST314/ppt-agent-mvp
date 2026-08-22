@@ -1,10 +1,10 @@
-import { api } from "../api.js?v=2026.08.22.144845041702";
-import { badge, button, confirmationDialog, element, field, metadataList, shortHash, versionTimeline } from "../components/index.js?v=2026.08.22.144845041702";
-import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.22.144845041702";
-import { comparePanel, deckPreview, modificationPanel } from "./deck.js?v=2026.08.22.144845041702";
+import { api } from "../api.js?v=2026.08.22.152316565533";
+import { badge, button, confirmationDialog, element, field, metadataList, shortHash, versionTimeline } from "../components/index.js?v=2026.08.22.152316565533";
+import { actionMessage, parseSlideIds, runAction, section, stageGrid } from "./shared.js?v=2026.08.22.152316565533";
+import { comparePanel, deckPreview, modificationPanel } from "./deck.js?v=2026.08.22.152316565533";
 
 export async function render(context) {
-  const [view, deckView, settings] = await Promise.all([api.inspection(context.taskId, context.controller), api.deck(context.taskId, context.controller), api.settings(context.controller)]);
+  const [view, deckView, settings] = await Promise.all([context.authoritativeView || api.inspection(context.taskId, context.controller), api.deck(context.taskId, context.controller), api.settings(context.controller)]);
   context.assertCurrent();
   return reviewStage(view, deckView, settings.values.review.default_max_rounds, context);
 }

@@ -39,6 +39,34 @@ class BlockingNarrativeService(TaskService):
         return super().generate_narrative(task_id, prompt, scope)
 
 
+class BlockingClarifier:
+    model = "authority-reconcile-clarifier"
+
+    def __init__(self):
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def clarify(self, _payload):
+        self.started.set()
+        if not self.release.wait(30):
+            raise RuntimeError("clarifier test timed out")
+        return {
+            "model": self.model,
+            "questions": [{
+                "question_id": "approval-mode",
+                "field_path": "approval_mode",
+                "prompt": "本次汇报需要申请预算批准，还是仅同步项目进展？",
+                "helper_text": "用于决定材料的论证深度。",
+                "options": [
+                    {"value": "approve", "label": "申请批准", "description": "突出预算与回报"},
+                    {"value": "update", "label": "同步进展", "description": "突出里程碑与风险"},
+                ],
+                "allow_other": True,
+                "blocking": True,
+            }],
+        }
+
+
 class JobRecoveryBrowserGate(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -72,20 +100,29 @@ class JobRecoveryBrowserGate(unittest.TestCase):
         self.thread.join(5)
         self.tmp.cleanup()
 
-    def new_page(self, *, fail_first_streams=0, width=1280, height=900):
+    def new_page(self, *, fail_first_streams=0, stale_authority_reads=0, width=1280, height=900):
         page = self.browser.new_page(viewport={"width": width, "height": height})
         script = """
             (() => {
               const failFirst = __FAIL_FIRST__;
+              const staleAuthorityLimit = __STALE_AUTHORITY__;
               const NativeEventSource = window.EventSource;
               const nativeFetch = window.fetch.bind(window);
               window.__streamUrls = [];
               window.__pollUrls = [];
+              window.__authorityUrls = [];
+              window.__staleAuthorityReplies = 0;
               const publish = () => {
                 document.documentElement?.setAttribute("data-test-stream-count", String(window.__streamUrls.length));
                 document.documentElement?.setAttribute("data-test-poll-count", String(window.__pollUrls.length));
+                document.documentElement?.setAttribute("data-test-authority-count", String(window.__authorityUrls.length));
+                document.documentElement?.setAttribute("data-test-stale-authority-count", String(window.__staleAuthorityReplies));
               };
               let attempts = 0;
+              let staleShell = null;
+              let staleInput = null;
+              let staleShellReplies = 0;
+              let staleInputReplies = 0;
               window.EventSource = function(url, options) {
                 attempts += 1;
                 window.__streamUrls.push(String(url));
@@ -103,16 +140,47 @@ class JobRecoveryBrowserGate(unittest.TestCase):
                 return new NativeEventSource(url, options);
               };
               window.EventSource.prototype = NativeEventSource.prototype;
-              window.fetch = (...args) => {
+              const staleResponse = (response, payload) => new Response(JSON.stringify(payload), {
+                status: response.status,
+                statusText: response.statusText,
+                headers: response.headers,
+              });
+              window.fetch = async (...args) => {
                 const target = String(args[0]);
-                if (/\/v1\/jobs\/[^/]+$/.test(new URL(target, location.origin).pathname)) {
+                const path = new URL(target, location.origin).pathname;
+                if (/\/v1\/jobs\/[^/]+$/.test(path)) {
                   window.__pollUrls.push(target);
                   publish();
                 }
-                return nativeFetch(...args);
+                const response = await nativeFetch(...args);
+                if (/\/v1\/tasks\/[^/]+\/shell$/.test(path)) {
+                  window.__authorityUrls.push(target);
+                  const payload = await response.clone().json().catch(() => null);
+                  if (!staleShell && payload?.active_jobs?.length) staleShell = payload;
+                  if (staleShell && payload?.task?.revision > staleShell.task.revision && staleShellReplies < staleAuthorityLimit) {
+                    staleShellReplies += 1;
+                    window.__staleAuthorityReplies += 1;
+                    publish();
+                    return staleResponse(response, staleShell);
+                  }
+                  publish();
+                }
+                if (/\/v1\/tasks\/[^/]+\/input$/.test(path)) {
+                  window.__authorityUrls.push(target);
+                  const payload = await response.clone().json().catch(() => null);
+                  if (!staleInput && payload?.clarification?.status === "generating") staleInput = payload;
+                  if (staleInput && payload?.state?.revision > staleInput.state.revision && staleInputReplies < staleAuthorityLimit) {
+                    staleInputReplies += 1;
+                    window.__staleAuthorityReplies += 1;
+                    publish();
+                    return staleResponse(response, staleInput);
+                  }
+                  publish();
+                }
+                return response;
               };
             })();
-            """.replace("__FAIL_FIRST__", str(fail_first_streams))
+            """.replace("__FAIL_FIRST__", str(fail_first_streams)).replace("__STALE_AUTHORITY__", str(stale_authority_reads))
         page.add_init_script(script=script)
         return page
 
@@ -187,15 +255,41 @@ class JobRecoveryBrowserGate(unittest.TestCase):
         page.get_by_role("button", name="生成叙事结构", exact=True).click()
         self.assertTrue(self.service.started.wait(2))
 
-    def wait_for_job_count(self, count, timeout=6000):
+    def wait_for_job_count(self, count, timeout=6000, task_id="recovery"):
         deadline = time.monotonic() + timeout / 1000
         jobs = []
         while time.monotonic() < deadline:
-            jobs = self.app.state.job_service.list("recovery")
+            jobs = self.app.state.job_service.list(task_id)
             if len(jobs) == count and jobs[-1]["status"] in TERMINAL:
                 return jobs
             time.sleep(0.05)
         self.fail(f"expected {count} terminal jobs, got {jobs}")
+
+    def test_terminal_waits_for_authoritative_revision_and_shows_questions_without_reload(self):
+        clarifier = BlockingClarifier()
+        self.service.clarifier = clarifier
+        self.service.create("authority")
+        page = self.new_page(fail_first_streams=5, stale_authority_reads=2, width=375, height=820)
+        page.goto(self.base + "/tasks/authority?stage=created")
+        page.get_by_label("任务卡内容").fill("核心主题：新品发布")
+        page.get_by_role("button", name="导入并冻结资料", exact=True).click()
+
+        page.get_by_role("heading", name="模型正在阅读任务卡", exact=True).wait_for()
+        self.assertTrue(clarifier.started.wait(2))
+        self.assertEqual(page.locator("fieldset.question-card").count(), 0)
+        clarifier.release.set()
+
+        jobs = self.wait_for_job_count(1, timeout=8000, task_id="authority")
+        self.assertEqual(jobs[-1]["status"], "succeeded")
+        self.assertEqual(jobs[-1]["result"]["revision"], self.service.get("authority")["revision"])
+        page.locator('html[data-test-poll-count]:not([data-test-poll-count="0"])').wait_for(timeout=10000)
+        page.locator('html[data-test-stale-authority-count="4"]').wait_for(timeout=10000)
+        page.get_by_role("heading", name="需求澄清", exact=True).wait_for(timeout=10000)
+        self.assertEqual(page.locator("fieldset.question-card").count(), 1)
+        self.assertTrue(page.get_by_text("本次汇报需要申请预算批准，还是仅同步项目进展？", exact=True).is_visible())
+        self.assertEqual(page.evaluate("performance.getEntriesByType('navigation').length"), 1)
+        self.assertGreaterEqual(page.evaluate("window.__authorityUrls.length"), 6)
+        page.close()
 
     def test_disconnect_falls_back_to_polling_then_recovers_sse_from_last_seq(self):
         page = self.new_page(fail_first_streams=2)

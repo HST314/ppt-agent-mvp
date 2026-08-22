@@ -1,6 +1,6 @@
-import { api } from "../api.js?v=2026.08.22.144845041702";
-import { badge, button, confirmationDialog, element, field, metadataList, shortHash } from "../components/index.js?v=2026.08.22.144845041702";
-import { actionMessage, invalidationNotice, runAction, section, stageGrid } from "./shared.js?v=2026.08.22.144845041702";
+import { api } from "../api.js?v=2026.08.22.152316565533";
+import { badge, button, confirmationDialog, element, field, metadataList, shortHash } from "../components/index.js?v=2026.08.22.152316565533";
+import { actionMessage, invalidationNotice, runAction, section, stageGrid } from "./shared.js?v=2026.08.22.152316565533";
 
 const FIELD_LABELS = { goal: "演示目标", audience: "主要受众", topic: "核心主题" };
 const WARNING_LABELS = {
@@ -18,7 +18,7 @@ function frozenSourceText(source, format) {
 }
 
 export async function render(context) {
-  const view = await api.input(context.taskId, context.controller);
+  const view = context.authoritativeView || await api.input(context.taskId, context.controller);
   context.assertCurrent();
   if (context.selected.id !== "clarification") scheduleResourceReminder(view, context);
   return context.selected.id === "clarification" ? clarificationStage(view, context) : inputStage(view, context);

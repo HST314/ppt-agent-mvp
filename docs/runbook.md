@@ -24,6 +24,7 @@ python -m uvicorn main_front:app --host 127.0.0.1 --port 8000
 - 浏览器刷新后会查询 `/v1/tasks/{task_id}/jobs?status=active`，并从持久化的 `job_id ↔ intent storage key` 映射恢复清理责任；终态会同时清理 intent 与映射，下一次同参操作会生成新幂等键。
 - 工作台通过 `/v1/jobs/{job_id}/event-history` 恢复最多 500 条持久化事件，并按 `(job_id, seq)` 去重；实时 SSE 与轮询都从最后已接收序号续传。执行详情显示 Agent 步数、provider 请求、Skill 工具调用、阶段剩余时间与脱敏 Agent 审计；成功工具事件只展示工具名和合法相对路径，不展示正文、stdin 或参数；终态 Job 的用时固定在 `finished_at`。
 - SSE 断开后先执行有界指数退避重连；连续失败才降级轮询。轮询期间继续进行有限 SSE 恢复探测，成功后以 `after=last_seq` 续传并停止轮询；恢复连接再次断开时立即重启轮询，再消耗剩余探测次数，达到探测上限后保持轮询到终态。
+- `checkpoint` 会去重读取权威任务 Shell 与当前阶段视图；Job 终态不会直接用创建 Job 时捕获的旧路由重绘。成功终态返回 `revision` 和 artifact 引用时，前端以有界退避重复核对 Shell/阶段视图，达到该修订与工件版本后才停止追踪，并按浏览器当前路由替换页面。这样即使 SSE 丢失、轮询先观察到终态或业务视图短暂滞后，澄清问题等等待人工内容也会在原页面出现。
 - 每个任务同时只允许一个写业务状态的活动 Job。相同 `idempotency_key` 与相同请求返回原 Job；同 key 不同请求返回 409。
 - 排队 Job 在服务重启后可重新调度；运行中或已请求取消但结果未知的 Job 会标记为 `interrupted`，必须由用户发起新的明确尝试。
 - 活动 Job 不清理。MVP 终态 Job 至少保留 7 天；当前版本由运维在备份后按 `finished_at` 清理任务目录内的终态 `jobs/*.json` 及同名事件文件，不得清理活动状态。

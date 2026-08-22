@@ -1,11 +1,11 @@
-import { api, ApiError } from "./api.js?v=2026.08.22.144845041702";
-import { JobTracker } from "./job-tracker.js?v=2026.08.22.144845041702";
-import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.22.144845041702";
-import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.22.144845041702";
-import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.22.144845041702";
-import { inlineError, setBusy } from "./components/index.js?v=2026.08.22.144845041702";
-import { renderStage } from "./stages/index.js?v=2026.08.22.144845041702";
-import { setVersionMatchGuard } from "./stages/shared.js?v=2026.08.22.144845041702";
+import { api, ApiError } from "./api.js?v=2026.08.22.152316565533";
+import { JobTracker } from "./job-tracker.js?v=2026.08.22.152316565533";
+import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.22.152316565533";
+import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.22.152316565533";
+import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.22.152316565533";
+import { inlineError, setBusy } from "./components/index.js?v=2026.08.22.152316565533";
+import { renderStage } from "./stages/index.js?v=2026.08.22.152316565533";
+import { setVersionMatchGuard } from "./stages/shared.js?v=2026.08.22.152316565533";
 
 const app = document.getElementById("app");
 const APP_BUILD = document.querySelector('meta[name="app-build"]')?.content || "unknown";
@@ -14,9 +14,11 @@ const jobTransports = new Map();
 const jobSnapshots = new Map();
 const jobEvents = new Map();
 const jobAudits = new Map();
+const authorityRefreshes = new Map();
 let renderGeneration = 0;
 let activeController = null;
 let hasUnsavedDraft = false;
+let renderedAuthority = null;
 let acceptedLocation = `${window.location.pathname}${window.location.search}${window.location.hash}`;
 let runtimeProbe = null;
 let versionMismatchNotified = false;
@@ -82,7 +84,7 @@ refreshRuntimeStatus();
 window.setInterval(() => refreshRuntimeStatus(), 15_000);
 window.setInterval(refreshJobClocks, 1000);
 
-async function renderRoute(route) {
+async function renderRoute(route, authority = null) {
   const requestedLocation = `${window.location.pathname}${window.location.search}${window.location.hash}`;
   if (requestedLocation !== acceptedLocation && hasUnsavedDraft && !window.confirm("当前阶段有未保存修改，确定离开吗？")) {
     window.history.pushState({}, "", acceptedLocation);
@@ -95,9 +97,15 @@ async function renderRoute(route) {
   activeController = new AbortController();
   tracker.stopAll();
   app.setAttribute("aria-busy", "true");
-  if (route.name === "home") await renderHome(generation);
-  else if (route.name === "components") renderComponents();
-  else await renderWorkspace(route, generation);
+  if (route.name === "home") {
+    renderedAuthority = null;
+    await renderHome(generation);
+  }
+  else if (route.name === "components") {
+    renderedAuthority = null;
+    renderComponents();
+  }
+  else await renderWorkspace(route, generation, authority);
   if (generation === renderGeneration) app.setAttribute("aria-busy", "false");
 }
 
@@ -448,11 +456,11 @@ function taskForm() {
   ]);
 }
 
-async function renderWorkspace(route, generation) {
+async function renderWorkspace(route, generation, authority = null) {
   renderLoading(true);
   try {
     const [shell, recent] = await Promise.all([
-      api.shell(route.taskId, activeController),
+      authority?.shell?.task?.task_id === route.taskId ? authority.shell : api.shell(route.taskId, activeController),
       api.listTasks(activeController),
     ]);
     if (generation !== renderGeneration) return;
@@ -476,6 +484,7 @@ async function renderWorkspace(route, generation) {
       sidebar.querySelector("button, a")?.focus();
     };
     const selected = shell.stages.find((stage) => stage.id === route.stage) || shell.stages.find((stage) => stage.status === "current") || shell.stages[shell.stages.length - 1];
+    renderedAuthority = { taskId: shell.task.task_id, signature: authoritySignature(shell) };
     sidebar = workspaceSidebar(shell, recent.tasks, selected, closeDrawer);
     scrim = element("button", { className: "drawer-scrim", type: "button", "aria-label": "关闭导航", onClick: closeDrawer });
     const page = element("div", { className: "app-shell" }, [
@@ -501,12 +510,12 @@ async function renderWorkspace(route, generation) {
       }
     }, { signal: activeController.signal });
     replaceApp(page);
-    shell.active_jobs.forEach((job) => connectJob(job, route));
+    shell.active_jobs.forEach((job) => connectJob(job));
     const recentJob = route.view === "workspace" ? latestRelevantJob(shell, selected) : null;
     if (recentJob && ["succeeded", "failed", "cancelled", "interrupted"].includes(recentJob.status)) {
       hydrateJobDetails(recentJob);
     }
-    await reconcileStoredIntents(shell.task.task_id, shell.active_jobs, route);
+    await reconcileStoredIntents(shell.task.task_id, shell.active_jobs);
     if (generation !== renderGeneration) return;
     if (route.view === "status") {
       await renderStatusView(shell, route, generation);
@@ -514,7 +523,8 @@ async function renderWorkspace(route, generation) {
       await renderSettingsView(shell, route, generation);
     } else if (!lockedStage(selected)) {
       try {
-        const content = await renderStage(selected.id, stageContext(shell, selected, route, generation));
+        const prefetchedView = authority?.stageId === selected.id ? authority.stageView : null;
+        const content = await renderStage(selected.id, stageContext(shell, selected, route, generation, prefetchedView));
         if (generation !== renderGeneration) return;
         enforceTaskActionState(content, shell.task);
         enforceStageAccess(content, selected, shell.task);
@@ -817,7 +827,82 @@ function rememberJobEvent(event) {
   jobEvents.set(event.job_id, dedupeEvents([...current, event]));
 }
 
-function connectJob(job, route, storageKey = null) {
+function authoritySignature(shell) {
+  const task = shell?.task || {};
+  const artifacts = Object.entries(shell?.summary?.latest_artifacts || {}).sort(([left], [right]) => left.localeCompare(right));
+  return JSON.stringify({
+    task: [task.stage, task.status, task.revision, task.waiting_reason, task.required_action],
+    artifacts,
+  });
+}
+
+function selectedStage(shell, route) {
+  return shell.stages.find((stage) => stage.id === route.stage)
+    || shell.stages.find((stage) => stage.status === "current")
+    || shell.stages[shell.stages.length - 1];
+}
+
+async function readAuthoritativeStageView(taskId, stageId) {
+  if (["created", "clarification"].includes(stageId)) return api.input(taskId);
+  if (["narrative", "outline"].includes(stageId)) return api.planning(taskId);
+  if (stageId === "sample") return api.samples(taskId);
+  if (stageId === "deck") return api.deck(taskId);
+  if (stageId === "review") return api.inspection(taskId);
+  if (stageId === "delivery") return api.delivery(taskId);
+  return null;
+}
+
+async function readAuthoritativeWorkspace(job) {
+  const shell = await api.shell(job.task_id);
+  const route = currentRoute();
+  if (route.name !== "workspace" || route.taskId !== job.task_id || route.view !== "workspace") {
+    return { shell, route, stageId: null, stageView: null };
+  }
+  const stage = selectedStage(shell, route);
+  const stageView = stage && !lockedStage(stage)
+    ? await readAuthoritativeStageView(job.task_id, stage.id)
+    : null;
+  return { shell, route, stageId: stage?.id || null, stageView };
+}
+
+function authoritativeReferenceReached(job, authority) {
+  const expected = job.result;
+  if (!expected) return true;
+  const shell = authority?.shell;
+  if (!shell || shell.task?.task_id !== expected.task_id) return false;
+  const expectedRevision = Number.isInteger(expected.revision) ? expected.revision : null;
+  const shellRevision = Number.isInteger(shell.task?.revision) ? shell.task.revision : null;
+  if (expectedRevision !== null && (shellRevision === null || shellRevision < expectedRevision)) return false;
+  const viewRevision = authority?.stageView?.state?.revision;
+  if (expectedRevision !== null && authority?.stageId && (!Number.isInteger(viewRevision) || viewRevision < expectedRevision)) return false;
+  if (expectedRevision !== null && shellRevision > expectedRevision) return true;
+  if (expected.stage && shell.task?.stage !== expected.stage) return false;
+  if (expected.status && shell.task?.status !== expected.status) return false;
+  const actualArtifacts = shell.summary?.latest_artifacts || {};
+  return Object.entries(expected.artifacts || {}).every(([kind, reference]) => !reference || actualArtifacts[kind] === reference);
+}
+
+function scheduleCheckpointAuthorityRefresh(job) {
+  if (authorityRefreshes.has(job.job_id)) return authorityRefreshes.get(job.job_id);
+  const refresh = readAuthoritativeWorkspace(job).then(async (authority) => {
+    const route = currentRoute();
+    if (route.name !== "workspace" || route.taskId !== job.task_id) return authority;
+    const changed = renderedAuthority?.taskId !== job.task_id
+      || renderedAuthority.signature !== authoritySignature(authority.shell);
+    if (changed && !hasUnsavedDraft) {
+      const stage = route.view === "workspace" ? selectedStage(authority.shell, route) : null;
+      const currentAuthority = stage?.id === authority.stageId
+        ? { ...authority, route, stageId: stage.id }
+        : { ...authority, route, stageId: null, stageView: null };
+      await renderRoute(route, currentAuthority);
+    }
+    return authority;
+  }).catch(() => null).finally(() => authorityRefreshes.delete(job.job_id));
+  authorityRefreshes.set(job.job_id, refresh);
+  return refresh;
+}
+
+function connectJob(job, storageKey = null) {
   const recoveredStorageKey = storageKey || storageKeyForJob(job.job_id);
   jobSnapshots.set(job.job_id, job);
   tracker.track(job, {
@@ -827,10 +912,15 @@ function connectJob(job, route, storageKey = null) {
     },
     onEvent: (event) => {
       rememberJobEvent(event);
-      updateJobEvent(event);
+      const next = updateJobEvent(event);
+      if (event.type === "checkpoint" && next) scheduleCheckpointAuthorityRefresh(next);
     },
     onTransport: (state, details) => updateJobTransport(job.job_id, state, details),
-    onComplete: async (finished) => {
+    onTerminalReconcile: async (finished) => {
+      const authority = await readAuthoritativeWorkspace(finished);
+      return { ready: finished.status !== "succeeded" || authoritativeReferenceReached(finished, authority), authority };
+    },
+    onComplete: async (finished, completion) => {
       jobSnapshots.set(finished.job_id, finished);
       jobTransports.delete(finished.job_id);
       if (recoveredStorageKey) clearIdempotencyKey(recoveredStorageKey, finished.job_id);
@@ -839,33 +929,41 @@ function connectJob(job, route, storageKey = null) {
       else if (finished.status === "failed") showToast(`${label}失败：${finished.error?.message || "请查看阶段内详情"}`);
       else showToast(`${label}已${finished.status === "cancelled" ? "取消" : "中断"}，请查看阶段内详情`);
       await hydrateJobDetails(finished);
-      renderRoute(route);
+      let authority = completion?.reconcileValue?.authority || null;
+      try {
+        // The user may confirm or otherwise advance the task while optional Job
+        // details are loading. Re-read here so a terminal snapshot can never
+        // overwrite a newer business revision with its older Shell.
+        authority = await readAuthoritativeWorkspace(finished);
+      } catch (_error) {
+        // The successfully reconciled snapshot remains a safe fallback; the
+        // route renderer will perform its normal API reads when it is absent.
+      }
+      const route = currentRoute();
+      if (route.name === "workspace" && route.taskId === finished.task_id) await renderRoute(route, authority);
     },
   });
 }
 
-async function reconcileStoredIntents(taskId, activeJobs, route) {
+async function reconcileStoredIntents(taskId, activeJobs) {
   const activeIds = new Set(activeJobs.map((job) => job.job_id));
   const stored = storedJobIntents(taskId).filter((item) => !activeIds.has(item.jobId));
   await Promise.all(stored.map(async ({ jobId, storageKey }) => {
     try {
       const job = await api.getJob(jobId);
-      if (["succeeded", "failed", "cancelled", "interrupted"].includes(job.status)) {
-        clearIdempotencyKey(storageKey, jobId);
-      } else {
-        connectJob(job, route, storageKey);
-      }
+      connectJob(job, storageKey);
     } catch (_error) {
       clearIdempotencyKey(storageKey, jobId);
     }
   }));
 }
 
-function stageContext(shell, selected, route, generation) {
+function stageContext(shell, selected, route, generation, authoritativeView = null) {
   return {
     taskId: shell.task.task_id,
     shell,
     selected,
+    authoritativeView,
     controller: activeController,
     assertCurrent() {
       if (generation !== renderGeneration) throw new DOMException("stale view", "AbortError");
@@ -902,7 +1000,7 @@ async function retryClarification(taskId, route, { buttonNode = null, region = n
     busyLabel: "正在创建重试任务…",
     create: () => api.retryClarification(taskId, intent.value),
   });
-  if (job && !["succeeded", "failed", "cancelled", "interrupted"].includes(job.status)) renderRoute(route);
+  if (job && !["succeeded", "failed", "cancelled", "interrupted"].includes(job.status)) renderRoute(currentRoute());
   return job;
 }
 
@@ -921,7 +1019,7 @@ async function startTrackedJob({ taskId, route, buttonNode, region, intent, crea
     const existing = document.getElementById(`job-${job.job_id}`);
     if (existing) existing.replaceWith(jobPanel(job));
     else activeRegion?.append(jobPanel(job));
-    connectJob(job, route, intent.storageKey);
+    connectJob(job, intent.storageKey);
     if (buttonNode) {
       buttonNode.textContent = "后台任务运行中";
       buttonNode.disabled = true;
@@ -984,6 +1082,7 @@ function updateJobEvent(event) {
   };
   jobSnapshots.set(event.job_id, next);
   updateJobPanel(next);
+  return next;
 }
 
 function updateJobTransport(jobId, state, details = {}) {
@@ -993,6 +1092,8 @@ function updateJobTransport(jobId, state, details = {}) {
     "sse-retry": "进度通道重连中",
     polling: "进度通道重连中 · 状态轮询可用",
     "sse-recovery": "正在恢复实时进度通道",
+    "terminal-reconcile": "正在核对权威业务视图",
+    "terminal-reconcile-exhausted": "权威业务视图同步超时 · 已显示最新可用状态",
     "storage-error": `事件存储暂不可用 · ${Math.max(1, Math.ceil((details.delay || 1000) / 1000))} 秒后重试`,
   };
   const label = labels[state] || "正在确认进度通道";
