@@ -17,7 +17,7 @@ from .schema import DeliveryManifest, InspectionReport, IssueDisposition
 from .p2 import canonical, digest, now, parse_task_card, questions_for, scan_resources, validate_answer
 from .schema import ClarificationSet, ResourceManifest, TaskCard, TaskInputSnapshot
 from .schema import NarrativeDocument, SlideOutline, SampleSelection, DeckArtifact
-from .p3 import changed_slide_ids, narrative_markdown, normalize_outline_markdown, outline_markdown, parse_outline, requested_slide_count, structured_outline_markdown
+from .p3 import assert_narrative_quality, changed_slide_ids, narrative_markdown, narrative_quality_evidence, normalize_outline_markdown, outline_markdown, parse_outline, requested_slide_count, structured_outline_markdown
 from .p4 import apply_design_contract, controlled_assets, infer_scope, recommend, render, validate_html
 from .render_gate import canonical_post_render_evidence, post_render_evidence_hash, run_post_render_gate
 from .offline import localize_delivery_html, offline_assets, offline_performance, offline_player, verify_delivery
@@ -40,6 +40,20 @@ def narrative_numeric_policy(ledger):
             "不得用假设、建议、示例或待确认包装未绑定量化值",
         ],
         "unnumbered_stage_labels":["启动阶段","扩展阶段","稳态阶段","复盘阶段"],
+    }
+
+def narrative_structure_policy(task_card):
+    return {
+        "mode":"minimum_semantic_structure",
+        "minimum_h1_count":1,
+        "minimum_section_count":2,
+        "minimum_body_characters":60,
+        "required_context":[
+            {"field":field,"value":task_card[field]}
+            for field in ("topic","goal","audience")
+            if isinstance(task_card.get(field),str) and len(re.sub(r"\s+","",task_card[field]))>=2
+        ],
+        "rule":"输出完整 Markdown 叙事，不得返回分析请求、待办或元说明；显式覆盖任务主题、目标、受众，并用至少两个有实质正文的二级章节表达核心论点与页面推进逻辑。",
     }
 
 INSPECTION_SOURCES=frozenset({"semantic_model","semantic_deterministic","technical_browser"})
@@ -924,27 +938,40 @@ class TaskService:
             if prompt: text += f"\n## 修改要求\n{prompt.strip()}\n"
             model_name=self.generator.model
             claim_bindings=assert_claims_bound(text,ledger_value,"叙事")
+            quality_evidence=assert_narrative_quality(text,view["task_card"])
         else:
             numeric_policy=narrative_numeric_policy(ledger_value)
-            payload={"task_id":task_id,"task_card":view["task_card"],"prompt":prompt,"scope":scope,"claim_ledger":ledger_value,"narrative_numeric_policy":numeric_policy}
+            structure_policy=narrative_structure_policy(view["task_card"])
+            payload={"task_id":task_id,"task_card":view["task_card"],"prompt":prompt,"scope":scope,"claim_ledger":ledger_value,"narrative_numeric_policy":numeric_policy,"narrative_structure_policy":structure_policy}
             for attempt in range(1,3):
                 generated=self.generator.generate("narrative",payload,skill=skill["content"])
                 text=generated["text"]; model_name=generated.get("model","unknown")
+                claim_error=quality_error=None
                 try:
                     claim_bindings=assert_claims_bound(text,ledger_value,"叙事",allow_disclosed_assumptions=False)
-                    break
                 except ValidationError as exc:
-                    if attempt==2: raise
-                    evidence=audit_claims(text,ledger_value,allow_disclosed_assumptions=False)
-                    payload={**payload,"semantic_correction":{
-                        "attempt":attempt,
-                        "error":exc.message,
-                        "forbidden_values":[item["value"] for item in evidence["unbound"]],
-                        "rule":"删除全部未绑定量化值；不得改标为假设、建议、示例或待确认。阶段改用无数字名称，仅保留 narrative_numeric_policy.allowed_claims 中的原始量化事实。",
-                    }}
+                    claim_error=exc
+                try:
+                    quality_evidence=assert_narrative_quality(text,view["task_card"])
+                except ValidationError as exc:
+                    quality_error=exc
+                    quality_evidence=narrative_quality_evidence(text,view["task_card"])
+                if claim_error is None and quality_error is None:
+                    break
+                if attempt==2:
+                    raise claim_error or quality_error
+                evidence=audit_claims(text,ledger_value,allow_disclosed_assumptions=False)
+                errors=[exc.message for exc in (claim_error,quality_error) if exc is not None]
+                payload={**payload,"semantic_correction":{
+                    "attempt":attempt,
+                    "error":"；".join(errors),
+                    "forbidden_values":[item["value"] for item in evidence["unbound"]],
+                    "missing_context_fields":quality_evidence["missing_context_fields"],
+                    "rule":"删除全部未绑定量化值；不得改标为假设、建议、示例或待确认。阶段改用无数字名称，仅保留 narrative_numeric_policy.allowed_claims 中的原始量化事实。并按 narrative_structure_policy 返回完整叙事，补齐任务主题、目标、受众、核心论点与页面推进逻辑；不得返回分析请求或元说明。",
+                }}
         version=len(self.versions(task_id,"narrative"))+1; content_hash=digest(text.encode())
         model=NarrativeDocument.parse({"document_id":f"narrative-{content_hash[:16]}","task_id":task_id,"version":version,"markdown":text,"content_hash":content_hash,"created_at":now(),"schema_version":"1.0"})
-        metadata={"parent":prior,"action":"generate" if not prior else "regenerate","scope":scope,"summary":"生成整稿叙事结构","model":model_name,"skill":{"action":"narrative","version":skill["version"],"hash":digest(skill["content"].encode()),"included":["narrative"],"trimmed":["outline","html","inspection"]},"input_snapshot_hash":view["snapshot_hash"],"claim_ledger_hash":ledger["hash"],"claim_bindings":claim_bindings["bindings"],"unbound_claim_count":0}
+        metadata={"parent":prior,"action":"generate" if not prior else "regenerate","scope":scope,"summary":"生成整稿叙事结构","model":model_name,"skill":{"action":"narrative","version":skill["version"],"hash":digest(skill["content"].encode()),"included":["narrative"],"trimmed":["outline","html","inspection"]},"input_snapshot_hash":view["snapshot_hash"],"claim_ledger_hash":ledger["hash"],"claim_bindings":claim_bindings["bindings"],"unbound_claim_count":0,"narrative_quality":quality_evidence}
         h=self._record_p3(task_id,"narrative",model,metadata,"narrative_generate")
         if state.stage in {state.stage.CLARIFICATION,state.stage.CREATED}:
             self.command(task_id,f"narrative-stage-{h[:12]}","advance")
@@ -956,9 +983,10 @@ class TaskService:
         view=self._p3_input(task_id)
         if not isinstance(markdown,str) or not markdown.strip(): raise ValidationError("叙事 Markdown 不得为空")
         ledger=view["claim_ledger"]; claim_bindings=assert_claims_bound(markdown,{key:value for key,value in ledger.items() if key!="hash"},"叙事")
+        quality_evidence=assert_narrative_quality(markdown,view["task_card"])
         prior=self._current_version(task_id,"narrative"); version=len(self.versions(task_id,"narrative"))+1; content_hash=digest(markdown.encode())
         model=NarrativeDocument.parse({"document_id":f"narrative-{content_hash[:16]}","task_id":task_id,"version":version,"markdown":markdown,"content_hash":content_hash,"created_at":now(),"schema_version":"1.0"})
-        h=self._record_p3(task_id,"narrative",model,{"parent":prior,"action":"direct_edit","summary":summary,"authoritative":True,"invalidated":["outline","sample","deck"],"claim_ledger_hash":ledger["hash"],"claim_bindings":claim_bindings["bindings"],"unbound_claim_count":0},"narrative_edit","user")
+        h=self._record_p3(task_id,"narrative",model,{"parent":prior,"action":"direct_edit","summary":summary,"authoritative":True,"invalidated":["outline","sample","deck"],"claim_ledger_hash":ledger["hash"],"claim_bindings":claim_bindings["bindings"],"unbound_claim_count":0,"narrative_quality":quality_evidence},"narrative_edit","user")
         self._reset_narrative_gate(task_id,h)
         return self.planning_view(task_id)
     def confirm_narrative(self,task_id):

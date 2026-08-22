@@ -34,10 +34,19 @@ def outline_response(count):
     } for index in range(count)]},ensure_ascii=False)
 
 
+def narrative_response(*, goal="演示", audience="客户", topic="方案", extra=""):
+    markdown = (
+        f"# 叙事结构\n\n## 核心结论\n{topic}服务于{goal}，以已确认事实形成清晰、可验证的决策依据。"
+        f"{extra}\n\n## 页面逻辑\n面向{audience}先建立背景与核心判断，再展开方案价值、证据与行动建议，"
+        "让每一章节推进同一结论。"
+    )
+    return json.dumps({"markdown": markdown}, ensure_ascii=False)
+
+
 class StageCIntegrationTests(unittest.TestCase):
     def test_structured_outline_is_validated_and_rendered_as_canonical_markdown(self):
         with tempfile.TemporaryDirectory() as root:
-            client=ScriptedClient('{"markdown":"# 叙事结构"}',outline_response(3))
+            client=ScriptedClient(narrative_response(),outline_response(3))
             svc=service(root,client); svc.create("task","manual")
             svc.import_input("task",{"goal":"演示","audience":"客户","topic":"方案","页数":3})
             svc.generate_narrative("task"); svc.confirm_narrative("task")
@@ -49,7 +58,7 @@ class StageCIntegrationTests(unittest.TestCase):
 
     def test_semantic_outline_failure_gets_one_correction_and_private_diagnostic(self):
         with tempfile.TemporaryDirectory() as root:
-            client=ScriptedClient('{"markdown":"# 叙事结构"}',outline_response(1),outline_response(3))
+            client=ScriptedClient(narrative_response(),outline_response(1),outline_response(3))
             svc=service(root,client); svc.create("task","manual")
             svc.import_input("task",{"goal":"演示","audience":"客户","topic":"方案","页数":3})
             svc.generate_narrative("task"); svc.confirm_narrative("task")
@@ -66,8 +75,8 @@ class StageCIntegrationTests(unittest.TestCase):
     def test_narrative_retries_disclosed_invented_stage_numbers_with_strict_allowlist(self):
         with tempfile.TemporaryDirectory() as root:
             client=ScriptedClient(
-                '{"markdown":"# 叙事结构\\n\\n建议第 4 周完成启动，第 8 周扩展，阶段资源占比 45%（待确认）。"}',
-                '{"markdown":"# 叙事结构\\n\\n项目按启动阶段、扩展阶段与稳态阶段推进，总周期 12 周。"}',
+                narrative_response(goal="扩容汇报",audience="管理层",topic="AI 客服试点",extra="建议第 4 周完成启动，第 8 周扩展，阶段资源占比 45%（待确认）。"),
+                narrative_response(goal="扩容汇报",audience="管理层",topic="AI 客服试点",extra="项目按启动阶段、扩展阶段与稳态阶段推进，总周期 12 周。"),
             )
             svc=service(root,client); svc.create("task","manual")
             svc.import_input("task",{"goal":"扩容汇报","audience":"管理层","topic":"AI 客服试点","项目周期":"12 周"})
@@ -86,7 +95,7 @@ class StageCIntegrationTests(unittest.TestCase):
 
     def test_narrative_invented_stage_numbers_remain_fail_closed_after_retry(self):
         with tempfile.TemporaryDirectory() as root:
-            bad='{"markdown":"# 叙事结构\\n\\n建议第 3 周完成启动，第 6 周扩展（均待确认）。"}'
+            bad=narrative_response(goal="扩容汇报",audience="管理层",topic="AI 客服试点",extra="建议第 3 周完成启动，第 6 周扩展（均待确认）。")
             client=ScriptedClient(bad,bad)
             svc=service(root,client); svc.create("task","manual")
             svc.import_input("task",{"goal":"扩容汇报","audience":"管理层","topic":"AI 客服试点","项目周期":"12 周"})
@@ -99,7 +108,7 @@ class StageCIntegrationTests(unittest.TestCase):
 
     def test_semantic_outline_correction_is_bounded_to_one_retry(self):
         with tempfile.TemporaryDirectory() as root:
-            client=ScriptedClient('{"markdown":"# 叙事结构"}',outline_response(1),outline_response(1))
+            client=ScriptedClient(narrative_response(),outline_response(1),outline_response(1))
             svc=service(root,client); svc.create("task","manual")
             svc.import_input("task",{"goal":"演示","audience":"客户","topic":"方案","页数":3})
             svc.generate_narrative("task"); svc.confirm_narrative("task")
@@ -107,6 +116,36 @@ class StageCIntegrationTests(unittest.TestCase):
             self.assertEqual(len(client.inputs),3)
             self.assertEqual(len(svc.versions("task","outline-diagnostic")),2)
             self.assertFalse(svc.versions("task","outline"))
+
+    def test_weak_narrative_gets_one_bounded_semantic_structure_correction(self):
+        with tempfile.TemporaryDirectory() as root:
+            client=ScriptedClient(
+                '{"markdown":"需要分析规划摘要来决定叙事结构。"}',
+                narrative_response(goal="扩容决策",audience="管理层",topic="AI 客服试点"),
+            )
+            svc=service(root,client); svc.create("task","manual")
+            svc.import_input("task",{"goal":"扩容决策","audience":"管理层","topic":"AI 客服试点"})
+
+            narrative=svc.generate_narrative("task")["narrative"]
+
+            self.assertTrue(narrative["metadata"]["narrative_quality"]["passed"])
+            self.assertEqual(len(client.inputs),2)
+            correction=json.loads(client.inputs[1]["input"][1]["content"])["semantic_correction"]
+            self.assertIn("最低语义/结构门禁",correction["error"])
+            self.assertEqual(set(correction["missing_context_fields"]),{"topic","goal","audience"})
+
+    def test_persistently_weak_narrative_fails_closed_without_artifact(self):
+        with tempfile.TemporaryDirectory() as root:
+            weak='{"markdown":"需要分析规划摘要来决定叙事结构。"}'
+            client=ScriptedClient(weak,weak)
+            svc=service(root,client); svc.create("task","manual")
+            svc.import_input("task",{"goal":"扩容决策","audience":"管理层","topic":"AI 客服试点"})
+
+            with self.assertRaisesRegex(ValidationError,"最低语义/结构门禁"):
+                svc.generate_narrative("task")
+
+            self.assertEqual(len(client.inputs),2)
+            self.assertFalse(svc.versions("task","narrative"))
     def test_reported_natural_language_input_uses_tool_free_agent_contract(self):
         with tempfile.TemporaryDirectory() as root:
             client=ScriptedClient('{"questions":[]}')
@@ -122,7 +161,7 @@ class StageCIntegrationTests(unittest.TestCase):
 
     def test_real_mode_narrative_commits_only_current_stage_then_waits_at_manual_gate(self):
         with tempfile.TemporaryDirectory() as root:
-            svc = service(root, ScriptedClient('{"markdown":"# 叙事结构\\n"}'))
+            svc = service(root, ScriptedClient(narrative_response()))
             svc.create("task", "manual")
             svc.import_input("task", {"goal":"演示", "audience":"客户", "topic":"方案", "页数":3})
             result = svc.generate_narrative("task")
@@ -158,7 +197,7 @@ class StageCIntegrationTests(unittest.TestCase):
 
     def test_agent_audit_survives_service_restart_and_records_failures(self):
         with tempfile.TemporaryDirectory() as root:
-            svc=service(root,ScriptedClient('{"markdown":"# ok"}'))
+            svc=service(root,ScriptedClient(narrative_response(goal="g",audience="a",topic="t")))
             svc.create("task"); svc.import_input("task",{"goal":"g","audience":"a","topic":"t"})
             svc.generate_narrative("task")
             first=WorkspaceStore(root).agent_audits()

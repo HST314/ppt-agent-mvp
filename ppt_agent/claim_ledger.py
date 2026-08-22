@@ -19,7 +19,10 @@ _METRIC = re.compile(
     r"百万\+?|亿\+?|万\+?(?![元人家条次])|美元|人民币|元|个\s*工作日|工作日|"
     r"毫秒|秒|分钟|小时|天|周|个月|月|年|倍|[×xX]|条|次|人|家|业务线)(?![A-Za-z])"
 )
-_TRANSITION = re.compile(r"(?<![A-Za-z0-9])\d+(?:\.\d+)?\s*(?:→|⇒|->|至)\s*\d+(?:\.\d+)?(?:\s*[%％])?(?![A-Za-z0-9])")
+_TRANSITION_WORD = r"(?:→|⇒|->|至|到|提升(?:到|至)|提高(?:到|至)|增长(?:到|至)|增至|升至|下降(?:到|至)|降低(?:到|至)|降至|变为)"
+_TRANSITION = re.compile(
+    rf"(?<![A-Za-z0-9])\d+(?:\.\d+)?\s*{_TRANSITION_WORD}\s*\d+(?:\.\d+)?(?:\s*[%％])?(?![A-Za-z0-9])"
+)
 _FREQUENCY = re.compile(r"(?:7\s*[×xX]\s*24|每(?:周|月|季度|年)|双周|会后\s*[一二三四五六七八九十两\d]+\s*(?:天|周|个工作日))")
 _LEGAL = re.compile(r"(?:符合|遵守|满足)《[^》]{2,60}》")
 _ORG = re.compile(r"(?:由|包含|组建|覆盖)[^。；;\n]{0,50}(?:法务|财务|运维|合规)[^。；;\n]{0,30}(?:代表|团队|小组|部门)")
@@ -36,7 +39,12 @@ def _canonical(value: Any) -> bytes:
 
 def _normalized(value: str) -> str:
     normalized = re.sub(r"[\s,，]", "", value).replace("％", "%").casefold()
-    normalized = normalized.replace("⇒", "→").replace("->", "→").replace("至", "→")
+    transition = re.fullmatch(
+        rf"(?P<before>\d+(?:\.\d+)?){_TRANSITION_WORD}(?P<after>\d+(?:\.\d+)?)(?P<unit>%?)",
+        normalized,
+    )
+    if transition:
+        normalized = f"{transition.group('before')}→{transition.group('after')}{transition.group('unit')}"
     # Chinese budget copy routinely alternates between ``24万`` and
     # ``24万元``.  They are the same RMB magnitude; dimension-bearing forms
     # such as ``24万人`` remain distinct and therefore fail closed.
@@ -260,7 +268,11 @@ def audit_html_claims(
     parser = _VisibleText()
     parser.feed(html_text)
     parser.close()
-    return audit_claims("\n".join(parser.text), ledger, required_claim_ids=required_claim_ids)
+    # A non-whitespace record separator preserves DOM/text-node boundaries.
+    # Regexes may consume ordinary formatting whitespace inside one node, but
+    # can no longer invent a metric by joining e.g. one node ending in ``0.4``
+    # with the next node starting in ``人员``.
+    return audit_claims("\n\u241e\n".join(parser.text), ledger, required_claim_ids=required_claim_ids)
 
 
 def assert_claims_bound(

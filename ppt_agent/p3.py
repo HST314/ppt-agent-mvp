@@ -13,6 +13,9 @@ NUMBERED_PAGE_TITLE = re.compile(
     re.IGNORECASE,
 )
 RESOURCE_REF = re.compile(r"!\[[^\]]*\]\((resources://[^)]+)\)")
+NARRATIVE_HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
+NARRATIVE_MIN_SECTION_COUNT = 2
+NARRATIVE_MIN_BODY_CHARACTERS = 60
 
 
 def requested_slide_count(card):
@@ -29,9 +32,79 @@ def requested_slide_count(card):
 
 
 def narrative_markdown(card):
-    return (f"# 整稿叙事结构\n\n## 核心结论\n{card.get('topic') or '待明确主题'}应服务于{card.get('goal') or '演示目标'}。\n\n"
-            f"## 叙事路径\n面向{card.get('audience') or '目标受众'}，依次建立背景、核心方案与行动建议。\n\n"
-            "## 章节组织\n1. 背景与目标\n2. 核心内容\n3. 总结与行动\n")
+    return (f"# 整稿叙事结构\n\n## 核心结论\n{card.get('topic') or '待明确主题'}应服务于{card.get('goal') or '演示目标'}，"
+            "以已确认事实形成清晰、可验证的决策依据。\n\n"
+            f"## 叙事路径\n面向{card.get('audience') or '目标受众'}，依次建立背景、核心方案与行动建议，"
+            "让每一章节都推进同一核心判断。\n\n"
+            "## 章节组织\n1. 背景与目标\n2. 核心内容与证据\n3. 总结、决策与行动\n")
+
+
+def _semantic_text(value):
+    return re.sub(r"[^0-9A-Za-z\u3400-\u9fff]+", "", str(value)).casefold()
+
+
+def narrative_quality_evidence(markdown, card):
+    """Return the deterministic minimum semantic/structure contract.
+
+    This is intentionally a floor rather than an editorial score.  It rejects
+    empty, deferred, or one-line meta answers before they can become planning
+    artifacts, while leaving wording and section names to the model or user.
+    """
+    if not isinstance(markdown, str):
+        markdown = ""
+    headings = list(NARRATIVE_HEADING.finditer(markdown))
+    level_one = [match for match in headings if len(match.group(1)) == 1]
+    sections = [match for match in headings if len(match.group(1)) == 2]
+    section_bodies = []
+    for index, match in enumerate(sections):
+        end = sections[index + 1].start() if index + 1 < len(sections) else len(markdown)
+        body = re.sub(r"^#{1,6}\s+.*$", "", markdown[match.end():end], flags=re.MULTILINE)
+        body = re.sub(r"[`*_>\-#|]", "", body)
+        section_bodies.append(_semantic_text(body))
+    body_text = re.sub(r"^#{1,6}\s+.*$", "", markdown, flags=re.MULTILINE)
+    body_characters = len(_semantic_text(body_text))
+    normalized = _semantic_text(markdown)
+    required_context = []
+    for field in ("topic", "goal", "audience"):
+        value = card.get(field) if isinstance(card, dict) else None
+        token = _semantic_text(value) if isinstance(value, str) else ""
+        # Single-character synthetic values used by low-level tests are not a
+        # meaningful semantic contract for a real narrative.
+        if len(token) >= 2:
+            required_context.append({"field": field, "value": value, "covered": token in normalized})
+    missing_context = [item for item in required_context if not item["covered"]]
+    issues = []
+    if not markdown.strip():
+        issues.append("Markdown 不得为空")
+    if not level_one:
+        issues.append("必须包含一级标题")
+    if len(sections) < NARRATIVE_MIN_SECTION_COUNT:
+        issues.append(f"必须包含至少 {NARRATIVE_MIN_SECTION_COUNT} 个二级叙事章节")
+    if len([body for body in section_bodies if len(body) >= 8]) < NARRATIVE_MIN_SECTION_COUNT:
+        issues.append("至少两个叙事章节必须包含实质正文")
+    if body_characters < NARRATIVE_MIN_BODY_CHARACTERS:
+        issues.append(f"正文有效字符不得少于 {NARRATIVE_MIN_BODY_CHARACTERS}")
+    if missing_context:
+        issues.append("必须显式覆盖任务主题、目标与受众：" + "、".join(item["field"] for item in missing_context))
+    return {
+        "passed": not issues,
+        "issues": issues,
+        "h1_count": len(level_one),
+        "section_count": len(sections),
+        "substantive_section_count": len([body for body in section_bodies if len(body) >= 8]),
+        "body_character_count": body_characters,
+        "minimum_section_count": NARRATIVE_MIN_SECTION_COUNT,
+        "minimum_body_characters": NARRATIVE_MIN_BODY_CHARACTERS,
+        "required_context": required_context,
+        "missing_context_fields": [item["field"] for item in missing_context],
+    }
+
+
+def assert_narrative_quality(markdown, card):
+    evidence = narrative_quality_evidence(markdown, card)
+    if not evidence["passed"]:
+        raise ValidationError("叙事最低语义/结构门禁未通过：" + "；".join(evidence["issues"]))
+    return evidence
 
 
 def outline_markdown(card, resources, count=None):

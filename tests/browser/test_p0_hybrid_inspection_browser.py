@@ -139,6 +139,21 @@ class P0HybridInspectionBrowserGate(unittest.TestCase):
         self.assertTrue(any("class=.ghost-layout-section" in item for item in undefined), evidence["issues"])
         self.assertTrue(any("matched_css_rule=0" in item for item in undefined))
 
+    def test_swiss_body_zh_is_a_real_locked_cssom_class(self):
+        fragment = (
+            '<section class="slide light" id="slide-1" data-slide-id="slide-1" data-layout="S07">'
+            '<h1 data-element-id="title">正文词汇一致性</h1>'
+            '<p class="body-zh" data-element-id="body">这段中文正文必须命中 Swiss 锁定 CSS 规则。</p>'
+            '</section>'
+        )
+        html = f'<!doctype html><html><head><style>{locked_template("swiss")["style"]}</style></head><body>{fragment}</body></html>'
+
+        evidence = ChromiumDeckInspector().inspect(html, ["slide-1"])
+
+        self.assertTrue(evidence["available"], evidence["issues"])
+        undefined = [item for item in evidence["issues"] if item["code"] == "undefined_layout_class"]
+        self.assertFalse(undefined, evidence["issues"])
+
 
 if __name__ == "__main__":
     unittest.main()

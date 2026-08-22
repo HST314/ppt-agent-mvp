@@ -44,7 +44,9 @@ class LockedTemplateTypographyTests(unittest.TestCase):
 
     def test_swiss_missing_layout_classes_now_defined(self):
         style = locked_template("swiss")["style"]
+        compact = "".join(style.split())
         for selector in (
+            ".body-zh{",
             ".rowline{", ".rowline .k{", ".rowline .v{", ".rowline .m{",
             ".pipeline-section{", ".pipeline-label{", ".pipeline{", '.pipeline[data-cols="3"]',
             ".step{", ".step-nb{", ".step-title{", ".step-desc{", ".step-meta{",
@@ -52,6 +54,10 @@ class LockedTemplateTypographyTests(unittest.TestCase):
         ):
             self.assertIn(selector, style)
         # 字号下限对齐清单: 正文≥18 / 描述≥16 / meta≥14
+        self.assertIn(
+            ".body-zh{font-family:var(--sans),var(--sans-zh);font-weight:400;font-size:max(18px,1.08vw)",
+            compact,
+        )
         for pin in (
             ".slide .rowline .k{font-size:18px}",
             ".slide .rowline .v{font-size:16px}",

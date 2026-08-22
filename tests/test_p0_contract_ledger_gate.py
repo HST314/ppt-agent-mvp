@@ -184,6 +184,48 @@ class ContractLedgerGateTests(unittest.TestCase):
         self.assertTrue(complete["passed"])
         self.assertEqual(complete["covered_required_count"], 2)
 
+    def test_transition_binding_normalizes_natural_language_and_arrow_across_stages(self):
+        ledger = build_claim_ledger(
+            task_id="task",
+            input_snapshot_hash="a" * 64,
+            source_binding={"known_facts": ["满意度从 4.2 提升至 4.6"]},
+            created_at=now(),
+        )
+
+        arrow = audit_claims("核心结果：满意度 4.2 → 4.6。", ledger)
+        wording = audit_claims("核心结果：满意度 4.2 提高到 4.6。", ledger)
+        invented = audit_claims("核心结果：满意度 4.2 → 4.7。", ledger)
+
+        self.assertTrue(arrow["passed"], arrow)
+        self.assertTrue(wording["passed"], wording)
+        self.assertFalse(invented["passed"])
+        self.assertEqual(invented["unbound"][0]["normalized_value"], "4.2→4.7")
+        self.assertEqual(ledger["claims"][0]["normalized_value"], "4.2→4.6")
+
+    def test_html_claim_extraction_never_joins_number_and_unit_across_dom_nodes(self):
+        ledger = build_claim_ledger(
+            task_id="task",
+            input_snapshot_hash="a" * 64,
+            source_binding={"known_facts": ["满意度 4.2 → 4.6"]},
+            created_at=now(),
+        )
+        html = """<!doctype html><html><body><section class="slide">
+        <p>系数 0.4</p><p>人员配置保持稳定</p>
+        <p>满意度 <strong>4.2 → 4.6</strong></p>
+        </section></body></html>"""
+
+        result = audit_html_claims(html, ledger, required_claim_ids=[ledger["claims"][0]["claim_id"]])
+        real_metric = audit_html_claims(
+            '<!doctype html><html><body><section class="slide"><p>新增配置 0.4 人</p></section></body></html>',
+            ledger,
+        )
+
+        self.assertTrue(result["passed"], result)
+        self.assertEqual(result["unbound_count"], 0)
+        self.assertEqual(result["covered_required_count"], 1)
+        self.assertFalse(real_metric["passed"])
+        self.assertEqual(real_metric["unbound"][0]["normalized_value"], "0.4人")
+
     def test_standard_head_meta_and_body_void_tags_do_not_hide_claim_text(self):
         ledger = build_claim_ledger(
             task_id="task",

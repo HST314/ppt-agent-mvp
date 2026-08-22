@@ -26,7 +26,7 @@ class BlockingGenerationGateway:
     def generate(self,action,payload,skill=None):
         self.entered.set()
         if not self.release.wait(3): raise TimeoutError("test gateway was not released")
-        return {"text":"# 叙事结构\n\n## 开场\n方案目标与受众。\n","model":self.model}
+        return {"text":"# 叙事结构\n\n## 核心结论\n方案服务于发布目标，并以已确认事实形成清晰、可验证的客户决策依据。\n\n## 页面逻辑\n面向客户先说明方案背景和关键挑战，再展开核心价值、支撑证据与行动建议，确保各章节完整推进发布并收束到明确决策。\n","model":self.model}
 
 
 class BranchingAndSettingsTests(unittest.TestCase):
