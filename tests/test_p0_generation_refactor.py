@@ -53,6 +53,27 @@ class LockedThemeRetryBuilder:
         return html
 
 
+class RequiredClaimRetryBuilder:
+    def __init__(self, *, always_bad=False):
+        self.always_bad=always_bad; self.calls=[]
+
+    def build(self, outline, **context):
+        self.calls.append(dict(context))
+        html=render(
+            outline,
+            context["slide_ids"],
+            context.get("rules"),
+            context.get("exceptions"),
+            context.get("assets"),
+            context.get("design_contract"),
+            context.get("design_contract_hash"),
+        )
+        required=context["required_claims_verbatim"]
+        if required and (self.always_bad or len(self.calls)==1):
+            html=html.replace(required[0]["value"],"冻结事实遗漏")
+        return html
+
+
 class P0GenerationRefactorTests(unittest.TestCase):
     def test_sample_exposes_only_read_only_skill_tools_and_server_assembles_public_shell(self):
         fragment='<section class="slide" id="slide-1" data-slide-id="slide-1"><h1>样品</h1></section>'
@@ -194,6 +215,44 @@ class P0GenerationRefactorTests(unittest.TestCase):
 
             self.assertEqual(len(builder.calls),2)
             self.assertFalse(svc.versions("task","sample"))
+
+    def test_sample_missing_required_claim_is_corrected_once_in_same_job(self):
+        with tempfile.TemporaryDirectory() as root:
+            builder=RequiredClaimRetryBuilder()
+            svc=TaskService(WorkspaceStore(root),builder=builder); svc.create("task","manual")
+            svc.import_input("task",{"goal":"批准预算","audience":"管理层","topic":"扩容方案","页数":3,"总预算":"80 万元"})
+            svc.generate_narrative("task"); svc.confirm_narrative("task")
+            svc.generate_outline("task"); svc.confirm_outline("task")
+            svc.select_samples("task",["slide-1","slide-2","slide-3"])
+
+            sample=svc.generate_sample("task")["sample"]
+
+            self.assertEqual(len(builder.calls),2)
+            required=builder.calls[0]["required_claims_verbatim"]
+            self.assertEqual({item["value"] for item in required},{"80 万元"})
+            correction=builder.calls[1]["semantic_correction"]
+            self.assertEqual(correction["reason"],"missing_required_claims")
+            self.assertEqual(correction["required_claims_verbatim"],required)
+            self.assertEqual(correction["missing_required_claims_verbatim"],required)
+            self.assertEqual(sample["metadata"]["locked_theme_generation"],{"attempts":2,"retry_count":1,"max_attempts":2})
+
+    def test_persistent_sample_required_claim_omission_remains_fail_closed(self):
+        with tempfile.TemporaryDirectory() as root:
+            builder=RequiredClaimRetryBuilder(always_bad=True)
+            svc=TaskService(WorkspaceStore(root),builder=builder); svc.create("task","manual")
+            svc.import_input("task",{"goal":"批准预算","audience":"管理层","topic":"扩容方案","页数":3,"总预算":"80 万元"})
+            svc.generate_narrative("task"); svc.confirm_narrative("task")
+            svc.generate_outline("task"); svc.confirm_outline("task")
+            svc.select_samples("task",["slide-1","slide-2","slide-3"])
+
+            with self.assertRaisesRegex(ValidationError,"missing_required_claim"):
+                svc.generate_sample("task")
+
+            self.assertEqual(len(builder.calls),2)
+            self.assertFalse(svc.versions("task","sample"))
+            record=svc.versions("task","post-render-gate-evidence")[-1]
+            evidence=json.loads(svc.version("task",record["hash"]))
+            self.assertEqual(evidence["claims"]["missing_required_count"],1)
 
     def test_deck_batch_locked_theme_override_is_corrected_once_in_same_job(self):
         with tempfile.TemporaryDirectory() as root:

@@ -68,13 +68,21 @@ def _kind(pattern: re.Pattern[str]) -> str:
 
 
 def _occurrences(text: str) -> list[dict[str, Any]]:
+    # Planning artifacts are Markdown.  Models commonly emphasize the two
+    # sides of a transition independently (for example
+    # ``**4.2** 提升至 **4.6**``).  Replace inline formatting delimiters with
+    # same-length whitespace before scanning so semantic claims can span the
+    # delimiters while every recorded offset still points into the original
+    # artifact.  The visible value is reconstructed without those delimiters.
+    scan_text = re.sub(r"[*_`]", " ", text)
     found = []
     for pattern in (_DATE, _QUARTER, _TRANSITION, _METRIC, _FREQUENCY, _LEGAL, _ORG):
-        for match in pattern.finditer(text):
+        for match in pattern.finditer(scan_text):
+            visible_value = re.sub(r"[*_`]", "", text[match.start():match.end()])
             found.append({
                 "kind": _kind(pattern),
-                "value": match.group(0),
-                "normalized_value": _normalized(match.group(0)),
+                "value": visible_value,
+                "normalized_value": _normalized(visible_value),
                 "start": match.start(),
                 "end": match.end(),
             })

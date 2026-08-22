@@ -52,8 +52,8 @@ STAGE_PROMPTS = {
         "按需最多读取 1 个当前阶段已列出的规划摘要，禁止尝试读取布局、主题、图片或 HTML 模板文件；"
         "读取后立即提交大纲 JSON，不要重复读取。"
     ),
-    "sample": "仅为外层状态机指定的样品页生成 section 片段，不得生成公共模板或扩展到全稿；必须完整应用版本化 Generation Contract 中的事实、主题、布局、组件与动效约束。输入中的 locked_theme_policy 是硬约束：section 根节点及全部后代的 inline style 都不得声明 forbidden_inline_tokens 中的锁定主题变量，只能消费模板已有的 var(--*) 或使用 DesignContract 指定的主题 class。每项 html 必须严格以 <section class=\"slide\" id=\"给定ID\" data-slide-id=\"给定ID\"> 开始并以 </section> 结束。若输入包含 semantic_correction，必须删除其中指出的全部锁定主题变量声明后重新提交完整 slides。",
-    "deck": "仅为外层状态机给定的未确认页面生成 section 片段；不得重做确认样品、不得生成公共模板；必须复用样稿设计语言并完整应用版本化 Generation Contract，避免重复探索。输入中的 locked_theme_policy 是硬约束：section 根节点及全部后代的 inline style 都不得声明 forbidden_inline_tokens 中的锁定主题变量，只能消费模板已有的 var(--*) 或使用 DesignContract 指定的主题 class。每项 html 必须严格以 <section class=\"slide\" id=\"给定ID\" data-slide-id=\"给定ID\"> 开始并以 </section> 结束。若输入包含 semantic_correction，必须删除其中指出的全部锁定主题变量声明后重新提交完整 slides。",
+    "sample": "仅为外层状态机指定的样品页生成 section 片段，不得生成公共模板或扩展到全稿；必须完整应用版本化 Generation Contract 中的事实、主题、布局、组件与动效约束。输入中的 required_claims_verbatim 是本批页面必须可见且逐项覆盖的冻结事实，不得合并、改写或遗漏。输入中的 locked_theme_policy 是硬约束：section 根节点及全部后代的 inline style 都不得声明 forbidden_inline_tokens 中的锁定主题变量，只能消费模板已有的 var(--*) 或使用 DesignContract 指定的主题 class。每项 html 必须严格以 <section class=\"slide\" id=\"给定ID\" data-slide-id=\"给定ID\"> 开始并以 </section> 结束。若输入包含 semantic_correction，必须修复其中指出的锁定主题变量或 missing_required_claims_verbatim，并重新提交完整 slides。",
+    "deck": "仅为外层状态机给定的未确认页面生成 section 片段；不得重做确认样品、不得生成公共模板；必须复用样稿设计语言并完整应用版本化 Generation Contract，避免重复探索。输入中的 required_claims_verbatim 是本批页面必须可见且逐项覆盖的冻结事实，不得合并、改写或遗漏。输入中的 locked_theme_policy 是硬约束：section 根节点及全部后代的 inline style 都不得声明 forbidden_inline_tokens 中的锁定主题变量，只能消费模板已有的 var(--*) 或使用 DesignContract 指定的主题 class。每项 html 必须严格以 <section class=\"slide\" id=\"给定ID\" data-slide-id=\"给定ID\"> 开始并以 </section> 结束。若输入包含 semantic_correction，必须修复其中指出的锁定主题变量或 missing_required_claims_verbatim，并重新提交完整 slides。",
     "inspection": "独立检查大纲与 HTML；必须逐项应用检查清单并结合 browser_evidence 中的 Chromium 渲染测量，仅报告有证据的问题，不得直接修改产物。浏览器证据不可用或包含问题时不得返回 passed=true。",
 }
 

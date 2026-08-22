@@ -890,6 +890,12 @@ class TaskService:
             for binding in coverage["bindings"]
             for claim_id in binding.get("source_claim_ids",[])
         })
+    def _required_claims_verbatim(self,task_id,slide_ids,contract,ledger):
+        required_ids=set(self._required_claim_ids(task_id,slide_ids,contract,ledger))
+        return [
+            {"claim_id":claim["claim_id"],"kind":claim["kind"],"value":claim["value"]}
+            for claim in ledger["claims"] if claim["claim_id"] in required_ids
+        ]
     def _post_render_gate(self,task_id,html_text,slide_ids,contract,ledger,assets):
         contract_hash=contract["hash"]; ledger_hash=ledger["hash"]
         contract_value={key:value for key,value in contract.items() if key!="hash"}
@@ -952,20 +958,24 @@ class TaskService:
     def _is_locked_theme_violation(error):
         return isinstance(error,ValidationError) and "锁定主题变量" in error.message
     def _build_with_locked_theme_retry(self,outline,*,action,slide_ids,assets,context):
-        """Regenerate a theme-violating sample/deck batch once in the same Job.
+        """Regenerate a repairable sample/deck batch once in the same Job.
 
-        Validation stays server-owned.  Only the narrowly classified locked
-        theme violation is retryable; every other validation failure exits
-        immediately, and a second theme violation remains fail-closed.
+        Validation stays server-owned.  A locked-theme violation or missing
+        required claim may trigger the single correction turn.  Unbound facts
+        and every other validation failure exit immediately.  A second
+        violation is returned to the full post-render gate, which persists the
+        failure evidence and remains fail-closed.
         """
         policy=locked_theme_generation_policy(); correction=None
+        ledger=context.get("claim_ledger")
+        required_claims=list(context.get("required_claims_verbatim") or [])
+        required_ids=[claim["claim_id"] for claim in required_claims]
         for attempt in range(1,LOCKED_THEME_GENERATION_ATTEMPTS+1):
             request={**context,"locked_theme_policy":policy,"generation_attempt":attempt}
             if correction is not None: request["semantic_correction"]=correction
             source=self.builder.build(outline,action=action,slide_ids=slide_ids,assets=assets,**request)
             try:
                 validate_html(source,slide_ids,assets)
-                return source,{"attempts":attempt,"retry_count":attempt-1,"max_attempts":LOCKED_THEME_GENERATION_ATTEMPTS}
             except ValidationError as exc:
                 if not self._is_locked_theme_violation(exc) or attempt==LOCKED_THEME_GENERATION_ATTEMPTS:
                     raise
@@ -976,6 +986,27 @@ class TaskService:
                     "forbidden_inline_tokens":policy["forbidden_inline_tokens"],
                     "rule":"删除 section 根节点及全部后代 inline style 中对 forbidden_inline_tokens 的全部声明；保留 DesignContract 指定的主题 class，只消费模板已有 var(--*)，重新提交本批完整 slides。",
                 }
+                continue
+            if ledger and required_ids:
+                coverage=audit_html_claims(source,ledger,required_claim_ids=required_ids)
+                if coverage["unbound_count"]:
+                    return source,{"attempts":attempt,"retry_count":attempt-1,"max_attempts":LOCKED_THEME_GENERATION_ATTEMPTS}
+                if coverage["missing_required_count"]:
+                    if attempt==LOCKED_THEME_GENERATION_ATTEMPTS:
+                        return source,{"attempts":attempt,"retry_count":attempt-1,"max_attempts":LOCKED_THEME_GENERATION_ATTEMPTS}
+                    missing_ids={claim["claim_id"] for claim in coverage["missing_required"]}
+                    correction={
+                        "attempt":attempt,
+                        "reason":"missing_required_claims",
+                        "error":"本批页面遗漏必需冻结事实",
+                        "required_claims_verbatim":required_claims,
+                        "missing_required_claims_verbatim":[
+                            claim for claim in required_claims if claim["claim_id"] in missing_ids
+                        ],
+                        "rule":"重新提交本批完整 slides；将 required_claims_verbatim 的每个 value 逐字写入可见页面内容，尤其补齐 missing_required_claims_verbatim；不得放入隐藏节点、样式、脚本或元数据，不得新增 Claim Ledger 之外的量化事实。",
+                    }
+                    continue
+            return source,{"attempts":attempt,"retry_count":attempt-1,"max_attempts":LOCKED_THEME_GENERATION_ATTEMPTS}
         raise AssertionError("锁定主题变量有界重取未终止")
     def planning_view(self,task_id):
         state=self.get(task_id); result={"state":state,"narrative":None,"outline":None,"versions":self.versions(task_id)}
@@ -1271,6 +1302,7 @@ class TaskService:
         contract,ledger=self._generation_contracts(task_id,outline)
         contract_value={key:value for key,value in contract.items() if key!="hash"}
         ledger_value={key:value for key,value in ledger.items() if key!="hash"}
+        required_claims=self._required_claims_verbatim(task_id,list(selection["slide_ids"]),contract,ledger)
         if prompt: rules.append(prompt.strip())
         if isinstance(self.builder,FakeHtmlBuilder):
             source=render(data["markdown"],selection["slide_ids"],rules,assets=assets,design_contract=contract_value,contract_hash=contract["hash"])
@@ -1278,7 +1310,7 @@ class TaskService:
         else:
             source,generation=self._build_with_locked_theme_retry(
                 data["markdown"],action="sample",slide_ids=list(selection["slide_ids"]),assets=assets,
-                context={"rules":rules,"design_contract":contract_value,"design_contract_hash":contract["hash"],"claim_ledger":ledger_value,"claim_ledger_hash":ledger["hash"]},
+                context={"rules":rules,"design_contract":contract_value,"design_contract_hash":contract["hash"],"claim_ledger":ledger_value,"claim_ledger_hash":ledger["hash"],"required_claims_verbatim":required_claims},
             )
         progress("validating_html", "校验 HTML")
         html_text,gate=self._post_render_gate(task_id,source,list(selection["slide_ids"]),contract,ledger,assets)
@@ -1304,6 +1336,7 @@ class TaskService:
         contract,ledger=self._generation_contracts(task_id,outline)
         contract_value={key:value for key,value in contract.items() if key!="hash"}
         ledger_value={key:value for key,value in ledger.items() if key!="hash"}
+        required_claims=self._required_claims_verbatim(task_id,ids,contract,ledger)
         previous_slides="".join(self._slide_fragments(sample["html"]).get(sid,"") for sid in ids)
         if isinstance(self.builder,FakeHtmlBuilder):
             source=render(data["markdown"],ids,rules,exceptions,assets,contract_value,contract["hash"])
@@ -1311,7 +1344,7 @@ class TaskService:
         else:
             source,generation=self._build_with_locked_theme_retry(
                 data["markdown"],action="sample",slide_ids=ids,assets=assets,
-                context={"rules":rules,"exceptions":exceptions,"previous_slides":previous_slides,"prompt":prompt,"scope":scope,"slide_id":slide_id,"element_id":element_id,"design_contract":contract_value,"design_contract_hash":contract["hash"],"claim_ledger":ledger_value,"claim_ledger_hash":ledger["hash"]},
+                context={"rules":rules,"exceptions":exceptions,"previous_slides":previous_slides,"prompt":prompt,"scope":scope,"slide_id":slide_id,"element_id":element_id,"design_contract":contract_value,"design_contract_hash":contract["hash"],"claim_ledger":ledger_value,"claim_ledger_hash":ledger["hash"],"required_claims_verbatim":required_claims},
             )
         html_text,gate=self._post_render_gate(task_id,source,ids,contract,ledger,assets)
         version=len(self.versions(task_id,"sample"))+1; ch=digest(html_text.encode()); model=DeckArtifact.parse({"artifact_id":f"sample-{ch[:16]}","task_id":task_id,"version":version,"kind":"sample","outline_hash":outline,"content_hash":ch,"created_at":now(),"schema_version":"1.0"})
@@ -1433,9 +1466,10 @@ class TaskService:
                 checkpoint(); batch=unconfirmed[index:index+3]
                 progress("generating_batch",f"生成未确认页面 {index+1}-{index+len(batch)} / {len(unconfirmed)}")
                 batch_contract=scope_design_contract(contract_value,batch)
+                required_claims=self._required_claims_verbatim(task_id,batch,contract,ledger)
                 partial,batch_generation=self._build_with_locked_theme_retry(
                     data["markdown"],action="deck",slide_ids=batch,assets=assets,
-                    context={"rules":meta.get("global_rules",[]),"exceptions":meta.get("local_exceptions",{}),"design_contract":batch_contract,"design_contract_hash":contract["hash"],"claim_ledger":ledger_value,"claim_ledger_hash":ledger["hash"]},
+                    context={"rules":meta.get("global_rules",[]),"exceptions":meta.get("local_exceptions",{}),"design_contract":batch_contract,"design_contract_hash":contract["hash"],"claim_ledger":ledger_value,"claim_ledger_hash":ledger["hash"],"required_claims_verbatim":required_claims},
                 )
                 generation_batches.append({"slide_ids":list(batch),**batch_generation})
                 generated.update(self._slide_fragments(validate_html(partial,batch,assets)))
@@ -1485,6 +1519,7 @@ class TaskService:
             raise ConflictError("候选全稿未绑定当前 DesignContract 或 Claim Ledger")
         contract_value={key:value for key,value in contract.items() if key!="hash"}
         ledger_value={key:value for key,value in ledger.items() if key!="hash"}
+        required_claims=self._required_claims_verbatim(task_id,all_ids,contract,ledger)
         deck_slides=self._slide_fragments(deck["html"])
         previous_slides="".join(deck_slides.get(sid,"") for sid in all_ids)
         if isinstance(self.builder,FakeHtmlBuilder):
@@ -1493,7 +1528,7 @@ class TaskService:
         else:
             source,generation=self._build_with_locked_theme_retry(
                 markdown,action="deck",slide_ids=all_ids,assets=assets,
-                context={"rules":rules,"exceptions":exceptions,"previous_slides":previous_slides,"prompt":prompt,"scope":inferred,"affected_slide_ids":affected,"element_id":element_id,"design_contract":contract_value,"design_contract_hash":contract["hash"],"claim_ledger":ledger_value,"claim_ledger_hash":ledger["hash"]},
+                context={"rules":rules,"exceptions":exceptions,"previous_slides":previous_slides,"prompt":prompt,"scope":inferred,"affected_slide_ids":affected,"element_id":element_id,"design_contract":contract_value,"design_contract_hash":contract["hash"],"claim_ledger":ledger_value,"claim_ledger_hash":ledger["hash"],"required_claims_verbatim":required_claims},
             )
         html_text,gate=self._post_render_gate(task_id,source,all_ids,contract,ledger,assets)
         before=deck["metadata"]["page_hashes"]; after={sid:digest(fragment.encode()) for sid,fragment in self._slide_fragments(html_text).items()}; actual=[sid for sid in all_ids if before[sid]!=after[sid]]

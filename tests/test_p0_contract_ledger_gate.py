@@ -151,6 +151,25 @@ class ContractLedgerGateTests(unittest.TestCase):
                 created_at=now(),
             ), "大纲")
 
+    def test_markdown_emphasis_does_not_hide_equivalent_transition_claim(self):
+        ledger = build_claim_ledger(
+            task_id="transition",
+            input_snapshot_hash="c" * 64,
+            source_binding={"客户满意度": "4.2→4.6"},
+            created_at=now(),
+        )
+        claim_id=ledger["claims"][0]["claim_id"]
+
+        result = audit_claims(
+            "客户满意度由 **4.2** 提升至 **4.6**。",
+            ledger,
+            required_claim_ids=[claim_id],
+        )
+
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["covered_required_claim_ids"],[claim_id])
+        self.assertEqual(result["bindings"][0]["value"],"4.2 提升至 4.6")
+
     def test_generated_narrative_cannot_disclose_invented_metrics_as_assumptions(self):
         ledger = build_claim_ledger(
             task_id="task",
