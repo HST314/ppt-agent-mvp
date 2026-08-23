@@ -146,7 +146,179 @@ class GeometryCorrectionBrowser:
         }
 
 
+VALID_DESIGN_INTENT = {
+    "style_summary":"清晰的业务汇报",
+    "color_strategy":"深色标题配高对比正文",
+    "typography_strategy":"系统无衬线字体与明确字号层级",
+    "layout_principles":["统一安全边距","同类信息保持一致结构"],
+    "rationale":"保证样品在固定画布内稳定可读",
+}
+
+
+def rendering_payload(slide_ids, *, css="", design_intent=None):
+    return json.dumps({
+        "slides":[{
+            "slide_id":slide_id,
+            "html":f'<section class="slide" id="{slide_id}" data-slide-id="{slide_id}"><h1>{slide_id}</h1><p>已按冻结大纲生成</p></section>',
+        } for slide_id in slide_ids],
+        "design_intent":design_intent or VALID_DESIGN_INTENT,
+        "shared_assets":{"css":css},
+    },ensure_ascii=False)
+
+
+class UnboundClaimRetryBuilder:
+    def __init__(self): self.calls=[]
+    def build(self,outline,**context):
+        self.calls.append(dict(context))
+        html=render(
+            outline,context["slide_ids"],context.get("rules"),context.get("exceptions"),
+            context.get("assets"),context.get("design_contract"),context.get("design_contract_hash"),
+        )
+        if len(self.calls)==1:
+            html=html.replace("</section>","<p>未经绑定的预测增长 999%</p></section>",1)
+        return html
+
+
+class AlwaysInvalidBuilder:
+    def __init__(self): self.calls=[]
+    def build(self,_outline,**context):
+        self.calls.append(dict(context))
+        raise ValidationError("CSS 包含规则或任务外资源")
+
+
+class AlwaysBlockedBrowser:
+    enforce_on_generation=True
+    def inspect(self,_html,expected_slide_ids):
+        slide_id=expected_slide_ids[0]
+        issue={
+            "issue_id":"persistent-overflow","severity":"blocker","level":"element",
+            "code":"element_scroll_overflow","message":"安全 fallback 仍溢出",
+            "slide_id":slide_id,"element_id":"body","selector":f"#{slide_id}",
+            "geometry":{"client_width":100,"client_height":100,"scroll_width":100,"scroll_height":200,"delta_height":100},
+            "evidence":"client=100x100; scroll=100x200","suggestion":"拒绝落盘",
+        }
+        return {
+            "available":True,"passed":False,"engine":"chromium","engine_version":"fallback-test",
+            "viewport":{"width":1280,"height":720},"issues":[issue],
+            "slides":[{"slide_id":item} for item in expected_slide_ids],
+        }
+
+
 class P0GenerationRefactorTests(unittest.TestCase):
+    @staticmethod
+    def prepared_sample_service(root, *, pages=8):
+        svc=TaskService(WorkspaceStore(root)); svc.create("task","manual")
+        svc.import_input("task",{"goal":"发布方案","audience":"管理层","topic":"一次生成验收","页数":pages})
+        svc.generate_narrative("task"); svc.confirm_narrative("task")
+        svc.generate_outline("task"); svc.confirm_outline("task")
+        selected=["slide-1","slide-7"] if pages>=7 else ["slide-1"]
+        svc.select_samples("task",selected)
+        return svc,selected
+
+    def test_empty_design_intent_is_corrected_by_outer_attempt_controller(self):
+        with tempfile.TemporaryDirectory() as root:
+            svc,slide_ids=self.prepared_sample_service(root,pages=3)
+            invalid_intent={**VALID_DESIGN_INTENT,"color_strategy":""}
+            client=RecordingClient([
+                ModelTurn(None,"skill",(ModelToolCall("read_skill_file",'{"path":"SKILL.md"}',"skill-1"),)),
+                ModelTurn(rendering_payload(slide_ids,design_intent=invalid_intent),"invalid-intent"),
+                ModelTurn(None,"skill",(ModelToolCall("read_skill_file",'{"path":"SKILL.md"}',"skill-2"),)),
+                ModelTurn(rendering_payload(slide_ids),"corrected-intent"),
+            ])
+            gateway=AgentGateway(client,skill=SkillRuntime.builtin(),max_steps=5,max_tool_calls=4,max_provider_calls=4)
+            svc.builder=gateway
+
+            sample=svc.generate_sample("task")["sample"]
+
+            generation=sample["metadata"]["generation"]
+            self.assertEqual({key:generation[key] for key in ("attempts","retry_count")},{"attempts":2,"retry_count":1})
+            self.assertEqual(sample["metadata"]["design_intent"],VALID_DESIGN_INTENT)
+            correction=json.loads(svc.version("task",generation["correction_evidence_hashes"][0]))["correction"]
+            self.assertEqual(correction["reason"],"technical_validation_failed")
+            self.assertIn("DesignIntent",correction["error"])
+            self.assertEqual(len(client.inputs),4)
+
+    def test_forbidden_shared_css_is_corrected_by_outer_attempt_controller(self):
+        with tempfile.TemporaryDirectory() as root:
+            svc,slide_ids=self.prepared_sample_service(root,pages=8)
+            client=RecordingClient([
+                ModelTurn(None,"skill-1",(ModelToolCall("read_skill_file",'{"path":"SKILL.md"}',"skill-1"),)),
+                ModelTurn(rendering_payload(slide_ids,css='@font-face{font-family:x;src:url("https://example.com/x.woff2")}'),"bad-css"),
+                ModelTurn(None,"skill-2",(ModelToolCall("read_skill_file",'{"path":"SKILL.md"}',"skill-2"),)),
+                ModelTurn(rendering_payload(slide_ids,css=".slide{font-family:Arial,sans-serif}"),"safe-css"),
+            ])
+            gateway=AgentGateway(client,skill=SkillRuntime.builtin(),max_steps=4,max_tool_calls=4,max_provider_calls=4)
+            svc.builder=gateway
+
+            sample=svc.generate_sample("task")["sample"]
+
+            generation=sample["metadata"]["generation"]
+            self.assertEqual({key:generation[key] for key in ("attempts","retry_count")},{"attempts":2,"retry_count":1})
+            correction=json.loads(svc.version("task",generation["correction_evidence_hashes"][0]))["correction"]
+            self.assertEqual(correction["reason"],"technical_validation_failed")
+            self.assertIn("CSS",correction["error"])
+            second_payload=json.loads(client.inputs[2]["input"][1]["content"])
+            self.assertEqual(second_payload["technical_correction"]["reason"],"technical_validation_failed")
+            self.assertNotIn("@font-face",sample["html"])
+            self.assertFalse(generation.get("degraded_fallback",False))
+
+    def test_two_invalid_shared_css_outputs_use_audited_safe_fallback(self):
+        with tempfile.TemporaryDirectory() as root:
+            svc,slide_ids=self.prepared_sample_service(root,pages=8)
+            turns=[]
+            for attempt in (1,2):
+                turns.extend((
+                    ModelTurn(None,f"skill-{attempt}",(ModelToolCall("read_skill_file",'{"path":"SKILL.md"}',f"skill-{attempt}"),)),
+                    ModelTurn(rendering_payload(slide_ids,css="@import url('https://example.com/theme.css');"),f"bad-css-{attempt}"),
+                ))
+            svc.builder=AgentGateway(RecordingClient(turns),skill=SkillRuntime.builtin(),max_steps=4,max_tool_calls=4,max_provider_calls=4)
+
+            sample=svc.generate_sample("task")["sample"]
+
+            generation=sample["metadata"]["generation"]
+            self.assertTrue(generation["degraded_fallback"])
+            self.assertEqual(generation["fallback"]["strategy"],"frozen_outline_generic_shell")
+            self.assertEqual(generation["fallback"]["reason"],"technical_validation_failed")
+            self.assertNotIn("@import",sample["html"])
+            self.assertTrue(sample["metadata"]["post_render_gate"]["passed"])
+            attempts=[json.loads(svc.version("task",item)) for item in generation["attempt_evidence_hashes"]]
+            self.assertEqual([item["status"] for item in attempts],["correction_required","accepted"])
+            self.assertIsNone(attempts[1]["generation_error"])
+            self.assertTrue(attempts[1]["fallback"]["degraded_fallback"])
+
+    def test_unbound_claim_is_regenerated_before_final_gate(self):
+        with tempfile.TemporaryDirectory() as root:
+            builder=UnboundClaimRetryBuilder()
+            svc,slide_ids=self.prepared_sample_service(root,pages=3)
+            svc.builder=builder
+
+            sample=svc.generate_sample("task")["sample"]
+
+            self.assertEqual(len(builder.calls),2)
+            self.assertEqual(builder.calls[1]["technical_correction"]["reason"],"unbound_claims")
+            self.assertEqual(sample["metadata"]["post_render_gate"]["claims"]["unbound_count"],0)
+            self.assertNotIn("999%",sample["html"])
+
+    def test_safe_fallback_still_fails_closed_when_browser_gate_blocks(self):
+        with tempfile.TemporaryDirectory() as root:
+            svc,_=self.prepared_sample_service(root,pages=3)
+            builder=AlwaysInvalidBuilder()
+            svc.builder=builder
+            svc.browser_inspector=AlwaysBlockedBrowser()
+
+            with self.assertRaisesRegex(ValidationError,"fallback 未通过技术门禁"):
+                svc.generate_sample("task")
+
+            self.assertEqual(len(builder.calls),2)
+            self.assertEqual(svc.versions("task","sample"),[])
+            attempts=svc.versions("task","generation-attempt-evidence")
+            corrections=svc.versions("task","generation-correction-evidence")
+            self.assertEqual(len(attempts),2)
+            self.assertEqual(len(corrections),1)
+            final=json.loads(svc.version("task",attempts[-1]["hash"]))
+            self.assertEqual(final["status"],"failed")
+            self.assertEqual(final["fallback"]["failed_reason"],"browser_render_blockers")
+
     def test_unfixable_geometry_gets_one_structured_regeneration_and_evidence_chain(self):
         with tempfile.TemporaryDirectory() as root:
             builder=GeometryCorrectionBuilder()

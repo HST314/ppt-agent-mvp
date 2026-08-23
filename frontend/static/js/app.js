@@ -1,11 +1,11 @@
-import { api, ApiError } from "./api.js?v=2026.08.22.152316565533";
-import { JobTracker } from "./job-tracker.js?v=2026.08.22.152316565533";
-import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.22.152316565533";
-import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.22.152316565533";
-import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.22.152316565533";
-import { inlineError, setBusy } from "./components/index.js?v=2026.08.22.152316565533";
-import { renderStage } from "./stages/index.js?v=2026.08.22.152316565533";
-import { setVersionMatchGuard } from "./stages/shared.js?v=2026.08.22.152316565533";
+import { api, ApiError } from "./api.js?v=2026.08.23.093634439968";
+import { JobTracker } from "./job-tracker.js?v=2026.08.23.093634439968";
+import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.23.093634439968";
+import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.23.093634439968";
+import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.23.093634439968";
+import { inlineError, setBusy } from "./components/index.js?v=2026.08.23.093634439968";
+import { renderStage } from "./stages/index.js?v=2026.08.23.093634439968";
+import { setVersionMatchGuard } from "./stages/shared.js?v=2026.08.23.093634439968";
 
 const app = document.getElementById("app");
 const APP_BUILD = document.querySelector('meta[name="app-build"]')?.content || "unknown";
@@ -356,7 +356,7 @@ function renderRuntimeVersionDetails(container) {
   if (backendBuild) {
     mismatch = runtimeVersionMismatch();
     if (mismatch) status = "前后端版本不一致：后端进程仍在运行旧代码，请重启后端服务后刷新页面";
-    else if (!commit || commit === "unknown") status = "前后端 Build 一致；后端 commit 未知，无法校验代码版本";
+    else if (!commit || commit === "unknown") status = "前后端版本一致；后端 commit 未知，无法校验代码版本";
     else status = "前后端版本一致";
   }
   container.replaceChildren(
@@ -1176,9 +1176,11 @@ function jobBusinessStep(job) {
     skill_completed: "Skill 工具调用已完成",
     validating_output: "正在校验模型输出与阶段 Schema",
     validating_html: "正在校验 HTML 与页面结构",
+    technical_correction: "模型输出未通过技术校验，正在自动修正",
+    safe_fallback: "模型输出仍不合规，正在生成安全样品",
     saving_result: "正在保存版本与业务状态",
     generating_batch: "正在生成页面批次",
-    agent_completed: "Agent 已提交有效阶段结果",
+    agent_completed: "模型输出已返回，正在执行技术校验",
   };
   if (steps[job.current_step]) return steps[job.current_step];
   return operations[job.operation] || "业务操作执行中";

@@ -743,7 +743,7 @@ class AgentRuntime:
             ):
                 fail("模型未完成工具能力探测", "capability_probe_failed")
             audit.append({"event": "terminal", "reason": "success", "tool_calls": tool_count, "provider_calls": provider_call_budget.claimed, "exploration_rounds": exploration_rounds, "cumulative_skill_bytes": skill_bytes, "unique_skill_files": len(successful_read_paths), "applied_skill_files": sorted(successful_read_paths), "skill_entry_read": SKILL_ENTRY in successful_read_paths, "repeated_skill_reads": repeated_read_count})
-            progress("agent_completed", "Agent 已提交有效阶段结果", metrics())
+            progress("agent_completed", "模型输出已返回，正在执行技术校验", metrics())
             self.last_audit = tuple(audit)
             return AgentResult(value, self.last_audit, turn.response_id)
         fail("Agent 达到最大步数，未提交阶段产物", "max_steps")

@@ -1072,7 +1072,14 @@ class TaskService:
             "parent_attempt_id":body["parent_attempt_id"],"immutable":True,
         })
     def _build_with_technical_retry(self,task_id,outline,*,action,slide_ids,assets,context):
-        """Run a bounded retry for objective output and rendering failures."""
+        """Run model output, assembly and every objective preflight as one attempt.
+
+        A real ``AgentGateway`` validates DesignIntent and assembles shared CSS
+        before it returns.  Those model-output failures therefore have to be
+        caught around ``builder.build`` itself, not only around the HTML that a
+        successful builder returns.  Two model attempts are followed by one
+        deterministic, network-free fallback inside the same user Job.
+        """
         correction=None
         ledger=context.get("claim_ledger")
         required_claims=list(context.get("required_claims_verbatim") or [])
@@ -1084,46 +1091,53 @@ class TaskService:
             for slide_id,claims in required_claims_by_slide.items()
         }
         attempt_hashes=[]; correction_hashes=[]; parent_attempt_id=""
-        for attempt in range(1,GENERATION_ATTEMPTS+1):
-            request={
-                **context,
-                "presentation_technical_contract":context["design_contract"],
-                "presentation_technical_contract_hash":context["design_contract_hash"],
-                "generation_attempt":attempt,
-            }
-            if correction is not None: request["technical_correction"]=correction
-            source=self.builder.build(outline,action=action,slide_ids=slide_ids,assets=assets,**request)
-            candidate=str(source); validation_error=None
+
+        def correctable(error):
+            if isinstance(error,ValidationError): return True
+            if not isinstance(error,GatewayError) or isinstance(error,GatewayUnknownResult): return False
+            # Transport/auth/provider failures have safe adapter details and
+            # must still degrade runtime readiness instead of being disguised
+            # as a successful model run.  Output-contract failures do not.
+            return not error.retryable and not error.safe_audit_details() and not error.code.startswith("probe_")
+
+        def prepare(source,*,forced_intent=None,forced_assets=None):
+            candidate=str(source)
             page_coverage=getattr(source,"builder_boundary",None)
             design_intent=validate_design_intent(
-                getattr(source,"design_intent",None)
-                or context.get("confirmed_design_intent")
-                or context.get("design_intent")
-                or default_design_intent()
+                forced_intent if forced_intent is not None else (
+                    getattr(source,"design_intent",None)
+                    or context.get("confirmed_design_intent")
+                    or context.get("design_intent")
+                    or default_design_intent()
+                )
             )
             shared_assets=validate_shared_design_assets(
-                getattr(source,"shared_assets",None)
-                or context.get("confirmed_shared_assets")
-                or context.get("shared_assets")
-            )
-            aggregate_coverage=None; browser_evidence=None; browser_blockers=[]; autofit=None
-            try:
-                candidate=self.technical_gate.validate_candidate_html(candidate,slide_ids,assets)
-                fragments=self._slide_fragments(candidate)
-                candidate=assemble_presentation(
-                    [fragments[slide_id] for slide_id in slide_ids],
-                    context.get("rules",[]),context["design_contract"],context["design_contract_hash"],
-                    design_intent=design_intent,
-                    shared_assets=shared_assets,
+                forced_assets if forced_assets is not None else (
+                    getattr(source,"shared_assets",None)
+                    or context.get("confirmed_shared_assets")
+                    or context.get("shared_assets")
                 )
-                candidate=self.technical_gate.validate_candidate_html(candidate,slide_ids,assets)
-            except ValidationError as exc:
-                validation_error=exc
-            if validation_error is None and ledger and required_ids:
+            )
+            candidate=self.technical_gate.validate_candidate_html(candidate,slide_ids,assets)
+            fragments=self._slide_fragments(candidate)
+            candidate=assemble_presentation(
+                [fragments[slide_id] for slide_id in slide_ids],
+                context.get("rules",[]),context["design_contract"],context["design_contract_hash"],
+                design_intent=design_intent,
+                shared_assets=shared_assets,
+            )
+            candidate=self.technical_gate.validate_candidate_html(candidate,slide_ids,assets)
+            return candidate,page_coverage,design_intent,shared_assets
+
+        def preflight(candidate,page_coverage):
+            aggregate_coverage=None; browser_evidence=None; browser_blockers=[]; autofit=None
+            if ledger:
                 aggregate_coverage=audit_html_claims(candidate,ledger,required_claim_ids=required_ids)
                 if not isinstance(page_coverage,dict):
-                    page_coverage=audit_html_claims_by_slide(self._slide_fragments(candidate),ledger,required_ids_by_slide)
-            browser=self._generation_browser_gate() if validation_error is None else None
+                    page_coverage=audit_html_claims_by_slide(
+                        self._slide_fragments(candidate),ledger,required_ids_by_slide,
+                    )
+            browser=self._generation_browser_gate()
             if browser is not None and not (aggregate_coverage or {}).get("unbound_count") and not (page_coverage or {}).get("missing_required_count"):
                 browser_evidence=browser.inspect(candidate,slide_ids)
                 browser_blockers=TechnicalGate.browser_blockers(browser_evidence)
@@ -1137,17 +1151,24 @@ class TaskService:
                         fitted_blockers=TechnicalGate.browser_blockers(fitted_browser)
                         if not fitted_blockers:
                             candidate=fitted_candidate; browser_evidence=fitted_browser; browser_blockers=[]
+            return candidate,page_coverage,aggregate_coverage,browser_evidence,browser_blockers,autofit,browser
 
-            correction=None
-            materialization=None
-            if validation_error is not None:
-                correction={
-                    "attempt":attempt,"reason":"technical_validation_failed","error":validation_error.message,
-                    "rule":"修复输出 Schema、页面集合、资源引用或 HTML 安全错误后重新提交本批完整 slides。",
+        def correction_for(attempt,error,aggregate_coverage,page_coverage,browser_blockers,autofit):
+            if error is not None:
+                return {
+                    "attempt":attempt,
+                    "reason":"gateway_output_failed" if isinstance(error,GatewayError) else "technical_validation_failed",
+                    "error_code":error.code,
+                    "error":error.message,
+                    "rule":"重新提交完整 slides、非空 DesignIntent 与不含 at-rule/任务外资源的 shared_assets；修复页面集合、资源引用和 HTML 安全错误。",
                 }
-            elif (aggregate_coverage or {}).get("unbound_count"):
-                correction=None
-            elif (page_coverage or {}).get("missing_required_count"):
+            if (aggregate_coverage or {}).get("unbound_count"):
+                return {
+                    "attempt":attempt,"reason":"unbound_claims","error":"本批页面包含 Claim Ledger 之外的量化事实",
+                    "unbound_claims":list(aggregate_coverage.get("unbound") or []),
+                    "rule":"删除所有 unbound_claims；只使用冻结大纲与 Claim Ledger 中的事实，不得用假设、示例或占位文本新增数字。",
+                }
+            if (page_coverage or {}).get("missing_required_count"):
                 missing_ids={claim["claim_id"] for claim in page_coverage["missing_required"]}
                 missing_by_slide={
                     slide_id:[
@@ -1155,19 +1176,46 @@ class TaskService:
                         if any(item["slide_id"]==slide_id and item["claim_id"]==claim["claim_id"] for item in page_coverage["missing_required"])
                     ] for slide_id in slide_ids
                 }
-                correction={
+                return {
                     "attempt":attempt,"reason":"missing_required_claims","error":"本批页面遗漏或错放必需冻结事实",
                     "required_claims_verbatim":required_claims,"required_claims_by_slide":required_claims_by_slide,
                     "missing_required_claims_verbatim":[claim for claim in required_claims if claim["claim_id"] in missing_ids],
                     "missing_required_claims_by_slide":missing_by_slide,
                     "rule":"重新提交本批完整 slides；逐页把 required_claims_by_slide 对应 value 逐字写入该 slide 的可见正文，尤其补齐 missing_required_claims_by_slide；出现在其他页不算覆盖。不得放入隐藏节点、样式、脚本或元数据，不得新增 Claim Ledger 之外的量化事实。",
                 }
-            elif browser_blockers:
-                correction={
+            if browser_blockers:
+                return {
                     "attempt":attempt,"reason":"browser_render_blockers","error":"Chromium builder 边界预检未通过",
                     "browser_blockers":browser_blockers,"overflow_autofit":autofit,
                     "rule":"根据 selector 与 geometry 修复溢出、裁切、坏资源或渲染错误；不得隐藏内容或放宽技术门禁。",
                 }
+            return None
+
+        for attempt in range(1,GENERATION_ATTEMPTS+1):
+            request={
+                **context,
+                "presentation_technical_contract":context["design_contract"],
+                "presentation_technical_contract_hash":context["design_contract_hash"],
+                "generation_attempt":attempt,
+            }
+            if correction is not None: request["technical_correction"]=correction
+            source=None; candidate=""; generation_error=None; page_coverage=None
+            design_intent=default_design_intent(); shared_assets={"css":""}
+            aggregate_coverage=None; browser_evidence=None; browser_blockers=[]; autofit=None; browser=None
+            try:
+                source=self.builder.build(outline,action=action,slide_ids=slide_ids,assets=assets,**request)
+                candidate,page_coverage,design_intent,shared_assets=prepare(source)
+                candidate,page_coverage,aggregate_coverage,browser_evidence,browser_blockers,autofit,browser=preflight(candidate,page_coverage)
+            except (GatewayError,ValidationError) as exc:
+                if not correctable(exc): raise
+                generation_error=exc
+                if source is not None: candidate=str(source)
+
+            correction=correction_for(
+                attempt,generation_error,aggregate_coverage,page_coverage,browser_blockers,autofit,
+            )
+            materialization=None
+            fallback=None
 
             # The model receives one structured correction.  If the second
             # candidate still omits a registered frozen fact, bind it into a
@@ -1182,14 +1230,13 @@ class TaskService:
                 candidate,materialization=materialize_required_claim_slots(
                     candidate,materialized_claims_by_slide,layout_by_slide,
                 )
-                validation_error=None
                 aggregate_coverage=None; page_coverage=None
                 browser_evidence=None; browser_blockers=[]; autofit=None
                 try:
                     candidate=self.technical_gate.validate_candidate_html(candidate,slide_ids,assets)
                 except ValidationError as exc:
-                    validation_error=exc
-                if validation_error is None and ledger and required_ids:
+                    generation_error=exc
+                if generation_error is None and ledger:
                     aggregate_coverage=audit_html_claims(candidate,ledger,required_claim_ids=required_ids)
                     page_coverage=audit_html_claims_by_slide(
                         self._slide_fragments(candidate),ledger,required_ids_by_slide,
@@ -1211,22 +1258,57 @@ class TaskService:
                             fitted_blockers=TechnicalGate.browser_blockers(fitted_browser)
                             if not fitted_blockers:
                                 candidate=fitted_candidate; browser_evidence=fitted_browser; browser_blockers=[]
-                correction=None
-                if (page_coverage or {}).get("missing_required_count"):
-                    correction={
-                        "attempt":attempt,"reason":"server_claim_materialization_failed",
-                        "error":"确定性事实槽位仍未覆盖目标页",
-                        "missing_required_claims_by_slide":materialized_claims_by_slide,
-                    }
-                elif browser_blockers:
-                    correction={
-                        "attempt":attempt,"reason":"browser_render_blockers","error":"确定性事实槽位后 Chromium 预检未通过",
-                        "browser_blockers":browser_blockers,"overflow_autofit":autofit,
-                    }
+                correction=correction_for(
+                    attempt,generation_error,aggregate_coverage,page_coverage,browser_blockers,autofit,
+                )
+
+            # The second invalid model result must not escape to the UI as a
+            # second user-visible failure.  Rebuild from the frozen outline
+            # with the generic, network-free shell and rerun every preflight.
+            if attempt==GENERATION_ATTEMPTS and correction is not None:
+                from .execution import progress
+                progress("safe_fallback","模型输出仍不合规，正在生成安全样品")
+                fallback={
+                    "degraded_fallback":True,
+                    "reason":correction["reason"],
+                    "error_code":correction.get("error_code"),
+                    "strategy":"frozen_outline_generic_shell",
+                }
+                fallback_intent=default_design_intent()
+                fallback_assets={"css":""}
+                try:
+                    fallback_source=render(
+                        outline,slide_ids,context.get("rules"),context.get("exceptions"),assets,
+                        context["design_contract"],context["design_contract_hash"],
+                        design_intent=fallback_intent,shared_assets=fallback_assets,
+                    )
+                    candidate,page_coverage,design_intent,shared_assets=prepare(
+                        fallback_source,forced_intent=fallback_intent,forced_assets=fallback_assets,
+                    )
+                    candidate,page_coverage,aggregate_coverage,browser_evidence,browser_blockers,autofit,browser=preflight(candidate,None)
+                    if (page_coverage or {}).get("missing_required_count"):
+                        candidate,materialization=materialize_required_claim_slots(
+                            candidate,{
+                                slide_id:[
+                                    claim for claim in required_claims_by_slide[slide_id]
+                                    if any(item["slide_id"]==slide_id and item["claim_id"]==claim["claim_id"] for item in page_coverage["missing_required"])
+                                ] for slide_id in slide_ids
+                            },layout_by_slide,
+                        )
+                        candidate=self.technical_gate.validate_candidate_html(candidate,slide_ids,assets)
+                        candidate,page_coverage,aggregate_coverage,browser_evidence,browser_blockers,autofit,browser=preflight(candidate,None)
+                    generation_error=None
+                except (GatewayError,ValidationError) as exc:
+                    generation_error=exc
+                correction=correction_for(
+                    attempt,generation_error,aggregate_coverage,page_coverage,browser_blockers,autofit,
+                )
+                if correction is not None:
+                    fallback["failed_reason"]=correction["reason"]
 
             accepted=(
                 correction is None
-                and validation_error is None
+                and generation_error is None
                 and not (aggregate_coverage or {}).get("unbound_count")
                 and not (page_coverage or {}).get("missing_required_count")
                 and not browser_blockers
@@ -1241,7 +1323,8 @@ class TaskService:
                 "visible_text_hash":digest(canonical(page_hashes)),"aggregate_claims":aggregate_coverage,
                 "browser_preflight":browser_evidence,"overflow_autofit":autofit,
                 "server_claim_materialization":materialization,
-                "validation_error":None if validation_error is None else validation_error.message,
+                "generation_error":None if generation_error is None else {"code":generation_error.code,"message":generation_error.message},
+                "fallback":fallback,
                 "status":status,"provider_audit_id":self._latest_generation_audit_id(task_id,action),
                 "result_certainty":"known","created_at":utcnow(),
             }
@@ -1250,8 +1333,11 @@ class TaskService:
             if status=="accepted":
                 generation_meta={"attempts":attempt,"retry_count":attempt-1,"max_attempts":GENERATION_ATTEMPTS,"attempt_evidence_hashes":attempt_hashes,"correction_evidence_hashes":correction_hashes,"design_intent":design_intent,"shared_assets":shared_assets}
                 if materialization is not None: generation_meta["server_claim_materialization"]=materialization
+                if fallback is not None: generation_meta.update(degraded_fallback=True,fallback=fallback)
                 return candidate,generation_meta
             if correction is not None and attempt<GENERATION_ATTEMPTS:
+                from .execution import progress
+                progress("technical_correction","模型输出未通过技术校验，正在自动修正")
                 correction_body={
                     "schema_version":"1.0","task_id":attempt_body["task_id"],"action":action,
                     "parent_attempt_id":attempt_hash,"next_attempt":attempt+1,"correction":correction,
@@ -1260,11 +1346,8 @@ class TaskService:
                 }
                 correction_hashes.append(self._persist_generation_correction(task_id,correction_body))
                 continue
-            if validation_error is not None:
-                raise validation_error
-            generation_meta={"attempts":attempt,"retry_count":attempt-1,"max_attempts":GENERATION_ATTEMPTS,"attempt_evidence_hashes":attempt_hashes,"correction_evidence_hashes":correction_hashes,"design_intent":design_intent,"shared_assets":shared_assets}
-            if materialization is not None: generation_meta["server_claim_materialization"]=materialization
-            return candidate,generation_meta
+            if generation_error is not None: raise generation_error
+            raise ValidationError(f"确定性安全 fallback 未通过技术门禁：{(correction or {}).get('reason','unknown')}")
         raise AssertionError("技术输出有界重取未终止")
     def planning_view(self,task_id):
         state=self.get(task_id); result={"state":state,"narrative":None,"outline":None,"versions":self.versions(task_id)}
