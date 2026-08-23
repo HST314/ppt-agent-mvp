@@ -7,7 +7,7 @@ from pathlib import Path
 from fastapi.responses import HTMLResponse
 
 
-FRONTEND_BUILD = "2026.08.23.100340566066"
+FRONTEND_BUILD = "2026.08.23.102655140222"
 
 
 def _commit_sha(value: str) -> str:

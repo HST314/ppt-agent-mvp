@@ -1,4 +1,4 @@
-import { api } from "./api.js?v=2026.08.23.100340566066";
+import { api } from "./api.js?v=2026.08.23.102655140222";
 
 const TERMINAL = new Set(["succeeded", "failed", "cancelled", "interrupted"]);
 const EVENT_TYPES = ["queued", "started", "progress", "checkpoint", "succeeded", "failed", "cancelled", "interrupted", "heartbeat"];
@@ -39,7 +39,7 @@ export class JobTracker {
     const track = {
       job, callbacks, source: null, timer: null, reconnectTimer: null, recoveryTimer: null,
       seq: 0, seen: new Set(), stopped: false, streamFailures: 0, recoveryAttempts: 0,
-      pollFailures: 0, polling: false, terminalReconciling: false,
+      pollFailures: 0, polling: false, terminalReconciling: false, controller: new AbortController(),
     };
     this.tracks.set(job.job_id, track);
     callbacks.onUpdate?.(job, "initial");
@@ -49,7 +49,8 @@ export class JobTracker {
   async hydrate(track) {
     try {
       await this.syncHistory(track);
-      const job = await api.getJob(track.job.job_id);
+      if (track.stopped) return;
+      const job = await api.getJob(track.job.job_id, track.controller);
       track.pollFailures = 0;
       track.job = job;
       track.callbacks.onUpdate?.(job, "hydrated");
@@ -62,7 +63,8 @@ export class JobTracker {
   }
 
   async syncHistory(track) {
-    const response = await api.jobEventHistory(track.job.job_id, track.seq);
+    const response = await api.jobEventHistory(track.job.job_id, track.seq, track.controller);
+    if (track.stopped) return;
     response.events.forEach((event) => this.applyEvent(track, event, false));
   }
 
@@ -137,7 +139,8 @@ export class JobTracker {
       if (track.stopped || !track.polling) return;
       try {
         await this.syncHistory(track);
-        const job = await api.getJob(track.job.job_id);
+        if (track.stopped) return;
+        const job = await api.getJob(track.job.job_id, track.controller);
         track.pollFailures = 0;
         track.job = job;
         track.callbacks.onUpdate?.(job, "polling");
@@ -165,7 +168,8 @@ export class JobTracker {
   async reconcile(track) {
     try {
       await this.syncHistory(track);
-      const job = await api.getJob(track.job.job_id);
+      if (track.stopped) return;
+      const job = await api.getJob(track.job.job_id, track.controller);
       track.pollFailures = 0;
       track.job = job;
       track.callbacks.onUpdate?.(job, "reconciled");
@@ -251,6 +255,7 @@ export class JobTracker {
     if (!track) return;
     track.stopped = true;
     track.polling = false;
+    track.controller.abort("tracker_stopped");
     track.source?.close();
     if (track.timer) window.clearTimeout(track.timer);
     if (track.reconnectTimer) window.clearTimeout(track.reconnectTimer);

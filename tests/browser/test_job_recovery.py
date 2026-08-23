@@ -100,23 +100,28 @@ class JobRecoveryBrowserGate(unittest.TestCase):
         self.thread.join(5)
         self.tmp.cleanup()
 
-    def new_page(self, *, fail_first_streams=0, stale_authority_reads=0, width=1280, height=900):
+    def new_page(self, *, fail_first_streams=0, stale_authority_reads=0, delay_job_reads=0, width=1280, height=900):
         page = self.browser.new_page(viewport={"width": width, "height": height})
         script = """
             (() => {
               const failFirst = __FAIL_FIRST__;
               const staleAuthorityLimit = __STALE_AUTHORITY__;
+              const jobReadDelay = __JOB_READ_DELAY__;
               const NativeEventSource = window.EventSource;
               const nativeFetch = window.fetch.bind(window);
               window.__streamUrls = [];
               window.__pollUrls = [];
               window.__authorityUrls = [];
               window.__staleAuthorityReplies = 0;
+              window.__trackerAbortCount = 0;
+              window.__trackerSignalCount = 0;
               const publish = () => {
                 document.documentElement?.setAttribute("data-test-stream-count", String(window.__streamUrls.length));
                 document.documentElement?.setAttribute("data-test-poll-count", String(window.__pollUrls.length));
                 document.documentElement?.setAttribute("data-test-authority-count", String(window.__authorityUrls.length));
                 document.documentElement?.setAttribute("data-test-stale-authority-count", String(window.__staleAuthorityReplies));
+                document.documentElement?.setAttribute("data-test-tracker-abort-count", String(window.__trackerAbortCount));
+                document.documentElement?.setAttribute("data-test-tracker-signal-count", String(window.__trackerSignalCount));
               };
               let attempts = 0;
               let staleShell = null;
@@ -148,6 +153,15 @@ class JobRecoveryBrowserGate(unittest.TestCase):
               window.fetch = async (...args) => {
                 const target = String(args[0]);
                 const path = new URL(target, location.origin).pathname;
+                if (/\/v1\/jobs\/[^/]+(?:\/event-history)?$/.test(path) && args[1]?.signal) {
+                  window.__trackerSignalCount += 1;
+                  args[1].signal.addEventListener("abort", () => {
+                    window.__trackerAbortCount += 1;
+                    publish();
+                  }, { once: true });
+                  publish();
+                  if (jobReadDelay) await new Promise((resolve) => window.setTimeout(resolve, jobReadDelay));
+                }
                 if (/\/v1\/jobs\/[^/]+$/.test(path)) {
                   window.__pollUrls.push(target);
                   publish();
@@ -180,7 +194,7 @@ class JobRecoveryBrowserGate(unittest.TestCase):
                 return response;
               };
             })();
-            """.replace("__FAIL_FIRST__", str(fail_first_streams)).replace("__STALE_AUTHORITY__", str(stale_authority_reads))
+            """.replace("__FAIL_FIRST__", str(fail_first_streams)).replace("__STALE_AUTHORITY__", str(stale_authority_reads)).replace("__JOB_READ_DELAY__", str(delay_job_reads))
         page.add_init_script(script=script)
         return page
 
@@ -304,6 +318,18 @@ class JobRecoveryBrowserGate(unittest.TestCase):
         jobs = self.wait_for_job_count(1)
         page.goto(self.base + "/tasks/recovery?stage=narrative")
         page.get_by_role("heading", name="叙事结构", exact=True).wait_for()
+        page.close()
+
+    def test_spa_navigation_aborts_queued_tracker_reads(self):
+        page = self.new_page(delay_job_reads=500)
+        self.start_first_job(page)
+        page.locator('html[data-test-tracker-signal-count]:not([data-test-tracker-signal-count="0"])').wait_for()
+
+        page.get_by_label("返回任务首页").click()
+        page.get_by_role("heading", name="从任务资料到可交付演示稿，都在一个工作台。").wait_for()
+        page.locator('html[data-test-tracker-abort-count]:not([data-test-tracker-abort-count="0"])').wait_for()
+
+        self.service.release.set()
         page.close()
 
     def test_second_disconnect_exhausts_probes_but_polls_until_terminal(self):
