@@ -28,7 +28,11 @@ jobs:
       - run: python -m pip install -r requirements-browser.txt
       - run: python -m playwright install --with-deps chromium
       - name: Install Skill script sandbox dependency
-        run: sudo apt-get update && sudo apt-get install --yes bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          bwrap --unshare-all --die-with-parent --ro-bind / / -- /usr/bin/true
       - run: python3 scripts/verify_release_matrix.py --profile full
 
   real-model:
