@@ -115,6 +115,8 @@ class JobRecoveryBrowserGate(unittest.TestCase):
               window.__staleAuthorityReplies = 0;
               window.__trackerAbortCount = 0;
               window.__trackerSignalCount = 0;
+              window.__trackerReadActive = new WeakMap();
+              window.__trackerReadMax = 0;
               const publish = () => {
                 document.documentElement?.setAttribute("data-test-stream-count", String(window.__streamUrls.length));
                 document.documentElement?.setAttribute("data-test-poll-count", String(window.__pollUrls.length));
@@ -122,6 +124,7 @@ class JobRecoveryBrowserGate(unittest.TestCase):
                 document.documentElement?.setAttribute("data-test-stale-authority-count", String(window.__staleAuthorityReplies));
                 document.documentElement?.setAttribute("data-test-tracker-abort-count", String(window.__trackerAbortCount));
                 document.documentElement?.setAttribute("data-test-tracker-signal-count", String(window.__trackerSignalCount));
+                document.documentElement?.setAttribute("data-test-tracker-read-max", String(window.__trackerReadMax));
               };
               let attempts = 0;
               let staleShell = null;
@@ -155,12 +158,18 @@ class JobRecoveryBrowserGate(unittest.TestCase):
                 const path = new URL(target, location.origin).pathname;
                 if (/\/v1\/jobs\/[^/]+(?:\/event-history)?$/.test(path) && args[1]?.signal) {
                   window.__trackerSignalCount += 1;
+                  const signal = args[1].signal;
+                  const signalReads = (window.__trackerReadActive.get(signal) || 0) + 1;
+                  window.__trackerReadActive.set(signal, signalReads);
+                  window.__trackerReadMax = Math.max(window.__trackerReadMax, signalReads);
                   args[1].signal.addEventListener("abort", () => {
                     window.__trackerAbortCount += 1;
                     publish();
                   }, { once: true });
                   publish();
                   if (jobReadDelay) await new Promise((resolve) => window.setTimeout(resolve, jobReadDelay));
+                  window.__trackerReadActive.set(signal, signalReads - 1);
+                  publish();
                 }
                 if (/\/v1\/jobs\/[^/]+$/.test(path)) {
                   window.__pollUrls.push(target);
@@ -330,6 +339,33 @@ class JobRecoveryBrowserGate(unittest.TestCase):
         page.locator('html[data-test-tracker-abort-count]:not([data-test-tracker-abort-count="0"])').wait_for()
 
         self.service.release.set()
+        page.close()
+
+    def test_checkpoint_burst_uses_single_reconcile_and_terminal_stream_does_not_reconnect(self):
+        page = self.new_page(delay_job_reads=150)
+        errors = []
+        http_errors = []
+        page.on("console", lambda message: errors.append(message.text) if message.type == "error" else None)
+        page.on("response", lambda response: http_errors.append((response.status, response.url)) if response.status >= 400 else None)
+        self.start_first_job(page)
+        page.locator('html[data-test-stream-count="1"]').wait_for(timeout=10000)
+
+        coordinator = self.app.state.job_service
+        job = coordinator.list("recovery")[-1]
+        with coordinator._guard:
+            record = coordinator._read("recovery", job["job_id"])
+            for index in range(3):
+                coordinator._publish_event(record, "checkpoint", message=f"burst-{index}")
+
+        self.service.release.set()
+        self.wait_for_job_count(1)
+        self.wait_for_session_state(page, True, timeout=10000)
+        page.wait_for_timeout(300)
+
+        self.assertEqual(page.evaluate("window.__trackerReadMax"), 1)
+        self.assertEqual(page.evaluate("window.__streamUrls.length"), 1)
+        self.assertEqual(http_errors, [])
+        self.assertEqual(errors, [])
         page.close()
 
     def test_second_disconnect_exhausts_probes_but_polls_until_terminal(self):

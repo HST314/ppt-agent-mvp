@@ -1,4 +1,4 @@
-import { api } from "./api.js?v=2026.08.23.102655140222";
+import { api } from "./api.js?v=2026.08.23.105055404954";
 
 const TERMINAL = new Set(["succeeded", "failed", "cancelled", "interrupted"]);
 const EVENT_TYPES = ["queued", "started", "progress", "checkpoint", "succeeded", "failed", "cancelled", "interrupted", "heartbeat"];
@@ -40,6 +40,7 @@ export class JobTracker {
       job, callbacks, source: null, timer: null, reconnectTimer: null, recoveryTimer: null,
       seq: 0, seen: new Set(), stopped: false, streamFailures: 0, recoveryAttempts: 0,
       pollFailures: 0, polling: false, terminalReconciling: false, controller: new AbortController(),
+      reconcilePromise: null, reconcileQueued: false, terminalEventSeen: false,
     };
     this.tracks.set(job.job_id, track);
     callbacks.onUpdate?.(job, "initial");
@@ -69,7 +70,7 @@ export class JobTracker {
   }
 
   openStream(track, { recovery = false } = {}) {
-    if (track.stopped || track.source) return;
+    if (track.stopped || track.source || track.terminalEventSeen) return;
     const source = new EventSource(`/v1/jobs/${encodeURIComponent(track.job.job_id)}/events?after=${track.seq}`);
     track.source = source;
     source.onopen = () => {
@@ -126,6 +127,18 @@ export class JobTracker {
       track.callbacks.onTransport?.("heartbeat", { at: event.at, seq: track.seq });
       return;
     }
+    if (TERMINAL.has(event.type)) {
+      // The server closes a terminal SSE stream immediately after this event.
+      // Close the browser side first so EventSource cannot treat that clean EOF
+      // as a transport failure and race a reconnect against terminal reads.
+      track.terminalEventSeen = true;
+      track.source?.close();
+      track.source = null;
+      if (track.reconnectTimer) window.clearTimeout(track.reconnectTimer);
+      if (track.recoveryTimer) window.clearTimeout(track.recoveryTimer);
+      track.reconnectTimer = null;
+      track.recoveryTimer = null;
+    }
     track.callbacks.onEvent?.(event);
     if (reconcile && (TERMINAL.has(event.type) || event.type === "started" || event.type === "checkpoint")) this.reconcile(track);
   }
@@ -165,7 +178,23 @@ export class JobTracker {
     }, delay);
   }
 
-  async reconcile(track) {
+  reconcile(track) {
+    if (track.stopped || track.terminalReconciling) return Promise.resolve();
+    if (track.reconcilePromise) {
+      track.reconcileQueued = true;
+      return track.reconcilePromise;
+    }
+    track.reconcilePromise = this.runReconcile(track).finally(() => {
+      track.reconcilePromise = null;
+      if (track.reconcileQueued && !track.stopped && !track.terminalReconciling) {
+        track.reconcileQueued = false;
+        this.reconcile(track);
+      }
+    });
+    return track.reconcilePromise;
+  }
+
+  async runReconcile(track) {
     try {
       await this.syncHistory(track);
       if (track.stopped) return;
@@ -173,8 +202,9 @@ export class JobTracker {
       track.pollFailures = 0;
       track.job = job;
       track.callbacks.onUpdate?.(job, "reconciled");
-      if (TERMINAL.has(job.status)) this.finish(track, job);
+      if (TERMINAL.has(job.status)) return this.finish(track, job);
     } catch (error) {
+      if (track.stopped) return;
       this.transportError(track, error, "reconcile");
       this.poll(track);
     }
