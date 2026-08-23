@@ -83,15 +83,21 @@ class DesktopJourney(unittest.TestCase):
         page.get_by_role("heading", name="澄清", exact=True).wait_for()
 
         page.get_by_role("button", name="生成叙事结构", exact=True).click()
+        self.wait_for_job("narrative.generate")
+        page.goto(self.base + "/tasks/desktop?stage=narrative")
         page.get_by_role("heading", name="叙事结构", exact=True).wait_for()
         page.get_by_role("button", name="确认当前叙事结构").click()
         page.get_by_role("heading", name="逐页大纲", exact=True).wait_for()
         page.get_by_role("button", name="生成逐页大纲", exact=True).click()
+        self.wait_for_job("outline.generate")
+        page.goto(self.base + "/tasks/desktop?stage=outline")
         page.get_by_role("button", name="确认当前逐页大纲").wait_for()
         page.get_by_role("button", name="确认当前逐页大纲").click()
 
         page.get_by_role("heading", name="样品", exact=True).wait_for()
         page.get_by_role("button", name="生成 HTML 样品").click()
+        self.wait_for_job("samples.generate")
+        page.goto(self.base + "/tasks/desktop?stage=sample")
         page.get_by_role("button", name="确认当前样品并进入全稿").wait_for()
         page.get_by_role("button", name="确认当前样品并进入全稿").click()
         page.get_by_role("heading", name="全稿", exact=True).wait_for()
@@ -113,6 +119,7 @@ class DesktopJourney(unittest.TestCase):
             page.get_by_role("dialog").get_by_role("button", name="确定终稿并前往交付").click()
         self.assertEqual(finalized.value.status, 200)
 
+        page.goto(self.base + "/tasks/desktop?stage=delivery")
         page.get_by_role("heading", name="交付", exact=True).wait_for()
         page.get_by_text("检查通过", exact=True).first.wait_for()
         page.goto(self.base + "/tasks/desktop?stage=review")
@@ -124,6 +131,8 @@ class DesktopJourney(unittest.TestCase):
         page.get_by_role("heading", name="交付", exact=True).wait_for()
         page.get_by_role("button", name="将离线包写入工程文件夹").click()
         page.get_by_role("dialog").get_by_role("button", name="开始写入并校验").click()
+        self.wait_for_job("delivery.publish")
+        page.goto(self.base + "/tasks/desktop?stage=delivery")
         page.get_by_text("已完成", exact=True).first.wait_for()
         deck = self.service.deck_view("desktop")["deck"]
         page.get_by_label("派生要求").fill("统一使用蓝色主题")

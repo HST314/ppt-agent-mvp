@@ -41,7 +41,8 @@ class SamplePageBrowserTests(unittest.TestCase):
         self.svc.generate_outline("task")
         self.svc.confirm_outline("task")
         port = free_port()
-        self.server = uvicorn.Server(uvicorn.Config(create_app(self.svc), host="127.0.0.1", port=port, log_level="critical"))
+        self.app = create_app(self.svc)
+        self.server = uvicorn.Server(uvicorn.Config(self.app, host="127.0.0.1", port=port, log_level="critical"))
         self.thread = threading.Thread(target=self.server.run, daemon=True)
         self.thread.start()
         deadline = time.monotonic() + 5
@@ -56,6 +57,16 @@ class SamplePageBrowserTests(unittest.TestCase):
         self.server.should_exit = True
         self.thread.join(5)
         self.tmp.cleanup()
+
+    def wait_for_job(self, operation, timeout=15):
+        deadline=time.monotonic()+timeout; jobs=[]
+        while time.monotonic()<deadline:
+            jobs=[job for job in self.app.state.job_service.list("task") if job["operation"]==operation]
+            if jobs and jobs[-1]["status"] in {"succeeded","failed","cancelled","interrupted"}:
+                self.assertEqual(jobs[-1]["status"],"succeeded",jobs[-1])
+                return jobs[-1]
+            time.sleep(.05)
+        self.fail(f"{operation} did not reach a terminal state: {jobs}")
 
     def wait_for_versions(self, count, timeout=15):
         deadline = time.monotonic() + timeout
@@ -78,6 +89,7 @@ class SamplePageBrowserTests(unittest.TestCase):
         page.get_by_role("heading", name="样品", exact=True).wait_for()
         page.get_by_label("视觉要求").fill("首屏主视觉")
         page.get_by_role("button", name="生成 HTML 样品").click()
+        self.wait_for_job("samples.generate")
         first = self.wait_for_versions(1)
         page.reload()
         page.get_by_role("button", name="确认当前样品并进入全稿").wait_for()
@@ -87,6 +99,7 @@ class SamplePageBrowserTests(unittest.TestCase):
         page.get_by_label("视觉要求").fill("当前页标题更醒目")
         page.get_by_label("页面 ID", exact=True).fill(slide_id)
         page.get_by_role("button", name="提交样品修改").click()
+        self.wait_for_job("samples.modify")
         modified = self.wait_for_versions(2)
         page.reload()
         page.get_by_role("button", name="确认当前样品并进入全稿").wait_for()

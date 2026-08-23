@@ -1,11 +1,11 @@
-import { api, ApiError } from "./api.js?v=2026.08.23.093634439968";
-import { JobTracker } from "./job-tracker.js?v=2026.08.23.093634439968";
-import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.23.093634439968";
-import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.23.093634439968";
-import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.23.093634439968";
-import { inlineError, setBusy } from "./components/index.js?v=2026.08.23.093634439968";
-import { renderStage } from "./stages/index.js?v=2026.08.23.093634439968";
-import { setVersionMatchGuard } from "./stages/shared.js?v=2026.08.23.093634439968";
+import { api, ApiError } from "./api.js?v=2026.08.23.100340566066";
+import { JobTracker } from "./job-tracker.js?v=2026.08.23.100340566066";
+import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.23.100340566066";
+import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.23.100340566066";
+import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.23.100340566066";
+import { inlineError, setBusy } from "./components/index.js?v=2026.08.23.100340566066";
+import { renderStage } from "./stages/index.js?v=2026.08.23.100340566066";
+import { setVersionMatchGuard } from "./stages/shared.js?v=2026.08.23.100340566066";
 
 const app = document.getElementById("app");
 const APP_BUILD = document.querySelector('meta[name="app-build"]')?.content || "unknown";
@@ -526,6 +526,7 @@ async function renderWorkspace(route, generation, authority = null) {
         const prefetchedView = authority?.stageId === selected.id ? authority.stageView : null;
         const content = await renderStage(selected.id, stageContext(shell, selected, route, generation, prefetchedView));
         if (generation !== renderGeneration) return;
+        enforceActiveJobState(content, shell.active_jobs);
         enforceTaskActionState(content, shell.task);
         enforceStageAccess(content, selected, shell.task);
         document.getElementById("stage-content")?.replaceChildren(content);
@@ -951,6 +952,16 @@ async function reconcileStoredIntents(taskId, activeJobs) {
   await Promise.all(stored.map(async ({ jobId, storageKey }) => {
     try {
       const job = await api.getJob(jobId);
+      if (["succeeded", "failed", "cancelled", "interrupted"].includes(job.status)) {
+        // A terminal Job commits business authority before its terminal record.
+        // The Shell fetched for this refresh is therefore already current.
+        // Clear the stale intent synchronously instead of reconnecting a
+        // completed tracker whose delayed onComplete render could erase a new
+        // prompt the user has started typing.
+        jobSnapshots.set(job.job_id, job);
+        clearIdempotencyKey(storageKey, jobId);
+        return;
+      }
       connectJob(job, storageKey);
     } catch (_error) {
       clearIdempotencyKey(storageKey, jobId);
@@ -1035,6 +1046,17 @@ async function startTrackedJob({ taskId, route, buttonNode, region, intent, crea
 
 function lockedStage(stage) {
   return stage.status === "locked";
+}
+
+function enforceActiveJobState(content, activeJobs) {
+  const active = activeJobs?.[0];
+  if (!active) return;
+  const reason = `${operationLabel(active.operation)}正在运行；完成后可继续操作`;
+  content.querySelectorAll('[data-mutates="true"]').forEach((control) => {
+    control.disabled = true;
+    control.title = reason;
+    control.setAttribute("aria-description", reason);
+  });
 }
 
 function enforceTaskActionState(content, task) {

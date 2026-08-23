@@ -485,10 +485,18 @@ class FastAPIAppTests(unittest.TestCase):
         self.assertEqual(replay.status_code,200)
         self.assertEqual(replay.json()["deck_job"]["job_id"],first["deck_job"]["job_id"])
         deadline=time.monotonic()+3
+        job=None
         while time.monotonic()<deadline:
-            if self.client.get(f"/v1/jobs/{first['deck_job']['job_id']}").json()["status"] in {"succeeded","failed","cancelled","interrupted"}:
+            # Poll the coordinator directly: TestClient itself is not safe for
+            # concurrent requests while the executor is committing the deck.
+            # A transient HTTP error used to raise KeyError and let teardown
+            # delete the workspace under the still-running Job.
+            job=self.client.app.state.job_service.get(first["deck_job"]["job_id"])
+            if job["status"] in {"succeeded","failed","cancelled","interrupted"}:
                 break
             time.sleep(.01)
+        self.assertIsNotNone(job)
+        self.assertEqual(job["status"],"succeeded",job)
 
     def test_empty_resources_and_unstructured_markdown_return_clarifications(self):
         self.client.post("/v1/tasks", json={"task_id": "missing-input", "mode": "manual"})
