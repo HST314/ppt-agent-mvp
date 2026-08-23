@@ -52,8 +52,20 @@ class DesktopJourney(unittest.TestCase):
         self.base = f"http://127.0.0.1:{port}"
         self.page = self.browser.new_page(viewport={"width": 1440, "height": 1000})
         self.errors = []
-        self.page.on("console", lambda message: self.errors.append(message.text) if message.type == "error" else None)
+        self.http_errors = []
+        self.page.on(
+            "console",
+            lambda message: self.errors.append({"text": message.text, "location": message.location})
+            if message.type == "error"
+            else None,
+        )
         self.page.on("pageerror", lambda error: self.errors.append(str(error)))
+        self.page.on(
+            "response",
+            lambda response: self.http_errors.append({"status": response.status, "url": response.url})
+            if response.status >= 400
+            else None,
+        )
 
     def tearDown(self):
         self.page.close()
@@ -143,7 +155,11 @@ class DesktopJourney(unittest.TestCase):
         self.assertNotEqual(derived["hash"], deck["hash"])
         self.assertEqual(self.service.status_summary("desktop")["stage"], "deck")
         self.assertTrue(page.locator("body").evaluate("node => node.scrollWidth <= node.clientWidth"))
-        self.assertEqual(self.errors, [])
+        self.assertEqual(
+            self.errors,
+            [],
+            msg=json.dumps({"console_errors": self.errors, "http_errors": self.http_errors}, ensure_ascii=False),
+        )
 
 
 if __name__ == "__main__":

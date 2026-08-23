@@ -63,8 +63,20 @@ class FastAPIFullJourneyGate(unittest.TestCase):
     def test_create_to_delivery_and_derive_in_one_shell(self):
         page = self.browser.new_page(viewport={"width": 1440, "height": 950})
         errors = []
-        page.on("console", lambda message: errors.append(message.text) if message.type == "error" else None)
+        http_errors = []
+        page.on(
+            "console",
+            lambda message: errors.append({"text": message.text, "location": message.location})
+            if message.type == "error"
+            else None,
+        )
         page.on("pageerror", lambda error: errors.append(str(error)))
+        page.on(
+            "response",
+            lambda response: http_errors.append({"status": response.status, "url": response.url})
+            if response.status >= 400
+            else None,
+        )
         page.goto(self.base + "/")
         page.get_by_label("任务 ID").fill("step2-journey")
         page.get_by_role("button", name="创建任务并进入工作台").click()
@@ -129,7 +141,11 @@ class FastAPIFullJourneyGate(unittest.TestCase):
         page.get_by_role("heading", name="自检与修改", exact=True).wait_for()
 
         self.assertLessEqual(page.locator("body").evaluate("node => node.scrollWidth"), page.locator("body").evaluate("node => node.clientWidth"))
-        self.assertEqual(errors, [])
+        self.assertEqual(
+            errors,
+            [],
+            msg=json.dumps({"console_errors": errors, "http_errors": http_errors}, ensure_ascii=False),
+        )
         page.close()
 
 
