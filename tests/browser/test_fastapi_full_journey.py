@@ -60,6 +60,10 @@ class FastAPIFullJourneyGate(unittest.TestCase):
             time.sleep(.05)
         self.fail(f"{operation} did not reach a terminal state: jobs={json.dumps(jobs,ensure_ascii=False,sort_keys=True)}, state={json.dumps(self.service.get(task_id),ensure_ascii=False,sort_keys=True)}")
 
+    @staticmethod
+    def wait_for_browser_job_cleanup(page, job, timeout=10):
+        page.locator(f"#{job['job_id']}").wait_for(state="detached", timeout=timeout * 1000)
+
     def test_create_to_delivery_and_derive_in_one_shell(self):
         page = self.browser.new_page(viewport={"width": 1440, "height": 950})
         errors = []
@@ -102,7 +106,8 @@ class FastAPIFullJourneyGate(unittest.TestCase):
         page.get_by_role("button", name="确认当前样品并进入全稿").click()
         page.get_by_role("heading", name="全稿", exact=True).wait_for()
         self.assertEqual(self.service.get("step2-journey")["stage"],"deck")
-        self.wait_for_job("step2-journey","deck.generate")
+        job = self.wait_for_job("step2-journey","deck.generate")
+        self.wait_for_browser_job_cleanup(page, job)
         page.reload()
         page.get_by_role("heading", name="全稿", exact=True).wait_for()
         page.get_by_role("link", name="前往自检与修改", exact=True).wait_for()
@@ -111,7 +116,8 @@ class FastAPIFullJourneyGate(unittest.TestCase):
         page.get_by_role("heading", name="自检与修改", exact=True).wait_for()
         page.get_by_text("尚未检查", exact=True).wait_for()
         page.get_by_role("button", name="执行独立检查", exact=True).click()
-        self.wait_for_job("step2-journey", "inspection.run")
+        job = self.wait_for_job("step2-journey", "inspection.run")
+        self.wait_for_browser_job_cleanup(page, job)
         page.reload()
         page.get_by_role("heading", name="自检与修改", exact=True).wait_for()
         page.get_by_role("button", name="处置本组 1 项").wait_for()
@@ -128,7 +134,8 @@ class FastAPIFullJourneyGate(unittest.TestCase):
         page.get_by_role("heading", name="交付", exact=True).wait_for()
         page.get_by_role("button", name="将离线包写入工程文件夹").click()
         page.get_by_role("dialog").get_by_role("button", name="开始写入并校验").click()
-        self.wait_for_job("step2-journey", "delivery.publish")
+        job = self.wait_for_job("step2-journey", "delivery.publish")
+        self.wait_for_browser_job_cleanup(page, job)
         page.reload()
         page.get_by_role("heading", name="交付", exact=True).wait_for()
         page.get_by_text("已完成", exact=True).first.wait_for()
