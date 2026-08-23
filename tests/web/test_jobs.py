@@ -52,6 +52,34 @@ class ProgressService(TaskService):
 
 
 class JobServiceTests(unittest.TestCase):
+    def test_get_ignores_transaction_snapshot_seen_before_live_task(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = TaskService(WorkspaceStore(root))
+            service.create("snapshot-safe")
+            service.command("snapshot-safe", "to-clarification", "advance")
+            service.command("snapshot-safe", "to-narrative", "advance")
+            jobs = JobService(service, executor=DeferredExecutor())
+            created, _ = jobs.create("snapshot-safe", "narrative.generate", {}, "snapshot-key")
+
+            live_task = Path(root) / "snapshot-safe"
+            snapshot = Path(root) / ".snapshot-safe.test.transaction"
+            (snapshot / "jobs").mkdir(parents=True)
+            (snapshot / "checkpoint.json").write_text(
+                (live_task / "checkpoint.json").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            snapshot_job = snapshot / "jobs" / f"{created['job_id']}.json"
+            snapshot_job.write_text(
+                (live_task / "jobs" / snapshot_job.name).read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+
+            with patch.object(Path, "iterdir", return_value=iter((snapshot, live_task))):
+                found = jobs.get(created["job_id"])
+
+            self.assertEqual(found["task_id"], "snapshot-safe")
+            jobs.close()
+
     def test_runtime_probe_deduplicates_equal_capability_identities(self):
         class ProbeGateway:
             def __init__(self,name,key): self.model=name; self.key=key; self.calls=0

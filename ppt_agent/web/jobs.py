@@ -34,6 +34,19 @@ OPERATIONS = {
     "inspection.fix",
     "delivery.publish",
 }
+
+
+def _is_task_directory(path: Path) -> bool:
+    """Exclude lock, transaction and failed snapshots from task discovery."""
+    name = path.name
+    return (
+        path.is_dir()
+        and bool(name)
+        and all(char in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in name)
+        and (path / "checkpoint.json").is_file()
+    )
+
+
 OPERATION_STAGES = {
     "clarification.generate": {"clarification"},
     "narrative.generate": {"clarification", "narrative"},
@@ -552,7 +565,7 @@ class JobService:
             return
         queued: list[tuple[str, str]] = []
         for task_path in self.store.root.iterdir():
-            if not task_path.is_dir() or not (task_path / "checkpoint.json").exists():
+            if not _is_task_directory(task_path):
                 continue
             jobs = task_path / "jobs"
             if not jobs.is_dir():
@@ -845,6 +858,8 @@ class JobService:
         if not job_id.startswith("job_"):
             raise ValidationError("job_id 格式无效")
         for task_path in self.store.root.iterdir():
+            if not _is_task_directory(task_path):
+                continue
             path = task_path / "jobs" / f"{job_id}.json"
             if path.exists():
                 return self.public(self._read(task_path.name, job_id))
@@ -922,9 +937,9 @@ class JobService:
     def list_tasks(self) -> list[dict[str, Any]]:
         tasks = []
         for path in self.store.root.iterdir():
-            checkpoint = path / "checkpoint.json"
-            if not path.is_dir() or not checkpoint.exists():
+            if not _is_task_directory(path):
                 continue
+            checkpoint = path / "checkpoint.json"
             try:
                 state = json.loads(checkpoint.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
