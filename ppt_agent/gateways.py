@@ -117,7 +117,9 @@ class AgentGateway:
         self.runtime = AgentRuntime(
             self.client,
             self.skill_factory(),
-            timeout_seconds=self.run_timeout_seconds,
+            # Clarification is a text-only two-call stage.  It must never
+            # inherit the ten-minute HTML generation budget.
+            timeout_seconds=min(self.run_timeout_seconds, 60) if stage == "clarification" else self.run_timeout_seconds,
             **runtime_limits,
         )
         failure = None
@@ -287,6 +289,55 @@ class AgentGateway:
 
         checks={"basic_response":True,"strict_json_schema":True,"tool_round_trip":True}
         self.last_probe_audit={"probe_id":probe_id,"model":self.model,"status":"succeeded","checks":checks,"events":list(events)}
+        return checks
+
+    def probe_clarification_capabilities(self, *, probe_id=None):
+        """Probe only the capabilities needed before a clarification Job.
+
+        A successful strict clarification response proves both connectivity and
+        the exact JSON contract.  It intentionally does not inspect another
+        model, read a Skill, call a tool, or depend on Chromium.
+        """
+        probe_id = probe_id or f"clarification-probe-{uuid.uuid4().hex}"
+        budget = self.stage_budgets.get("clarification")
+        runtime = AgentRuntime(
+            self.client,
+            self.skill_factory(),
+            max_steps=getattr(budget, "max_steps", 2),
+            max_tool_calls=getattr(budget, "max_tool_calls", 1),
+            max_provider_calls=getattr(budget, "max_provider_calls", 2),
+            max_exploration_rounds=getattr(budget, "max_exploration_rounds", 0),
+            max_unique_files=getattr(budget, "max_unique_files", 1),
+            max_skill_bytes=getattr(budget, "max_skill_bytes", 1024),
+            reserved_final_calls=getattr(budget, "reserved_final_calls", 1),
+            timeout_seconds=min(self.run_timeout_seconds, 45),
+        )
+        try:
+            result = runtime.run(
+                "clarification",
+                {"capability_probe": "return_no_questions"},
+                capability_probe=True,
+            )
+        except Exception as exc:
+            self.last_probe_audit = {
+                "probe_id": probe_id,
+                "model": self.model,
+                "status": "failed",
+                "failed_check": "clarification_json_schema",
+                "events": list(runtime.last_audit),
+            }
+            if isinstance(exc, GatewayError):
+                exc.probe_id = probe_id
+                exc.failed_check = "clarification_json_schema"
+            raise
+        checks = {"basic_response": True, "clarification_json_schema": True}
+        self.last_probe_audit = {
+            "probe_id": probe_id,
+            "model": self.model,
+            "status": "succeeded",
+            "checks": checks,
+            "events": list(result.audit),
+        }
         return checks
 
     def generate(self, action, payload, *, skill=""):

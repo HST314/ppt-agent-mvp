@@ -101,7 +101,8 @@ class FrontendAssetTests(unittest.TestCase):
         self.assertIn("Agent 审计 ID", input_stage)
         self.assertIn("复制探测 ID", input_stage)
         self.assertIn("waiting_for_runtime", input_stage)
-        self.assertIn("继续生成澄清问题", input_stage)
+        self.assertIn("立即重试澄清问题", input_stage)
+        self.assertIn("无需再次点击", input_stage)
         self.assertIn("模型恢复探测中", app)
         self.assertIn('role: "alert"', input_stage)
         for label in ("失败阶段", "工具调用数", "底层错误"):

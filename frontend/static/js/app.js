@@ -1,11 +1,11 @@
-import { api, ApiError } from "./api.js?v=2026.08.23.105055404954";
-import { JobTracker } from "./job-tracker.js?v=2026.08.23.105055404954";
-import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.23.105055404954";
-import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.23.105055404954";
-import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.23.105055404954";
-import { inlineError, setBusy } from "./components/index.js?v=2026.08.23.105055404954";
-import { renderStage } from "./stages/index.js?v=2026.08.23.105055404954";
-import { setVersionMatchGuard } from "./stages/shared.js?v=2026.08.23.105055404954";
+import { api, ApiError } from "./api.js?v=2026.08.24.091507484151";
+import { JobTracker } from "./job-tracker.js?v=2026.08.24.091507484151";
+import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.24.091507484151";
+import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.24.091507484151";
+import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.24.091507484151";
+import { inlineError, setBusy } from "./components/index.js?v=2026.08.24.091507484151";
+import { renderStage } from "./stages/index.js?v=2026.08.24.091507484151";
+import { setVersionMatchGuard } from "./stages/shared.js?v=2026.08.24.091507484151";
 
 const app = document.getElementById("app");
 const APP_BUILD = document.querySelector('meta[name="app-build"]')?.content || "unknown";
@@ -180,7 +180,12 @@ function renderRuntimeBadges(group) {
   let modelLabel = "模型检测中";
   let modelTone = "warning";
   if (runtimeState.health?.startup_status === "starting") {
-    modelLabel = "后台初始化中";
+    if (runtimeState.health?.clarification_runtime_ready) {
+      modelLabel = "澄清模型可用·后续能力检测中";
+      modelTone = "primary";
+    } else {
+      modelLabel = "澄清模型连接中";
+    }
   } else if (runtimeState.health?.clarification_mode === "fake" && runtimeState.runtimeReady) {
     modelLabel = "模型：本地模式";
     modelTone = "primary";
@@ -1009,6 +1014,7 @@ async function retryClarification(taskId, route, { buttonNode = null, region = n
     region,
     intent,
     busyLabel: "正在创建重试任务…",
+    requiresRuntime: false,
     create: () => api.retryClarification(taskId, intent.value),
   });
   if (job && !["succeeded", "failed", "cancelled", "interrupted"].includes(job.status)) renderRoute(currentRoute());
@@ -1171,7 +1177,9 @@ function jobStatus(job) {
 }
 
 function jobBusinessStep(job) {
-  if (job.status === "queued") return "等待执行资源";
+  if (job.status === "queued") return job.current_step === "waiting_clarification_runtime"
+    ? "任务已保存，等待生成模型连接"
+    : "任务已入队，等待执行资源";
   if (job.status === "cancellation_requested" || job.cancellation_requested) return "正在取消：等待当前安全停止点";
   const terminal = {
     succeeded: "业务操作已完成",
@@ -1506,7 +1514,7 @@ function renderRuntimeProbeDetails(container) {
 }
 
 function runtimeCheckLabel(check) {
-  return ({ basic_response: "基础文本响应", strict_json_schema: "严格 JSON Schema", tool_round_trip: "工具调用与结果回传", capability_contract: "能力契约" })[check] || check;
+  return ({ basic_response: "基础文本响应", clarification_json_schema: "澄清 JSON Schema", strict_json_schema: "严格 JSON Schema", tool_round_trip: "工具调用与结果回传", capability_contract: "能力契约" })[check] || check;
 }
 
 function runtimePhaseLabel(phase) {

@@ -1,6 +1,6 @@
-import { api } from "../api.js?v=2026.08.23.105055404954";
-import { badge, button, confirmationDialog, element, field, metadataList, shortHash } from "../components/index.js?v=2026.08.23.105055404954";
-import { actionMessage, invalidationNotice, runAction, section, stageGrid } from "./shared.js?v=2026.08.23.105055404954";
+import { api } from "../api.js?v=2026.08.24.091507484151";
+import { badge, button, confirmationDialog, element, field, metadataList, shortHash } from "../components/index.js?v=2026.08.24.091507484151";
+import { actionMessage, invalidationNotice, runAction, section, stageGrid } from "./shared.js?v=2026.08.24.091507484151";
 
 const FIELD_LABELS = { goal: "演示目标", audience: "主要受众", topic: "核心主题" };
 const WARNING_LABELS = {
@@ -214,10 +214,20 @@ function clarificationStage(view, context) {
 function clarificationGenerating(job, clarification) {
   const round = clarification && Number.isInteger(clarification.round) && Number.isInteger(clarification.max_rounds)
     ? `第 ${clarification.round}/${clarification.max_rounds} 轮` : "本轮";
-  return section("模型正在阅读任务卡", element("div", { className: "clarification-generating", role: "status", "aria-live": "polite", "aria-atomic": "true" }, [
+  const waitingRuntime = job?.status === "queued" && job?.current_step === "waiting_clarification_runtime";
+  const queued = job?.status === "queued";
+  const heading = waitingRuntime ? "澄清任务已入队" : queued ? "澄清任务等待执行" : "模型正在生成澄清问题";
+  const label = waitingRuntime ? "等待模型连接" : queued ? "已持久化" : "AI 生成中";
+  const tone = waitingRuntime || queued ? "warning" : "primary";
+  const detail = waitingRuntime
+    ? "任务卡和澄清 Job 均已保存；生成模型轻量检测完成后会自动执行，无需再次点击。"
+    : queued
+      ? "澄清 Job 已持久化，执行资源可用后会自动把请求发送给模型。"
+      : `已向生成模型提交任务，正在整理${round}问题并校验返回格式。`;
+  return section(heading, element("div", { className: "clarification-generating", role: "status", "aria-live": "polite", "aria-atomic": "true" }, [
     element("div", { className: "clarification-generating__header" }, [
-      badge("AI 生成中", "primary"),
-      element("p", { text: `正在结合原始任务卡、规范化字段、资源摘要和已答记录整理${round}问题。` }),
+      badge(label, tone),
+      element("p", { text: detail }),
     ]),
     element("div", { className: "clarification-generating__skeleton", "aria-hidden": "true" }, [
       element("span", { className: "skeleton skeleton--title" }),
@@ -225,16 +235,16 @@ function clarificationGenerating(job, clarification) {
       element("span", { className: "skeleton skeleton--line" }),
     ]),
     element("p", { className: "field__hint", text: job
-      ? "生成任务已持久化，可以安全离开此页；完成后工作台会自动刷新。"
+      ? "可以安全离开此页；请求、校验或失败都会在 90 秒执行硬截止内形成明确结果，完成后工作台会自动刷新。"
       : "模型完成前不会显示任何问题。工作台会从服务端重新读取最终结果。" }),
-  ]), { description: "模型完成前不会展示问题，也不会自动切换到系统兜底题。" });
+  ]), { description: "任务卡确认后会自动排队、调用生成模型并校验问题结构。" });
 }
 
 function clarificationFailed(clarification, context) {
   const error = clarification.error || {};
   const message = actionMessage();
   const advice = clarificationRecoveryAdvice(error);
-  const retry = button("重新生成问题", { kind: "primary", mutates: true, requiresRuntime: true, onClick: () => {
+  const retry = button("重新生成问题", { kind: "primary", mutates: true, onClick: () => {
     context.retryClarification({ buttonNode: retry, region: message });
   } });
   const fallback = button("使用系统兜底问题", { kind: "secondary", mutates: true, onClick: () => {
@@ -279,7 +289,7 @@ function clarificationFailed(clarification, context) {
 function clarificationWaitingForRuntime(clarification, context) {
   const error = clarification.error || {};
   const message = actionMessage();
-  const resume = button("继续生成澄清问题", { kind: "primary", mutates: true, requiresRuntime: true, onClick: () => {
+  const resume = button("立即重试澄清问题", { kind: "primary", mutates: true, onClick: () => {
     context.retryClarification({ buttonNode: resume, region: message });
   } });
   const fallback = button("使用系统兜底问题", { kind: "secondary", mutates: true, onClick: () => {
@@ -300,7 +310,7 @@ function clarificationWaitingForRuntime(clarification, context) {
   return section("等待模型运行时恢复", [
     element("div", { className: "notice notice--warning", role: "status" }, [
       badge("资料已冻结", "warning"),
-      element("p", { text: "模型请求尚未入队，当前任务不会被标记为生成失败。运行时探测恢复后可直接继续，无需新建任务或重新导入资料。" }),
+      element("p", { text: "这是旧版本遗留的无 Job 状态。服务会自动补建持久化澄清任务；无需新建任务或重新导入资料。" }),
       metadataList([
         error.runtime_error_code ? ["运行时错误", error.runtime_error_code] : null,
         error.failed_check ? ["失败检查", runtimeCheckLabel(error.failed_check)] : null,
@@ -312,7 +322,7 @@ function clarificationWaitingForRuntime(clarification, context) {
     element("p", { className: "field__hint", text: clarificationRecoveryAdvice(error) }),
     element("p", { className: "field__hint", text: "系统会对未知传输故障做独立能力探测，但不会重放结果未知的旧 Job。" }),
     message,
-  ], { description: "运行时门禁在模型边界前关闭，冻结输入和资源清单保持不变。" });
+  ], { description: "冻结输入和资源清单保持不变；正常路径会自动恢复，手动重试仅用于异常处置。" });
 }
 
 function clarificationRecoveryAdvice(error) {
@@ -347,7 +357,7 @@ function clarificationRecoveryAdvice(error) {
 }
 
 function runtimeCheckLabel(check) {
-  return ({ basic_response: "基础文本响应", strict_json_schema: "严格 JSON Schema", tool_round_trip: "工具调用与结果回传", capability_contract: "能力契约" })[check] || check;
+  return ({ basic_response: "基础文本响应", clarification_json_schema: "澄清 JSON Schema", strict_json_schema: "严格 JSON Schema", tool_round_trip: "工具调用与结果回传", capability_contract: "能力契约" })[check] || check;
 }
 
 function runtimePhaseLabel(phase) {

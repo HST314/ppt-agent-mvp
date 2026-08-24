@@ -240,9 +240,13 @@ class JobServiceTests(unittest.TestCase):
             self.assertEqual(len(executor.calls), 1)
             recovered.close()
 
-    def test_queued_clarification_waits_when_runtime_degrades_before_execution(self):
+    def test_queued_clarification_fails_explicitly_when_its_runtime_degrades(self):
+        class Clarifier:
+            model="clarifier"
+            def clarify(self,_payload):
+                raise AssertionError("unready clarification runtime must block before provider call")
         with tempfile.TemporaryDirectory() as root:
-            service = TaskService(WorkspaceStore(root))
+            service = TaskService(WorkspaceStore(root),clarifier=Clarifier())
             service.create("clarification-gated")
             service.import_input("clarification-gated", {"topic": "新品"})
             executor = DeferredExecutor()
@@ -254,15 +258,15 @@ class JobServiceTests(unittest.TestCase):
                 "clarification-gate-key",
             )
             failure = GatewayError("auth", code="model_authentication_failed")
-            service.record_runtime_failure(failure)
+            service.record_clarification_runtime_failure(failure)
             function, args = executor.calls.pop(0)
             function(*args)
             clarification = service.input_view("clarification-gated")["clarification"]
-            self.assertEqual(clarification["status"], "waiting_for_runtime")
+            self.assertEqual(clarification["status"], "failed")
             self.assertEqual(clarification["error"]["code"], "runtime_unavailable")
             state=service.get("clarification-gated")
-            self.assertEqual(state["waiting_reason"],"waiting_for_runtime")
-            self.assertEqual(state["required_action"],"continue_clarification")
+            self.assertEqual(state["waiting_reason"],"clarification_failed")
+            self.assertEqual(state["required_action"],"retry_clarification")
             # 落入本任务记录的运行时错误换发本任务自己的诊断 ID，且不引用
             # 其他任务的 Agent 审计，避免跨任务错误污染。
             self.assertNotEqual(clarification["error"]["diagnostic_id"], failure.diagnostic_id)

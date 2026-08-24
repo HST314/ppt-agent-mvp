@@ -32,26 +32,45 @@ def create_app(
         raise RuntimeError(f"frontend assets missing: {frontend}")
     coordinator = JobService(service, defer_queued_recovery=True, defer_recovery_scan=True)
     shutdown=threading.Event()
-    bootstrap={"recovery":"starting","runtime":"starting"}
+    bootstrap={"recovery":"starting","clarification":"starting","runtime":"starting","generation_core":"starting"}
 
     def initialize_background():
         try:
-            coordinator.initialize_recovery()
-            bootstrap["recovery"]="ready"
+            service.initialize_clarification_runtime()
+            bootstrap["clarification"]="ready"
+        except Exception:
+            bootstrap["clarification"]="failed"
+            logging.exception("background clarification initialization failed")
+        finally:
+            # The light probe has reached a terminal state.  Persisted Jobs can
+            # now either run or fail explicitly; none remain in an endless
+            # startup spinner.  Legacy waiting inputs are repaired as well.
+            coordinator.resume_clarification_queued()
+            coordinator.reconcile_waiting_clarifications()
+        try:
             capabilities=service.initialize_runtime()
+            bootstrap["runtime"]="ready"
             generation_core=service.initialize_generation_core()
+            bootstrap["generation_core"]="ready"
             # Startup completion and provider capability are separate signals.
             # A later background probe can recover capability without mutating
             # this one-shot bootstrap state.
-            bootstrap["runtime"]="ready"
             if capabilities.get("ready") and generation_core.get("ready") and not shutdown.is_set(): coordinator.resume_recovered_queued()
         except Exception:
-            pending="recovery" if bootstrap["recovery"]=="starting" else "runtime"
+            pending="runtime" if bootstrap["runtime"]=="starting" else "generation_core"
             bootstrap[pending]="failed"
             logging.exception("background startup initialization failed")
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        try:
+            # Recovery is local and deterministic.  Finish it before accepting
+            # input so saving a task card can always create its durable Job.
+            coordinator.initialize_recovery()
+            bootstrap["recovery"]="ready"
+        except Exception:
+            bootstrap["recovery"]="failed"
+            logging.exception("startup Job recovery failed")
         thread=threading.Thread(target=initialize_background,name="ppt-startup",daemon=True)
         thread.start()
         yield
@@ -79,6 +98,7 @@ def create_app(
 
     def runtime_payload():
         capabilities=service.runtime_health()
+        clarification=service.clarification_runtime_health()
         generation_core=service.generation_core_health()
         config_summary=service.runtime_config_summary()
         startup=startup_status()
@@ -92,6 +112,8 @@ def create_app(
             "backend_commit": backend_commit(),
             "config_summary_sha256": hashlib.sha256(json.dumps(config_summary,sort_keys=True,separators=(",",":")).encode()).hexdigest(),
             "clarification_mode":"model" if service.clarifier is not None else "fake",
+            "clarification_runtime_ready":clarification["ready"],
+            "clarification_runtime":clarification,
             "model_capabilities":capabilities,
             "generation_core":generation_core,
             "release":service.release_status(),
@@ -140,9 +162,16 @@ def create_app(
 
     @app.post("/v1/runtime/recheck", tags=["runtime"])
     def recheck_runtime():
+        service.initialize_clarification_runtime()
+        bootstrap["clarification"]="ready"
+        coordinator.resume_clarification_queued()
+        coordinator.reconcile_waiting_clarifications()
         capabilities=service.initialize_runtime()
-        service.initialize_generation_core()
+        generation_core=service.initialize_generation_core()
         bootstrap["runtime"]="ready"
+        bootstrap["generation_core"]="ready"
+        if capabilities.get("ready") and generation_core.get("ready"):
+            coordinator.resume_recovered_queued()
         return runtime_payload()
 
     @app.get("/v1/runtime/probes", tags=["runtime"])

@@ -297,7 +297,7 @@ class JobRecoveryBrowserGate(unittest.TestCase):
         page.get_by_label("任务卡内容").fill("核心主题：新品发布")
         page.get_by_role("button", name="导入并冻结资料", exact=True).click()
 
-        page.get_by_role("heading", name="模型正在阅读任务卡", exact=True).wait_for()
+        page.get_by_role("heading", name="模型正在生成澄清问题", exact=True).wait_for()
         self.assertTrue(clarifier.started.wait(2))
         self.assertEqual(page.locator("fieldset.question-card").count(), 0)
         clarifier.release.set()

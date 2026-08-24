@@ -354,11 +354,16 @@ class FastAPIShellBrowserGate(unittest.TestCase):
         page.get_by_label("任务卡内容").fill("核心主题：新品发布")
         page.get_by_role("button", name="导入并冻结资料").click()
 
-        page.get_by_role("heading", name="模型正在阅读任务卡").wait_for()
+        page.get_by_role("heading", name="模型正在生成澄清问题").wait_for()
         self.assertTrue(clarifier.started.wait(2))
         self.assertEqual(page.locator("fieldset.question-card").count(), 0)
         self.assertEqual(page.get_by_text("无需额外澄清", exact=True).count(), 0)
-        self.assertTrue(page.get_by_text("模型完成前不会展示问题，也不会自动切换到系统兜底题。", exact=True).is_visible())
+        self.assertTrue(
+            page.get_by_text(
+                "可以安全离开此页；请求、校验或失败都会在 90 秒执行硬截止内形成明确结果，完成后工作台会自动刷新。",
+                exact=True,
+            ).is_visible()
+        )
         self.assertEqual(page.get_by_role("button", name="取消后台任务").count(), 0)
         self.assert_no_page_overflow(page)
 
@@ -385,6 +390,7 @@ class FastAPIShellBrowserGate(unittest.TestCase):
 
         clarifier = UnreadyClarifier()
         self.service.clarifier = clarifier
+        self.service.initialize_clarification_runtime()
         self.service.initialize_runtime()
         self.service.create("runtime-unready")
         page, errors = self.new_page(375, 820, "reduce")
@@ -406,15 +412,12 @@ class FastAPIShellBrowserGate(unittest.TestCase):
 
         page.get_by_label("任务卡内容").fill("核心主题：新品发布")
         page.get_by_role("button", name="导入并冻结资料").click()
-        page.get_by_role("heading", name="等待模型运行时恢复").wait_for()
-        retry = page.get_by_role("button", name="继续生成澄清问题")
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline and not retry.is_disabled():
-            time.sleep(0.01)
-        self.assertTrue(retry.is_disabled())
+        page.get_by_role("heading", name="问题生成失败").wait_for()
+        retry = page.get_by_role("button", name="重新生成问题")
+        self.assertFalse(retry.is_disabled())
         self.assertFalse(page.get_by_role("button", name="使用系统兜底问题").is_disabled())
         self.assertTrue(page.get_by_text("model_authentication_failed", exact=True).is_visible())
-        self.assertTrue(page.get_by_text("能力契约", exact=True).is_visible())
+        self.assertTrue(page.get_by_text("澄清 JSON Schema", exact=True).is_visible())
         self.assertTrue(page.get_by_role("button", name="复制探测 ID").is_visible())
         self.assertTrue(page.get_by_text("这是确定性配置故障", exact=False).is_visible())
 
@@ -440,7 +443,7 @@ class FastAPIShellBrowserGate(unittest.TestCase):
 
         clarifier.release.clear()
         page.get_by_role("button", name="重新生成问题").click()
-        page.get_by_role("heading", name="模型正在阅读任务卡").wait_for()
+        page.get_by_role("heading", name="模型正在生成澄清问题").wait_for()
         self.assertEqual(page.locator("fieldset.question-card").count(), 0)
         clarifier.release.set()
         page.get_by_role("heading", name="需求澄清", exact=True).wait_for()

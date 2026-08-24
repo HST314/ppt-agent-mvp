@@ -60,7 +60,8 @@ class P0FaultInjectionGate(unittest.TestCase):
             service = TaskService(WorkspaceStore(root), clarifier=AgentGateway(adapter(sdk),skill=SkillRuntime.builtin()))
             # This gate exercises cancellation after dispatch. Capability-probe
             # readiness is covered separately and would consume the blocking SDK.
-            service.require_runtime_ready = Mock(return_value=None)
+            service.require_clarification_runtime_ready = Mock(return_value=None)
+            service.clarification_runtime_health = Mock(return_value={"status":"ready","ready":True})
             service.create("clarify-cancel")
             service.import_input("clarify-cancel", {"goal":"g", "audience":"a", "topic":"t"}, "json")
             jobs = JobService(service)

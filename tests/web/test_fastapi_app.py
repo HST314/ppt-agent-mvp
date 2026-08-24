@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from fastapi.testclient import TestClient
 
 from ppt_agent.config import ClarificationConfig
-from ppt_agent.errors import GatewayError
+from ppt_agent.errors import GatewayError, RuntimeUnavailableError
 from ppt_agent.gateways import AgentGateway
 from ppt_agent.model_clients import OpenAIResponsesClient
 from ppt_agent.service import TaskService
@@ -46,6 +46,15 @@ class FastAPIAppTests(unittest.TestCase):
                 return response
             time.sleep(.01)
         self.fail("后台初始化未在时限内完成")
+
+    def wait_for_job(self,client,job_id,timeout=3):
+        deadline=time.monotonic()+timeout
+        while time.monotonic()<deadline:
+            job=client.get(f"/v1/jobs/{job_id}").json()
+            if job["status"] in {"succeeded","failed","cancelled","interrupted"}:
+                return job
+            time.sleep(.01)
+        self.fail(f"Job {job_id} 未在时限内结束")
 
     def test_health_shell_static_and_retired_legacy_routes(self):
         self.wait_for_startup(self.client)
@@ -110,7 +119,10 @@ class FastAPIAppTests(unittest.TestCase):
                     self.assertEqual(client.get("/livez").status_code,200)
                     starting=client.get("/v1/runtime/status").json()
                     self.assertEqual(starting["startup_status"],"starting")
-                    self.assertEqual(starting["startup_components"],{"recovery":"ready","runtime":"starting"})
+                    self.assertEqual(starting["startup_components"],{
+                        "recovery":"ready","clarification":"ready",
+                        "runtime":"starting","generation_core":"starting",
+                    })
                     self.assertFalse(starting["runtime_ready"])
                     self.assertEqual(client.get("/readyz").status_code,503)
                     service.release_probe.set()
@@ -120,6 +132,115 @@ class FastAPIAppTests(unittest.TestCase):
                     self.assertEqual(client.get("/readyz").status_code,200)
             finally:
                 service.release_probe.set()
+
+    def test_input_persists_job_during_clarification_probe_and_auto_dispatches(self):
+        class BlockingClarifier:
+            model="clarification-only"
+            def __init__(self):
+                self.probe_started=threading.Event()
+                self.release_probe=threading.Event()
+                self.calls=0
+            def set_audit_sink(self,_sink): pass
+            def probe_clarification_capabilities(self):
+                self.probe_started.set()
+                self.release_probe.wait(3)
+                return {"basic_response":True,"clarification_json_schema":True}
+            def probe_capabilities(self): return {"strict_json_schema":True}
+            def clarify(self,_payload):
+                self.calls+=1
+                return {"questions":[],"model":self.model}
+
+        with tempfile.TemporaryDirectory() as root:
+            clarifier=BlockingClarifier()
+            service=TaskService(WorkspaceStore(root),clarifier=clarifier)
+            try:
+                with TestClient(create_app(service)) as client:
+                    self.assertTrue(clarifier.probe_started.wait(1))
+                    client.post("/v1/tasks",json={"task_id":"queued-cold","mode":"manual"})
+                    started=time.monotonic()
+                    imported=client.post("/v1/tasks/queued-cold/input",json={"source":{"topic":"新品"}})
+                    self.assertLess(time.monotonic()-started,1)
+                    job_id=imported.json()["clarification"]["job_id"]
+                    queued=client.get(f"/v1/jobs/{job_id}").json()
+                    self.assertEqual(queued["status"],"queued")
+                    self.assertEqual(queued["current_step"],"waiting_clarification_runtime")
+                    self.assertEqual(queued["deadline_seconds"],90)
+                    self.assertIsNone(queued["deadline_at"])
+                    clarifier.release_probe.set()
+                    self.assertEqual(self.wait_for_job(client,job_id)["status"],"succeeded")
+                    self.assertTrue(client.get("/v1/tasks/queued-cold/input").json()["clarification"]["confirmed"])
+                    self.assertEqual(clarifier.calls,1)
+            finally:
+                clarifier.release_probe.set()
+
+    def test_clarification_runs_while_unrelated_full_runtime_probe_is_blocked(self):
+        class Clarifier:
+            model="clarification-only"
+            def __init__(self): self.calls=0
+            def set_audit_sink(self,_sink): pass
+            def probe_clarification_capabilities(self):
+                return {"basic_response":True,"clarification_json_schema":True}
+            def clarify(self,_payload):
+                self.calls+=1
+                return {"questions":[],"model":self.model}
+
+        class BlockingFullRuntime(TaskService):
+            def __init__(self,store,clarifier):
+                super().__init__(store,clarifier=clarifier)
+                self.full_probe_started=threading.Event()
+                self.release_full_probe=threading.Event()
+            def initialize_runtime(self):
+                self.full_probe_started.set()
+                self.release_full_probe.wait(3)
+                return super().initialize_runtime()
+
+        with tempfile.TemporaryDirectory() as root:
+            clarifier=Clarifier()
+            service=BlockingFullRuntime(WorkspaceStore(root),clarifier)
+            try:
+                with TestClient(create_app(service)) as client:
+                    self.assertTrue(service.full_probe_started.wait(1))
+                    status=client.get("/v1/runtime/status").json()
+                    self.assertEqual(status["startup_status"],"starting")
+                    self.assertTrue(status["clarification_runtime_ready"])
+                    self.assertFalse(status["runtime_ready"])
+                    client.post("/v1/tasks",json={"task_id":"independent","mode":"manual"})
+                    imported=client.post("/v1/tasks/independent/input",json={"source":{"topic":"新品"}}).json()
+                    job=self.wait_for_job(client,imported["clarification"]["job_id"])
+                    self.assertEqual(job["status"],"succeeded")
+                    self.assertEqual(clarifier.calls,1)
+            finally:
+                service.release_full_probe.set()
+
+    def test_startup_repairs_legacy_waiting_input_without_manual_click(self):
+        class Clarifier:
+            model="clarification-only"
+            def __init__(self): self.calls=0
+            def set_audit_sink(self,_sink): pass
+            def clarify(self,_payload):
+                self.calls+=1
+                return {"questions":[],"model":self.model}
+
+        with tempfile.TemporaryDirectory() as root:
+            clarifier=Clarifier()
+            service=TaskService(WorkspaceStore(root),clarifier=clarifier)
+            service.create("legacy-wait")
+            service.import_input("legacy-wait",{"topic":"新品"})
+            service.wait_clarification_for_runtime(
+                "legacy-wait",
+                RuntimeUnavailableError(runtime_error_code="model_connection_error"),
+            )
+            with TestClient(create_app(service)) as client:
+                deadline=time.monotonic()+3
+                jobs=[]
+                while time.monotonic()<deadline:
+                    jobs=client.get("/v1/tasks/legacy-wait/jobs").json()["jobs"]
+                    if jobs and jobs[0]["status"] in {"succeeded","failed"}: break
+                    time.sleep(.01)
+                self.assertEqual(len(jobs),1)
+                self.assertEqual(jobs[0]["status"],"succeeded")
+                self.assertTrue(client.get("/v1/tasks/legacy-wait/input").json()["clarification"]["confirmed"])
+                self.assertEqual(clarifier.calls,1)
 
     def test_failed_startup_model_probe_marks_readiness_unavailable(self):
         class ProbeFailure:
@@ -161,6 +282,8 @@ class FastAPIAppTests(unittest.TestCase):
                 self.calls = 0
 
             def create(self, **_kwargs):
+                if _kwargs.get("text",{}).get("format",{}).get("name")=="clarification":
+                    return SimpleNamespace(output_text='{"questions":[]}',id="clarification-probe-id",output=[])
                 self.calls += 1
                 if self.calls in self.fail_at:
                     raise RuntimeError("raw provider message with secret-key")
@@ -195,12 +318,7 @@ class FastAPIAppTests(unittest.TestCase):
                 with TestClient(create_app(service)) as client:
                     status = self.wait_for_runtime_probe(client)["model_capabilities"]
                     persisted = client.get("/v1/runtime/probes?limit=1").json()["probes"][0]
-                    task_id=f"probe-{failed_check}"
-                    client.post("/v1/tasks", json={"task_id": task_id, "mode": "manual"})
-                    blocked = client.post(
-                        f"/v1/tasks/{task_id}/input",
-                        json={"source": {"topic": "probe lineage"}},
-                    ).json()["clarification"]["error"]
+                    clarification_status=client.get("/v1/runtime/status").json()["clarification_runtime"]
 
                 probe_id = status["probe_id"]
                 self.assertEqual(status["failed_check"], failed_check)
@@ -213,14 +331,13 @@ class FastAPIAppTests(unittest.TestCase):
                 self.assertEqual(failure_event["error_code"], expected_code)
                 self.assertEqual(failure_event["category"], "sdk_error")
                 self.assertEqual(failure_event["sdk_exception_type"], "RuntimeError")
-                self.assertEqual(blocked["runtime_error_code"], expected_code)
-                self.assertEqual(blocked["failed_check"], failed_check)
-                self.assertEqual(blocked["probe_id"], probe_id)
+                self.assertTrue(clarification_status["ready"])
+                self.assertEqual(clarification_status["models"][0]["checks"]["clarification_json_schema"],True)
 
                 restarted = TaskService(WorkspaceStore(root)).runtime_probes(1)[0]
                 self.assertEqual(restarted, persisted)
                 serialized = json.dumps(
-                    {"status": status, "persisted": persisted, "blocked": blocked, "restarted": restarted}
+                    {"status": status, "persisted": persisted, "clarification":clarification_status,"restarted": restarted}
                 )
                 self.assertNotIn("raw provider message", serialized)
                 self.assertNotIn("secret-key", serialized)
@@ -233,6 +350,8 @@ class FastAPIAppTests(unittest.TestCase):
                 self.calls = 0
 
             def create(self, **_kwargs):
+                if _kwargs.get("text",{}).get("format",{}).get("name")=="clarification":
+                    return SimpleNamespace(output_text='{"questions":[]}',id="clarification-probe-id",output=[])
                 self.calls += 1
                 common = {
                     1: SimpleNamespace(output_text="OK", id="provider-basic-id", output=[]),
@@ -268,11 +387,7 @@ class FastAPIAppTests(unittest.TestCase):
                 with TestClient(create_app(service)) as client:
                     status = self.wait_for_runtime_probe(client)["model_capabilities"]
                     persisted = client.get("/v1/runtime/probes?limit=1").json()["probes"][0]
-                    client.post("/v1/tasks", json={"task_id": f"probe-{scenario}", "mode": "manual"})
-                    blocked = client.post(
-                        f"/v1/tasks/probe-{scenario}/input",
-                        json={"source": {"goal": "演示", "audience": "客户", "topic": "诊断"}},
-                    ).json()["clarification"]["error"]
+                    clarification_status=client.get("/v1/runtime/status").json()["clarification_runtime"]
 
                 for error in (status["error"], persisted["error"]):
                     self.assertEqual(error["code"], code)
@@ -281,13 +396,11 @@ class FastAPIAppTests(unittest.TestCase):
                     self.assertEqual(error["tool_calls"], tool_calls)
                 self.assertEqual(persisted["failed_check"], "tool_round_trip")
                 self.assertEqual(persisted["events"][-1]["probe_phase"], phase)
-                self.assertEqual(blocked["runtime_error_code"], code)
-                self.assertEqual(blocked["probe_phase"], phase)
-                self.assertEqual(blocked["terminal_reason"], reason)
-                self.assertEqual(blocked["tool_calls"], tool_calls)
+                self.assertTrue(clarification_status["ready"])
+                self.assertEqual(clarification_status["models"][0]["checks"]["clarification_json_schema"],True)
                 self.assertEqual(TaskService(WorkspaceStore(root)).runtime_probes(1)[0], persisted)
 
-                serialized = json.dumps({"status": status, "persisted": persisted, "blocked": blocked})
+                serialized = json.dumps({"status": status, "persisted": persisted,"clarification":clarification_status})
                 self.assertNotIn("I will not call a tool", serialized)
                 self.assertNotIn("not-json", serialized)
                 self.assertNotIn("secret-key", serialized)
@@ -339,7 +452,7 @@ class FastAPIAppTests(unittest.TestCase):
                 previous=clarifier.calls[1]["clarification_context"]["previous_qa"]
                 self.assertEqual(previous[0]["answers"],{question["question_id"]:"管理层"})
 
-    def test_unready_clarifier_does_not_enqueue_and_preserves_fallback(self):
+    def test_unready_clarifier_persists_failed_job_and_preserves_fallback(self):
         class UnreadyClarifier:
             model="unready-model"
             calls=0
@@ -360,26 +473,21 @@ class FastAPIAppTests(unittest.TestCase):
                 imported=client.post("/v1/tasks/unready/input",json={"source":{"topic":"新品"}})
                 self.assertEqual(imported.status_code,200)
                 body=imported.json()
-                error=body["clarification"]["error"]
-                self.assertEqual(body["clarification"]["status"],"waiting_for_runtime")
-                self.assertEqual(body["state"]["waiting_reason"],"waiting_for_runtime")
-                self.assertEqual(body["state"]["required_action"],"continue_clarification")
+                self.assertRegex(body["clarification"]["job_id"],r"^job_")
+                job=self.wait_for_job(client,body["clarification"]["job_id"])
+                self.assertEqual(job["status"],"failed")
+                view=client.get("/v1/tasks/unready/input").json()
+                error=view["clarification"]["error"]
+                self.assertEqual(view["clarification"]["status"],"failed")
+                self.assertEqual(view["state"]["waiting_reason"],"clarification_failed")
+                self.assertEqual(view["state"]["required_action"],"retry_clarification")
                 self.assertEqual(error["code"],"runtime_unavailable")
                 self.assertEqual(error["runtime_error_code"],"model_authentication_failed")
-                self.assertEqual(error["failed_check"],"capability_contract")
-                self.assertRegex(error["probe_id"],r"^runtime-probe-[0-9a-f]{32}$")
-                retry=client.post(
-                    "/v1/tasks/unready/clarifications/retry",
-                    json={"idempotency_key":"unready-retry"},
-                )
-                self.assertEqual(retry.status_code,503)
-                self.assertEqual(retry.json()["error"]["code"],"runtime_unavailable")
-                # 每次运行时门禁拒绝都会换发新的诊断 ID；与全局运行时状态的
-                # 关联通过 probe_id 保持。
-                self.assertNotEqual(retry.json()["error"]["diagnostic_id"],error["diagnostic_id"])
-                self.assertEqual(retry.json()["error"]["probe_id"],error["probe_id"])
-                self.assertEqual(client.get("/v1/tasks/unready/jobs").json()["jobs"],[])
-                self.assertEqual(client.get("/v1/tasks/unready/input").json()["clarification"]["status"],"waiting_for_runtime")
+                self.assertEqual(error["failed_check"],"clarification_json_schema")
+                self.assertRegex(error["probe_id"],r"^clarification-probe-[0-9a-f]{32}$")
+                jobs=client.get("/v1/tasks/unready/jobs").json()["jobs"]
+                self.assertEqual(len(jobs),1)
+                self.assertEqual(jobs[0]["deadline_seconds"],90)
                 fallback=client.post("/v1/tasks/unready/clarifications/fallback",json={"confirm":True})
                 self.assertEqual(fallback.status_code,200)
                 self.assertEqual(fallback.json()["question_source"],"fallback")

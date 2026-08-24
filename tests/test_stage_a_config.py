@@ -56,6 +56,8 @@ class StageAConfigTests(unittest.TestCase):
         self.assertEqual(cfg.generation.job_timeout_seconds,330)
         self.assertEqual(cfg.generation.max_tool_calls,24)
         self.assertEqual(cfg.generation.max_provider_calls,8)
+        self.assertEqual(cfg.generation.stage_budgets["clarification"].max_steps,2)
+        self.assertEqual(cfg.generation.stage_budgets["clarification"].max_provider_calls,2)
         self.assertEqual(cfg.generation.stage_budgets["sample"].max_provider_calls,6)
         self.assertEqual(cfg.generation.stage_budgets["sample"].reserved_final_calls,2)
         cfg=self.config(base % "    timeout_seconds: 45\n",env)

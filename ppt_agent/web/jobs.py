@@ -60,7 +60,9 @@ OPERATION_STAGES = {
     "delivery.publish": {"delivery"},
 }
 OPERATION_BUDGET_SECONDS = {
-    "clarification.generate": 180,
+    # Clarification is one structured model response plus one possible Schema
+    # repair.  Queue wait does not consume this execution deadline.
+    "clarification.generate": 90,
     "narrative.generate": 240,
     "outline.generate": 240,
     "samples.generate": 630,
@@ -72,7 +74,7 @@ OPERATION_BUDGET_SECONDS = {
     "delivery.publish": 180,
 }
 GENERATION_OPERATIONS = {
-    "clarification.generate", "narrative.generate", "outline.generate",
+    "narrative.generate", "outline.generate",
     "samples.generate", "samples.modify", "deck.generate", "deck.modify", "inspection.fix",
 }
 METRIC_KEYS = {
@@ -206,6 +208,13 @@ class JobService:
         for delay in self._runtime_recovery_delays:
             if self._runtime_recovery_stop.wait(delay):
                 return
+            if not self.service.clarification_runtime_health().get("ready"):
+                try:
+                    self.service.initialize_clarification_runtime()
+                    self.resume_clarification_queued()
+                    self.reconcile_waiting_clarifications()
+                except Exception:
+                    logging.exception("background clarification capability probe failed")
             if self.service.runtime_health().get("ready"):
                 return
             try:
@@ -608,6 +617,39 @@ class JobService:
         for task_id, job_id in queued:
             self._submit(task_id, job_id)
 
+    def resume_clarification_queued(self) -> None:
+        """Dispatch every persisted clarification Job after its light probe ends."""
+        for task_path in self.store.root.iterdir():
+            if not _is_task_directory(task_path):
+                continue
+            try:
+                records=self._records(task_path.name)
+            except (OSError, json.JSONDecodeError, portalocker.exceptions.LockException):
+                logging.exception("failed to scan queued clarification Jobs",extra={"task_id":task_path.name})
+                continue
+            for record in records:
+                if record.get("operation")=="clarification.generate" and record.get("status")=="queued":
+                    self._submit(record["task_id"],record["job_id"])
+
+    def reconcile_waiting_clarifications(self) -> None:
+        """Upgrade legacy frozen inputs that were left without a persisted Job."""
+        for task_path in self.store.root.iterdir():
+            if not _is_task_directory(task_path):
+                continue
+            task_id=task_path.name
+            try:
+                view=self.service.input_view(task_id)
+                if view.get("clarification",{}).get("status")!="waiting_for_runtime":
+                    continue
+                if any(record.get("operation")=="clarification.generate" and record.get("status") in ACTIVE for record in self._records(task_id)):
+                    continue
+                self.create(
+                    task_id,"clarification.generate",{},
+                    f"clarification-{view['snapshot_hash']}",
+                )
+            except (ConflictError, NotFoundError, ValidationError, OSError, json.JSONDecodeError, portalocker.exceptions.LockException):
+                logging.exception("failed to reconcile waiting clarification",extra={"task_id":task_id})
+
     @staticmethod
     def _validate_payload(operation: str, payload: dict[str, Any]) -> None:
         if operation not in OPERATIONS:
@@ -646,7 +688,7 @@ class JobService:
                     raise ConflictError("相同 idempotency_key 对应了不同请求")
                 return self.public(previous), False
             self.service.require_release_write_enabled()
-            if operation != "delivery.publish":
+            if operation not in {"delivery.publish","clarification.generate"}:
                 self.service.require_runtime_ready()
             if state["status"] in {"paused", "cancelled", "failed", "completed"}:
                 raise ConflictError("当前任务状态不能启动长任务")
@@ -668,7 +710,12 @@ class JobService:
                 "fingerprint": fingerprint,
                 "status": "queued",
                 "progress": 0,
-                "current_step": "queued",
+                "current_step": (
+                    "waiting_clarification_runtime"
+                    if operation=="clarification.generate"
+                    and self.service.clarification_runtime_health().get("status") in {"not_checked","checking"}
+                    else "queued"
+                ),
                 "last_seq": 0,
                 "created_at": _now(),
                 "started_at": None,
@@ -684,8 +731,13 @@ class JobService:
                 "parent_hash":parent_hash,
             }
             self._write(record)
-            self._publish_event(record, "queued", message="任务已进入执行队列")
-            self._submit(task_id, job_id)
+            waiting_runtime=record["current_step"]=="waiting_clarification_runtime"
+            self._publish_event(
+                record,"queued",
+                message="澄清任务已保存，等待生成模型连接" if waiting_runtime else "任务已进入执行队列",
+            )
+            if not waiting_runtime:
+                self._submit(task_id, job_id)
             return self.public(record), True
 
     def _submit(self, task_id: str, job_id: str) -> None:
@@ -736,14 +788,11 @@ class JobService:
             with execution_scope(lambda: self._read(task_id, job_id).get("cancellation_requested", False), deadline, publish_progress, publication_guard, publication_advance):
                 # Readiness can change after enqueue or while a queued job is being
                 # recovered. Never cross the model boundary without a fresh gate.
-                try:
-                    self.service.require_release_write_enabled()
-                    if record["operation"] != "delivery.publish":
-                        self.service.require_runtime_ready()
-                except RuntimeUnavailableError as error:
-                    if record["operation"] == "clarification.generate":
-                        self.service.wait_clarification_for_runtime(task_id, error)
-                    raise
+                self.service.require_release_write_enabled()
+                if record["operation"] == "clarification.generate":
+                    self.service.require_clarification_runtime_ready()
+                elif record["operation"] != "delivery.publish":
+                    self.service.require_runtime_ready()
                 with bind_agent_audit_context(task_id=task_id, job_id=job_id):
                     result = self._invoke(record["operation"], task_id, record["payload"])
                 self.service.record_runtime_success()
@@ -777,6 +826,8 @@ class JobService:
         except Exception as error:
             if isinstance(error, GatewayError):
                 self.service.record_runtime_failure(error)
+                if record.get("operation") == "clarification.generate":
+                    self.service.record_clarification_runtime_failure(error)
                 if isinstance(error,GatewayUnknownResult):
                     self.schedule_runtime_recovery()
             if record.get("operation") == "clarification.generate":

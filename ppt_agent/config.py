@@ -23,6 +23,9 @@ class StageBudgetConfig:
 
 
 DEFAULT_STAGE_BUDGETS = {
+    # Clarification never reads Skill files or calls tools.  Keep the model
+    # boundary deliberately small: one response plus at most one Schema repair.
+    "clarification": StageBudgetConfig(2, 1, 2, 0, 1, 1024, 1),
     "sample": StageBudgetConfig(8, 4, 6, 2, 4, 128 * 1024, 2),
     "deck": StageBudgetConfig(12, 8, 10, 3, 4, 128 * 1024, 2),
 }
@@ -245,8 +248,8 @@ def _model(value: dict, name: str, *, required: bool) -> ModelConfig | None:
         raise ValidationError(f"models.{name}.structured_output 只能是 auto、json_schema 或 prompt")
     raw_stage_budgets = value.get("stage_budgets", {})
     raw_stage_budgets = _mapping(raw_stage_budgets, f"models.{name}.stage_budgets")
-    if set(raw_stage_budgets) - {"sample", "deck"}:
-        raise ValidationError(f"models.{name}.stage_budgets 只能配置 sample 或 deck")
+    if set(raw_stage_budgets) - {"clarification", "sample", "deck"}:
+        raise ValidationError(f"models.{name}.stage_budgets 只能配置 clarification、sample 或 deck")
     stage_budgets: dict[str, StageBudgetConfig] = {}
     for stage, defaults in DEFAULT_STAGE_BUDGETS.items():
         raw_budget = _mapping(raw_stage_budgets.get(stage, {}), f"models.{name}.stage_budgets.{stage}")

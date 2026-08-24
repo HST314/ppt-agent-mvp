@@ -200,14 +200,22 @@ class TaskService:
         self._settings_store=settings_store
         self._clarification_config=clarification_config or ClarificationConfig()
         self._runtime_capabilities={"checked":False,"ready":True,"status":"not_required","models":[]}
+        self._clarification_capabilities={"checked":False,"ready":True,"status":"not_required","models":[]}
         self._runtime_guard=threading.RLock()
         self._runtime_probe_guard=threading.Lock()
+        self._clarification_probe_guard=threading.Lock()
         for gateway in {id(x):x for x in (self.generator,self.inspector,self.builder,self.clarifier) if x is not None}.values():
             if hasattr(gateway,"set_audit_sink"): gateway.set_audit_sink(self.store.append_agent_audit)
         if self._disabled_release_features():
             self._runtime_capabilities=self._release_disabled_capabilities()
+            self._clarification_capabilities=self._release_disabled_capabilities()
         elif self._runtime_gateways():
             self._runtime_capabilities={"checked":False,"ready":False,"status":"not_checked","models":[]}
+        if self.clarifier is not None and (
+            hasattr(self.clarifier,"probe_clarification_capabilities")
+            or hasattr(self.clarifier,"probe_capabilities")
+        ) and not self._disabled_release_features():
+            self._clarification_capabilities={"checked":False,"ready":False,"status":"not_checked","models":[]}
         generation_timeout=max((getattr(gateway,"job_timeout_seconds",0) for gateway in (self.clarifier,self.generator,self.builder) if gateway is not None),default=0) or 630
         inspection_timeout=getattr(self.inspector,"job_timeout_seconds",0) or 630
         snapshot=self._settings_store.read() if self._settings_store is not None else {"values":{},"config_revision":None,"scope":"memory"}
@@ -370,6 +378,69 @@ class TaskService:
             "rollback_mode":"traffic_to_previous_release",
             "legacy_implementation_present":False,
         }
+    def initialize_clarification_runtime(self):
+        """Probe only the generation-model contract required by clarification."""
+        with self._clarification_probe_guard:
+            if self._disabled_release_features():
+                with self._runtime_guard:
+                    self._clarification_capabilities=self._release_disabled_capabilities()
+                return self.clarification_runtime_health()
+            gateway=self.clarifier
+            method=(getattr(gateway,"probe_clarification_capabilities",None) if gateway is not None else None)
+            if not callable(method) and gateway is not None:
+                method=getattr(gateway,"probe_capabilities",None)
+            if not callable(method):
+                with self._runtime_guard:
+                    self._clarification_capabilities={"checked":False,"ready":True,"status":"not_required","models":[],"checked_at":utcnow()}
+                return self.clarification_runtime_health()
+            probe_id=f"clarification-probe-{uuid.uuid4().hex}"
+            started_at=utcnow()
+            with self._runtime_guard:
+                self._clarification_capabilities={"checked":False,"ready":False,"status":"checking","models":[],"probe_id":probe_id,"checked_at":started_at}
+            try:
+                parameters=inspect.signature(method).parameters
+                accepts_probe_id="probe_id" in parameters or any(item.kind==inspect.Parameter.VAR_KEYWORD for item in parameters.values())
+                checks=method(probe_id=probe_id) if accepts_probe_id else method()
+                if not checks or not all(checks.values()):
+                    failed_check=next((key for key,value in (checks or {}).items() if not value),"clarification_json_schema")
+                    error=GatewayError("澄清模型未满足结构化输出契约",code="capability_probe_failed")
+                    error.failed_check=failed_check
+                    error.probe_id=probe_id
+                    raise error
+            except Exception as exc:
+                failed_check=getattr(exc,"failed_check",None) or "clarification_json_schema"
+                if not isinstance(exc,GatewayError):
+                    wrapped=GatewayError(
+                        "澄清模型轻量探测发生无法分类的 SDK 故障",
+                        code="capability_probe_failed",
+                        audit_details={"category":"sdk_error","sdk_exception_type":type(exc).__name__,"retryable":False},
+                    )
+                    wrapped.__cause__=exc
+                    wrapped.__suppress_context__=True
+                    exc=wrapped
+                public=exc.public()["error"]
+                error={key:public[key] for key in (
+                    "code","message","diagnostic_id","retryable","retry_after_seconds",
+                    "probe_phase","terminal_reason","tool_calls","underlying_code",
+                ) if key in public}
+                error.update({"probe_id":probe_id,"failed_check":failed_check})
+                with self._runtime_guard:
+                    self._clarification_capabilities={
+                        "checked":True,"ready":False,"status":"unavailable","models":[],
+                        "probe_id":probe_id,"failed_check":failed_check,"error":error,"checked_at":utcnow(),
+                    }
+                return self.clarification_runtime_health()
+            completed_at=utcnow()
+            with self._runtime_guard:
+                self._clarification_capabilities={
+                    "checked":True,"ready":True,"status":"ready",
+                    "models":[{"model":str(getattr(gateway,"model","unknown")),"checks":dict(checks)}],
+                    "probe_id":probe_id,"checked_at":completed_at,
+                }
+            return self.clarification_runtime_health()
+    def clarification_runtime_health(self):
+        with self._runtime_guard:
+            return json.loads(json.dumps(self._clarification_capabilities))
     def initialize_runtime(self):
         with self._runtime_probe_guard:
             if self._disabled_release_features():
@@ -563,6 +634,25 @@ class TaskService:
             tool_calls=error.get("tool_calls"),
             underlying_code=error.get("underlying_code"),
         )
+    def require_clarification_runtime_ready(self):
+        capabilities=self.clarification_runtime_health()
+        if capabilities.get("ready"):
+            return
+        error=capabilities.get("error",{})
+        failed_check=error.get("failed_check") or capabilities.get("failed_check")
+        raise RuntimeUnavailableError(
+            "澄清模型尚未就绪",
+            runtime_error_code=error.get("code"),
+            retryable=error.get("retryable") is True,
+            retry_after_seconds=error.get("retry_after_seconds"),
+            diagnostic_id=uuid.uuid4().hex,
+            probe_id=error.get("probe_id") or capabilities.get("probe_id"),
+            failed_check=failed_check,
+            probe_phase=error.get("probe_phase"),
+            terminal_reason=error.get("terminal_reason"),
+            tool_calls=error.get("tool_calls"),
+            underlying_code=error.get("underlying_code"),
+        )
     def runtime_probes(self,limit=20): return self.store.runtime_probes(limit)
     def record_runtime_failure(self,error):
         if not isinstance(error,GatewayError): return
@@ -581,6 +671,18 @@ class TaskService:
                 "status":"recovering" if isinstance(error,GatewayUnknownResult) else "unavailable",
                 "error":safe,
                 "checked_at":utcnow(),
+            }
+    def record_clarification_runtime_failure(self,error):
+        if not isinstance(error,GatewayError) or error.code not in RUNTIME_DEGRADING_CODES:
+            return
+        public=error.public()["error"]
+        safe={key:public[key] for key in ("code","diagnostic_id","retryable","retry_after_seconds") if key in public}
+        with self._runtime_guard:
+            current=self._clarification_capabilities
+            self._clarification_capabilities={
+                **current,"checked":True,"ready":False,
+                "status":"recovering" if isinstance(error,GatewayUnknownResult) else "unavailable",
+                "error":safe,"checked_at":utcnow(),
             }
     def record_runtime_success(self):
         with self._runtime_guard:
@@ -822,10 +924,14 @@ class TaskService:
         if (view.get("state",{}).get("waiting_reason") in {"clarification_failed","waiting_for_runtime"}
             and view.get("clarification",{}).get("status") in {"failed","waiting_for_runtime"}):
             return view["clarification"]
-        code = "clarification_infrastructure_failure"
-        if error.__class__.__name__ == "ExecutionDeadlineExceeded": code = "stage_deadline_exceeded"
-        elif isinstance(error,OSError): code = "job_persistence_error"
-        return self._record_clarification(task_id,view,[],"failed",None,{"code":code,"message":"澄清服务暂时不可用，请重试或使用兜底问题"},"clarification_failed")
+        if isinstance(error,RuntimeUnavailableError):
+            public=error.public()["error"]
+        else:
+            code = "clarification_infrastructure_failure"
+            if error.__class__.__name__ == "ExecutionDeadlineExceeded": code = "stage_deadline_exceeded"
+            elif isinstance(error,OSError): code = "job_persistence_error"
+            public={"code":code,"message":"澄清服务暂时不可用，请重试或使用兜底问题"}
+        return self._record_clarification(task_id,view,[],"failed",None,public,"clarification_failed")
     def use_fallback_clarification(self,task_id):
         view=self.input_view(task_id)
         return self._record_clarification(task_id,view,questions_for(view["task_card"]),"ready",None,None,"clarification_fallback",source="fallback")
