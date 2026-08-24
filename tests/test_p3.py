@@ -21,8 +21,9 @@ class P3Tests(unittest.TestCase):
             source={"goal":"发布","audience":"客户","topic":"学院方案","content":"2025年9月30日，经第133次会议研究决定，正式成立集成电路学院"}
             service.import_input("evidence",source)
             brief=service._generation_core_brief("evidence")
-            self.assertEqual(len(brief.text_resources),1)
-            self.assertIn(source["content"],brief.text_resources[0].content)
+            resources={item.resource_id:item.content for item in brief.text_resources}
+            self.assertEqual(set(("original-prompt","clarification-transcript","confirmed-task-card"))-set(resources),set())
+            self.assertTrue(any(source["content"] in content for content in resources.values()))
             self.assertTrue(any(fact.fact_type=="date" and source["content"] in fact.statement for fact in brief.confirmed_facts))
             self.assertTrue(any(fact.fact_type=="ordinal" and fact.value=="第133次" for fact in brief.confirmed_facts))
     def setUp(self):

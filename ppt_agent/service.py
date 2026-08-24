@@ -21,6 +21,7 @@ from .errors import ConflictError, GatewayError, GatewayUnknownResult, NotFoundE
 from .fsm import TaskState, transition
 from .gateways import FakeGenerationGateway, FakeHtmlBuilder, FakeInspectionGateway, FakeSkillLoader
 from .generation.contracts import TaskBrief
+from .generation.context import ContextTextSource, GenerationContextV2, build_stage_payload, stage_payload_metadata
 from .schema import DeliveryManifest, InspectionReport, IssueDisposition
 from .p2 import canonical, digest, now, parse_task_card, questions_for, scan_resources, validate_answer
 from .schema import ClarificationSet, ResourceManifest, TaskCard, TaskInputSnapshot
@@ -246,10 +247,114 @@ class TaskService:
         return self.generation_core_health()
     def generation_core_health(self):
         return json.loads(json.dumps(self._generation_core_health))
-    def _generation_core_brief(self,task_id,view=None):
+    @staticmethod
+    def _clarification_transcript(clarification):
+        """Normalize persisted rounds without dropping question wording or raw answers."""
+        rounds=[]
+        history=list(clarification.get("rounds_history",[]))
+        current_round=clarification.get("round",1)
+        current_questions=list(clarification.get("details",clarification.get("questions",[])) or [])
+        current_answers=dict(clarification.get("answers",{}) or {})
+        if current_questions and current_answers and not any(item.get("round")==current_round for item in history if isinstance(item,dict)):
+            history.append({
+                "round":current_round,
+                "questions":current_questions,
+                "answers":current_answers,
+                "raw_answers":dict(clarification.get("raw_answers",{}) or {}),
+            })
+        for item in history:
+            if not isinstance(item,dict): continue
+            answers=dict(item.get("answers",{}) or {})
+            raw_answers=dict(item.get("raw_answers",{}) or {})
+            exchanges=[]
+            for question in item.get("questions",[]) or []:
+                if not isinstance(question,dict): continue
+                question_id=question.get("question_id")
+                if not isinstance(question_id,str) or question_id not in answers: continue
+                exchanges.append({
+                    "question_id":question_id,
+                    "field_path":question.get("field_path",question.get("field","")),
+                    "prompt":question.get("prompt",""),
+                    "helper_text":question.get("helper_text",""),
+                    "options":question.get("options",[]),
+                    "allow_other":question.get("allow_other",False),
+                    "blocking":question.get("blocking",False),
+                    "raw_answer":raw_answers.get(question_id,answers[question_id]),
+                    "adopted_value":answers[question_id],
+                })
+            if exchanges: rounds.append({"round":item.get("round",len(rounds)+1),"exchanges":exchanges})
+        return rounds
+    @staticmethod
+    def _generation_source_texts(view):
+        materials=[]; seen=set()
+        def add(source_ref,value):
+            if not isinstance(value,str) or not value.strip(): return
+            key=(source_ref,value)
+            if key in seen: return
+            seen.add(key); materials.append(ContextTextSource.create(f"source-material-{len(materials)+1:03d}",source_ref,value))
+        def walk(prefix,value):
+            if isinstance(value,str): add(prefix,value)
+            elif isinstance(value,dict):
+                for key,item in value.items(): walk(f"{prefix}.{key}",item)
+            elif isinstance(value,(list,tuple)):
+                for index,item in enumerate(value): walk(f"{prefix}[{index}]",item)
+        card=view.get("task_card",{})
+        for key,value in card.items():
+            if key not in {"goal","audience","topic","source_format","format_detection","missing","assumptions","defaults"}:
+                walk(f"normalized_task_card.{key}",value)
+        for index,item in enumerate(view.get("manifest",{}).get("resources",[])):
+            add(f"resource_manifest[{index}].description",item.get("description"))
+        return tuple(materials)
+    def _generation_context(self,task_id,view=None):
+        view=view or self.input_view(task_id)
+        if not view.get("snapshot"): raise ConflictError("须先冻结输入再建立 GenerationContextV2")
+        snapshot_record=next(item for item in self.versions(task_id,"input-snapshot") if item["hash"]==view["snapshot_hash"])
+        raw_source_hash=snapshot_record["metadata"]["raw_source_hash"]
+        original_content=self.version(task_id,raw_source_hash).decode("utf-8")
+        original=ContextTextSource.create("original-prompt","input-source",original_content,"application/json; charset=utf-8" if view.get("source_format")=="json" else "text/markdown; charset=utf-8")
+        clarification_hash=view.get("clarification_hash") or snapshot_record["metadata"]["clarification_hash"]
+        card=view["task_card"]
+        constraints=card.get("constraints") if isinstance(card.get("constraints"),dict) else {}
+        count=requested_slide_count(card) or self.get(task_id).get("target_slide_count") or 6
+        confirmed_constraints={
+            "goal":card.get("goal"),"audience":card.get("audience"),"topic":card.get("topic"),
+            "slide_count":count,"language":constraints.get("language","zh-CN"),
+            "style_preferences":constraints.get("style_preferences",{}),"constraints":constraints,
+        }
+        resources=[]
+        for item in view.get("manifest",{}).get("resources",[]):
+            resources.append({key:item[key] for key in ("resource_id","uri","media_type","content_hash")})
+        context=GenerationContextV2.create(
+            original_prompt=original,
+            clarification_transcript=self._clarification_transcript(view.get("clarification",{})),
+            normalized_task_card=card,
+            source_texts=self._generation_source_texts(view),
+            resource_manifest=resources,
+            confirmed_constraints=confirmed_constraints,
+            lineage={
+                "input_snapshot_hash":view["snapshot_hash"],
+                "original_input_hash":raw_source_hash,
+                "clarification_hash":clarification_hash,
+                "task_card_hash":digest(canonical(card)),
+                "resource_manifest_hash":view["snapshot"]["resource_manifest_hash"],
+            },
+        )
+        context_hash=self.store.put_version(task_id,"generation-context",canonical(context.to_dict()),{
+            "context_snapshot_id":context.context_snapshot_id,
+            "input_snapshot_hash":view["snapshot_hash"],
+            "clarification_hash":clarification_hash,
+            "immutable":True,
+        })
+        if context_hash!=context.context_hash: raise ConflictError("GenerationContextV2 内容寻址持久化失败")
+        return context
+    def generation_context_view(self,task_id):
+        context=self._generation_context(task_id)
+        return {**context.to_dict(),"context_snapshot_hash":context.context_hash}
+    def _generation_core_brief(self,task_id,view=None,context=None):
         """Adapt the frozen task input to the model-owned content boundary."""
         if self.generation_pipeline is None: raise ConflictError("生成内核未配置")
         view=view or self._p3_input(task_id)
+        context=context or self._generation_context(task_id,view)
         card=view["task_card"]
         count=requested_slide_count(card) or self.get(task_id).get("target_slide_count") or 6
         resources=[]
@@ -259,16 +364,15 @@ class TaskService:
                 uri=f"{task_id}/resources/{uri[len('resources://') :]}"
             resources.append({key:item[key] for key in ("resource_id","media_type","content_hash")} | {"uri":uri})
         ledger=view.get("claim_ledger") or self._ensure_claim_ledger(task_id,view)
-        source_text=json.dumps(view.get("source"),ensure_ascii=False,sort_keys=True) if not isinstance(view.get("source"),str) else view.get("source")
-        source_text=source_text or json.dumps(card,ensure_ascii=False,sort_keys=True)
-        text_resource_id="task-card-content"
-        text_resources=[{
-            "resource_id":text_resource_id,
-            "source_ref":"task_card.content_source",
-            "media_type":"text/plain; charset=utf-8",
-            "content_hash":digest(source_text.encode("utf-8")),
-            "content":source_text,
-        }]
+        transcript_text=json.dumps(context.to_dict()["clarification_transcript"],ensure_ascii=False,sort_keys=True,separators=(",",":"))
+        card_text=json.dumps(context.to_dict()["normalized_task_card"],ensure_ascii=False,sort_keys=True,separators=(",",":"))
+        text_resources=[
+            {"resource_id":"original-prompt","source_ref":context.original_prompt.source_ref,"media_type":context.original_prompt.media_type,"content_hash":context.original_prompt.content_hash,"content":context.original_prompt.content},
+            {"resource_id":"clarification-transcript","source_ref":"generation_context.clarification_transcript","media_type":"application/json; charset=utf-8","content_hash":digest(transcript_text.encode("utf-8")),"content":transcript_text},
+            {"resource_id":"confirmed-task-card","source_ref":"generation_context.normalized_task_card","media_type":"application/json; charset=utf-8","content_hash":digest(card_text.encode("utf-8")),"content":card_text},
+        ]
+        for index,item in enumerate(context.source_texts[:29],1):
+            text_resources.append({"resource_id":f"source-material-{index:03d}","source_ref":item.source_ref,"media_type":item.media_type,"content_hash":item.content_hash,"content":item.content})
         type_map={
             "date":"date","quarter":"date","ordinal":"ordinal","metric":"count",
             "metric_transition":"metric","frequency":"frequency",
@@ -277,6 +381,9 @@ class TaskService:
         facts=[]
         for claim in ledger.get("claims",[]):
             value=str(claim["value"])
+            evidence_resource=next((item for item in text_resources if value in item["content"]),text_resources[2])
+            source_text=evidence_resource["content"]
+            text_resource_id=evidence_resource["resource_id"]
             start=source_text.find(value)
             span=None
             statement=value
@@ -295,7 +402,7 @@ class TaskService:
                 "source_refs":[text_resource_id],
                 "fact_type":type_map.get(claim.get("kind"),"statement"),
                 "statement":statement,
-                "source_ref":"task_card.content_source",
+                "source_ref":evidence_resource["source_ref"],
                 "source_span":span,
                 "subject":str(card.get("topic") or ""),
                 "predicate":"confirmed_source_statement",
@@ -323,7 +430,7 @@ class TaskService:
             "pipeline_version":result.checkpoint.metadata.get("pipeline_version"),
             "reused":result.reused,
         }
-        for key in ("skill_digest","skill_entry_read","applied_skill_file_hashes","validator_version","evidence_version"):
+        for key in ("skill_digest","skill_entry_read","applied_skill_file_hashes","validator_version","evidence_version","context_snapshot_id","context_snapshot_hash","stage_payload_hash","context_sections_read"):
             if key in result.checkpoint.metadata: evidence[key]=result.checkpoint.metadata[key]
         return evidence
     def _version_metadata(self,task_id,kind,artifact_hash):
@@ -336,7 +443,8 @@ class TaskService:
                 f"## 冻结任务上下文\n主题：{brief.topic}\n\n目标：{brief.goal}\n\n受众：{brief.audience}\n\n"
                 f"## 叙事路径\n{beats}\n\n## 表达语气\n{value.tone}\n")
     def _generate_narrative_with_core(self,task_id,view,state,scope):
-        brief=self._generation_core_brief(task_id,view)
+        context=self._generation_context(task_id,view)
+        brief=self._generation_core_brief(task_id,view,context)
         ledger=view["claim_ledger"]; ledger_value={key:value for key,value in ledger.items() if key!="hash"}
         def validate_candidate(candidate):
             candidate_text=self._narrative_markdown_from_core(candidate,brief)
@@ -348,6 +456,7 @@ class TaskService:
             brief,
             input_version=view["snapshot_hash"],
             candidate_validator=validate_candidate,
+            context=context,
         )
         value=result.value
         text=self._narrative_markdown_from_core(value,brief)
@@ -908,7 +1017,7 @@ class TaskService:
             diagnostic_id=f"clarification-{digest(canonical({'task_id':task_id,'card':card,'raw_source_hash':raw_source_hash}))[:16]}"
             clarification=ClarificationSet.parse({"clarification_id":f"clarification-{digest(canonical({'questions':questions,'diagnostic_id':diagnostic_id,'raw_source_hash':raw_source_hash}))[:16]}","task_id":task_id,"questions":tuple(q["prompt"] for q in questions),"assumptions":tuple(card["assumptions"]),"confirmed":not questions,"schema_version":"1.0"})
             clarification_config=self._task_clarification_config(task_id)
-            clarification_meta={"questions":questions,"details":questions,"answers":{},"invalidated":[],"status":"generating" if self.clarifier is not None else "ready","question_source":None if self.clarifier is not None else "fallback","question_model":None,"diagnostic_id":diagnostic_id,"question_schema_version":"1.0","input_hash":raw_source_hash,"round":1,"rounds_history":[],"max_rounds":clarification_config.max_rounds,"max_questions_per_round":clarification_config.max_questions_per_round,"style":clarification_config.style}
+            clarification_meta={"questions":questions,"details":questions,"answers":{},"raw_answers":{},"invalidated":[],"status":"generating" if self.clarifier is not None else "ready","question_source":None if self.clarifier is not None else "fallback","question_model":None,"diagnostic_id":diagnostic_id,"question_schema_version":"1.0","input_hash":raw_source_hash,"round":1,"rounds_history":[],"max_rounds":clarification_config.max_rounds,"max_questions_per_round":clarification_config.max_questions_per_round,"style":clarification_config.style}
             clarification_hash=self.store.put_version(task_id,"clarification",canonical(clarification.to_dict()),clarification_meta)
             snapshot=TaskInputSnapshot.parse({"snapshot_id":f"snapshot-{digest((raw_source_hash+card_hash+manifest_hash).encode())[:16]}","task_id":task_id,"task_card_hash":card_hash,"resource_manifest_hash":manifest_hash,"created_at":now(),"schema_version":"1.0"})
             snapshot_hash=self.store.put_version(task_id,"input-snapshot",canonical(snapshot.to_dict()),{"clarification_hash":clarification_hash,"raw_source_hash":raw_source_hash,"rebuild_of":existing[-1]["hash"] if existing else None})
@@ -917,6 +1026,7 @@ class TaskService:
             event={"event_id":hashlib.sha256(f"{task_id}:input:{snapshot_hash}".encode()).hexdigest()[:24],"command_id":f"input-{snapshot_hash[:16]}","action":"rebuild_input" if existing else "import_input","actor":"user","request_hash":snapshot_hash,"at":utcnow(),"from":state.to_dict(),"to":new.to_dict(),"result":{"snapshot_hash":snapshot_hash}}
             self.store.commit(task_id,new.to_dict(),event)
             result={"state":new.to_dict(),"snapshot":snapshot.to_dict(),"snapshot_hash":snapshot_hash,"task_card":card,"manifest":{**manifest.to_dict(),"resources":resources,"warnings":warnings},"clarification":{**clarification.to_dict(),"details":questions,**clarification_meta},"clarification_hash":clarification_hash}
+            if not waiting: self._generation_context(task_id,self.input_view(task_id))
             # Fake mode can advance immediately. In real mode the empty
             # placeholder means the clarification model has not run yet; the
             # route will enqueue that persisted Job first.
@@ -949,7 +1059,7 @@ class TaskService:
         source_format=card["metadata"]["normalized"]["source_format"]
         raw_source=self.version(task_id,meta["raw_source_hash"]).decode("utf-8")
         source=json.loads(raw_source) if source_format=="json" else raw_source
-        return {"state":self.get(task_id),"snapshot":snapshot,"snapshot_hash":item["hash"],"source":source,"source_format":source_format,"task_card":task_card,"manifest":{**json.loads(self.version(task_id,snapshot["resource_manifest_hash"])),**manifest["metadata"]},"clarification":clarification}
+        return {"state":self.get(task_id),"snapshot":snapshot,"snapshot_hash":item["hash"],"source":source,"source_format":source_format,"task_card":task_card,"manifest":{**json.loads(self.version(task_id,snapshot["resource_manifest_hash"])),**manifest["metadata"]},"clarification":clarification,"clarification_hash":ch}
     def generate_clarification(self,task_id):
         if self.clarifier is None: raise ConflictError("当前为 fake 模式，不能调用澄清模型")
         view=self.input_view(task_id); snapshot_record=next(v for v in self.versions(task_id,"input-snapshot") if v["hash"]==view["snapshot_hash"]); raw_hash=snapshot_record["metadata"]["raw_source_hash"]
@@ -972,6 +1082,7 @@ class TaskService:
         if result["confirmed"] and history:
             # 模型在后续轮次返回 0 题 = 提前确认；此前轮次的答案已合并进任务卡，同步冻结。
             self._freeze_task_card(task_id,view["task_card"],result["clarification_hash"])
+        if result["confirmed"]: self._generation_context(task_id,self.input_view(task_id))
         if result["confirmed"] and self.get(task_id).get("mode") in {"auto","quick"}:
             self._drive_auto_to_sample(task_id)
         return result
@@ -1030,7 +1141,7 @@ class TaskService:
         return result, filtered
     def _record_clarification(self,task_id,view,questions,status,model,error,action,source="model",extra=None):
         config=self._task_clarification_config(task_id)
-        meta={"questions":questions,"details":questions,"answers":{},"invalidated":[],"status":status,"question_source":source if status=="ready" else None,"question_model":model,"diagnostic_id":view["clarification"]["diagnostic_id"],"question_schema_version":"1.0","input_hash":view["clarification"]["input_hash"],"normalized_task_card":view["task_card"],"round":config.max_rounds if source=="fallback" else view["clarification"].get("round",1),"rounds_history":list(view["clarification"].get("rounds_history",[])),"max_rounds":config.max_rounds,"max_questions_per_round":config.max_questions_per_round,"style":config.style}
+        meta={"questions":questions,"details":questions,"answers":{},"raw_answers":{},"invalidated":[],"status":status,"question_source":source if status=="ready" else None,"question_model":model,"diagnostic_id":view["clarification"]["diagnostic_id"],"question_schema_version":"1.0","input_hash":view["clarification"]["input_hash"],"normalized_task_card":view["task_card"],"round":config.max_rounds if source=="fallback" else view["clarification"].get("round",1),"rounds_history":list(view["clarification"].get("rounds_history",[])),"max_rounds":config.max_rounds,"max_questions_per_round":config.max_questions_per_round,"style":config.style}
         if error: meta["error"]=error
         if extra: meta.update(extra)
         artifact=ClarificationSet.parse({"clarification_id":f"clarification-{digest(canonical(meta))[:16]}","task_id":task_id,"questions":tuple(q["prompt"] for q in questions),"assumptions":tuple(),"confirmed":status=="ready" and not questions,"schema_version":"1.0"}); ch=self.store.put_version(task_id,"clarification",canonical(artifact.to_dict()),meta)
@@ -1051,6 +1162,17 @@ class TaskService:
         cards=self.versions(task_id,"task-card")
         if cards and self.version(task_id,cards[-1]["hash"])==raw: return
         self.store.put_version(task_id,"task-card",raw,{"normalized":merged,"clarification_hash":clarification_hash})
+    @staticmethod
+    def _archive_clarification_round(history,round_number,questions,answers,raw_answers):
+        archived={
+            "round":round_number,
+            "questions":json.loads(json.dumps(questions,ensure_ascii=False)),
+            "answers":dict(answers),
+            "raw_answers":json.loads(json.dumps(raw_answers,ensure_ascii=False)),
+        }
+        values=[item for item in history if not isinstance(item,dict) or item.get("round")!=round_number]
+        values.append(archived)
+        return sorted(values,key=lambda item:item.get("round",0) if isinstance(item,dict) else 0)
     def answer_clarification(self,task_id,question_id,answer):
         return self.answer_clarifications(task_id,{question_id:answer})
     def answer_clarifications(self,task_id,submitted,require_complete=False):
@@ -1059,39 +1181,77 @@ class TaskService:
         view=self.input_view(task_id); clarification=view.get("clarification")
         if not clarification: raise ConflictError("尚未生成澄清问题")
         if clarification.get("status") != "ready": raise ConflictError("澄清问题尚未生成完成")
-        details=clarification.get("details",clarification.get("questions",[]))
-        by_id={q["question_id"]:q for q in details}; answers=dict(clarification.get("answers",{})); changed=False
+        details=list(clarification.get("details",clarification.get("questions",[])) or [])
+        history=json.loads(json.dumps(clarification.get("rounds_history",[]) or [],ensure_ascii=False))
+        answers=dict(clarification.get("answers",{}) or {})
+        raw_answers=json.loads(json.dumps(clarification.get("raw_answers",{}) or {},ensure_ascii=False))
+        current_by_id={q["question_id"]:q for q in details}
+        history_locations={}
+        for entry in history:
+            if not isinstance(entry,dict): continue
+            entry.setdefault("answers",{}); entry.setdefault("raw_answers",{})
+            for question in entry.get("questions",[]) or []:
+                if isinstance(question,dict) and isinstance(question.get("question_id"),str):
+                    history_locations[question["question_id"]]=(entry,question)
+        by_id={question_id:question for question_id,(_,question) in history_locations.items()} | current_by_id
+        changed=False
         if require_complete:
             required={q["question_id"] for q in details if q["blocking"]}
             missing=sorted(required-set(submitted))
             if missing: raise ValidationError("必须一次提交本轮全部阻断题："+",".join(missing))
         for question_id,answer in submitted.items():
             if question_id not in by_id: raise ValidationError("澄清问题不存在")
-            value=validate_answer(by_id[question_id],answer); changed |= question_id in answers and answers[question_id]!=value; answers[question_id]=value
+            value=validate_answer(by_id[question_id],answer)
+            raw_value=json.loads(json.dumps(answer,ensure_ascii=False))
+            if question_id in current_by_id:
+                changed |= question_id in answers and (answers[question_id]!=value or raw_answers.get(question_id)!=raw_value)
+                answers[question_id]=value
+                raw_answers[question_id]=raw_value
+            else:
+                entry,_=history_locations[question_id]
+                changed |= question_id in entry["answers"] and (entry["answers"][question_id]!=value or entry["raw_answers"].get(question_id)!=raw_value)
+                entry["answers"][question_id]=value
+                entry["raw_answers"][question_id]=raw_value
         pending=[q for q in details if q["blocking"] and q["question_id"] not in answers]
-        merged=dict(view["task_card"]); merged.update({q["field"]:answers[q["question_id"]] for q in details if q["question_id"] in answers})
+        merged=dict(view["task_card"])
+        for entry in history:
+            if not isinstance(entry,dict): continue
+            for question in entry.get("questions",[]) or []:
+                question_id=question.get("question_id") if isinstance(question,dict) else None
+                field=question.get("field",question.get("field_path")) if isinstance(question,dict) else None
+                if isinstance(field,str) and question_id in entry.get("answers",{}): merged[field]=entry["answers"][question_id]
+        merged.update({q.get("field",q.get("field_path")):answers[q["question_id"]] for q in details if q["question_id"] in answers})
         merged["missing"]=[key for key in merged.get("missing",[]) if not merged.get(key)]
-        payload={"questions":details,"details":details,"answers":answers,"status":"ready","normalized_task_card":merged,"invalidated":(["narrative","outline","sample","deck","inspection","delivery"] if changed else clarification.get("invalidated",[])),**{k:clarification.get(k) for k in ("question_source","question_model","diagnostic_id","question_schema_version","input_hash")}}
+        invalidated=["narrative","outline","sample","deck","inspection","delivery"] if changed else clarification.get("invalidated",[])
+        payload={"questions":details,"details":details,"answers":answers,"raw_answers":raw_answers,"status":"ready","normalized_task_card":merged,"invalidated":invalidated,"round":clarification.get("round",1),"rounds_history":history,"max_rounds":clarification.get("max_rounds",1),"max_questions_per_round":clarification.get("max_questions_per_round",6),"style":clarification.get("style","minimal"),**{k:clarification.get(k) for k in ("question_source","question_model","diagnostic_id","question_schema_version","input_hash")}}
         if not pending:
             config=self._task_clarification_config(task_id); current_round=clarification.get("round",1)
-            if self.clarifier is not None and clarification.get("question_source")=="model" and current_round < config.max_rounds:
+            if details and self.clarifier is not None and clarification.get("question_source")=="model" and current_round < config.max_rounds:
                 # 阻断题已答完且轮次预算未用尽：归档本轮问答，自动生成下一轮。
-                history=list(clarification.get("rounds_history",[]))
-                history.append({"round":current_round,"questions":details,"answers":{q["question_id"]:answers[q["question_id"]] for q in details if q["question_id"] in answers}})
-                next_meta={"questions":[],"details":[],"answers":{},"invalidated":payload["invalidated"],"status":"generating","question_source":None,"question_model":None,"diagnostic_id":clarification["diagnostic_id"],"question_schema_version":"1.0","input_hash":clarification["input_hash"],"normalized_task_card":merged,"round":current_round+1,"rounds_history":history,"max_rounds":config.max_rounds,"max_questions_per_round":config.max_questions_per_round,"style":config.style}
+                current_adopted={q["question_id"]:answers[q["question_id"]] for q in details if q["question_id"] in answers}
+                current_raw={q["question_id"]:raw_answers[q["question_id"]] for q in details if q["question_id"] in raw_answers}
+                history=self._archive_clarification_round(history,current_round,details,current_adopted,current_raw)
+                next_meta={"questions":[],"details":[],"answers":{},"raw_answers":{},"invalidated":payload["invalidated"],"status":"generating","question_source":None,"question_model":None,"diagnostic_id":clarification["diagnostic_id"],"question_schema_version":"1.0","input_hash":clarification["input_hash"],"normalized_task_card":merged,"round":current_round+1,"rounds_history":history,"max_rounds":config.max_rounds,"max_questions_per_round":config.max_questions_per_round,"style":config.style}
                 artifact=ClarificationSet.parse({"clarification_id":f"clarification-{digest(canonical(next_meta))[:16]}","task_id":task_id,"questions":tuple(),"assumptions":tuple(),"confirmed":False,"schema_version":"1.0"})
                 ch=self.store.put_version(task_id,"clarification",canonical(artifact.to_dict()),next_meta)
                 state=TaskState.parse(self.get(task_id)); new=TaskState(**{**state.__dict__,"status":state.status.WAITING_FOR_USER,"waiting_reason":"clarification_generating","required_action":"wait_for_clarification","revision":state.revision+1})
                 event={"event_id":hashlib.sha256(f"{task_id}:answer:{ch}".encode()).hexdigest()[:24],"command_id":f"answer-{ch[:16]}","action":"answer_clarification","actor":"user","request_hash":fingerprint(submitted),"at":utcnow(),"from":state.to_dict(),"to":new.to_dict(),"result":{"clarification_hash":ch,"invalidated":payload["invalidated"],"next_round":current_round+1}}
                 self.store.commit(task_id,new.to_dict(),event)
                 return {"state":self.get(task_id),"clarification_hash":ch,**next_meta,"confirmed":False}
+            if details:
+                current_adopted={q["question_id"]:answers[q["question_id"]] for q in details if q["question_id"] in answers}
+                current_raw={q["question_id"]:raw_answers[q["question_id"]] for q in details if q["question_id"] in raw_answers}
+                payload["rounds_history"]=self._archive_clarification_round(history,current_round,details,current_adopted,current_raw)
         model=ClarificationSet.parse({"clarification_id":f"clarification-{digest(canonical(payload))[:16]}","task_id":task_id,"questions":tuple(q["prompt"] for q in details),"assumptions":tuple(),"confirmed":not pending,"schema_version":"1.0"})
         ch=self.store.put_version(task_id,"clarification",canonical(model.to_dict()),payload)
-        state=TaskState.parse(self.get(task_id)); new=TaskState(**{**state.__dict__,"status":state.status.WAITING_FOR_USER if pending else state.status.READY,"waiting_reason":"missing_required_input" if pending else None,"required_action":"answer_clarifications" if pending else None,"revision":state.revision+1})
+        state=TaskState.parse(self.get(task_id))
+        reset={"stage":state.stage.CLARIFICATION,"sample_confirmed":False,"blockers_resolved":False,"delivery_confirmed":False} if changed and not pending else {}
+        new=TaskState(**{**state.__dict__,**reset,"status":state.status.WAITING_FOR_USER if pending else state.status.READY,"waiting_reason":"missing_required_input" if pending else None,"required_action":"answer_clarifications" if pending else None,"revision":state.revision+1})
         event={"event_id":hashlib.sha256(f"{task_id}:answer:{ch}".encode()).hexdigest()[:24],"command_id":f"answer-{ch[:16]}","action":"answer_clarification","actor":"user","request_hash":fingerprint(submitted),"at":utcnow(),"from":state.to_dict(),"to":new.to_dict(),"result":{"clarification_hash":ch,"invalidated":payload["invalidated"]}}
         self.store.commit(task_id,new.to_dict(),event)
         if not pending:
             self._freeze_task_card(task_id,merged,ch)
+            self._generation_context(task_id,self.input_view(task_id))
         if new.mode in {"auto","quick"} and not pending: self._drive_auto_to_sample(task_id)
         return {"state":self.get(task_id),"clarification_hash":ch,**payload,"confirmed":not pending}
 
@@ -1103,6 +1263,8 @@ class TaskService:
         if not self._current_version(task_id,"sample"): self.generate_sample(task_id)
     def _current_version(self,task_id,kind):
         for event in reversed(self.events(task_id)):
+            if event["action"]=="answer_clarification" and kind in event.get("result",{}).get("invalidated",[]):
+                return None
             # A narrative revision invalidates the previously generated outline.
             if kind == "outline" and event["action"] in {"narrative_generate","narrative_edit"}:
                 return None
@@ -1134,18 +1296,21 @@ class TaskService:
         view=input_view or self.input_view(task_id)
         snapshot_hash=view.get("snapshot_hash")
         if not snapshot_hash: raise ConflictError("须先冻结输入再建立 Claim Ledger")
+        context=self._generation_context(task_id,view)
+        context_hash=context.context_hash
         for record in reversed(self.versions(task_id,"claim-ledger")):
-            if record["metadata"].get("input_snapshot_hash")==snapshot_hash:
+            if record["metadata"].get("generation_context_hash")==context_hash:
                 ledger=validate_claim_ledger(json.loads(self.version(task_id,record["hash"])))
                 return {**ledger,"hash":record["hash"]}
         ledger=build_claim_ledger(
             task_id=task_id,
-            input_snapshot_hash=snapshot_hash,
+            input_snapshot_hash=context_hash,
             source_binding={"source":view.get("source"),"task_card":view.get("task_card")},
             created_at=utcnow(),
         )
         ledger_hash=self.store.put_version(task_id,"claim-ledger",canonical(ledger),{
             "input_snapshot_hash":snapshot_hash,
+            "generation_context_hash":context_hash,
             "claim_count":len(ledger["claims"]),
             "immutable":True,
         })
@@ -1353,6 +1518,12 @@ class TaskService:
         deterministic, network-free fallback inside the same user Job.
         """
         correction=None
+        generation_context=self._generation_context(task_id)
+        payload_stage="modify" if context.get("prompt") else "sample" if action=="sample" else "deck_batch"
+        base_payload=build_stage_payload(generation_context,payload_stage,{
+            "task_id":task_id,"requested_action":action,"upstream_outline":outline,"requested_slide_ids":list(slide_ids),"stage_context":context,
+        })
+        context_evidence=stage_payload_metadata(generation_context,base_payload)
         ledger=context.get("claim_ledger")
         required_claims=list(context.get("required_claims_verbatim") or [])
         required_ids=[claim["claim_id"] for claim in required_claims]
@@ -1465,6 +1636,7 @@ class TaskService:
 
         for attempt in range(1,GENERATION_ATTEMPTS+1):
             request={
+                **base_payload,
                 **context,
                 "presentation_technical_contract":context["design_contract"],
                 "presentation_technical_contract_hash":context["design_contract_hash"],
@@ -1603,7 +1775,7 @@ class TaskService:
             attempt_hash=self._persist_generation_attempt(task_id,attempt_body)
             attempt_hashes.append(attempt_hash); parent_attempt_id=attempt_hash
             if status=="accepted":
-                generation_meta={"attempts":attempt,"retry_count":attempt-1,"max_attempts":GENERATION_ATTEMPTS,"attempt_evidence_hashes":attempt_hashes,"correction_evidence_hashes":correction_hashes,"design_intent":design_intent,"shared_assets":shared_assets}
+                generation_meta={"attempts":attempt,"retry_count":attempt-1,"max_attempts":GENERATION_ATTEMPTS,"attempt_evidence_hashes":attempt_hashes,"correction_evidence_hashes":correction_hashes,"design_intent":design_intent,"shared_assets":shared_assets,**context_evidence}
                 if materialization is not None: generation_meta["server_claim_materialization"]=materialization
                 if fallback is not None: generation_meta.update(degraded_fallback=True,fallback=fallback)
                 return candidate,generation_meta
@@ -1638,7 +1810,7 @@ class TaskService:
                 return self.planning_view(task_id)
             if not current:
                 return self._generate_narrative_with_core(task_id,view,state,scope)
-        skill=self.skills.load("narrative"); prior=self._current_version(task_id,"narrative")
+        skill=self.skills.load("narrative"); prior=self._current_version(task_id,"narrative"); context_evidence={}
         ledger=view["claim_ledger"]; ledger_value={key:value for key,value in ledger.items() if key!="hash"}
         if isinstance(self.generator,FakeGenerationGateway):
             text=narrative_markdown(view["task_card"])
@@ -1649,7 +1821,9 @@ class TaskService:
         else:
             numeric_policy=narrative_numeric_policy(ledger_value)
             structure_policy=narrative_structure_policy(view["task_card"])
-            payload={"task_id":task_id,"task_card":view["task_card"],"prompt":prompt,"scope":scope,"claim_ledger":ledger_value,"narrative_numeric_policy":numeric_policy,"narrative_structure_policy":structure_policy}
+            generation_context=self._generation_context(task_id,view)
+            payload=build_stage_payload(generation_context,"narrative",{"task_id":task_id,"task_card":view["task_card"],"prompt":prompt,"scope":scope,"claim_ledger":ledger_value,"narrative_numeric_policy":numeric_policy,"narrative_structure_policy":structure_policy})
+            context_evidence=stage_payload_metadata(generation_context,payload)
             for attempt in range(1,3):
                 generated=self.generator.generate("narrative",payload,skill=skill["content"])
                 text=generated["text"]; model_name=generated.get("model","unknown")
@@ -1685,7 +1859,7 @@ class TaskService:
                 }}
         version=len(self.versions(task_id,"narrative"))+1; content_hash=digest(text.encode())
         model=NarrativeDocument.parse({"document_id":f"narrative-{content_hash[:16]}","task_id":task_id,"version":version,"markdown":text,"content_hash":content_hash,"created_at":now(),"schema_version":"1.0"})
-        metadata={"parent":prior,"action":"generate" if not prior else "regenerate","scope":scope,"summary":"生成整稿叙事结构","model":model_name,"skill":{"action":"narrative","version":skill["version"],"hash":digest(skill["content"].encode()),"included":["narrative"],"trimmed":["outline","html","inspection"]},"input_snapshot_hash":view["snapshot_hash"],"claim_ledger_hash":ledger["hash"],"claim_bindings":claim_bindings["bindings"],"unbound_claim_count":0,"narrative_quality":quality_evidence}
+        metadata={"parent":prior,"action":"generate" if not prior else "regenerate","scope":scope,"summary":"生成整稿叙事结构","model":model_name,"skill":{"action":"narrative","version":skill["version"],"hash":digest(skill["content"].encode()),"included":["narrative"],"trimmed":["outline","html","inspection"]},"input_snapshot_hash":view["snapshot_hash"],"claim_ledger_hash":ledger["hash"],"claim_bindings":claim_bindings["bindings"],"unbound_claim_count":0,"narrative_quality":quality_evidence,**context_evidence}
         h=self._record_p3(task_id,"narrative",model,metadata,"narrative_generate")
         if state.stage in {state.stage.CLARIFICATION,state.stage.CREATED}:
             self.command(task_id,f"narrative-stage-{h[:12]}","advance")
@@ -1719,14 +1893,15 @@ class TaskService:
         if not narrative: raise ConflictError("须先生成叙事结构")
         state=TaskState.parse(self.get(task_id))
         if state.mode=="manual" and self._confirmed_narrative_hash(task_id) != narrative: raise ConflictError("manual 模式须先确认当前版本叙事结构")
-        current=self._current_version(task_id,"outline")
+        current=self._current_version(task_id,"outline"); context_evidence={}
         narrative_meta=self._version_metadata(task_id,"narrative",narrative)
         if self.generation_pipeline is not None and prompt is None and not slide_ids and narrative_meta.get("generation_core"):
             if current and self._version_metadata(task_id,"outline",current).get("generation_core"):
                 return self.planning_view(task_id)
             if not current:
-                brief=self._generation_core_brief(task_id,view)
-                result=self.generation_pipeline.generate_outline(task_id,brief,narrative_meta["generation_core"]["checkpoint_id"])
+                context=self._generation_context(task_id,view)
+                brief=self._generation_core_brief(task_id,view,context)
+                result=self.generation_pipeline.generate_outline(task_id,brief,narrative_meta["generation_core"]["checkpoint_id"],context=context)
                 text=self._outline_markdown_from_core(result.value,brief)
                 return self.edit_outline(task_id,text,"生成逐页大纲",actor="system",extra_metadata={"generation_core":self._generation_core_evidence(result)})
         skill=self.skills.load("outline"); count=requested_slide_count(view["task_card"]); resources=view["manifest"].get("resources",[])
@@ -1749,7 +1924,9 @@ class TaskService:
                     for claim in ledger_value["claims"]
                 ]
                 required_claim_ids=[claim["claim_id"] for claim in required_claims]
-                payload={"task_id":task_id,"task_card":view["task_card"],"narrative":json.loads(self.version(task_id,narrative))["markdown"],"resources":resources,"slide_count":count,"prompt":prompt,"claim_ledger":ledger_value,"outline_required_claims_verbatim":required_claims}
+                generation_context=self._generation_context(task_id,view)
+                payload=build_stage_payload(generation_context,"outline",{"task_id":task_id,"task_card":view["task_card"],"narrative":json.loads(self.version(task_id,narrative))["markdown"],"resources":resources,"slide_count":count,"prompt":prompt,"claim_ledger":ledger_value,"outline_required_claims_verbatim":required_claims})
+                context_evidence=stage_payload_metadata(generation_context,payload)
                 for attempt in range(1,3):
                     generated=self.generator.generate("outline",payload,skill=skill["content"])
                     text=None
@@ -1785,7 +1962,7 @@ class TaskService:
                             "missing_required_claims_verbatim":missing_claims,
                             "rule":"重新提交完整 slides；逐字覆盖 required_claims_verbatim 的每个 value，尤其不得合并、概括或遗漏预算拆分。missing_required_claims_verbatim 是上一候选明确缺失的子集。不得新增 Claim Ledger 之外的量化事实。",
                         }}
-        return self.edit_outline(task_id,text,"生成逐页大纲",actor="system",skill=skill)
+        return self.edit_outline(task_id,text,"生成逐页大纲",actor="system",skill=skill,extra_metadata=context_evidence)
     def edit_outline(self,task_id,markdown,summary="直接编辑",actor="user",skill=None,extra_metadata=None):
         self._require_actionable(task_id)
         view=self._p3_input(task_id); expected=requested_slide_count(view["task_card"])
@@ -1952,8 +2129,9 @@ class TaskService:
             and current_sample["metadata"].get("selection_hash")==selection["hash"]):
             return view
         if self.generation_pipeline is not None and prompt is None and outline_meta.get("generation_core"):
-            brief=self._generation_core_brief(task_id)
-            result=self.generation_pipeline.generate_sample(task_id,brief,outline_meta["generation_core"]["checkpoint_id"],selected_slide_ids=selection["slide_ids"])
+            context=self._generation_context(task_id)
+            brief=self._generation_core_brief(task_id,context=context)
+            result=self.generation_pipeline.generate_sample(task_id,brief,outline_meta["generation_core"]["checkpoint_id"],selected_slide_ids=selection["slide_ids"],context=context)
             source=self._generation_core_preview_html(result.artifact,brief,assets)
             design_intent=self._design_intent_from_core(result.value.theme_tokens,{slide.layout_family for slide in result.value.slides})
             shared_assets={"css":""}
@@ -1972,7 +2150,9 @@ class TaskService:
         html_text,gate=self._post_render_gate(task_id,source,list(selection["slide_ids"]),contract,ledger,assets,generation.get("attempt_evidence_hashes"))
         version=len(self.versions(task_id,"sample"))+1; content_hash=digest(html_text.encode()); model=DeckArtifact.parse({"artifact_id":f"sample-{content_hash[:16]}","task_id":task_id,"version":version,"kind":"sample","outline_hash":outline,"content_hash":content_hash,"created_at":now(),"schema_version":"1.0"})
         prior=self._current_version(task_id,"sample"); meta={"html":html_text,"selection_hash":selection["hash"],"parent":prior,"summary":"生成真实 HTML 样品","scope":"global","global_rules":rules,"local_exceptions":{},"build":"success","generation":generation,"design_intent":generation.get("design_intent",default_design_intent()),"shared_design_assets":generation.get("shared_assets",{"css":""}),"presentation_technical_contract_hash":contract["hash"],"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate":gate}
-        if "checkpoint_id" in generation: meta["generation_core"]={key:generation[key] for key in ("checkpoint_id","output_sha256","contract_name","model","provider_calls","recovery_count","pipeline_version","reused")}
+        if "checkpoint_id" in generation:
+            keys=("checkpoint_id","output_sha256","contract_name","model","provider_calls","recovery_count","pipeline_version","reused","context_snapshot_id","context_snapshot_hash","stage_payload_hash","context_sections_read")
+            meta["generation_core"]={key:generation[key] for key in keys if key in generation}
         h=self._record_p3(task_id,"sample",model,meta,"sample_generate")
         self._invalidate_sample_gate(task_id,h)
         return self.sample_view(task_id)
@@ -2131,8 +2311,9 @@ class TaskService:
             current=self.deck_view(task_id).get("deck")
             if current and current.get("metadata",{}).get("generation_core") and current["metadata"].get("sample_hash")==sample["hash"]:
                 return self.deck_view(task_id)
-            brief=self._generation_core_brief(task_id)
-            core_result=self.generation_pipeline.generate_deck(task_id,brief,outline_meta["generation_core"]["checkpoint_id"],core_confirmation["checkpoint_id"])
+            context=self._generation_context(task_id)
+            brief=self._generation_core_brief(task_id,context=context)
+            core_result=self.generation_pipeline.generate_deck(task_id,brief,outline_meta["generation_core"]["checkpoint_id"],core_confirmation["checkpoint_id"],context=context)
             review_result=self.generation_pipeline.create_review_input(task_id,core_result.checkpoint.checkpoint_id)
             html_text=self._generation_core_preview_html(core_result.artifact,brief,assets)
             html_text=self._replace_slide_fragments(html_text,sample_fragments)

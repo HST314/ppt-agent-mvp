@@ -34,6 +34,7 @@ from .contracts import (
     validate_slide_outline_alignment,
     verify_evidence_refs,
 )
+from .context import GenerationContextV2, build_stage_payload, stage_payload_metadata
 from .errors import CheckpointConflict, ContractValidationError, ErrorContext
 from .model_gateway import GatewayResult, ModelGateway
 from .prompts import PROMPT_VERSION, narrative_prompt, outline_prompt, sample_prompt, slide_batch_prompt
@@ -44,7 +45,7 @@ from ..rendering.validator import TechnicalValidator, ValidationReport
 
 
 CHECKPOINT_VERSION = "1.0"
-PIPELINE_VERSION = "2.0.0"
+PIPELINE_VERSION = "2.1.0"
 VALIDATOR_VERSION = "2.0"
 EVIDENCE_VERSION = "2.0"
 
@@ -323,20 +324,23 @@ class GenerationPipeline:
         *,
         input_version: str | None = None,
         candidate_validator: Callable[[NarrativeSpec], dict[str, Any] | None] | None = None,
+        context: GenerationContextV2 | None = None,
     ) -> StageResult:
         self._progress("freezing_inputs", "冻结任务、资源与 Evidence v2")
-        input_version = input_version or brief.sha256
-        brief_checkpoint = self._brief_checkpoint(task_id, brief, input_version)
+        context = context or GenerationContextV2.from_task_brief(brief, input_version=input_version)
+        brief_checkpoint = self._brief_checkpoint(task_id, brief, context)
         skill_snapshot = self.stage_agent.snapshot if self.stage_agent is not None else None
-        key = self._stage_key(task_id, "narrative", brief_checkpoint.checkpoint_id, skill_snapshot=skill_snapshot)
+        key = self._stage_key(task_id, "narrative", brief_checkpoint.checkpoint_id, context.context_hash, skill_snapshot=skill_snapshot)
         existing = self.checkpoints.find(task_id, key)
         if existing:
+            self._assert_checkpoint_context(existing, context, "narrative")
             return StageResult(existing, NarrativeSpec.parse(existing.output), reused=True)
         self._event(task_id, "narrative", "started")
         self._progress("resolving_skill", "解析不可变 Skill 快照")
         evidence_ids = tuple(item.resource_id for item in brief.resource_manifest) + tuple(item.fact_id for item in brief.confirmed_facts)
         evidence_ids += tuple(item.resource_id for item in brief.text_resources)
         contract_type = narrative_contract_for_evidence(evidence_ids)
+        payload = build_stage_payload(context, "narrative", {"task_brief": brief.to_dict(), "evidence_version": EVIDENCE_VERSION})
         def validate_narrative(candidate):
             verify_evidence_refs(candidate, brief)
             return candidate_validator(candidate) if candidate_validator is not None else {}
@@ -344,8 +348,8 @@ class GenerationPipeline:
             gateway_result = self._generate_contract(
                 "narrative",
                 contract_type,
-                payload={"task_brief": brief.to_dict(), "evidence_version": EVIDENCE_VERSION},
-                fallback_input=narrative_prompt({"task_brief": brief.to_dict()}),
+                payload=payload,
+                fallback_input=narrative_prompt(payload),
                 key=key,
                 instruction=(
                     "返回 NarrativeSpec JSON：thesis、audience_takeaway、story_arc、evidence_refs、tone。"
@@ -373,22 +377,31 @@ class GenerationPipeline:
             self._event(task_id, "narrative", "rejected")
             raise
         self._progress("saving_result", "保存已通过校验的权威结果")
-        checkpoint = self._commit_contract(task_id, "narrative", brief_checkpoint.checkpoint_id, narrative, gateway_result, key)
+        checkpoint = self._commit_contract(task_id, "narrative", brief_checkpoint.checkpoint_id, narrative, gateway_result, key, context=context, payload=payload)
         self._event(task_id, "narrative", "succeeded", checkpoint=checkpoint)
         return StageResult(checkpoint, narrative)
 
-    def generate_outline(self, task_id: str, brief: TaskBrief, narrative_checkpoint_id: str) -> StageResult:
+    def generate_outline(self, task_id: str, brief: TaskBrief, narrative_checkpoint_id: str, *, context: GenerationContextV2 | None = None) -> StageResult:
         narrative_checkpoint = self._require_checkpoint(task_id, narrative_checkpoint_id, "narrative")
+        context = context or GenerationContextV2.from_task_brief(brief)
+        self._assert_checkpoint_context(narrative_checkpoint, context, "outline")
         narrative = NarrativeSpec.parse(narrative_checkpoint.output)
         skill_snapshot = self.stage_agent.snapshot if self.stage_agent is not None else None
-        key = self._stage_key(task_id, "outline", narrative_checkpoint_id, brief.sha256, skill_snapshot=skill_snapshot)
+        key = self._stage_key(task_id, "outline", narrative_checkpoint_id, brief.sha256, context.context_hash, skill_snapshot=skill_snapshot)
         existing = self.checkpoints.find(task_id, key)
         if existing:
+            self._assert_checkpoint_context(existing, context, "outline")
             return StageResult(existing, OutlineSpec.parse(existing.output, expected_slide_count=brief.slide_count), reused=True)
         self._event(task_id, "outline", "started")
         evidence_ids = tuple(item.resource_id for item in brief.resource_manifest) + tuple(item.fact_id for item in brief.confirmed_facts)
         evidence_ids += tuple(item.resource_id for item in brief.text_resources)
         contract_type = outline_contract_for_evidence(evidence_ids, brief.slide_count)
+        payload = build_stage_payload(context, "outline", {
+            "task_brief": brief.to_dict(),
+            "narrative": narrative.to_dict(),
+            "slide_count": brief.slide_count,
+            "evidence_version": EVIDENCE_VERSION,
+        })
         def validate_outline(candidate):
             projected = OutlineSpec.from_draft(candidate, expected_slide_count=brief.slide_count)
             verify_evidence_refs(projected, brief)
@@ -397,8 +410,8 @@ class GenerationPipeline:
             gateway_result = self._generate_contract(
                 "outline",
                 contract_type,
-                payload={"task_brief": brief.to_dict(), "narrative": narrative.to_dict(), "slide_count": brief.slide_count, "evidence_version": EVIDENCE_VERSION},
-                fallback_input=outline_prompt({"task_brief": brief.to_dict(), "narrative": narrative.to_dict(), "slide_count": brief.slide_count}),
+                payload=payload,
+                fallback_input=outline_prompt(payload),
                 key=key,
                 instruction="返回严格 OutlineDraft JSON；每页包含 role、title、message、evidence_refs、visual_intent，不得返回 Markdown 或 HTML。",
                 validator=validate_outline,
@@ -418,12 +431,22 @@ class GenerationPipeline:
             self._reject_candidate(task_id, "outline", narrative_checkpoint_id, key, exc)
             self._event(task_id, "outline", "rejected")
             raise
-        checkpoint = self._commit_contract(task_id, "outline", narrative_checkpoint_id, outline, gateway_result, key)
+        checkpoint = self._commit_contract(task_id, "outline", narrative_checkpoint_id, outline, gateway_result, key, context=context, payload=payload)
         self._event(task_id, "outline", "succeeded", checkpoint=checkpoint)
         return StageResult(checkpoint, outline)
 
-    def generate_sample(self, task_id: str, brief: TaskBrief, outline_checkpoint_id: str, *, selected_slide_ids: Sequence[str] | None = None) -> StageResult:
+    def generate_sample(
+        self,
+        task_id: str,
+        brief: TaskBrief,
+        outline_checkpoint_id: str,
+        *,
+        selected_slide_ids: Sequence[str] | None = None,
+        context: GenerationContextV2 | None = None,
+    ) -> StageResult:
         outline_checkpoint = self._require_checkpoint(task_id, outline_checkpoint_id, "outline")
+        context = context or GenerationContextV2.from_task_brief(brief)
+        self._assert_checkpoint_context(outline_checkpoint, context, "sample")
         outline = OutlineSpec.parse(outline_checkpoint.output, expected_slide_count=brief.slide_count)
         selected = tuple(selected_slide_ids or self.select_representative_slides(outline))
         if not 2 <= len(selected) <= 3 or len(set(selected)) != len(selected):
@@ -432,18 +455,20 @@ class GenerationPipeline:
         if any(slide_id not in by_id for slide_id in selected):
             raise ContractValidationError("样品页不在大纲中", context=ErrorContext(stage="sample", field_path="selected_slide_ids"))
         skill_snapshot = self.stage_agent.snapshot if self.stage_agent is not None else None
-        key = self._stage_key(task_id, "sample", outline_checkpoint_id, content_sha256(selected), skill_snapshot=skill_snapshot)
+        key = self._stage_key(task_id, "sample", outline_checkpoint_id, content_sha256(selected), context.context_hash, skill_snapshot=skill_snapshot)
         existing = self.checkpoints.find(task_id, key)
         if existing:
+            self._assert_checkpoint_context(existing, context, "sample")
             sample, artifact, validation = self._read_rendered_sample(existing)
             return StageResult(existing, sample, artifact, validation, reused=True)
         self._event(task_id, "sample", "started")
         allowed_assets = tuple(item.resource_id for item in brief.resource_manifest)
-        sample_payload = {
+        sample_payload = build_stage_payload(context, "sample", {
             "task_brief": brief.to_dict(),
             "outline_checkpoint_id": outline_checkpoint_id,
+            "outline": outline.to_dict(),
             "selected_slides": [by_id[slide_id].to_dict() for slide_id in selected],
-        }
+        })
         gateway_result = self._generate_contract(
             "sample",
             sample_contract_for_assets(allowed_assets, len(selected)),
@@ -472,7 +497,11 @@ class GenerationPipeline:
             model=gateway_result.model,
             parent_checkpoint_id=outline_checkpoint_id,
             idempotency_key=key,
-            metadata=self._gateway_metadata(gateway_result) | {"pipeline_version": PIPELINE_VERSION, "selected_slide_ids": list(selected)},
+            metadata=self._gateway_metadata(gateway_result) | {
+                "pipeline_version": PIPELINE_VERSION,
+                "selected_slide_ids": list(selected),
+                **stage_payload_metadata(context, sample_payload),
+            },
         )
         self._event(task_id, "sample", "succeeded", checkpoint=checkpoint)
         return StageResult(checkpoint, sample, artifact, validation)
@@ -503,14 +532,32 @@ class GenerationPipeline:
             model="service",
             parent_checkpoint_id=sample_checkpoint_id,
             idempotency_key=key,
-            metadata={"pipeline_version": PIPELINE_VERSION, "confirmed_by": "user"},
+            metadata={
+                "pipeline_version": PIPELINE_VERSION,
+                "confirmed_by": "user",
+                "context_snapshot_id": sample_checkpoint.metadata.get("context_snapshot_id"),
+                "context_snapshot_hash": sample_checkpoint.metadata.get("context_snapshot_hash"),
+                "stage_payload_hash": content_sha256(frozen),
+                "context_sections_read": [],
+            },
         )
         self._event(task_id, "sample_confirmed", "succeeded", checkpoint=checkpoint)
         return StageResult(checkpoint, frozen)
 
-    def generate_deck(self, task_id: str, brief: TaskBrief, outline_checkpoint_id: str, sample_confirmation_checkpoint_id: str) -> StageResult:
+    def generate_deck(
+        self,
+        task_id: str,
+        brief: TaskBrief,
+        outline_checkpoint_id: str,
+        sample_confirmation_checkpoint_id: str,
+        *,
+        context: GenerationContextV2 | None = None,
+    ) -> StageResult:
         outline_checkpoint = self._require_checkpoint(task_id, outline_checkpoint_id, "outline")
         confirmation = self._require_checkpoint(task_id, sample_confirmation_checkpoint_id, "sample_confirmed")
+        context = context or GenerationContextV2.from_task_brief(brief)
+        self._assert_checkpoint_context(outline_checkpoint, context, "deck")
+        self._assert_checkpoint_context(confirmation, context, "deck")
         if confirmation.output.get("outline_checkpoint_id") != outline_checkpoint_id:
             raise CheckpointConflict("样品确认与当前大纲 checkpoint 不一致", context=ErrorContext(stage="deck"))
         outline = OutlineSpec.parse(outline_checkpoint.output, expected_slide_count=brief.slide_count)
@@ -521,9 +568,10 @@ class GenerationPipeline:
         sample_by_id = {slide.slide_id: slide for slide in sample_slides}
         remaining = [slide.slide_id for slide in outline.slides if slide.slide_id not in sample_by_id]
         skill_snapshot = self.stage_agent.snapshot if self.stage_agent is not None else None
-        key = self._stage_key(task_id, "deck", outline_checkpoint_id, sample_confirmation_checkpoint_id, skill_snapshot=skill_snapshot)
+        key = self._stage_key(task_id, "deck", outline_checkpoint_id, sample_confirmation_checkpoint_id, context.context_hash, skill_snapshot=skill_snapshot)
         existing = self.checkpoints.find(task_id, key)
         if existing:
+            self._assert_checkpoint_context(existing, context, "deck")
             deck, artifact, validation = self._read_rendered_deck(existing, outline)
             return StageResult(existing, deck, artifact, validation, reused=True)
         self._event(task_id, "deck", "started")
@@ -531,20 +579,22 @@ class GenerationPipeline:
         generated: dict[str, SlideSpec] = {}
         batch_evidence: list[dict[str, Any]] = []
 
-        def produce(item: tuple[int, list[str]]) -> tuple[int, list[str], GatewayResult]:
+        def produce(item: tuple[int, list[str]]) -> tuple[int, list[str], GatewayResult, dict[str, Any]]:
             index, ids = item
-            batch_key = self._stage_key(task_id, "deck_batch", outline_checkpoint_id, sample_confirmation_checkpoint_id, str(index), CONTRACT_VERSION, skill_snapshot=skill_snapshot)
+            batch_key = self._stage_key(task_id, "deck_batch", outline_checkpoint_id, sample_confirmation_checkpoint_id, str(index), CONTRACT_VERSION, context.context_hash, skill_snapshot=skill_snapshot)
             slides_by_id = {slide.slide_id: slide for slide in outline.slides}
-            batch_payload = {
+            batch_payload = build_stage_payload(context, "deck_batch", {
                 "task_brief": brief.to_dict(),
                 "outline_checkpoint_id": outline_checkpoint_id,
+                "outline": outline.to_dict(),
                 "sample_checkpoint_id": sample_confirmation_checkpoint_id,
+                "confirmed_sample": confirmation.output,
                 "batch_index": index,
                 "requested_slides": [slides_by_id[slide_id].to_dict() for slide_id in ids],
                 "frozen_theme_tokens": frozen_theme.to_dict(),
                 "allowed_layout_families": sorted(frozen_layouts),
                 "allowed_asset_refs": list(frozen_assets),
-            }
+            })
             result = self._generate_contract(
                 "deck_batch",
                 slide_batch_contract_for_assets(frozen_assets, len(ids), tuple(frozen_layouts)),
@@ -554,11 +604,11 @@ class GenerationPipeline:
                 instruction="返回严格 SlideBatchSpec JSON 的结构化 content_blocks；复用冻结主题、版式与资源许可，由确定性 renderer 生成 HTML。",
                 skill_snapshot=skill_snapshot,
             )
-            return index, ids, result
+            return index, ids, result, batch_payload
 
         with ThreadPoolExecutor(max_workers=self.max_batch_workers, thread_name_prefix="deck-batch") as executor:
             results = list(executor.map(produce, enumerate(batches)))
-        for batch_index, requested_ids, gateway_result in sorted(results):
+        for batch_index, requested_ids, gateway_result, batch_payload in sorted(results):
             batch = gateway_result.contract
             outline_by_id = {slide.slide_id: slide for slide in outline.slides}
             batch = SlideBatchSpec(tuple(replace(slide, slide_id=requested_ids[index], role=outline_by_id[requested_ids[index]].role) for index, slide in enumerate(batch.slides)))
@@ -568,7 +618,12 @@ class GenerationPipeline:
             if any(not set(slide.asset_refs).issubset(set(frozen_assets)) for slide in batch.slides):
                 raise ContractValidationError("模型批次使用了未冻结资源", context=ErrorContext(stage="deck", field_path=f"batches[{batch_index}].asset_refs"))
             generated.update({slide.slide_id: slide for slide in batch.slides})
-            batch_evidence.append({"batch_index": batch_index, "slide_ids": requested_ids, **self._gateway_metadata(gateway_result)})
+            batch_evidence.append({
+                "batch_index": batch_index,
+                "slide_ids": requested_ids,
+                **self._gateway_metadata(gateway_result),
+                **stage_payload_metadata(context, batch_payload),
+            })
         ordered = tuple(sample_by_id.get(slide.slide_id) or generated[slide.slide_id] for slide in outline.slides)
         shared_assets = tuple(sorted({resource_id for slide in ordered for resource_id in slide.asset_refs}))
         # Frozen shared assets are a permission ceiling. DeckSpec carries only
@@ -579,6 +634,12 @@ class GenerationPipeline:
         artifact = self.renderer.render(deck, assets, language=brief.language)
         validation = self.validator.validate(artifact.html, [slide.slide_id for slide in outline.slides], assets)
         output = {**deck.to_dict(), "rendered_html": artifact.html, "rendered_sha256": artifact.sha256, "renderer_version": artifact.renderer_version, "validation": validation.to_dict()}
+        deck_payload = build_stage_payload(context, "deck", {
+            "task_brief": brief.to_dict(),
+            "outline_checkpoint_id": outline_checkpoint_id,
+            "sample_checkpoint_id": sample_confirmation_checkpoint_id,
+            "batch_payload_hashes": [item["stage_payload_hash"] for item in batch_evidence],
+        })
         checkpoint = self.checkpoints.commit(
             task_id=task_id,
             stage="deck",
@@ -588,7 +649,12 @@ class GenerationPipeline:
             model=self.gateway.model,
             parent_checkpoint_id=sample_confirmation_checkpoint_id,
             idempotency_key=key,
-            metadata={"pipeline_version": PIPELINE_VERSION, "batches": batch_evidence, "sample_slide_hashes": {slide.slide_id: slide.sha256 for slide in sample_slides}},
+            metadata={
+                "pipeline_version": PIPELINE_VERSION,
+                "batches": batch_evidence,
+                "sample_slide_hashes": {slide.slide_id: slide.sha256 for slide in sample_slides},
+                **stage_payload_metadata(context, deck_payload),
+            },
         )
         self._event(task_id, "deck", "succeeded", checkpoint=checkpoint)
         return StageResult(checkpoint, deck, artifact, validation)
@@ -607,7 +673,23 @@ class GenerationPipeline:
             "slides": [{"slide_id": slide.slide_id, "role": slide.role, "title": slide.title, "speaker_notes": slide.speaker_notes, "content_sha256": slide.sha256} for slide in deck.slides],
             "technical_validation_hash": deck_checkpoint.output["validation"]["evidence_hash"],
         }
-        checkpoint = self.checkpoints.commit(task_id=task_id, stage="review_input", input_version=deck_checkpoint_id, contract_name="review_input_v1", output=output, model="service", parent_checkpoint_id=deck_checkpoint_id, idempotency_key=key, metadata={"pipeline_version": PIPELINE_VERSION})
+        checkpoint = self.checkpoints.commit(
+            task_id=task_id,
+            stage="review_input",
+            input_version=deck_checkpoint_id,
+            contract_name="review_input_v1",
+            output=output,
+            model="service",
+            parent_checkpoint_id=deck_checkpoint_id,
+            idempotency_key=key,
+            metadata={
+                "pipeline_version": PIPELINE_VERSION,
+                "context_snapshot_id": deck_checkpoint.metadata.get("context_snapshot_id"),
+                "context_snapshot_hash": deck_checkpoint.metadata.get("context_snapshot_hash"),
+                "stage_payload_hash": content_sha256(output),
+                "context_sections_read": [],
+            },
+        )
         return StageResult(checkpoint, output)
 
     def publish_offline(self, task_id: str, deck_checkpoint_id: str, target_root: str | Path) -> StageResult:
@@ -655,7 +737,23 @@ class GenerationPipeline:
             shutil.rmtree(staging, ignore_errors=True)
             raise
         output = {"schema_version": CONTRACT_VERSION, "deck_checkpoint_id": deck_checkpoint_id, "manifest_sha256": manifest_hash, "files": sorted([*files, "manifest.json"]), "target_name": target.name}
-        checkpoint = self.checkpoints.commit(task_id=task_id, stage="delivery", input_version=deck_checkpoint_id, contract_name="delivery_manifest_v1", output=output, model="service", parent_checkpoint_id=deck_checkpoint_id, idempotency_key=key, metadata={"pipeline_version": PIPELINE_VERSION})
+        checkpoint = self.checkpoints.commit(
+            task_id=task_id,
+            stage="delivery",
+            input_version=deck_checkpoint_id,
+            contract_name="delivery_manifest_v1",
+            output=output,
+            model="service",
+            parent_checkpoint_id=deck_checkpoint_id,
+            idempotency_key=key,
+            metadata={
+                "pipeline_version": PIPELINE_VERSION,
+                "context_snapshot_id": deck_checkpoint.metadata.get("context_snapshot_id"),
+                "context_snapshot_hash": deck_checkpoint.metadata.get("context_snapshot_hash"),
+                "stage_payload_hash": content_sha256(output),
+                "context_sections_read": [],
+            },
+        )
         self._event(task_id, "delivery", "succeeded", checkpoint=checkpoint)
         return StageResult(checkpoint, output)
 
@@ -702,17 +800,47 @@ class GenerationPipeline:
                 selected.append(candidate)
         return tuple(selected[:3])
 
-    def _brief_checkpoint(self, task_id: str, brief: TaskBrief, input_version: str) -> Checkpoint:
-        key = self._key(task_id, "brief", input_version, brief.sha256)
+    def _brief_checkpoint(self, task_id: str, brief: TaskBrief, context: GenerationContextV2) -> Checkpoint:
+        payload = build_stage_payload(context, "brief", {"task_brief": brief.to_dict()})
+        key = self._key(task_id, "brief", context.context_hash, brief.sha256)
         existing = self.checkpoints.find(task_id, key)
         if existing:
             if TaskBrief.parse(existing.output) != brief:
                 raise CheckpointConflict("任务简报幂等输入冲突")
+            self._assert_checkpoint_context(existing, context, "brief")
             return existing
-        return self.checkpoints.commit(task_id=task_id, stage="brief", input_version=input_version, contract_name=TaskBrief.TITLE, output=brief.to_dict(), model="service", parent_checkpoint_id=None, idempotency_key=key, metadata={"pipeline_version": PIPELINE_VERSION})
+        return self.checkpoints.commit(
+            task_id=task_id,
+            stage="brief",
+            input_version=context.context_hash,
+            contract_name=TaskBrief.TITLE,
+            output=brief.to_dict(),
+            model="service",
+            parent_checkpoint_id=None,
+            idempotency_key=key,
+            metadata={"pipeline_version": PIPELINE_VERSION, **stage_payload_metadata(context, payload)},
+        )
 
-    def _commit_contract(self, task_id: str, stage: str, parent_checkpoint_id: str, contract, result: GatewayResult, key: str) -> Checkpoint:
-        return self.checkpoints.commit(task_id=task_id, stage=stage, input_version=parent_checkpoint_id, contract_name=contract.TITLE, output=contract.to_dict(), model=result.model, parent_checkpoint_id=parent_checkpoint_id, idempotency_key=key, metadata=self._gateway_metadata(result) | {"pipeline_version": PIPELINE_VERSION})
+    def _commit_contract(
+        self,
+        task_id: str,
+        stage: str,
+        parent_checkpoint_id: str,
+        contract,
+        result: GatewayResult,
+        key: str,
+        *,
+        context: GenerationContextV2,
+        payload: Mapping[str, Any],
+    ) -> Checkpoint:
+        metadata = self._gateway_metadata(result) | {"pipeline_version": PIPELINE_VERSION}
+        metadata.update(stage_payload_metadata(context, payload))
+        return self.checkpoints.commit(task_id=task_id, stage=stage, input_version=parent_checkpoint_id, contract_name=contract.TITLE, output=contract.to_dict(), model=result.model, parent_checkpoint_id=parent_checkpoint_id, idempotency_key=key, metadata=metadata)
+
+    @staticmethod
+    def _assert_checkpoint_context(checkpoint: Checkpoint, context: GenerationContextV2, stage: str) -> None:
+        if checkpoint.metadata.get("context_snapshot_hash") != context.context_hash:
+            raise CheckpointConflict("checkpoint 与当前 GenerationContextV2 不一致", context=ErrorContext(stage=stage))
 
     @staticmethod
     def _gateway_metadata(result: GatewayResult) -> dict[str, Any]:

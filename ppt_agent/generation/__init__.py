@@ -9,6 +9,7 @@ from .contracts import (
     TaskBrief,
     ThemeTokens,
 )
+from .context import ContextTextSource, GenerationContextV2, build_stage_payload
 from .model_gateway import ModelGateway
 from .pipeline import FileCheckpointStore, GenerationPipeline, StageResult
 
@@ -17,6 +18,8 @@ __all__ = [
     "DeckSpec",
     "FileCheckpointStore",
     "GenerationPipeline",
+    "GenerationContextV2",
+    "ContextTextSource",
     "ModelGateway",
     "NarrativeSpec",
     "OutlineSpec",
@@ -24,4 +27,5 @@ __all__ = [
     "StageResult",
     "TaskBrief",
     "ThemeTokens",
+    "build_stage_payload",
 ]
