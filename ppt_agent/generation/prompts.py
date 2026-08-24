@@ -84,3 +84,13 @@ def html_deck_batch_prompt(payload: dict[str, Any]) -> list[dict[str, str]]:
         "Return frozen_shared_css and frozen_design_intent byte-for-byte as shared_css and design_intent.",
         "Keep the confirmed sample's visual language while choosing a page composition appropriate to each slide's content.",
     ))
+
+
+def html_modify_prompt(payload: dict[str, Any]) -> list[dict[str, str]]:
+    return _html_request(f"{payload['artifact_kind']} modify", HtmlDeckBatchSpec, payload, (
+        "Modify exactly requested_slides, in exactly that order, using modification_instruction and current_artifact.",
+        "Preserve each supplied slide_id and section root boundary; do not return any unrequested slide.",
+        "When allow_shared_design_change is false, return frozen_shared_css and frozen_design_intent byte-for-byte.",
+        "For page or element scope, keep the rest of the page composition stable and apply only the requested local change.",
+        "Use the complete generation_context and current authoritative HTML fragments; do not reconstruct the artifact from summaries.",
+    ))

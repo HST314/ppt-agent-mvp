@@ -46,6 +46,7 @@ from .model_gateway import GatewayResult, ModelGateway
 from .prompts import (
     PROMPT_VERSION,
     html_deck_batch_prompt,
+    html_modify_prompt,
     html_sample_prompt,
     narrative_prompt,
     outline_prompt,
@@ -60,7 +61,7 @@ from ..rendering.validator import TechnicalValidator, ValidationReport
 
 
 CHECKPOINT_VERSION = "1.0"
-PIPELINE_VERSION = "2.2.0"
+PIPELINE_VERSION = "2.3.0"
 VALIDATOR_VERSION = "2.0"
 EVIDENCE_VERSION = "2.0"
 AGENT_HTML_RENDERER_VERSION = "agent-html-1.0.0"
@@ -798,6 +799,7 @@ class GenerationPipeline:
                 "generation_mode": "agent_html",
                 "selected_slide_ids": list(selected),
                 "allowed_asset_refs": list(allowed_assets),
+                "page_contract_hashes": self._contract_page_hashes(sample.slides, sample.shared_css, sample.design_intent),
                 **stage_payload_metadata(context, sample_payload),
             },
         )
@@ -1008,11 +1010,475 @@ class GenerationPipeline:
                 "generation_mode": "agent_html",
                 "batches": batch_evidence,
                 "sample_slide_hashes": {slide.slide_id: slide.sha256 for slide in sample_slides},
+                "page_contract_hashes": self._contract_page_hashes(deck.slides, deck.shared_css, deck.design_intent),
                 **stage_payload_metadata(context, deck_payload),
             },
         )
         self._event(task_id, "deck", "succeeded", checkpoint=checkpoint)
         return StageResult(checkpoint, deck, artifact, validation)
+
+    def modify_sample(
+        self,
+        task_id: str,
+        brief: TaskBrief,
+        sample_checkpoint_id: str,
+        prompt: str,
+        *,
+        scope: str,
+        slide_id: str | None = None,
+        element_id: str | None = None,
+        current_fragments: Mapping[str, str] | None = None,
+        context: GenerationContextV2 | None = None,
+    ) -> StageResult:
+        if self.generation_mode != "agent_html":
+            raise CheckpointConflict("HTML 样品修改只适用于 agent_html 生成路径", context=ErrorContext(stage="sample"))
+        sample_checkpoint = self._require_checkpoint(task_id, sample_checkpoint_id, "sample")
+        if sample_checkpoint.contract_name != HtmlSampleSpec.TITLE:
+            raise CheckpointConflict("样品修改必须引用 HTML 样品 checkpoint", context=ErrorContext(stage="sample"))
+        context = context or GenerationContextV2.from_task_brief(brief)
+        self._assert_checkpoint_context(sample_checkpoint, context, "sample_modify")
+        sample = HtmlSampleSpec.parse({
+            key: value
+            for key, value in sample_checkpoint.output.items()
+            if key in {"schema_version", "shared_css", "design_intent", "slides", "outline_checkpoint_id"}
+        })
+        slides = self._authoritative_html_slides(sample.slides, current_fragments, "sample_modify")
+        all_slide_ids = tuple(slide.slide_id for slide in slides)
+        requested_slide_ids = self._modification_targets(all_slide_ids, scope, (slide_id,) if slide_id else (), element_id, "sample_modify")
+        modification = {
+            "instruction": self._modification_prompt(prompt, "sample_modify"),
+            "scope": scope,
+            "change_type": "visual",
+            "slide_ids": list(requested_slide_ids),
+            "element_id": element_id,
+        }
+        skill_snapshot = self.stage_agent.snapshot if self.stage_agent is not None else None
+        authority_hash = content_sha256({
+            "slides": [slide.to_dict() for slide in slides],
+            "shared_css": sample.shared_css,
+            "design_intent": sample.design_intent,
+        })
+        key = self._stage_key(
+            task_id,
+            "sample_modify",
+            sample_checkpoint_id,
+            authority_hash,
+            content_sha256(modification),
+            context.context_hash,
+            skill_snapshot=skill_snapshot,
+        )
+        existing = self.checkpoints.find(task_id, key)
+        if existing:
+            self._assert_checkpoint_context(existing, context, "sample_modify")
+            value, artifact, validation = self._read_rendered_html_sample(existing)
+            return StageResult(existing, value, artifact, validation, reused=True)
+        self._event(task_id, "sample_modify", "started")
+        try:
+            modified_slides, shared_css, design_intent, batch_evidence = self._modify_html_slides(
+                task_id,
+                brief,
+                context,
+                artifact_kind="sample",
+                parent_checkpoint_id=sample_checkpoint_id,
+                slides=slides,
+                shared_css=sample.shared_css,
+                design_intent=sample.design_intent,
+                requested_slide_ids=requested_slide_ids,
+                modification=modification,
+                current_artifact={
+                    "schema_version": CONTRACT_VERSION,
+                    "shared_css": sample.shared_css,
+                    "design_intent": sample.design_intent,
+                    "slides": [slide.to_dict() for slide in slides],
+                    "outline_checkpoint_id": sample.outline_checkpoint_id,
+                },
+                authoritative_outline=None,
+                overall_key=key,
+                skill_snapshot=skill_snapshot,
+            )
+            value = HtmlSampleSpec.parse({
+                "schema_version": CONTRACT_VERSION,
+                "shared_css": shared_css,
+                "design_intent": design_intent,
+                "slides": [slide.to_dict() for slide in modified_slides],
+                "outline_checkpoint_id": sample.outline_checkpoint_id,
+            })
+            artifact, validation = self._render_agent_html(value.slides, value.shared_css, value.design_intent, brief)
+        except Exception as exc:
+            self._reject_candidate(task_id, "sample_modify", sample_checkpoint_id, key, exc)
+            self._event(task_id, "sample_modify", "rejected")
+            raise
+        before_hashes = self._contract_page_hashes(slides, sample.shared_css, sample.design_intent)
+        after_hashes = self._contract_page_hashes(value.slides, value.shared_css, value.design_intent)
+        changed = [slide_id for slide_id in all_slide_ids if before_hashes[slide_id] != after_hashes[slide_id]]
+        output = {
+            **value.to_dict(),
+            "rendered_html": artifact.html,
+            "rendered_sha256": artifact.sha256,
+            "renderer_version": artifact.renderer_version,
+            "validation": validation.to_dict(),
+        }
+        payload_summary = build_stage_payload(context, "modify", {
+            "generation_mode": "agent_html",
+            "artifact_kind": "sample",
+            "parent_checkpoint_id": sample_checkpoint_id,
+            "current_artifact_hash": authority_hash,
+            "modification": modification,
+            "batch_payload_hashes": [item["stage_payload_hash"] for item in batch_evidence],
+        })
+        metadata = self._modification_metadata(batch_evidence) | {
+            "pipeline_version": PIPELINE_VERSION,
+            "generation_mode": "agent_html",
+            "operation": "modify",
+            "artifact_kind": "sample",
+            "modification_scope": scope,
+            "requested_slide_ids": list(requested_slide_ids),
+            "modified_slide_ids": changed,
+            "preserved_slide_ids": [slide_id for slide_id in all_slide_ids if slide_id not in changed],
+            "design_system_changed": sample.shared_css != value.shared_css or sample.design_intent != value.design_intent,
+            "page_contract_hashes": after_hashes,
+            "batches": batch_evidence,
+            **stage_payload_metadata(context, payload_summary),
+        }
+        checkpoint = self.checkpoints.commit(
+            task_id=task_id,
+            stage="sample",
+            input_version=sample_checkpoint_id,
+            contract_name=HtmlSampleSpec.TITLE,
+            output=output,
+            model=batch_evidence[0]["model"],
+            parent_checkpoint_id=sample_checkpoint_id,
+            idempotency_key=key,
+            metadata=metadata,
+        )
+        self._event(task_id, "sample_modify", "succeeded", checkpoint=checkpoint)
+        return StageResult(checkpoint, value, artifact, validation)
+
+    def modify_deck(
+        self,
+        task_id: str,
+        brief: TaskBrief,
+        deck_checkpoint_id: str,
+        prompt: str,
+        *,
+        scope: str,
+        slide_ids: Sequence[str] | None = None,
+        element_id: str | None = None,
+        change_type: str = "visual",
+        current_fragments: Mapping[str, str] | None = None,
+        authoritative_outline: Mapping[str, Any] | None = None,
+        context: GenerationContextV2 | None = None,
+    ) -> StageResult:
+        if self.generation_mode != "agent_html":
+            raise CheckpointConflict("HTML 全稿修改只适用于 agent_html 生成路径", context=ErrorContext(stage="deck"))
+        deck_checkpoint = self._require_checkpoint(task_id, deck_checkpoint_id, "deck")
+        if deck_checkpoint.contract_name != HtmlDeckSpec.TITLE:
+            raise CheckpointConflict("全稿修改必须引用 HTML 全稿 checkpoint", context=ErrorContext(stage="deck"))
+        if change_type not in {"visual", "content"}:
+            raise ContractValidationError("修改类型只能是 visual 或 content", context=ErrorContext(stage="deck_modify", field_path="change_type"))
+        context = context or GenerationContextV2.from_task_brief(brief)
+        self._assert_checkpoint_context(deck_checkpoint, context, "deck_modify")
+        deck = HtmlDeckSpec.parse({
+            key: value
+            for key, value in deck_checkpoint.output.items()
+            if key in {"schema_version", "shared_css", "design_intent", "slides", "shared_assets", "outline_checkpoint_id", "sample_checkpoint_id"}
+        })
+        slides = self._authoritative_html_slides(deck.slides, current_fragments, "deck_modify")
+        all_slide_ids = tuple(slide.slide_id for slide in slides)
+        requested_slide_ids = self._modification_targets(all_slide_ids, scope, tuple(slide_ids or ()), element_id, "deck_modify")
+        modification = {
+            "instruction": self._modification_prompt(prompt, "deck_modify"),
+            "scope": scope,
+            "change_type": change_type,
+            "slide_ids": list(requested_slide_ids),
+            "element_id": element_id,
+        }
+        skill_snapshot = self.stage_agent.snapshot if self.stage_agent is not None else None
+        authority_hash = content_sha256({
+            "slides": [slide.to_dict() for slide in slides],
+            "shared_css": deck.shared_css,
+            "design_intent": deck.design_intent,
+            "authoritative_outline": dict(authoritative_outline or {}),
+        })
+        key = self._stage_key(
+            task_id,
+            "deck_modify",
+            deck_checkpoint_id,
+            authority_hash,
+            content_sha256(modification),
+            context.context_hash,
+            skill_snapshot=skill_snapshot,
+        )
+        existing = self.checkpoints.find(task_id, key)
+        if existing:
+            self._assert_checkpoint_context(existing, context, "deck_modify")
+            value = HtmlDeckSpec.parse({
+                key: item
+                for key, item in existing.output.items()
+                if key in {"schema_version", "shared_css", "design_intent", "slides", "shared_assets", "outline_checkpoint_id", "sample_checkpoint_id"}
+            }, expected_slide_ids=all_slide_ids)
+            return StageResult(existing, value, self._artifact(existing), self._validation(existing), reused=True)
+        self._event(task_id, "deck_modify", "started")
+        try:
+            modified_slides, shared_css, design_intent, batch_evidence = self._modify_html_slides(
+                task_id,
+                brief,
+                context,
+                artifact_kind="deck",
+                parent_checkpoint_id=deck_checkpoint_id,
+                slides=slides,
+                shared_css=deck.shared_css,
+                design_intent=deck.design_intent,
+                requested_slide_ids=requested_slide_ids,
+                modification=modification,
+                current_artifact={
+                    "schema_version": CONTRACT_VERSION,
+                    "shared_css": deck.shared_css,
+                    "design_intent": deck.design_intent,
+                    "slides": [slide.to_dict() for slide in slides],
+                    "shared_assets": list(deck.shared_assets),
+                    "outline_checkpoint_id": deck.outline_checkpoint_id,
+                    "sample_checkpoint_id": deck.sample_checkpoint_id,
+                },
+                authoritative_outline=dict(authoritative_outline or {}),
+                overall_key=key,
+                skill_snapshot=skill_snapshot,
+            )
+            shared_assets = tuple(sorted({resource_id for slide in modified_slides for resource_id in slide.asset_refs}))
+            value = HtmlDeckSpec.parse({
+                "schema_version": CONTRACT_VERSION,
+                "shared_css": shared_css,
+                "design_intent": design_intent,
+                "slides": [slide.to_dict() for slide in modified_slides],
+                "shared_assets": list(shared_assets),
+                "outline_checkpoint_id": deck.outline_checkpoint_id,
+                "sample_checkpoint_id": deck.sample_checkpoint_id,
+            }, expected_slide_ids=all_slide_ids)
+            artifact, validation = self._render_agent_html(value.slides, value.shared_css, value.design_intent, brief)
+        except Exception as exc:
+            self._reject_candidate(task_id, "deck_modify", deck_checkpoint_id, key, exc)
+            self._event(task_id, "deck_modify", "rejected")
+            raise
+        before_hashes = self._contract_page_hashes(slides, deck.shared_css, deck.design_intent)
+        after_hashes = self._contract_page_hashes(value.slides, value.shared_css, value.design_intent)
+        changed = [slide_id for slide_id in all_slide_ids if before_hashes[slide_id] != after_hashes[slide_id]]
+        output = {
+            **value.to_dict(),
+            "rendered_html": artifact.html,
+            "rendered_sha256": artifact.sha256,
+            "renderer_version": artifact.renderer_version,
+            "validation": validation.to_dict(),
+        }
+        payload_summary = build_stage_payload(context, "modify", {
+            "generation_mode": "agent_html",
+            "artifact_kind": "deck",
+            "parent_checkpoint_id": deck_checkpoint_id,
+            "current_artifact_hash": authority_hash,
+            "modification": modification,
+            "authoritative_outline": dict(authoritative_outline or {}),
+            "batch_payload_hashes": [item["stage_payload_hash"] for item in batch_evidence],
+        })
+        metadata = self._modification_metadata(batch_evidence) | {
+            "pipeline_version": PIPELINE_VERSION,
+            "generation_mode": "agent_html",
+            "operation": "modify",
+            "artifact_kind": "deck",
+            "change_type": change_type,
+            "modification_scope": scope,
+            "requested_slide_ids": list(requested_slide_ids),
+            "modified_slide_ids": changed,
+            "preserved_slide_ids": [slide_id for slide_id in all_slide_ids if slide_id not in changed],
+            "design_system_changed": deck.shared_css != value.shared_css or deck.design_intent != value.design_intent,
+            "page_contract_hashes": after_hashes,
+            "batches": batch_evidence,
+            **stage_payload_metadata(context, payload_summary),
+        }
+        checkpoint = self.checkpoints.commit(
+            task_id=task_id,
+            stage="deck",
+            input_version=deck_checkpoint_id,
+            contract_name=HtmlDeckSpec.TITLE,
+            output=output,
+            model=batch_evidence[0]["model"],
+            parent_checkpoint_id=deck_checkpoint_id,
+            idempotency_key=key,
+            metadata=metadata,
+        )
+        self._event(task_id, "deck_modify", "succeeded", checkpoint=checkpoint)
+        return StageResult(checkpoint, value, artifact, validation)
+
+    def _modify_html_slides(
+        self,
+        task_id: str,
+        brief: TaskBrief,
+        context: GenerationContextV2,
+        *,
+        artifact_kind: str,
+        parent_checkpoint_id: str,
+        slides: Sequence[HtmlSlideSpec],
+        shared_css: str,
+        design_intent: dict[str, Any],
+        requested_slide_ids: Sequence[str],
+        modification: Mapping[str, Any],
+        current_artifact: Mapping[str, Any],
+        authoritative_outline: Mapping[str, Any] | None,
+        overall_key: str,
+        skill_snapshot,
+    ) -> tuple[tuple[HtmlSlideSpec, ...], str, dict[str, Any], list[dict[str, Any]]]:
+        allowed_assets = tuple(item.resource_id for item in brief.resource_manifest)
+        current_by_id = {slide.slide_id: slide for slide in slides}
+        batches = [tuple(requested_slide_ids[index:index + 8]) for index in range(0, len(requested_slide_ids), 8)]
+        evidence: list[dict[str, Any]] = []
+        active_css = shared_css
+        active_intent = design_intent
+        for batch_index, batch_ids in enumerate(batches):
+            allow_shared_design_change = modification["scope"] == "global" and batch_index == 0
+            artifact_value = {
+                **dict(current_artifact),
+                "shared_css": active_css,
+                "design_intent": active_intent,
+                "slides": [current_by_id[slide.slide_id].to_dict() for slide in slides],
+            }
+            payload = build_stage_payload(context, "modify", {
+                "generation_mode": "agent_html",
+                "artifact_kind": artifact_kind,
+                "task_brief": brief.to_dict(),
+                "parent_checkpoint_id": parent_checkpoint_id,
+                "current_artifact": artifact_value,
+                "authoritative_outline": dict(authoritative_outline or {}),
+                "modification_instruction": dict(modification),
+                "batch_index": batch_index,
+                "slide_ids": list(batch_ids),
+                "requested_slides": [current_by_id[slide_id].to_dict() for slide_id in batch_ids],
+                "allow_shared_design_change": allow_shared_design_change,
+                "frozen_shared_css": active_css,
+                "frozen_design_intent": active_intent,
+                "allowed_assets": self._agent_asset_payload(brief),
+            })
+            contract_type = html_deck_batch_contract_for_assets(allowed_assets, batch_ids)
+
+            def validate_candidate(candidate: HtmlDeckBatchSpec) -> dict[str, Any]:
+                if not allow_shared_design_change and (candidate.shared_css != active_css or candidate.design_intent != active_intent):
+                    raise ContractValidationError("局部修改不得改变共享设计系统", context=ErrorContext(stage=f"{artifact_kind}_modify"))
+                self._assert_html_contract(candidate.slides, batch_ids, allowed_assets, f"{artifact_kind}_modify")
+                _, validation = self._render_agent_html(candidate.slides, candidate.shared_css, candidate.design_intent, brief)
+                return {"technical_validation_hash": validation.evidence_hash, "generation_mode": "agent_html"}
+
+            gateway_result = self._generate_contract(
+                "sample" if artifact_kind == "sample" else "deck_batch",
+                contract_type,
+                payload=payload,
+                fallback_input=html_modify_prompt(payload),
+                key=f"{overall_key}:batch:{batch_index}",
+                instruction=(
+                    "返回严格 HtmlDeckBatchSpec JSON，只修改 requested_slides。"
+                    "必须基于 current_artifact 中的权威 HTML fragment 与完整 GenerationContextV2；"
+                    "局部修改不得重建未请求页面，且不得返回 content_blocks/layout_family。"
+                ),
+                validator=validate_candidate,
+                skill_snapshot=skill_snapshot,
+            )
+            candidate = gateway_result.contract
+            if not allow_shared_design_change and (candidate.shared_css != active_css or candidate.design_intent != active_intent):
+                raise ContractValidationError("局部修改不得改变共享设计系统", context=ErrorContext(stage=f"{artifact_kind}_modify"))
+            self._assert_html_contract(candidate.slides, batch_ids, allowed_assets, f"{artifact_kind}_modify")
+            if allow_shared_design_change:
+                active_css = candidate.shared_css
+                active_intent = candidate.design_intent
+            current_by_id.update({slide.slide_id: slide for slide in candidate.slides})
+            evidence.append({
+                "batch_index": batch_index,
+                "slide_ids": list(batch_ids),
+                "allow_shared_design_change": allow_shared_design_change,
+                **self._gateway_metadata(gateway_result),
+                **stage_payload_metadata(context, payload),
+            })
+        return tuple(current_by_id[slide.slide_id] for slide in slides), active_css, active_intent, evidence
+
+    @staticmethod
+    def _modification_prompt(prompt: str, stage: str) -> str:
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ContractValidationError("修改 Prompt 不得为空", context=ErrorContext(stage=stage, field_path="prompt"))
+        if len(prompt.strip()) > 20_000:
+            raise ContractValidationError("修改 Prompt 过长", context=ErrorContext(stage=stage, field_path="prompt"))
+        return prompt.strip()
+
+    @staticmethod
+    def _modification_targets(
+        all_slide_ids: Sequence[str],
+        scope: str,
+        requested_slide_ids: Sequence[str],
+        element_id: str | None,
+        stage: str,
+    ) -> tuple[str, ...]:
+        if scope not in {"global", "page", "element"}:
+            raise ContractValidationError("修改范围必须是 global、page 或 element", context=ErrorContext(stage=stage, field_path="scope"))
+        if scope == "element" and not element_id:
+            raise ContractValidationError("元素级修改必须指定 element_id", context=ErrorContext(stage=stage, field_path="element_id"))
+        if scope == "global":
+            return tuple(all_slide_ids)
+        requested = tuple(requested_slide_ids)
+        if not requested or len(set(requested)) != len(requested) or any(slide_id not in all_slide_ids for slide_id in requested):
+            raise ContractValidationError("修改页面集合无效", context=ErrorContext(stage=stage, field_path="slide_ids"))
+        return requested
+
+    @staticmethod
+    def _authoritative_html_slides(
+        slides: Sequence[HtmlSlideSpec],
+        current_fragments: Mapping[str, str] | None,
+        stage: str,
+    ) -> tuple[HtmlSlideSpec, ...]:
+        if current_fragments is None:
+            return tuple(slides)
+        expected = {slide.slide_id for slide in slides}
+        if set(current_fragments) != expected:
+            raise ContractValidationError("当前权威 HTML 页面集合与 checkpoint 不一致", context=ErrorContext(stage=stage, field_path="current_fragments"))
+        return tuple(
+            HtmlSlideSpec.parse(
+                {**slide.to_dict(), "html_fragment": current_fragments[slide.slide_id]},
+                f"{stage}.current_fragments[{slide.slide_id}]",
+            )
+            for slide in slides
+        )
+
+    @staticmethod
+    def _contract_page_hashes(
+        slides: Sequence[HtmlSlideSpec],
+        shared_css: str,
+        design_intent: Mapping[str, Any],
+    ) -> dict[str, str]:
+        return {
+            slide.slide_id: content_sha256({
+                "slide": slide.to_dict(),
+                "shared_css": shared_css,
+                "design_intent": dict(design_intent),
+            })
+            for slide in slides
+        }
+
+    @staticmethod
+    def _modification_metadata(batch_evidence: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        first = dict(batch_evidence[0])
+        metadata = {
+            key: first[key]
+            for key in (
+                "model", "prompt_version", "validator_version", "evidence_version", "stage_agent_version",
+                "skill_digest", "skill_entry_read",
+            )
+            if key in first
+        } | {
+            "provider_calls": sum(int(item.get("provider_calls", 0)) for item in batch_evidence),
+            "recovery_count": sum(int(item.get("recovery_count", 0)) for item in batch_evidence),
+            "elapsed_ms": sum(float(item.get("elapsed_ms", 0)) for item in batch_evidence),
+        }
+        applied = {
+            path: file_hash
+            for item in batch_evidence
+            for path, file_hash in item.get("applied_skill_file_hashes", {}).items()
+        }
+        if applied:
+            metadata["applied_skill_file_hashes"] = applied
+        return metadata
 
     @staticmethod
     def _assert_html_contract(

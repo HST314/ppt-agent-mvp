@@ -20,7 +20,7 @@ from .diagnostics import log_exception_chain
 from .errors import ConflictError, GatewayError, GatewayUnknownResult, NotFoundError, RuntimeUnavailableError, ValidationError
 from .fsm import TaskState, transition
 from .gateways import FakeGenerationGateway, FakeHtmlBuilder, FakeInspectionGateway, FakeSkillLoader
-from .generation.contracts import HtmlSampleSpec, TaskBrief
+from .generation.contracts import HtmlDeckSpec, HtmlSampleSpec, TaskBrief
 from .generation.context import ContextTextSource, GenerationContextV2, build_stage_payload, stage_payload_metadata
 from .schema import DeliveryManifest, InspectionReport, IssueDisposition
 from .p2 import canonical, digest, now, parse_task_card, questions_for, scan_resources, validate_answer
@@ -430,7 +430,7 @@ class TaskService:
             "pipeline_version":result.checkpoint.metadata.get("pipeline_version"),
             "reused":result.reused,
         }
-        for key in ("generation_mode","skill_digest","skill_entry_read","applied_skill_file_hashes","validator_version","evidence_version","context_snapshot_id","context_snapshot_hash","stage_payload_hash","context_sections_read"):
+        for key in ("generation_mode","skill_digest","skill_entry_read","applied_skill_file_hashes","validator_version","evidence_version","context_snapshot_id","context_snapshot_hash","stage_payload_hash","context_sections_read","operation","artifact_kind","modification_scope","change_type","requested_slide_ids","modified_slide_ids","preserved_slide_ids","design_system_changed","page_contract_hashes"):
             if key in result.checkpoint.metadata: evidence[key]=result.checkpoint.metadata[key]
         return evidence
     def _version_metadata(self,task_id,kind,artifact_hash):
@@ -981,13 +981,14 @@ class TaskService:
         if left not in records or right not in records: raise ValidationError("只能对比全稿版本")
         def describe(value):
             artifact=json.loads(self.version(task_id,value)); meta=records[value]["metadata"]
-            return {"hash":value,"version":artifact["version"],"outline_hash":artifact["outline_hash"],"source":meta.get("source","unknown"),"operator":meta.get("operator","system"),"summary":meta.get("summary",""),"html":meta["html"],"fragments":self._slide_fragments(meta["html"])}
+            return {"hash":value,"version":artifact["version"],"outline_hash":artifact["outline_hash"],"source":meta.get("source","unknown"),"operator":meta.get("operator","system"),"summary":meta.get("summary",""),"html":meta["html"],"fragments":self._slide_fragments(meta["html"]),"contract_hashes":meta.get("page_contract_hashes",{})}
         lhs,rhs=describe(left),describe(right); page_ids=list(dict.fromkeys([*lhs["fragments"],*rhs["fragments"]])); pages=[]
         for slide_id in page_ids:
             lhtml=lhs["fragments"].get(slide_id); rhtml=rhs["fragments"].get(slide_id)
-            status="added" if lhtml is None else "removed" if rhtml is None else "unchanged" if lhtml==rhtml else "modified"
-            pages.append({"slide_id":slide_id,"status":status,"left_html":lhtml,"right_html":rhtml})
-        for side in (lhs,rhs): side.pop("fragments")
+            contract_changed=(slide_id in lhs["contract_hashes"] and slide_id in rhs["contract_hashes"] and lhs["contract_hashes"][slide_id]!=rhs["contract_hashes"][slide_id])
+            status="added" if lhtml is None else "removed" if rhtml is None else "unchanged" if lhtml==rhtml and not contract_changed else "modified"
+            pages.append({"slide_id":slide_id,"status":status,"left_html":lhtml,"right_html":rhtml,"left_contract_hash":lhs["contract_hashes"].get(slide_id),"right_contract_hash":rhs["contract_hashes"].get(slide_id)})
+        for side in (lhs,rhs): side.pop("fragments"); side.pop("contract_hashes")
         return {"left":lhs,"right":rhs,"equal":all(p["status"]=="unchanged" for p in pages),"pages":pages,"changed_slide_ids":[p["slide_id"] for p in pages if p["status"]!="unchanged"]}
     def events(self,task_id): return self.store.events(task_id)
     def import_input(self,task_id,source,source_format="auto",rebuild=False):
@@ -2154,6 +2155,7 @@ class TaskService:
         html_text,gate=self._post_render_gate(task_id,source,list(selection["slide_ids"]),contract,ledger,assets,generation.get("attempt_evidence_hashes"))
         version=len(self.versions(task_id,"sample"))+1; content_hash=digest(html_text.encode()); model=DeckArtifact.parse({"artifact_id":f"sample-{content_hash[:16]}","task_id":task_id,"version":version,"kind":"sample","outline_hash":outline,"content_hash":content_hash,"created_at":now(),"schema_version":"1.0"})
         prior=self._current_version(task_id,"sample"); meta={"html":html_text,"selection_hash":selection["hash"],"parent":prior,"summary":"生成真实 HTML 样品","scope":"global","global_rules":rules,"local_exceptions":{},"build":"success","generation":generation,"design_intent":generation.get("design_intent",default_design_intent()),"shared_design_assets":generation.get("shared_assets",{"css":""}),"presentation_technical_contract_hash":contract["hash"],"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate":gate}
+        if generation.get("page_contract_hashes"): meta["page_contract_hashes"]=generation["page_contract_hashes"]
         if "checkpoint_id" in generation:
             keys=("checkpoint_id","output_sha256","contract_name","model","provider_calls","recovery_count","pipeline_version","generation_mode","reused","context_snapshot_id","context_snapshot_hash","stage_payload_hash","context_sections_read")
             meta["generation_core"]={key:generation[key] for key in keys if key in generation}
@@ -2182,7 +2184,24 @@ class TaskService:
         previous_slides="".join(self._slide_fragments(sample["html"]).get(sid,"") for sid in ids)
         prior_intent=validate_design_intent(sample["metadata"].get("design_intent"))
         prior_assets=validate_shared_design_assets(sample["metadata"].get("shared_design_assets"))
-        if isinstance(self.builder,FakeHtmlBuilder):
+        core_evidence=None
+        core_sample=meta.get("generation_core")
+        if (self.generation_pipeline is not None and core_sample
+            and core_sample.get("contract_name")==HtmlSampleSpec.TITLE
+            and core_sample.get("generation_mode")=="agent_html"):
+            context=self._generation_context(task_id)
+            brief=self._generation_core_brief(task_id,context=context)
+            result=self.generation_pipeline.modify_sample(
+                task_id,brief,core_sample["checkpoint_id"],prompt,
+                scope=scope,slide_id=slide_id,element_id=element_id,
+                current_fragments=self._slide_fragments(sample["html"]),context=context,
+            )
+            source=self._generation_core_preview_html(result.artifact,brief,assets)
+            prior_intent=validate_design_intent(result.value.design_intent)
+            prior_assets=validate_shared_design_assets({"css":result.value.shared_css})
+            core_evidence=self._generation_core_evidence(result)
+            generation={**core_evidence,"attempts":1,"retry_count":result.checkpoint.metadata.get("recovery_count",0),"max_attempts":2,"design_intent":prior_intent,"shared_assets":prior_assets,"validation_hash":result.validation.evidence_hash,"renderer_version":result.artifact.renderer_version}
+        elif isinstance(self.builder,FakeHtmlBuilder):
             source=render(data["markdown"],ids,rules,exceptions,assets,contract_value,contract["hash"],design_intent=prior_intent,shared_assets=prior_assets)
             generation={"attempts":1,"retry_count":0,"max_attempts":1,"design_intent":prior_intent,"shared_assets":prior_assets}
         else:
@@ -2192,7 +2211,11 @@ class TaskService:
             )
         html_text,gate=self._post_render_gate(task_id,source,ids,contract,ledger,assets,generation.get("attempt_evidence_hashes"))
         version=len(self.versions(task_id,"sample"))+1; ch=digest(html_text.encode()); model=DeckArtifact.parse({"artifact_id":f"sample-{ch[:16]}","task_id":task_id,"version":version,"kind":"sample","outline_hash":outline,"content_hash":ch,"created_at":now(),"schema_version":"1.0"})
-        h=self._record_p3(task_id,"sample",model,{"html":html_text,"selection_hash":view["selection"]["hash"],"parent":sample["hash"],"summary":prompt.strip(),"scope":scope,"scope_understanding":understanding,"slide_id":slide_id,"element_id":element_id,"global_rules":rules,"local_exceptions":exceptions,"build":"success","generation":generation,"design_intent":generation.get("design_intent",sample["metadata"].get("design_intent",default_design_intent())),"shared_design_assets":generation.get("shared_assets",sample["metadata"].get("shared_design_assets",{"css":""})),"presentation_technical_contract_hash":contract["hash"],"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate":gate},"sample_modify","user")
+        modification_meta={"html":html_text,"selection_hash":view["selection"]["hash"],"parent":sample["hash"],"summary":prompt.strip(),"scope":scope,"scope_understanding":understanding,"slide_id":slide_id,"element_id":element_id,"global_rules":rules,"local_exceptions":exceptions,"build":"success","generation":generation,"design_intent":generation.get("design_intent",sample["metadata"].get("design_intent",default_design_intent())),"shared_design_assets":generation.get("shared_assets",sample["metadata"].get("shared_design_assets",{"css":""})),"presentation_technical_contract_hash":contract["hash"],"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate":gate}
+        if core_evidence:
+            modification_meta["generation_core"]=core_evidence
+            modification_meta["page_contract_hashes"]=core_evidence.get("page_contract_hashes",{})
+        h=self._record_p3(task_id,"sample",model,modification_meta,"sample_modify","user")
         self._invalidate_sample_gate(task_id,h)
         return self.sample_view(task_id)
     def confirm_sample(self,task_id):
@@ -2327,7 +2350,7 @@ class TaskService:
             if not all(preserved.values()): raise ConflictError("确认样品发生未提示变化")
             core_evidence=self._generation_core_evidence(core_result)
             core_evidence["review_checkpoint_id"]=review_result.checkpoint.checkpoint_id
-            return self._commit_candidate_deck(task_id,html_text,outline,{"parent":token["parent_deck_hash"],"summary":"生成未检查候选稿","scope":"global","affected":ids,"sample_hash":sample["hash"],"sample_pages_preserved":preserved,"outline_consistent":True,"inspection_status":"pending","global_rules":meta.get("global_rules",[]),"local_exceptions":meta.get("local_exceptions",{}),"generation_batches":core_result.checkpoint.metadata.get("batches",[]),"design_intent":design_intent,"shared_design_assets":shared_assets,"presentation_technical_contract_hash":contract["hash"],"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate":gate,"generation_core":core_evidence},"deck_generate",token)
+            return self._commit_candidate_deck(task_id,html_text,outline,{"parent":token["parent_deck_hash"],"summary":"生成未检查候选稿","scope":"global","affected":ids,"sample_hash":sample["hash"],"sample_pages_preserved":preserved,"outline_consistent":True,"inspection_status":"pending","global_rules":meta.get("global_rules",[]),"local_exceptions":meta.get("local_exceptions",{}),"generation_batches":core_result.checkpoint.metadata.get("batches",[]),"design_intent":design_intent,"shared_design_assets":shared_assets,"presentation_technical_contract_hash":contract["hash"],"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate":gate,"generation_core":core_evidence,"page_contract_hashes":core_result.checkpoint.metadata.get("page_contract_hashes",{})},"deck_generate",token)
         generation_batches=[]
         if isinstance(self.builder,FakeHtmlBuilder):
             html_text=render(data["markdown"],ids,meta.get("global_rules",[]),meta.get("local_exceptions",{}),assets,contract_value,contract["hash"],design_intent=design_intent,shared_assets=shared_assets)
@@ -2400,7 +2423,34 @@ class TaskService:
         previous_slides="".join(deck_slides.get(sid,"") for sid in all_ids)
         prior_intent=validate_design_intent(deck["metadata"].get("design_intent"))
         prior_assets=validate_shared_design_assets(deck["metadata"].get("shared_design_assets"))
-        if isinstance(self.builder,FakeHtmlBuilder):
+        core_evidence=None; core_modified=set(); core_contract_hashes={}
+        core_deck=deck["metadata"].get("generation_core")
+        if (self.generation_pipeline is not None and core_deck
+            and core_deck.get("contract_name")==HtmlDeckSpec.TITLE
+            and core_deck.get("generation_mode")=="agent_html"):
+            context=self._generation_context(task_id)
+            brief=self._generation_core_brief(task_id,context=context)
+            core_result=self.generation_pipeline.modify_deck(
+                task_id,brief,core_deck["checkpoint_id"],prompt,
+                scope=inferred,slide_ids=affected,element_id=element_id,change_type=change_type,
+                current_fragments=deck_slides,
+                authoritative_outline={"outline_hash":outline_hash,"markdown":markdown},
+                context=context,
+            )
+            source=self._generation_core_preview_html(core_result.artifact,brief,assets)
+            prior_intent=validate_design_intent(core_result.value.design_intent)
+            prior_assets=validate_shared_design_assets({"css":core_result.value.shared_css})
+            core_evidence=self._generation_core_evidence(core_result)
+            core_modified=set(core_result.checkpoint.metadata.get("modified_slide_ids",[]))
+            core_contract_hashes=core_result.checkpoint.metadata.get("page_contract_hashes",{})
+            prior_contract_hashes=deck["metadata"].get("page_contract_hashes",{})
+            core_contract_hashes={
+                slide_id:(core_contract_hashes.get(slide_id) if slide_id in core_modified else prior_contract_hashes.get(slide_id,core_contract_hashes.get(slide_id)))
+                for slide_id in all_ids
+                if core_contract_hashes.get(slide_id) or prior_contract_hashes.get(slide_id)
+            }
+            generation={**core_evidence,"attempts":1,"retry_count":core_result.checkpoint.metadata.get("recovery_count",0),"max_attempts":2,"design_intent":prior_intent,"shared_assets":prior_assets,"validation_hash":core_result.validation.evidence_hash,"renderer_version":core_result.artifact.renderer_version}
+        elif isinstance(self.builder,FakeHtmlBuilder):
             source=render(markdown,all_ids,rules,exceptions,assets,contract_value,contract["hash"],design_intent=prior_intent,shared_assets=prior_assets)
             generation={"attempts":1,"retry_count":0,"max_attempts":1,"design_intent":prior_intent,"shared_assets":prior_assets}
         else:
@@ -2409,12 +2459,16 @@ class TaskService:
                 context={"rules":rules,"exceptions":exceptions,"previous_slides":previous_slides,"prompt":prompt,"scope":inferred,"affected_slide_ids":affected,"element_id":element_id,"design_contract":contract_value,"design_contract_hash":contract["hash"],"claim_ledger":ledger_value,"claim_ledger_hash":ledger["hash"],"required_claims_verbatim":required_claims,"required_claims_by_slide":required_claims_by_slide,"design_intent":prior_intent,"shared_assets":prior_assets},
             )
         html_text,gate=self._post_render_gate(task_id,source,all_ids,contract,ledger,assets,generation.get("attempt_evidence_hashes"))
-        before=deck["metadata"]["page_hashes"]; after={sid:digest(fragment.encode()) for sid,fragment in self._slide_fragments(html_text).items()}; actual=[sid for sid in all_ids if before[sid]!=after[sid]]
+        before=deck["metadata"]["page_hashes"]; after={sid:digest(fragment.encode()) for sid,fragment in self._slide_fragments(html_text).items()}; actual=[sid for sid in all_ids if before[sid]!=after[sid] or sid in core_modified]
         if any(s not in affected for s in actual): raise ConflictError("修改超出声明影响范围")
         # Cross-artifact edits are prepared and validated above. Only successful
         # render/validation may publish the outline and deck versions.
         publish_outline=(lambda:self._record_p3(task_id,"outline",pending_outline[0],pending_outline[1],"outline_edit","user")) if pending_outline else None
-        return self._commit_candidate_deck(task_id,html_text,outline_hash,{"parent":deck["hash"],"summary":prompt.strip(),"scope":inferred,"change_type":change_type,"affected":actual,"requested_affected":affected,"unchanged":[s for s in all_ids if s not in actual],"scope_understanding":understanding,"element_id":element_id,"outline_consistent":True,"global_rules":rules,"local_exceptions":exceptions,"generation":generation,"design_intent":generation.get("design_intent",prior_intent),"shared_design_assets":generation.get("shared_assets",prior_assets),"presentation_technical_contract_hash":contract["hash"],"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate":gate},"deck_modify",token,"user",publish_outline)
+        modification_meta={"parent":deck["hash"],"summary":prompt.strip(),"scope":inferred,"change_type":change_type,"affected":actual,"requested_affected":affected,"unchanged":[s for s in all_ids if s not in actual],"scope_understanding":understanding,"element_id":element_id,"outline_consistent":True,"global_rules":rules,"local_exceptions":exceptions,"generation":generation,"design_intent":generation.get("design_intent",prior_intent),"shared_design_assets":generation.get("shared_assets",prior_assets),"presentation_technical_contract_hash":contract["hash"],"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate":gate}
+        if core_evidence:
+            modification_meta["generation_core"]=core_evidence
+            modification_meta["page_contract_hashes"]=core_contract_hashes
+        return self._commit_candidate_deck(task_id,html_text,outline_hash,modification_meta,"deck_modify",token,"user",publish_outline)
     def rollback_deck(self,task_id,target_hash):
         with self.store.lock(task_id):
             token=self._candidate_write_token(task_id)
@@ -2422,7 +2476,7 @@ class TaskService:
             if target_hash not in known: raise ValidationError("目标全稿版本不存在")
             target=json.loads(self.version(task_id,target_hash)); meta=next(v["metadata"] for v in self.versions(task_id,"deck") if v["hash"]==target_hash)
             current_outline=self._current_version(task_id,"outline"); inconsistent=target["outline_hash"]!=current_outline
-        return self._commit_candidate_deck(task_id,meta["html"],target["outline_hash"],{"parent":token["parent_deck_hash"],"rollback_from":target_hash,"summary":f"回退自 {target_hash[:12]}","scope":"global","affected":list(meta["page_hashes"]),"outline_consistent":not inconsistent,"regenerate_required":list(meta["page_hashes"]) if inconsistent else [],"global_rules":meta.get("global_rules",[]),"local_exceptions":meta.get("local_exceptions",{}),"design_contract_hash":meta.get("design_contract_hash"),"claim_ledger_hash":meta.get("claim_ledger_hash"),"post_render_gate":meta.get("post_render_gate")},"deck_rollback",token,"user")
+        return self._commit_candidate_deck(task_id,meta["html"],target["outline_hash"],{"parent":token["parent_deck_hash"],"rollback_from":target_hash,"summary":f"回退自 {target_hash[:12]}","scope":"global","affected":list(meta["page_hashes"]),"outline_consistent":not inconsistent,"regenerate_required":list(meta["page_hashes"]) if inconsistent else [],"global_rules":meta.get("global_rules",[]),"local_exceptions":meta.get("local_exceptions",{}),"design_contract_hash":meta.get("design_contract_hash"),"claim_ledger_hash":meta.get("claim_ledger_hash"),"post_render_gate":meta.get("post_render_gate"),"page_contract_hashes":meta.get("page_contract_hashes",{})},"deck_rollback",token,"user")
 
     def inspection_view(self,task_id):
         deck=self.deck_view(task_id)["deck"]
