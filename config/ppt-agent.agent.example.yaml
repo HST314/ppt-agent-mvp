@@ -1,5 +1,7 @@
 gateway:
   mode: agent
+  # 真实模型默认直接生成逐页 HTML/CSS；deterministic 仅用于显式降级与测试。
+  generation_mode: agent_html
 
 models:
   generation:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import unittest
 
-from ppt_agent.generation.contracts import DeckSpec, NarrativeSpec, OutlineDraft, OutlineSpec, SampleSpec, SlideSpec, TaskBrief, ThemeTokens, narrative_contract_for_evidence, outline_contract_for_evidence, sample_contract_for_assets, slide_batch_contract_for_assets
+from ppt_agent.generation.contracts import DeckSpec, HtmlSlideSpec, NarrativeSpec, OutlineDraft, OutlineSpec, SampleSpec, SlideSpec, TaskBrief, ThemeTokens, html_sample_contract_for_assets, narrative_contract_for_evidence, outline_contract_for_evidence, sample_contract_for_assets, slide_batch_contract_for_assets
 from ppt_agent.generation.errors import ContractValidationError
 
 from .support import THEME, brief, slide
@@ -112,6 +112,26 @@ class ContractTests(unittest.TestCase):
         self.assertIn("schema_version", NarrativeSpec.provider_schema()["schema"]["required"])
         with self.assertRaises(ContractValidationError):
             SampleSpec.parse({"schema_version": "2.0"})
+
+    def test_agent_html_contract_binds_page_ids_assets_and_page_css(self):
+        schema = html_sample_contract_for_assets(("asset-one",), ("slide-001", "slide-002")).provider_schema()["schema"]
+        self.assertEqual(schema["properties"]["slides"]["minItems"], 2)
+        self.assertEqual(schema["properties"]["slides"]["items"]["properties"]["slide_id"]["enum"], ["slide-001", "slide-002"])
+        self.assertEqual(schema["properties"]["slides"]["items"]["properties"]["asset_refs"]["items"]["enum"], ["asset-one"])
+
+        valid = {
+            "schema_version": "1.0",
+            "slide_id": "slide-001",
+            "html_fragment": '<section class="slide custom" id="slide-001" data-slide-id="slide-001"><section><p>内容</p></section></section>',
+            "slide_css": "#slide-001 p{font-size:24px}",
+            "asset_refs": [],
+            "speaker_notes": "",
+        }
+        self.assertEqual(HtmlSlideSpec.parse(valid).slide_id, "slide-001")
+        with self.assertRaises(ContractValidationError):
+            HtmlSlideSpec.parse(valid | {"html_fragment": valid["html_fragment"] + '<section class="extra"></section>'})
+        with self.assertRaises(ContractValidationError):
+            HtmlSlideSpec.parse(valid | {"slide_css": ".slide{font-size:12px}"})
 
 
 if __name__ == "__main__":

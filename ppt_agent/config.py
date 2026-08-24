@@ -122,6 +122,7 @@ class FeatureFlagsConfig:
 @dataclass(frozen=True)
 class RuntimeConfig:
     mode: str
+    generation_mode: str = "deterministic"
     generation: ModelConfig | None = None
     inspection: ModelConfig | None = None
     inspection_fallback: bool = False
@@ -133,7 +134,7 @@ class RuntimeConfig:
 
     def public(self) -> dict:
         return {
-            "gateway": {"mode": self.mode},
+            "gateway": {"mode": self.mode, "generation_mode": self.generation_mode},
             "models": {
                 "generation": self.generation.public() if self.generation else None,
                 "inspection": self.inspection.public() if self.inspection else None,
@@ -394,11 +395,14 @@ def load_config(path: str | Path | None = None, *, env_file: str | Path | None =
     if unknown:
         raise ValidationError(f"配置包含未知字段：{', '.join(sorted(unknown))}")
     gateway = _mapping(raw.get("gateway", {}), "gateway")
-    if set(gateway) - {"mode"}:
+    if set(gateway) - {"mode", "generation_mode"}:
         raise ValidationError("gateway 包含未知字段")
     mode = gateway.get("mode", "fake")
     if mode not in {"fake", "agent"}:
         raise ValidationError("gateway.mode 只能是 fake 或 agent")
+    generation_mode = gateway.get("generation_mode", "agent_html" if mode == "agent" else "deterministic")
+    if generation_mode not in {"agent_html", "deterministic"}:
+        raise ValidationError("gateway.generation_mode 只能是 agent_html 或 deterministic")
     skills = _skills(raw.get("skills", {}), config_path=config_path.resolve())
     feature_flags = _feature_flags(raw.get("feature_flags", {}))
     capabilities = _mapping(raw.get("capabilities", {}), "capabilities")
@@ -413,6 +417,7 @@ def load_config(path: str | Path | None = None, *, env_file: str | Path | None =
         jobs = _jobs(raw.get("jobs", {}), generation_default=630, inspection_default=630)
         return RuntimeConfig(
             mode="fake",
+            generation_mode=generation_mode,
             clarification=clarification,
             jobs=jobs,
             review=review,
@@ -442,6 +447,7 @@ def load_config(path: str | Path | None = None, *, env_file: str | Path | None =
     )
     return RuntimeConfig(
         mode="agent",
+        generation_mode=generation_mode,
         generation=generation,
         inspection=inspection,
         inspection_fallback=fallback,

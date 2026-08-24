@@ -127,4 +127,5 @@ def build_generation_pipeline(config, *, data_root: str | Path, generation_clien
         TechnicalValidator(ChromiumDeckInspector(executable_path=chromium), require_browser=True),
         asset_root=root,
         stage_agent=stage_agent,
+        generation_mode=config.generation_mode,
     )

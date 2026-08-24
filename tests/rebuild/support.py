@@ -20,6 +20,27 @@ THEME = {
     "space_unit": 12,
 }
 
+DESIGN_INTENT = {
+    "style_summary": "高对比编辑式演示",
+    "color_strategy": "深蓝画布配青色强调",
+    "typography_strategy": "大号标题与紧凑正文",
+    "layout_principles": ["保持清晰层级", "按页面内容自主构图"],
+    "rationale": "让样品设计系统稳定延续到全稿",
+}
+
+
+def html_slide(slide_id: str) -> dict:
+    return {
+        "slide_id": slide_id,
+        "html_fragment": (
+            f'<section class="slide editorial" id="{slide_id}" data-slide-id="{slide_id}">'
+            f'<h1 data-element-id="title">{slide_id}</h1><p>Agent HTML content</p></section>'
+        ),
+        "slide_css": f"#{slide_id} h1{{font-size:52px;color:#22D3EE}}",
+        "asset_refs": [],
+        "speaker_notes": "",
+    }
+
 
 def brief(slide_count: int = 6, resources=None) -> TaskBrief:
     resources = resources or []
@@ -101,6 +122,21 @@ class ContractProvider:
             output = {
                 "schema_version": "1.0",
                 "slides": [slide(item["slide_id"], item["role"], layout="metrics") for item in payload["requested_slides"]],
+            }
+        elif name == "html_sample_spec_v1":
+            output = {
+                "schema_version": "1.0",
+                "shared_css": ".slide{background:#0F172A;color:#F8FAFC;padding:64px}",
+                "design_intent": DESIGN_INTENT,
+                "slides": [html_slide(item["slide_id"]) for item in payload["selected_slides"]],
+                "outline_checkpoint_id": payload["outline_checkpoint_id"],
+            }
+        elif name == "html_deck_batch_spec_v1":
+            output = {
+                "schema_version": "1.0",
+                "shared_css": payload["frozen_shared_css"],
+                "design_intent": payload["frozen_design_intent"],
+                "slides": [html_slide(item["slide_id"]) for item in payload["requested_slides"]],
             }
         else:
             raise AssertionError(name)

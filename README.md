@@ -1,6 +1,6 @@
 # PPT Agent MVP
 
-The contract-first generation core is documented in [docs/rebuild/generation-core.md](docs/rebuild/generation-core.md). It provides versioned model contracts, response recovery, immutable checkpoints, deterministic HTML rendering and atomic offline delivery while preserving the existing workflow, Web API and task store boundaries.
+The contract-first generation core is documented in [docs/rebuild/generation-core.md](docs/rebuild/generation-core.md). It provides versioned model contracts, response recovery, immutable checkpoints, Agent-authored HTML/CSS with safe service assembly, an explicit deterministic fallback, and atomic offline delivery while preserving the existing workflow, Web API and task store boundaries.
 
 > 一个本地优先、人工可控的 AI 演示文稿工作台：从任务资料、叙事结构和逐页大纲，一路完成样品、全稿、可选自检修改与离线交付。
 

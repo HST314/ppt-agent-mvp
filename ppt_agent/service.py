@@ -20,7 +20,7 @@ from .diagnostics import log_exception_chain
 from .errors import ConflictError, GatewayError, GatewayUnknownResult, NotFoundError, RuntimeUnavailableError, ValidationError
 from .fsm import TaskState, transition
 from .gateways import FakeGenerationGateway, FakeHtmlBuilder, FakeInspectionGateway, FakeSkillLoader
-from .generation.contracts import TaskBrief
+from .generation.contracts import HtmlSampleSpec, TaskBrief
 from .generation.context import ContextTextSource, GenerationContextV2, build_stage_payload, stage_payload_metadata
 from .schema import DeliveryManifest, InspectionReport, IssueDisposition
 from .p2 import canonical, digest, now, parse_task_card, questions_for, scan_resources, validate_answer
@@ -430,7 +430,7 @@ class TaskService:
             "pipeline_version":result.checkpoint.metadata.get("pipeline_version"),
             "reused":result.reused,
         }
-        for key in ("skill_digest","skill_entry_read","applied_skill_file_hashes","validator_version","evidence_version","context_snapshot_id","context_snapshot_hash","stage_payload_hash","context_sections_read"):
+        for key in ("generation_mode","skill_digest","skill_entry_read","applied_skill_file_hashes","validator_version","evidence_version","context_snapshot_id","context_snapshot_hash","stage_payload_hash","context_sections_read"):
             if key in result.checkpoint.metadata: evidence[key]=result.checkpoint.metadata[key]
         return evidence
     def _version_metadata(self,task_id,kind,artifact_hash):
@@ -2133,8 +2133,12 @@ class TaskService:
             brief=self._generation_core_brief(task_id,context=context)
             result=self.generation_pipeline.generate_sample(task_id,brief,outline_meta["generation_core"]["checkpoint_id"],selected_slide_ids=selection["slide_ids"],context=context)
             source=self._generation_core_preview_html(result.artifact,brief,assets)
-            design_intent=self._design_intent_from_core(result.value.theme_tokens,{slide.layout_family for slide in result.value.slides})
-            shared_assets={"css":""}
+            if isinstance(result.value,HtmlSampleSpec):
+                design_intent=validate_design_intent(result.value.design_intent)
+                shared_assets=validate_shared_design_assets({"css":result.value.shared_css})
+            else:
+                design_intent=self._design_intent_from_core(result.value.theme_tokens,{slide.layout_family for slide in result.value.slides})
+                shared_assets={"css":""}
             generation={**self._generation_core_evidence(result),"attempts":1,"retry_count":0,"max_attempts":1,"design_intent":design_intent,"shared_assets":shared_assets,"validation_hash":result.validation.evidence_hash,"renderer_version":result.artifact.renderer_version}
         elif isinstance(self.builder,FakeHtmlBuilder):
             design_intent=validate_design_intent(self.builder.design_intent)
@@ -2151,7 +2155,7 @@ class TaskService:
         version=len(self.versions(task_id,"sample"))+1; content_hash=digest(html_text.encode()); model=DeckArtifact.parse({"artifact_id":f"sample-{content_hash[:16]}","task_id":task_id,"version":version,"kind":"sample","outline_hash":outline,"content_hash":content_hash,"created_at":now(),"schema_version":"1.0"})
         prior=self._current_version(task_id,"sample"); meta={"html":html_text,"selection_hash":selection["hash"],"parent":prior,"summary":"生成真实 HTML 样品","scope":"global","global_rules":rules,"local_exceptions":{},"build":"success","generation":generation,"design_intent":generation.get("design_intent",default_design_intent()),"shared_design_assets":generation.get("shared_assets",{"css":""}),"presentation_technical_contract_hash":contract["hash"],"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate":gate}
         if "checkpoint_id" in generation:
-            keys=("checkpoint_id","output_sha256","contract_name","model","provider_calls","recovery_count","pipeline_version","reused","context_snapshot_id","context_snapshot_hash","stage_payload_hash","context_sections_read")
+            keys=("checkpoint_id","output_sha256","contract_name","model","provider_calls","recovery_count","pipeline_version","generation_mode","reused","context_snapshot_id","context_snapshot_hash","stage_payload_hash","context_sections_read")
             meta["generation_core"]={key:generation[key] for key in keys if key in generation}
         h=self._record_p3(task_id,"sample",model,meta,"sample_generate")
         self._invalidate_sample_gate(task_id,h)

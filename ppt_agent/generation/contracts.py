@@ -18,6 +18,9 @@ COLOR_PATTERN = re.compile(r"^#[0-9A-Fa-f]{6}$")
 LAYOUT_FAMILIES = frozenset({"cover", "statement", "columns", "metrics", "table", "image", "quote", "closing"})
 BLOCK_TYPES = frozenset({"heading", "paragraph", "bullets", "metric", "table", "image", "quote"})
 MAX_VISIBLE_CHARACTERS = 420
+MAX_HTML_FRAGMENT_BYTES = 256 * 1024
+MAX_SLIDE_CSS_BYTES = 128 * 1024
+MAX_SHARED_CSS_BYTES = 256 * 1024
 
 
 def canonical_json(value: Any) -> str:
@@ -949,6 +952,367 @@ class DeckSpec(Contract):
 
     def to_dict(self) -> dict[str, Any]:
         return {"schema_version": self.schema_version, "slides": [_slide_provider_dict(value) for value in self.slides], "theme_tokens": _theme_provider_dict(self.theme_tokens), "shared_assets": list(self.shared_assets), "outline_checkpoint_id": self.outline_checkpoint_id, "sample_checkpoint_id": self.sample_checkpoint_id}
+
+
+DESIGN_INTENT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "style_summary": {"type": "string", "minLength": 1, "maxLength": 4_000},
+        "color_strategy": {"type": "string", "minLength": 1, "maxLength": 4_000},
+        "typography_strategy": {"type": "string", "minLength": 1, "maxLength": 4_000},
+        "layout_principles": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 12,
+            "uniqueItems": True,
+            "items": {"type": "string", "minLength": 1, "maxLength": 1_000},
+        },
+        "rationale": {"type": "string", "minLength": 1, "maxLength": 4_000},
+    },
+    "required": ["style_summary", "color_strategy", "typography_strategy", "layout_principles", "rationale"],
+}
+
+
+HTML_SLIDE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "slide_id": {"type": "string", "pattern": ID_PATTERN.pattern},
+        "html_fragment": {"type": "string", "minLength": 1, "maxLength": MAX_HTML_FRAGMENT_BYTES},
+        "slide_css": {"type": "string", "maxLength": MAX_SLIDE_CSS_BYTES},
+        "asset_refs": {
+            "type": "array",
+            "maxItems": 32,
+            "uniqueItems": True,
+            "items": {"type": "string", "pattern": ID_PATTERN.pattern},
+        },
+        "speaker_notes": {"type": "string", "maxLength": 4_000},
+    },
+    "required": ["slide_id", "html_fragment", "slide_css", "asset_refs", "speaker_notes"],
+}
+
+
+def _bounded_utf8(value: Any, path: str, maximum: int, *, allow_empty: bool = False) -> str:
+    text = _string(value, path, maximum=maximum, allow_empty=allow_empty)
+    if len(text.encode("utf-8")) > maximum:
+        _fail(f"字段 UTF-8 大小超过 {maximum} 字节", path)
+    return text
+
+
+def _design_intent(value: Any, path: str) -> dict[str, Any]:
+    item = _object(
+        value,
+        path,
+        required=("style_summary", "color_strategy", "typography_strategy", "layout_principles", "rationale"),
+    )
+    principles = _string_list(
+        item["layout_principles"],
+        f"{path}.layout_principles",
+        maximum_items=12,
+        maximum_length=1_000,
+    )
+    if not principles:
+        _fail("layout_principles 不能为空", f"{path}.layout_principles")
+    result = {
+        "style_summary": _string(item["style_summary"], f"{path}.style_summary"),
+        "color_strategy": _string(item["color_strategy"], f"{path}.color_strategy"),
+        "typography_strategy": _string(item["typography_strategy"], f"{path}.typography_strategy"),
+        "layout_principles": list(principles),
+        "rationale": _string(item["rationale"], f"{path}.rationale"),
+    }
+    if len(canonical_json(result).encode("utf-8")) > 32 * 1024:
+        _fail("DesignIntent 超过 32 KiB 限制", path)
+    return result
+
+
+def _section_root_attributes(fragment: str, path: str) -> str:
+    tokens = list(re.finditer(r"</?section\b[^>]*>", fragment, re.I))
+    if not tokens or tokens[0].start() != 0 or tokens[0].group(0).lower().startswith("</"):
+        _fail("html_fragment 必须以 section 根节点开始", path)
+    depth = 0
+    root_end = None
+    for token in tokens:
+        if token.group(0).lower().startswith("</"):
+            depth -= 1
+            if depth < 0:
+                _fail("html_fragment 的 section 边界无效", path)
+            if depth == 0:
+                root_end = token.end()
+                break
+        else:
+            depth += 1
+    if depth != 0 or root_end != len(fragment):
+        _fail("html_fragment 必须且只能包含一个完整 section 根节点", path)
+    opening = tokens[0].group(0)
+    return opening[len("<section"):-1]
+
+
+def _validate_slide_css_scope(css: str, slide_id: str, path: str) -> None:
+    if not css:
+        return
+    normalized = re.sub(r"/\*.*?\*/", "", css, flags=re.S).strip()
+    if "@" in normalized or normalized.count("{") != normalized.count("}"):
+        _fail("slide_css 不得包含 at-rule 且花括号必须闭合", path)
+    blocks = list(re.finditer(r"([^{}]+)\{([^{}]*)\}", normalized, re.S))
+    if not blocks or "".join(match.group(0) for match in blocks).replace("\n", "").replace("\r", "") != normalized.replace("\n", "").replace("\r", ""):
+        _fail("slide_css 必须是非嵌套页面级规则", path)
+    id_selector = re.compile(rf"#{re.escape(slide_id)}(?![A-Za-z0-9_-])")
+    attribute_selectors = {
+        f'[data-slide-id="{slide_id}"]',
+        f"[data-slide-id='{slide_id}']",
+    }
+    for block in blocks:
+        selectors = [selector.strip() for selector in block.group(1).split(",")]
+        if any(not selector or (not id_selector.search(selector) and not any(value in selector for value in attribute_selectors)) for selector in selectors):
+            _fail("slide_css 每个选择器都必须限定到当前 slide_id", path)
+
+
+@dataclass(frozen=True)
+class HtmlSlideSpec(Contract):
+    slide_id: str
+    html_fragment: str
+    slide_css: str
+    asset_refs: tuple[str, ...]
+    speaker_notes: str
+    schema_version: str = CONTRACT_VERSION
+
+    TITLE = "html_slide_spec_v1"
+    SCHEMA = {
+        **HTML_SLIDE_SCHEMA,
+        "properties": {"schema_version": {"type": "string", "const": CONTRACT_VERSION}, **HTML_SLIDE_SCHEMA["properties"]},
+        "required": ["schema_version", *HTML_SLIDE_SCHEMA["required"]],
+    }
+
+    @classmethod
+    def parse(cls, value: Any, path: str = "html_slide") -> "HtmlSlideSpec":
+        item = _object(value, path, required=("slide_id", "html_fragment", "slide_css", "asset_refs", "speaker_notes"))
+        fragment = _bounded_utf8(item["html_fragment"], f"{path}.html_fragment", MAX_HTML_FRAGMENT_BYTES)
+        attrs = _section_root_attributes(fragment, f"{path}.html_fragment")
+        classes = re.search(r"\bclass\s*=\s*(['\"])(.*?)\1", attrs, re.I | re.S)
+        if not classes or "slide" not in classes.group(2).split():
+            _fail("html_fragment 根 section 必须包含 slide class", f"{path}.html_fragment")
+        slide_id = _identifier(item["slide_id"], f"{path}.slide_id")
+        for name in ("id", "data-slide-id"):
+            declared = re.search(rf"\b{name}\s*=\s*(['\"])([A-Za-z0-9_-]+)\1", attrs, re.I)
+            if not declared or declared.group(2) != slide_id:
+                _fail(f"html_fragment 的 {name} 必须与 slide_id 一致", f"{path}.html_fragment")
+        slide_css = _bounded_utf8(item["slide_css"], f"{path}.slide_css", MAX_SLIDE_CSS_BYTES, allow_empty=True)
+        _validate_slide_css_scope(slide_css, slide_id, f"{path}.slide_css")
+        return cls(
+            slide_id,
+            fragment,
+            slide_css,
+            _string_list(item["asset_refs"], f"{path}.asset_refs", maximum_items=32, maximum_length=128),
+            _string(item["speaker_notes"], f"{path}.speaker_notes", maximum=4_000, allow_empty=True),
+            item.get("schema_version", CONTRACT_VERSION),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "slide_id": self.slide_id,
+            "html_fragment": self.html_fragment,
+            "slide_css": self.slide_css,
+            "asset_refs": list(self.asset_refs),
+            "speaker_notes": self.speaker_notes,
+        }
+
+
+@dataclass(frozen=True)
+class HtmlSampleSpec(Contract):
+    shared_css: str
+    design_intent: dict[str, Any]
+    slides: tuple[HtmlSlideSpec, ...]
+    outline_checkpoint_id: str
+    schema_version: str = CONTRACT_VERSION
+
+    TITLE = "html_sample_spec_v1"
+    SCHEMA = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "schema_version": {"type": "string", "const": CONTRACT_VERSION},
+            "shared_css": {"type": "string", "maxLength": MAX_SHARED_CSS_BYTES},
+            "design_intent": DESIGN_INTENT_SCHEMA,
+            "slides": {"type": "array", "minItems": 2, "maxItems": 3, "items": HTML_SLIDE_SCHEMA},
+            "outline_checkpoint_id": {"type": "string", "pattern": ID_PATTERN.pattern},
+        },
+        "required": ["schema_version", "shared_css", "design_intent", "slides", "outline_checkpoint_id"],
+    }
+
+    @classmethod
+    def parse(cls, value: Any) -> "HtmlSampleSpec":
+        item = _object(value, "html_sample", required=("shared_css", "design_intent", "slides", "outline_checkpoint_id"))
+        slides_value = item["slides"]
+        if not isinstance(slides_value, (list, tuple)) or not 2 <= len(slides_value) <= 3:
+            _fail("HTML 样品必须包含 2 到 3 页", "html_sample.slides")
+        slides = tuple(HtmlSlideSpec.parse(slide, f"html_sample.slides[{index}]") for index, slide in enumerate(slides_value))
+        _validate_html_slide_set(slides, "html_sample.slides")
+        return cls(
+            _bounded_utf8(item["shared_css"], "html_sample.shared_css", MAX_SHARED_CSS_BYTES, allow_empty=True),
+            _design_intent(item["design_intent"], "html_sample.design_intent"),
+            slides,
+            _identifier(item["outline_checkpoint_id"], "html_sample.outline_checkpoint_id"),
+            item.get("schema_version", CONTRACT_VERSION),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "shared_css": self.shared_css,
+            "design_intent": self.design_intent,
+            "slides": [_html_slide_provider_dict(slide) for slide in self.slides],
+            "outline_checkpoint_id": self.outline_checkpoint_id,
+        }
+
+
+@dataclass(frozen=True)
+class HtmlDeckBatchSpec(Contract):
+    shared_css: str
+    design_intent: dict[str, Any]
+    slides: tuple[HtmlSlideSpec, ...]
+    schema_version: str = CONTRACT_VERSION
+
+    TITLE = "html_deck_batch_spec_v1"
+    SCHEMA = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "schema_version": {"type": "string", "const": CONTRACT_VERSION},
+            "shared_css": {"type": "string", "maxLength": MAX_SHARED_CSS_BYTES},
+            "design_intent": DESIGN_INTENT_SCHEMA,
+            "slides": {"type": "array", "minItems": 1, "maxItems": 8, "items": HTML_SLIDE_SCHEMA},
+        },
+        "required": ["schema_version", "shared_css", "design_intent", "slides"],
+    }
+
+    @classmethod
+    def parse(cls, value: Any) -> "HtmlDeckBatchSpec":
+        item = _object(value, "html_deck_batch", required=("shared_css", "design_intent", "slides"))
+        slides_value = item["slides"]
+        if not isinstance(slides_value, (list, tuple)) or not 1 <= len(slides_value) <= 8:
+            _fail("HTML 批次必须包含 1 到 8 页", "html_deck_batch.slides")
+        slides = tuple(HtmlSlideSpec.parse(slide, f"html_deck_batch.slides[{index}]") for index, slide in enumerate(slides_value))
+        _validate_html_slide_set(slides, "html_deck_batch.slides")
+        return cls(
+            _bounded_utf8(item["shared_css"], "html_deck_batch.shared_css", MAX_SHARED_CSS_BYTES, allow_empty=True),
+            _design_intent(item["design_intent"], "html_deck_batch.design_intent"),
+            slides,
+            item.get("schema_version", CONTRACT_VERSION),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "shared_css": self.shared_css,
+            "design_intent": self.design_intent,
+            "slides": [_html_slide_provider_dict(slide) for slide in self.slides],
+        }
+
+
+@dataclass(frozen=True)
+class HtmlDeckSpec(Contract):
+    shared_css: str
+    design_intent: dict[str, Any]
+    slides: tuple[HtmlSlideSpec, ...]
+    shared_assets: tuple[str, ...]
+    outline_checkpoint_id: str
+    sample_checkpoint_id: str
+    schema_version: str = CONTRACT_VERSION
+
+    TITLE = "html_deck_spec_v1"
+    SCHEMA = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "schema_version": {"type": "string", "const": CONTRACT_VERSION},
+            "shared_css": {"type": "string", "maxLength": MAX_SHARED_CSS_BYTES},
+            "design_intent": DESIGN_INTENT_SCHEMA,
+            "slides": {"type": "array", "minItems": 1, "maxItems": 100, "items": HTML_SLIDE_SCHEMA},
+            "shared_assets": {"type": "array", "maxItems": 256, "uniqueItems": True, "items": {"type": "string", "pattern": ID_PATTERN.pattern}},
+            "outline_checkpoint_id": {"type": "string", "pattern": ID_PATTERN.pattern},
+            "sample_checkpoint_id": {"type": "string", "pattern": ID_PATTERN.pattern},
+        },
+        "required": ["schema_version", "shared_css", "design_intent", "slides", "shared_assets", "outline_checkpoint_id", "sample_checkpoint_id"],
+    }
+
+    @classmethod
+    def parse(cls, value: Any, *, expected_slide_ids: Sequence[str] | None = None) -> "HtmlDeckSpec":
+        item = _object(value, "html_deck", required=("shared_css", "design_intent", "slides", "shared_assets", "outline_checkpoint_id", "sample_checkpoint_id"))
+        slides_value = item["slides"]
+        if not isinstance(slides_value, (list, tuple)) or not 1 <= len(slides_value) <= 100:
+            _fail("HTML 全稿必须包含 1 到 100 页", "html_deck.slides")
+        slides = tuple(HtmlSlideSpec.parse(slide, f"html_deck.slides[{index}]") for index, slide in enumerate(slides_value))
+        _validate_html_slide_set(slides, "html_deck.slides")
+        if expected_slide_ids is not None and [slide.slide_id for slide in slides] != list(expected_slide_ids):
+            _fail("HTML 全稿页面集合或顺序与大纲不一致", "html_deck.slides")
+        shared_assets = _string_list(item["shared_assets"], "html_deck.shared_assets", maximum_items=256, maximum_length=128)
+        if {ref for slide in slides for ref in slide.asset_refs} != set(shared_assets):
+            _fail("HTML 全稿资源清单必须与页面声明精确闭包", "html_deck.shared_assets")
+        return cls(
+            _bounded_utf8(item["shared_css"], "html_deck.shared_css", MAX_SHARED_CSS_BYTES, allow_empty=True),
+            _design_intent(item["design_intent"], "html_deck.design_intent"),
+            slides,
+            shared_assets,
+            _identifier(item["outline_checkpoint_id"], "html_deck.outline_checkpoint_id"),
+            _identifier(item["sample_checkpoint_id"], "html_deck.sample_checkpoint_id"),
+            item.get("schema_version", CONTRACT_VERSION),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "shared_css": self.shared_css,
+            "design_intent": self.design_intent,
+            "slides": [_html_slide_provider_dict(slide) for slide in self.slides],
+            "shared_assets": list(self.shared_assets),
+            "outline_checkpoint_id": self.outline_checkpoint_id,
+            "sample_checkpoint_id": self.sample_checkpoint_id,
+        }
+
+
+def _bind_html_contract(schema: dict[str, Any], allowed_assets: Sequence[str], slide_ids: Sequence[str]) -> dict[str, Any]:
+    bound = copy.deepcopy(schema)
+    slides = bound["properties"]["slides"]
+    slides.update({"minItems": len(slide_ids), "maxItems": len(slide_ids)})
+    slide = slides["items"]
+    slide["properties"]["slide_id"] = {"type": "string", "enum": list(slide_ids)}
+    refs = slide["properties"]["asset_refs"]
+    refs["maxItems"] = min(32, len(allowed_assets))
+    if allowed_assets:
+        refs["items"] = {"type": "string", "enum": list(allowed_assets)}
+    return bound
+
+
+@lru_cache(maxsize=128)
+def html_sample_contract_for_assets(allowed_assets: tuple[str, ...], slide_ids: tuple[str, ...]) -> type[HtmlSampleSpec]:
+    schema = _bind_html_contract(HtmlSampleSpec.SCHEMA, tuple(dict.fromkeys(allowed_assets)), tuple(slide_ids))
+
+    class BoundHtmlSampleSpec(HtmlSampleSpec):
+        SCHEMA = schema
+
+    return BoundHtmlSampleSpec
+
+
+@lru_cache(maxsize=256)
+def html_deck_batch_contract_for_assets(allowed_assets: tuple[str, ...], slide_ids: tuple[str, ...]) -> type[HtmlDeckBatchSpec]:
+    schema = _bind_html_contract(HtmlDeckBatchSpec.SCHEMA, tuple(dict.fromkeys(allowed_assets)), tuple(slide_ids))
+
+    class BoundHtmlDeckBatchSpec(HtmlDeckBatchSpec):
+        SCHEMA = schema
+
+    return BoundHtmlDeckBatchSpec
+
+
+def _validate_html_slide_set(slides: Sequence[HtmlSlideSpec], path: str) -> None:
+    identifiers = [slide.slide_id for slide in slides]
+    if len(set(identifiers)) != len(identifiers):
+        _fail("slide_id 必须唯一", path)
+
+
+def _html_slide_provider_dict(value: HtmlSlideSpec) -> dict[str, Any]:
+    return {key: item for key, item in value.to_dict().items() if key != "schema_version"}
 
 
 def _validate_slide_set(slides: Sequence[SlideSpec], path: str) -> None:

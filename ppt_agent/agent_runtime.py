@@ -191,9 +191,10 @@ def normalize_rendering_output(value: dict, expected_slide_ids: list[str]) -> di
         raise GatewayError("模型页面片段与请求页面不一致")
     normalized = []
     for index, item in enumerate(slides):
-        fragment = item.get("html")
+        fragment_field = "html_fragment" if isinstance(item, dict) and "html_fragment" in item else "html"
+        fragment = item.get(fragment_field)
         if not isinstance(fragment, str) or not fragment.strip():
-            raise GatewayError(f"output.slides[{index}].html 不能为空")
+            raise GatewayError(f"output.slides[{index}].{fragment_field} 不能为空")
         fragment = fragment.strip()
         if fragment.startswith("```"):
             fragment = re.sub(r"^```[a-zA-Z]*\s*", "", fragment)
@@ -215,7 +216,13 @@ def normalize_rendering_output(value: dict, expected_slide_ids: list[str]) -> di
             fragment = re.sub(r'^<section\b', f'<section id="{slide_id}"', fragment, count=1, flags=re.I)
         if not data_id_match:
             fragment = re.sub(r'^<section\b', f'<section data-slide-id="{slide_id}"', fragment, count=1, flags=re.I)
-        normalized.append({**item, "html": fragment})
+        normalized.append({**item, fragment_field: fragment})
+    uses_html_fragment = any(isinstance(item, dict) and "html_fragment" in item for item in slides)
+    if uses_html_fragment:
+        result = {**value, "slides": normalized}
+        if "design_intent" in value:
+            result["design_intent"] = validate_design_intent(value.get("design_intent"))
+        return result
     return {
         "slides": normalized,
         "design_intent": validate_design_intent(value.get("design_intent")),

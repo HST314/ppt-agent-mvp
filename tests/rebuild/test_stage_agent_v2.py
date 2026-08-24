@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from ppt_agent.errors import ValidationError
+from ppt_agent.generation.contracts import HtmlSampleSpec, html_sample_contract_for_assets
 from ppt_agent.generation.model_gateway import ModelGateway
 from ppt_agent.generation.pipeline import FileCheckpointStore, GenerationPipeline
 from ppt_agent.generation.stage_agent import StageAgentExecutor
@@ -14,7 +15,7 @@ from ppt_agent.rendering.renderer import DeterministicRenderer
 from ppt_agent.rendering.validator import TechnicalValidator
 from ppt_agent.skill_runtime import ActiveSkillResolver
 
-from .support import ContractProvider, brief
+from .support import ContractProvider, DESIGN_INTENT, brief, html_slide
 
 
 class ScriptedAgentClient:
@@ -86,6 +87,44 @@ class StageAgentV2Tests(unittest.TestCase):
             self.assertIn("SKILL.md", result.checkpoint.metadata["applied_skill_file_hashes"])
             self.assertEqual(result.checkpoint.metadata["semantic_validation"], {"accepted": True})
             self.assertEqual(len(list((root / "checkpoints" / "task" / "authority").glob("*.json"))), 2)
+
+    def test_stage_agent_accepts_html_fragment_contract_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            skill = root / "skills" / "open"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text(
+                "---\nname: open-skill\ndescription: Open HTML skill\n---\nDesign the requested pages.\n",
+                encoding="utf-8",
+            )
+            output = {
+                "schema_version": "1.0",
+                "shared_css": ".slide{background:#0F172A;color:#F8FAFC}",
+                "design_intent": DESIGN_INTENT,
+                "slides": [html_slide("slide-001"), html_slide("slide-002")],
+                "outline_checkpoint_id": "cp-outline",
+            }
+            client = ScriptedAgentClient([
+                ModelTurn(None, "entry-response", (ModelToolCall("read_skill_file", '{"path":"SKILL.md"}', "entry-call"),)),
+                ModelTurn(json.dumps(output, ensure_ascii=False), "html-candidate"),
+            ])
+            executor = StageAgentExecutor(
+                client,
+                ActiveSkillResolver(root / "skills", "open"),
+                model="scripted",
+                max_steps=4,
+                max_provider_calls=4,
+            )
+            result = executor.execute(
+                "sample",
+                html_sample_contract_for_assets((), ("slide-001", "slide-002")),
+                payload={"slide_ids": ["slide-001", "slide-002"]},
+                idempotency_key="html-sample",
+                instruction="Return HtmlSampleSpec with html_fragment and shared_css.",
+            )
+            self.assertIsInstance(result.contract, HtmlSampleSpec)
+            self.assertEqual(result.contract.slides[0].html_fragment, output["slides"][0]["html_fragment"])
+            self.assertEqual(client.calls[-1]["response_schema"]["name"], "html_sample_spec_v1")
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ from .assets import ResolvedAsset
 UNSAFE_TAGS = frozenset({"script", "iframe", "object", "embed", "form", "base", "link", "video", "audio"})
 URL_ATTRIBUTES = frozenset({"src", "href", "poster", "action"})
 REMOTE_CSS = re.compile(r"(?:url\s*\(\s*['\"]?\s*(?:https?:)?//|@import\b)", re.I)
+CSS_URL = re.compile(r"url\s*\(\s*(?:['\"])?([^)'\"]+)(?:['\"])?\s*\)", re.I)
 
 
 @dataclass(frozen=True)
@@ -113,13 +114,18 @@ class TechnicalValidator:
         if len(set(observed)) != len(observed):
             issues.append(_issue("duplicate_slide", "页面 ID 重复"))
         expected_paths = {asset.offline_path for asset in assets.values()}
+        style = _extract_style(html_text)
         observed_paths = set(parser.asset_paths)
+        observed_paths.update(
+            value.strip()
+            for value in CSS_URL.findall(style)
+            if value.strip() and not value.strip().startswith(("data:", "http://", "https://", "//"))
+        )
         if observed_paths != expected_paths:
             issues.append(_issue("asset_closure", "HTML 资源引用与资源清单不一致", expected=sorted(expected_paths), observed=sorted(observed_paths)))
         for slide_id, count in parser.text_counts.items():
             if count > 2_400:
                 issues.append(_issue("content_budget", "页面文本预算超限", slide_id=slide_id, characters=count))
-        style = _extract_style(html_text)
         if "width:1280px" not in style or "height:720px" not in style or "overflow:hidden" not in style:
             issues.append(_issue("canvas_contract", "renderer 未固定 1280×720 画布与溢出边界"))
         if REMOTE_CSS.search(style):

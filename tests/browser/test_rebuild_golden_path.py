@@ -71,7 +71,14 @@ class RebuildGoldenPathBrowserTests(unittest.TestCase):
             provider = ContractProvider()
             chromium = resolve_chromium_executable(Path(__file__).resolve().parents[2])
             validator = TechnicalValidator(ChromiumDeckInspector(executable_path=chromium), require_browser=True)
-            pipeline = GenerationPipeline(ModelGateway(provider, model="test"), FileCheckpointStore(root / "cp"), DeterministicRenderer(), validator, asset_root=root)
+            pipeline = GenerationPipeline(
+                ModelGateway(provider, model="test"),
+                FileCheckpointStore(root / "cp"),
+                DeterministicRenderer(),
+                validator,
+                asset_root=root,
+                generation_mode="agent_html",
+            )
             task_brief = brief(4)
             narrative = pipeline.generate_narrative("browser-task", task_brief)
             outline = pipeline.generate_outline("browser-task", task_brief, narrative.checkpoint.checkpoint_id)

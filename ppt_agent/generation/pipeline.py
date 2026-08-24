@@ -17,6 +17,10 @@ import portalocker
 from .contracts import (
     CONTRACT_VERSION,
     DeckSpec,
+    HtmlDeckBatchSpec,
+    HtmlDeckSpec,
+    HtmlSampleSpec,
+    HtmlSlideSpec,
     NarrativeSpec,
     OutlineDraft,
     OutlineSpec,
@@ -27,6 +31,8 @@ from .contracts import (
     ThemeTokens,
     canonical_json,
     content_sha256,
+    html_deck_batch_contract_for_assets,
+    html_sample_contract_for_assets,
     narrative_contract_for_evidence,
     outline_contract_for_evidence,
     sample_contract_for_assets,
@@ -37,17 +43,28 @@ from .contracts import (
 from .context import GenerationContextV2, build_stage_payload, stage_payload_metadata
 from .errors import CheckpointConflict, ContractValidationError, ErrorContext
 from .model_gateway import GatewayResult, ModelGateway
-from .prompts import PROMPT_VERSION, narrative_prompt, outline_prompt, sample_prompt, slide_batch_prompt
+from .prompts import (
+    PROMPT_VERSION,
+    html_deck_batch_prompt,
+    html_sample_prompt,
+    narrative_prompt,
+    outline_prompt,
+    sample_prompt,
+    slide_batch_prompt,
+)
 from .stage_agent import StageAgentExecutor
+from ..p4 import assemble_presentation, validate_html
 from ..rendering.assets import AssetResolver, ResolvedAsset
 from ..rendering.renderer import DeterministicRenderer, RenderedDeck
 from ..rendering.validator import TechnicalValidator, ValidationReport
 
 
 CHECKPOINT_VERSION = "1.0"
-PIPELINE_VERSION = "2.1.0"
+PIPELINE_VERSION = "2.2.0"
 VALIDATOR_VERSION = "2.0"
 EVIDENCE_VERSION = "2.0"
+AGENT_HTML_RENDERER_VERSION = "agent-html-1.0.0"
+GENERATION_MODES = frozenset({"deterministic", "agent_html"})
 
 
 def _now() -> str:
@@ -302,11 +319,14 @@ class GenerationPipeline:
         max_batch_workers: int = 1,
         event_sink: Callable[[dict[str, Any]], None] | None = None,
         stage_agent: StageAgentExecutor | None = None,
+        generation_mode: str = "deterministic",
     ):
         if not 1 <= batch_size <= 8:
             raise ValueError("batch_size must be between 1 and 8")
         if not 1 <= max_batch_workers <= 8:
             raise ValueError("max_batch_workers must be between 1 and 8")
+        if generation_mode not in GENERATION_MODES:
+            raise ValueError("generation_mode must be deterministic or agent_html")
         self.gateway = gateway
         self.checkpoints = checkpoints
         self.renderer = renderer
@@ -316,6 +336,7 @@ class GenerationPipeline:
         self.max_batch_workers = max_batch_workers
         self.event_sink = event_sink
         self.stage_agent = stage_agent
+        self.generation_mode = generation_mode
 
     def generate_narrative(
         self,
@@ -444,6 +465,14 @@ class GenerationPipeline:
         selected_slide_ids: Sequence[str] | None = None,
         context: GenerationContextV2 | None = None,
     ) -> StageResult:
+        if self.generation_mode == "agent_html":
+            return self._generate_html_sample(
+                task_id,
+                brief,
+                outline_checkpoint_id,
+                selected_slide_ids=selected_slide_ids,
+                context=context,
+            )
         outline_checkpoint = self._require_checkpoint(task_id, outline_checkpoint_id, "outline")
         context = context or GenerationContextV2.from_task_brief(brief)
         self._assert_checkpoint_context(outline_checkpoint, context, "sample")
@@ -508,6 +537,8 @@ class GenerationPipeline:
 
     def confirm_sample(self, task_id: str, sample_checkpoint_id: str) -> StageResult:
         sample_checkpoint = self._require_checkpoint(task_id, sample_checkpoint_id, "sample")
+        if sample_checkpoint.contract_name == HtmlSampleSpec.TITLE:
+            return self._confirm_html_sample(task_id, sample_checkpoint)
         sample = SampleSpec.parse({key: value for key, value in sample_checkpoint.output.items() if key in {"schema_version", "slides", "theme_tokens", "shared_assets", "outline_checkpoint_id"}})
         key = self._key(task_id, "sample_confirmed", sample_checkpoint_id)
         existing = self.checkpoints.find(task_id, key)
@@ -553,6 +584,14 @@ class GenerationPipeline:
         *,
         context: GenerationContextV2 | None = None,
     ) -> StageResult:
+        if self.generation_mode == "agent_html":
+            return self._generate_html_deck(
+                task_id,
+                brief,
+                outline_checkpoint_id,
+                sample_confirmation_checkpoint_id,
+                context=context,
+            )
         outline_checkpoint = self._require_checkpoint(task_id, outline_checkpoint_id, "outline")
         confirmation = self._require_checkpoint(task_id, sample_confirmation_checkpoint_id, "sample_confirmed")
         context = context or GenerationContextV2.from_task_brief(brief)
@@ -659,20 +698,416 @@ class GenerationPipeline:
         self._event(task_id, "deck", "succeeded", checkpoint=checkpoint)
         return StageResult(checkpoint, deck, artifact, validation)
 
+    def _generate_html_sample(
+        self,
+        task_id: str,
+        brief: TaskBrief,
+        outline_checkpoint_id: str,
+        *,
+        selected_slide_ids: Sequence[str] | None,
+        context: GenerationContextV2 | None,
+    ) -> StageResult:
+        outline_checkpoint = self._require_checkpoint(task_id, outline_checkpoint_id, "outline")
+        context = context or GenerationContextV2.from_task_brief(brief)
+        self._assert_checkpoint_context(outline_checkpoint, context, "sample")
+        outline = OutlineSpec.parse(outline_checkpoint.output, expected_slide_count=brief.slide_count)
+        selected = tuple(selected_slide_ids or self.select_representative_slides(outline))
+        if not 2 <= len(selected) <= 3 or len(set(selected)) != len(selected):
+            raise ContractValidationError("样品页必须是 2 到 3 个唯一页面", context=ErrorContext(stage="sample", field_path="selected_slide_ids"))
+        by_id = {slide.slide_id: slide for slide in outline.slides}
+        if any(slide_id not in by_id for slide_id in selected):
+            raise ContractValidationError("样品页不在大纲中", context=ErrorContext(stage="sample", field_path="selected_slide_ids"))
+        narrative_checkpoint = self._require_checkpoint(task_id, outline_checkpoint.parent_checkpoint_id or "", "narrative")
+        narrative = NarrativeSpec.parse(narrative_checkpoint.output)
+        skill_snapshot = self.stage_agent.snapshot if self.stage_agent is not None else None
+        key = self._stage_key(
+            task_id,
+            "sample",
+            "agent_html",
+            outline_checkpoint_id,
+            content_sha256(selected),
+            context.context_hash,
+            skill_snapshot=skill_snapshot,
+        )
+        existing = self.checkpoints.find(task_id, key)
+        if existing:
+            self._assert_checkpoint_context(existing, context, "sample")
+            sample, artifact, validation = self._read_rendered_html_sample(existing)
+            return StageResult(existing, sample, artifact, validation, reused=True)
+        self._event(task_id, "sample", "started")
+        allowed_assets = tuple(item.resource_id for item in brief.resource_manifest)
+        sample_payload = build_stage_payload(context, "sample", {
+            "generation_mode": "agent_html",
+            "task_brief": brief.to_dict(),
+            "narrative_checkpoint_id": narrative_checkpoint.checkpoint_id,
+            "narrative": narrative.to_dict(),
+            "outline_checkpoint_id": outline_checkpoint_id,
+            "outline": outline.to_dict(),
+            "slide_ids": list(selected),
+            "selected_slides": [by_id[slide_id].to_dict() for slide_id in selected],
+            "allowed_assets": self._agent_asset_payload(brief),
+        })
+        contract_type = html_sample_contract_for_assets(allowed_assets, selected)
+
+        def validate_candidate(candidate: HtmlSampleSpec) -> dict[str, Any]:
+            projected = HtmlSampleSpec(candidate.shared_css, candidate.design_intent, candidate.slides, outline_checkpoint_id)
+            self._assert_html_contract(projected.slides, selected, allowed_assets, "sample")
+            _, validation = self._render_agent_html(projected.slides, projected.shared_css, projected.design_intent, brief)
+            return {"technical_validation_hash": validation.evidence_hash, "generation_mode": "agent_html"}
+
+        try:
+            gateway_result = self._generate_contract(
+                "sample",
+                contract_type,
+                payload=sample_payload,
+                fallback_input=html_sample_prompt(sample_payload),
+                key=key,
+                instruction=(
+                    "返回严格 HtmlSampleSpec JSON。页面主体必须由 html_fragment、slide_css 与 shared_css 表达；"
+                    "自主依据 Skill、完整 GenerationContextV2、Narrative 与 Outline 设计，不得返回 content_blocks/layout_family。"
+                ),
+                validator=validate_candidate,
+                skill_snapshot=skill_snapshot,
+            )
+        except Exception as exc:
+            self._reject_candidate(task_id, "sample", outline_checkpoint_id, key, exc)
+            self._event(task_id, "sample", "rejected")
+            raise
+        candidate = gateway_result.contract
+        sample = HtmlSampleSpec(candidate.shared_css, candidate.design_intent, candidate.slides, outline_checkpoint_id)
+        self._assert_html_contract(sample.slides, selected, allowed_assets, "sample")
+        artifact, validation = self._render_agent_html(sample.slides, sample.shared_css, sample.design_intent, brief)
+        output = {
+            **sample.to_dict(),
+            "rendered_html": artifact.html,
+            "rendered_sha256": artifact.sha256,
+            "renderer_version": artifact.renderer_version,
+            "validation": validation.to_dict(),
+        }
+        checkpoint = self.checkpoints.commit(
+            task_id=task_id,
+            stage="sample",
+            input_version=outline_checkpoint_id,
+            contract_name=HtmlSampleSpec.TITLE,
+            output=output,
+            model=gateway_result.model,
+            parent_checkpoint_id=outline_checkpoint_id,
+            idempotency_key=key,
+            metadata=self._gateway_metadata(gateway_result) | {
+                "pipeline_version": PIPELINE_VERSION,
+                "generation_mode": "agent_html",
+                "selected_slide_ids": list(selected),
+                "allowed_asset_refs": list(allowed_assets),
+                **stage_payload_metadata(context, sample_payload),
+            },
+        )
+        self._event(task_id, "sample", "succeeded", checkpoint=checkpoint)
+        return StageResult(checkpoint, sample, artifact, validation)
+
+    def _confirm_html_sample(self, task_id: str, sample_checkpoint: Checkpoint) -> StageResult:
+        sample = HtmlSampleSpec.parse({
+            key: value
+            for key, value in sample_checkpoint.output.items()
+            if key in {"schema_version", "shared_css", "design_intent", "slides", "outline_checkpoint_id"}
+        })
+        key = self._key(task_id, "sample_confirmed", "agent_html", sample_checkpoint.checkpoint_id)
+        existing = self.checkpoints.find(task_id, key)
+        if existing:
+            return StageResult(existing, existing.output, reused=True)
+        frozen = {
+            "schema_version": CONTRACT_VERSION,
+            "generation_mode": "agent_html",
+            "sample_checkpoint_id": sample_checkpoint.checkpoint_id,
+            "outline_checkpoint_id": sample.outline_checkpoint_id,
+            "shared_css": sample.shared_css,
+            "design_intent": sample.design_intent,
+            "allowed_asset_refs": list(sample_checkpoint.metadata.get("allowed_asset_refs", [])),
+            "shared_assets": sorted({ref for slide in sample.slides for ref in slide.asset_refs}),
+            "slides": [slide.to_dict() for slide in sample.slides],
+            "rendered_sha256": sample_checkpoint.output["rendered_sha256"],
+            "renderer_version": AGENT_HTML_RENDERER_VERSION,
+        }
+        checkpoint = self.checkpoints.commit(
+            task_id=task_id,
+            stage="sample_confirmed",
+            input_version=sample_checkpoint.checkpoint_id,
+            contract_name="frozen_html_sample_v1",
+            output=frozen,
+            model="service",
+            parent_checkpoint_id=sample_checkpoint.checkpoint_id,
+            idempotency_key=key,
+            metadata={
+                "pipeline_version": PIPELINE_VERSION,
+                "generation_mode": "agent_html",
+                "confirmed_by": "user",
+                "context_snapshot_id": sample_checkpoint.metadata.get("context_snapshot_id"),
+                "context_snapshot_hash": sample_checkpoint.metadata.get("context_snapshot_hash"),
+                "stage_payload_hash": content_sha256(frozen),
+                "context_sections_read": [],
+            },
+        )
+        self._event(task_id, "sample_confirmed", "succeeded", checkpoint=checkpoint)
+        return StageResult(checkpoint, frozen)
+
+    def _generate_html_deck(
+        self,
+        task_id: str,
+        brief: TaskBrief,
+        outline_checkpoint_id: str,
+        sample_confirmation_checkpoint_id: str,
+        *,
+        context: GenerationContextV2 | None,
+    ) -> StageResult:
+        outline_checkpoint = self._require_checkpoint(task_id, outline_checkpoint_id, "outline")
+        confirmation = self._require_checkpoint(task_id, sample_confirmation_checkpoint_id, "sample_confirmed")
+        if confirmation.contract_name != "frozen_html_sample_v1":
+            raise CheckpointConflict("agent_html 全稿必须引用已确认 HTML 样品", context=ErrorContext(stage="deck"))
+        context = context or GenerationContextV2.from_task_brief(brief)
+        self._assert_checkpoint_context(outline_checkpoint, context, "deck")
+        self._assert_checkpoint_context(confirmation, context, "deck")
+        if confirmation.output.get("outline_checkpoint_id") != outline_checkpoint_id:
+            raise CheckpointConflict("样品确认与当前大纲 checkpoint 不一致", context=ErrorContext(stage="deck"))
+        outline = OutlineSpec.parse(outline_checkpoint.output, expected_slide_count=brief.slide_count)
+        narrative_checkpoint = self._require_checkpoint(task_id, outline_checkpoint.parent_checkpoint_id or "", "narrative")
+        narrative = NarrativeSpec.parse(narrative_checkpoint.output)
+        frozen_css = str(confirmation.output["shared_css"])
+        frozen_intent = dict(confirmation.output["design_intent"])
+        allowed_assets = tuple(confirmation.output.get("allowed_asset_refs", ()))
+        manifest_assets = tuple(item.resource_id for item in brief.resource_manifest)
+        if set(allowed_assets) != set(manifest_assets):
+            raise CheckpointConflict("样品确认的资源许可与当前任务清单不一致", context=ErrorContext(stage="deck"))
+        sample_slides = tuple(
+            HtmlSlideSpec.parse(value, f"sample_confirmation.slides[{index}]")
+            for index, value in enumerate(confirmation.output["slides"])
+        )
+        sample_by_id = {slide.slide_id: slide for slide in sample_slides}
+        remaining = [slide.slide_id for slide in outline.slides if slide.slide_id not in sample_by_id]
+        skill_snapshot = self.stage_agent.snapshot if self.stage_agent is not None else None
+        key = self._stage_key(
+            task_id,
+            "deck",
+            "agent_html",
+            outline_checkpoint_id,
+            sample_confirmation_checkpoint_id,
+            context.context_hash,
+            skill_snapshot=skill_snapshot,
+        )
+        existing = self.checkpoints.find(task_id, key)
+        if existing:
+            self._assert_checkpoint_context(existing, context, "deck")
+            deck, artifact, validation = self._read_rendered_html_deck(existing, outline)
+            return StageResult(existing, deck, artifact, validation, reused=True)
+        self._event(task_id, "deck", "started")
+        batches = [remaining[index:index + self.batch_size] for index in range(0, len(remaining), self.batch_size)]
+        generated: dict[str, HtmlSlideSpec] = {}
+        batch_evidence: list[dict[str, Any]] = []
+
+        def produce(item: tuple[int, list[str]]) -> tuple[int, list[str], GatewayResult, dict[str, Any]]:
+            index, ids = item
+            requested_ids = tuple(ids)
+            batch_key = self._stage_key(
+                task_id,
+                "deck_batch",
+                "agent_html",
+                outline_checkpoint_id,
+                sample_confirmation_checkpoint_id,
+                str(index),
+                CONTRACT_VERSION,
+                context.context_hash,
+                skill_snapshot=skill_snapshot,
+            )
+            slides_by_id = {slide.slide_id: slide for slide in outline.slides}
+            batch_payload = build_stage_payload(context, "deck_batch", {
+                "generation_mode": "agent_html",
+                "task_brief": brief.to_dict(),
+                "narrative_checkpoint_id": narrative_checkpoint.checkpoint_id,
+                "narrative": narrative.to_dict(),
+                "outline_checkpoint_id": outline_checkpoint_id,
+                "outline": outline.to_dict(),
+                "sample_checkpoint_id": sample_confirmation_checkpoint_id,
+                "confirmed_sample": confirmation.output,
+                "batch_index": index,
+                "slide_ids": list(ids),
+                "requested_slides": [slides_by_id[slide_id].to_dict() for slide_id in ids],
+                "frozen_shared_css": frozen_css,
+                "frozen_design_intent": frozen_intent,
+                "allowed_assets": self._agent_asset_payload(brief),
+            })
+            contract_type = html_deck_batch_contract_for_assets(allowed_assets, requested_ids)
+
+            def validate_candidate(candidate: HtmlDeckBatchSpec) -> dict[str, Any]:
+                if candidate.shared_css != frozen_css or candidate.design_intent != frozen_intent:
+                    raise ContractValidationError("全稿批次未精确复用已确认设计系统", context=ErrorContext(stage="deck"))
+                self._assert_html_contract(candidate.slides, requested_ids, allowed_assets, "deck")
+                _, validation = self._render_agent_html(candidate.slides, frozen_css, frozen_intent, brief)
+                return {"technical_validation_hash": validation.evidence_hash, "generation_mode": "agent_html"}
+
+            result = self._generate_contract(
+                "deck_batch",
+                contract_type,
+                payload=batch_payload,
+                fallback_input=html_deck_batch_prompt(batch_payload),
+                key=batch_key,
+                instruction=(
+                    "返回严格 HtmlDeckBatchSpec JSON，只生成 requested_slides 的 html_fragment/slide_css。"
+                    "shared_css 与 design_intent 必须逐字段精确复用已确认样品；不得重做样品页或返回 content_blocks/layout_family。"
+                ),
+                validator=validate_candidate,
+                skill_snapshot=skill_snapshot,
+            )
+            return index, ids, result, batch_payload
+
+        with ThreadPoolExecutor(max_workers=self.max_batch_workers, thread_name_prefix="deck-batch") as executor:
+            results = list(executor.map(produce, enumerate(batches)))
+        for batch_index, requested_ids, gateway_result, batch_payload in sorted(results):
+            batch = gateway_result.contract
+            if batch.shared_css != frozen_css or batch.design_intent != frozen_intent:
+                raise ContractValidationError("全稿批次未精确复用已确认设计系统", context=ErrorContext(stage="deck"))
+            self._assert_html_contract(batch.slides, requested_ids, allowed_assets, "deck")
+            generated.update({slide.slide_id: slide for slide in batch.slides})
+            batch_evidence.append({
+                "batch_index": batch_index,
+                "slide_ids": requested_ids,
+                **self._gateway_metadata(gateway_result),
+                **stage_payload_metadata(context, batch_payload),
+            })
+        ordered = tuple(sample_by_id.get(slide.slide_id) or generated[slide.slide_id] for slide in outline.slides)
+        shared_assets = tuple(sorted({resource_id for slide in ordered for resource_id in slide.asset_refs}))
+        deck = HtmlDeckSpec(frozen_css, frozen_intent, ordered, shared_assets, outline_checkpoint_id, sample_confirmation_checkpoint_id)
+        deck = HtmlDeckSpec.parse(deck.to_dict(), expected_slide_ids=[slide.slide_id for slide in outline.slides])
+        artifact, validation = self._render_agent_html(deck.slides, deck.shared_css, deck.design_intent, brief)
+        output = {
+            **deck.to_dict(),
+            "rendered_html": artifact.html,
+            "rendered_sha256": artifact.sha256,
+            "renderer_version": artifact.renderer_version,
+            "validation": validation.to_dict(),
+        }
+        deck_payload = build_stage_payload(context, "deck", {
+            "generation_mode": "agent_html",
+            "task_brief": brief.to_dict(),
+            "narrative_checkpoint_id": narrative_checkpoint.checkpoint_id,
+            "narrative": narrative.to_dict(),
+            "outline_checkpoint_id": outline_checkpoint_id,
+            "outline": outline.to_dict(),
+            "sample_checkpoint_id": sample_confirmation_checkpoint_id,
+            "confirmed_sample": confirmation.output,
+            "batch_payload_hashes": [item["stage_payload_hash"] for item in batch_evidence],
+        })
+        checkpoint = self.checkpoints.commit(
+            task_id=task_id,
+            stage="deck",
+            input_version=f"{outline_checkpoint_id}:{sample_confirmation_checkpoint_id}",
+            contract_name=HtmlDeckSpec.TITLE,
+            output=output,
+            model=self.gateway.model,
+            parent_checkpoint_id=sample_confirmation_checkpoint_id,
+            idempotency_key=key,
+            metadata={
+                "pipeline_version": PIPELINE_VERSION,
+                "generation_mode": "agent_html",
+                "batches": batch_evidence,
+                "sample_slide_hashes": {slide.slide_id: slide.sha256 for slide in sample_slides},
+                **stage_payload_metadata(context, deck_payload),
+            },
+        )
+        self._event(task_id, "deck", "succeeded", checkpoint=checkpoint)
+        return StageResult(checkpoint, deck, artifact, validation)
+
+    @staticmethod
+    def _assert_html_contract(
+        slides: Sequence[HtmlSlideSpec],
+        expected_slide_ids: Sequence[str],
+        allowed_assets: Sequence[str],
+        stage: str,
+    ) -> None:
+        if [slide.slide_id for slide in slides] != list(expected_slide_ids):
+            raise ContractValidationError("模型 HTML 页面集合或顺序与请求不一致", context=ErrorContext(stage=stage, field_path="slides"))
+        allowed = set(allowed_assets)
+        if any(not set(slide.asset_refs).issubset(allowed) for slide in slides):
+            raise ContractValidationError("模型 HTML 引用了未许可资源", context=ErrorContext(stage=stage, field_path="asset_refs"))
+
+    @staticmethod
+    def _agent_asset_payload(brief: TaskBrief) -> list[dict[str, str]]:
+        return [
+            {
+                "resource_id": item.resource_id,
+                "resource_uri": f"resources://{item.resource_id}",
+                "media_type": item.media_type,
+                "content_hash": item.content_hash,
+            }
+            for item in brief.resource_manifest
+        ]
+
+    def _render_agent_html(
+        self,
+        slides: Sequence[HtmlSlideSpec],
+        shared_css: str,
+        design_intent: Mapping[str, Any],
+        brief: TaskBrief,
+    ) -> tuple[RenderedDeck, ValidationReport]:
+        declared_assets = tuple(sorted({resource_id for slide in slides for resource_id in slide.asset_refs}))
+        assets = self._assets(brief, declared_assets)
+        replacements = {f"resources://{resource_id}": asset.offline_path for resource_id, asset in assets.items()}
+
+        def rewrite(value: str) -> str:
+            for resource_uri, offline_path in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
+                value = value.replace(resource_uri, offline_path)
+            return value
+
+        fragments = [rewrite(slide.html_fragment) for slide in slides]
+        combined_css = "\n".join(value for value in [rewrite(shared_css), *(rewrite(slide.slide_css) for slide in slides)] if value)
+        html_text = assemble_presentation(
+            fragments,
+            design_intent=dict(design_intent),
+            shared_assets={"css": combined_css},
+        )
+        allowed_paths = {f"resources://{asset.offline_path}": asset.offline_path for asset in assets.values()}
+        validate_html(html_text, [slide.slide_id for slide in slides], allowed_paths)
+        validation = self.validator.validate(html_text, [slide.slide_id for slide in slides], assets)
+        artifact = RenderedDeck(
+            html=html_text,
+            sha256=hashlib.sha256(html_text.encode()).hexdigest(),
+            renderer_version=AGENT_HTML_RENDERER_VERSION,
+            slide_hashes={slide.slide_id: hashlib.sha256(fragment.encode()).hexdigest() for slide, fragment in zip(slides, fragments)},
+        )
+        return artifact, validation
+
     def create_review_input(self, task_id: str, deck_checkpoint_id: str) -> StageResult:
         deck_checkpoint = self._require_checkpoint(task_id, deck_checkpoint_id, "deck")
         key = self._key(task_id, "review_input", deck_checkpoint_id)
         existing = self.checkpoints.find(task_id, key)
         if existing:
             return StageResult(existing, existing.output, reused=True)
-        deck = DeckSpec.parse({key: value for key, value in deck_checkpoint.output.items() if key in {"schema_version", "slides", "theme_tokens", "shared_assets", "outline_checkpoint_id", "sample_checkpoint_id"}})
-        output = {
-            "schema_version": CONTRACT_VERSION,
-            "deck_checkpoint_id": deck_checkpoint_id,
-            "deck_sha256": deck_checkpoint.output["rendered_sha256"],
-            "slides": [{"slide_id": slide.slide_id, "role": slide.role, "title": slide.title, "speaker_notes": slide.speaker_notes, "content_sha256": slide.sha256} for slide in deck.slides],
-            "technical_validation_hash": deck_checkpoint.output["validation"]["evidence_hash"],
-        }
+        if deck_checkpoint.contract_name == HtmlDeckSpec.TITLE:
+            deck = HtmlDeckSpec.parse({
+                key: value
+                for key, value in deck_checkpoint.output.items()
+                if key in {"schema_version", "shared_css", "design_intent", "slides", "shared_assets", "outline_checkpoint_id", "sample_checkpoint_id"}
+            })
+            output = {
+                "schema_version": CONTRACT_VERSION,
+                "deck_checkpoint_id": deck_checkpoint_id,
+                "deck_sha256": deck_checkpoint.output["rendered_sha256"],
+                "slides": [
+                    {
+                        "slide_id": slide.slide_id,
+                        "speaker_notes": slide.speaker_notes,
+                        "content_sha256": slide.sha256,
+                    }
+                    for slide in deck.slides
+                ],
+                "technical_validation_hash": deck_checkpoint.output["validation"]["evidence_hash"],
+            }
+        else:
+            deck = DeckSpec.parse({key: value for key, value in deck_checkpoint.output.items() if key in {"schema_version", "slides", "theme_tokens", "shared_assets", "outline_checkpoint_id", "sample_checkpoint_id"}})
+            output = {
+                "schema_version": CONTRACT_VERSION,
+                "deck_checkpoint_id": deck_checkpoint_id,
+                "deck_sha256": deck_checkpoint.output["rendered_sha256"],
+                "slides": [{"slide_id": slide.slide_id, "role": slide.role, "title": slide.title, "speaker_notes": slide.speaker_notes, "content_sha256": slide.sha256} for slide in deck.slides],
+                "technical_validation_hash": deck_checkpoint.output["validation"]["evidence_hash"],
+            }
         checkpoint = self.checkpoints.commit(
             task_id=task_id,
             stage="review_input",
@@ -694,7 +1129,14 @@ class GenerationPipeline:
 
     def publish_offline(self, task_id: str, deck_checkpoint_id: str, target_root: str | Path) -> StageResult:
         deck_checkpoint = self._require_checkpoint(task_id, deck_checkpoint_id, "deck")
-        deck = DeckSpec.parse({key: value for key, value in deck_checkpoint.output.items() if key in {"schema_version", "slides", "theme_tokens", "shared_assets", "outline_checkpoint_id", "sample_checkpoint_id"}})
+        if deck_checkpoint.contract_name == HtmlDeckSpec.TITLE:
+            deck = HtmlDeckSpec.parse({
+                key: value
+                for key, value in deck_checkpoint.output.items()
+                if key in {"schema_version", "shared_css", "design_intent", "slides", "shared_assets", "outline_checkpoint_id", "sample_checkpoint_id"}
+            })
+        else:
+            deck = DeckSpec.parse({key: value for key, value in deck_checkpoint.output.items() if key in {"schema_version", "slides", "theme_tokens", "shared_assets", "outline_checkpoint_id", "sample_checkpoint_id"}})
         brief_checkpoint = next((item for item in reversed(self.checkpoints.chain(deck_checkpoint_id)) if item.stage == "brief"), None)
         if brief_checkpoint is None:
             raise CheckpointConflict("deck checkpoint 链缺少任务简报")
@@ -779,7 +1221,15 @@ class GenerationPipeline:
         else:
             checks["provider"] = {"ready": True, "checks": "deferred"}
         ready = bool(checks["data_directory"] and checks["temporary_directory"] and checks["asset_root"] and checks["chromium"].get("ready") and checks["provider"].get("ready"))
-        return {"ready": ready, "pipeline_version": PIPELINE_VERSION, "contract_version": CONTRACT_VERSION, "renderer_version": self.renderer.version, "checks": checks}
+        renderer_version = AGENT_HTML_RENDERER_VERSION if self.generation_mode == "agent_html" else self.renderer.version
+        return {
+            "ready": ready,
+            "pipeline_version": PIPELINE_VERSION,
+            "contract_version": CONTRACT_VERSION,
+            "generation_mode": self.generation_mode,
+            "renderer_version": renderer_version,
+            "checks": checks,
+        }
 
     @staticmethod
     def select_representative_slides(outline: OutlineSpec) -> tuple[str, ...]:
@@ -908,8 +1358,27 @@ class GenerationPipeline:
         sample = SampleSpec.parse({key: value for key, value in checkpoint.output.items() if key in {"schema_version", "slides", "theme_tokens", "shared_assets", "outline_checkpoint_id"}})
         return sample, self._artifact(checkpoint), self._validation(checkpoint)
 
+    def _read_rendered_html_sample(self, checkpoint: Checkpoint) -> tuple[HtmlSampleSpec, RenderedDeck, ValidationReport]:
+        sample = HtmlSampleSpec.parse({
+            key: value
+            for key, value in checkpoint.output.items()
+            if key in {"schema_version", "shared_css", "design_intent", "slides", "outline_checkpoint_id"}
+        })
+        return sample, self._artifact(checkpoint), self._validation(checkpoint)
+
     def _read_rendered_deck(self, checkpoint: Checkpoint, outline: OutlineSpec) -> tuple[DeckSpec, RenderedDeck, ValidationReport]:
         deck = DeckSpec.parse({key: value for key, value in checkpoint.output.items() if key in {"schema_version", "slides", "theme_tokens", "shared_assets", "outline_checkpoint_id", "sample_checkpoint_id"}}, expected_slide_ids=[slide.slide_id for slide in outline.slides])
+        return deck, self._artifact(checkpoint), self._validation(checkpoint)
+
+    def _read_rendered_html_deck(self, checkpoint: Checkpoint, outline: OutlineSpec) -> tuple[HtmlDeckSpec, RenderedDeck, ValidationReport]:
+        deck = HtmlDeckSpec.parse(
+            {
+                key: value
+                for key, value in checkpoint.output.items()
+                if key in {"schema_version", "shared_css", "design_intent", "slides", "shared_assets", "outline_checkpoint_id", "sample_checkpoint_id"}
+            },
+            expected_slide_ids=[slide.slide_id for slide in outline.slides],
+        )
         return deck, self._artifact(checkpoint), self._validation(checkpoint)
 
     @staticmethod

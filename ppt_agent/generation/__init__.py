@@ -1,8 +1,12 @@
-"""Deterministic, contract-first presentation generation core."""
+"""Contract-first presentation generation core with Agent HTML production output."""
 
 from .contracts import (
     CONTRACT_VERSION,
     DeckSpec,
+    HtmlDeckBatchSpec,
+    HtmlDeckSpec,
+    HtmlSampleSpec,
+    HtmlSlideSpec,
     NarrativeSpec,
     OutlineSpec,
     SlideSpec,
@@ -16,6 +20,10 @@ from .pipeline import FileCheckpointStore, GenerationPipeline, StageResult
 __all__ = [
     "CONTRACT_VERSION",
     "DeckSpec",
+    "HtmlDeckBatchSpec",
+    "HtmlDeckSpec",
+    "HtmlSampleSpec",
+    "HtmlSlideSpec",
     "FileCheckpointStore",
     "GenerationPipeline",
     "GenerationContextV2",
