@@ -6,7 +6,7 @@ import json
 import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Protocol, TypeVar
 
 from .contracts import CONTRACT_VERSION, Contract, canonical_json
@@ -58,6 +58,7 @@ class GatewayResult:
     recovery_count: int
     model: str
     elapsed_ms: float
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 ContractType = TypeVar("ContractType", bound=Contract)
@@ -116,6 +117,12 @@ class ModelGateway:
                     raise ModelOutputError("幂等键已绑定其他输出契约", context=ErrorContext(stage=stage))
                 return cached
             return self._generate_once(contract_type, input=input, idempotency_key=idempotency_key, stage=stage)
+
+    def discard(self, idempotency_key: str) -> None:
+        """Remove a locally completed candidate rejected by downstream validation."""
+
+        with self._guard:
+            self._completed.pop(idempotency_key, None)
 
     def _generate_once(
         self,

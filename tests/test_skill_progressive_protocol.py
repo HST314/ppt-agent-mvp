@@ -49,6 +49,36 @@ class ProgressiveSkillProtocolTests(unittest.TestCase):
         skill = ActiveSkillResolver(root, "progressive").runtime(**limits.pop("skill_limits", {}))
         return AgentRuntime(client, skill, **limits)
 
+    def test_open_reading_is_not_limited_to_four_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            skill = write_skill(root)
+            for index in range(5):
+                (skill / "references" / f"guide-{index}.md").write_text(f"guide-{index}", encoding="utf-8")
+            turns = [call("read_skill_file", {"path": "SKILL.md"}, "entry")]
+            turns.extend(
+                call("read_skill_file", {"path": f"references/guide-{index}.md"}, f"guide-{index}")
+                for index in range(5)
+            )
+            turns.append(ModelTurn('{"markdown":"done"}', "final"))
+            result = self.runtime(root, Client(turns), max_steps=8, max_provider_calls=8).run("narrative", {})
+            self.assertEqual(result.value, {"markdown": "done"})
+            self.assertEqual(result.audit[-1]["unique_skill_files"], 6)
+
+    def test_large_text_can_be_read_in_cached_utf8_chunks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_skill(root)
+            runtime = ActiveSkillResolver(root, "progressive").runtime(max_file_bytes=4, max_total_bytes=12)
+            first = runtime.read_skill_file("references/guide.md", offset=0, limit=4)
+            second = runtime.read_skill_file("references/guide.md", offset=4, limit=4)
+            third = runtime.read_skill_file("references/guide.md", offset=8, limit=4)
+            cached = runtime.read_skill_file("references/guide.md", offset=0, limit=4)
+            self.assertEqual(first["content"] + second["content"] + third["content"], "guide-body")
+            self.assertTrue(third["eof"])
+            self.assertTrue(cached["cached"])
+            self.assertEqual(runtime.total_bytes, len("guide-body"))
+
     def test_entry_is_forced_before_generic_progressive_tools(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

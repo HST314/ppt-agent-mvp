@@ -20,14 +20,31 @@ NARRATIVE_MIN_BODY_CHARACTERS = 60
 
 def requested_slide_count(card):
     constraints = card.get("constraints") or {}
-    for key in ("页数", "slide_count", "slides", "page_count"):
-        if key in constraints:
-            match = re.search(r"\d+", str(constraints[key]))
-            if match:
-                value = int(match.group())
-                if value < 1 or value > 200:
-                    raise ValidationError("强页数必须在 1 到 200 之间")
-                return value
+
+    def candidates(value):
+        if not isinstance(value, dict):
+            return
+        for key in ("页数", "slide_count", "slides", "page_count"):
+            if key in value:
+                yield value[key]
+        for nested in value.values():
+            if isinstance(nested, dict):
+                yield from candidates(nested)
+
+    for raw in candidates(constraints):
+        numbers = [int(item) for item in re.findall(r"\d+", str(raw))]
+        if not numbers:
+            continue
+        lower = numbers[0]
+        upper = numbers[1] if len(numbers) > 1 else lower
+        if lower > upper:
+            lower, upper = upper, lower
+        if lower < 1 or upper > 200:
+            raise ValidationError("强页数必须在 1 到 200 之间")
+        # Range choices use the lower bound deterministically. It is within the
+        # user's selected product range and avoids the previous silent 6-page
+        # fallback for values such as ``10_to_15``.
+        return lower
     return None
 
 

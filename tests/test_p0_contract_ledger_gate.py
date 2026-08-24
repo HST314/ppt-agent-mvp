@@ -99,6 +99,29 @@ class RegisteredClaimDroppingBuilder:
 
 
 class ContractLedgerGateTests(unittest.TestCase):
+    def test_temporal_ranges_ordinals_dates_and_navigation_are_typed(self):
+        source = (
+            "2025年7月1日，经第122次会议讨论。"
+            "2025年10月1日，经第133次会议决定。4人才培养"
+        )
+        ledger = build_claim_ledger(
+            task_id="task",
+            input_snapshot_hash="a" * 64,
+            source_binding=source,
+            created_at="2026-01-01T00:00:00+00:00",
+        )
+        values = {(item["kind"], item["value"]) for item in ledger["claims"]}
+        self.assertIn(("ordinal", "第122次"), values)
+        self.assertIn(("ordinal", "第133次"), values)
+        self.assertFalse(any(item[1] in {"2025年", "7月", "10月", "122次", "133次", "4人"} for item in values))
+
+        temporal = audit_claims("项目从7月到10月推进。", ledger)
+        self.assertTrue(temporal["passed"], temporal)
+        self.assertEqual(temporal["bindings"][0]["formula"], "derived_temporal_range")
+
+        ordinal_growth = audit_claims("会议次数从122次增长到133次。", ledger)
+        self.assertFalse(ordinal_growth["passed"])
+        self.assertEqual(ordinal_growth["unbound"][0]["kind"], "metric_transition")
     def _service(self, root, browser=None):
         return TaskService(
             WorkspaceStore(root),

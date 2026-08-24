@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from ppt_agent.generation.errors import CheckpointConflict
+from ppt_agent.errors import ValidationError
 from ppt_agent.generation.model_gateway import ModelGateway
 from ppt_agent.generation.pipeline import FileCheckpointStore, GenerationPipeline
 from ppt_agent.rendering.renderer import DeterministicRenderer
@@ -87,6 +88,24 @@ class PipelineCheckpointTests(unittest.TestCase):
         path.write_text(json.dumps(value), encoding="utf-8")
         with self.assertRaises(CheckpointConflict):
             self.store.load(result.checkpoint.checkpoint_id)
+
+    def test_business_rejection_never_creates_or_reuses_authority(self):
+        def reject(_candidate):
+            raise ValidationError("evidence rejected")
+
+        with self.assertRaises(ValidationError):
+            self.pipeline.generate_narrative("task-rejected", self.brief, candidate_validator=reject)
+        calls_after_first = len(self.provider.calls)
+        task_root = self.root / "checkpoints" / "task-rejected"
+        self.assertEqual(len(list((task_root / "authority").glob("*.json"))), 1)
+        self.assertFalse(any(json.loads(path.read_text())["stage"] == "narrative" for path in (task_root / "checkpoints").glob("*.json")))
+        rejected = list((task_root / "rejected").glob("*.json"))
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(json.loads(rejected[0].read_text())["status"], "rejected")
+
+        with self.assertRaises(ValidationError):
+            self.pipeline.generate_narrative("task-rejected", self.brief, candidate_validator=reject)
+        self.assertGreater(len(self.provider.calls), calls_after_first)
 
 
 if __name__ == "__main__":

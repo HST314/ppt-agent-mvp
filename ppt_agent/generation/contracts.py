@@ -153,18 +153,64 @@ class ConfirmedFact:
     fact_id: str
     text: str
     source_refs: tuple[str, ...]
+    fact_type: str = "statement"
+    statement: str = ""
+    source_ref: str = ""
+    source_span: tuple[int, int] | None = None
+    subject: str = ""
+    predicate: str = ""
+    value: str = ""
 
     @classmethod
     def parse(cls, value: Any, path: str) -> "ConfirmedFact":
-        item = _object(value, path, required=("fact_id", "text", "source_refs"))
+        item = _object(
+            value,
+            path,
+            required=("fact_id", "text", "source_refs"),
+            optional=("fact_type", "statement", "source_ref", "source_span", "subject", "predicate", "value"),
+        )
+        fact_type = item.get("fact_type", "statement")
+        if fact_type not in {"date", "ordinal", "count", "ratio", "statement", "metric", "frequency", "temporal_range"}:
+            _fail("fact_type 不受支持", f"{path}.fact_type")
+        span_value = item.get("source_span")
+        span = None
+        if span_value is not None:
+            if (
+                not isinstance(span_value, dict)
+                or set(span_value) != {"start", "end"}
+                or any(isinstance(span_value[name], bool) or not isinstance(span_value[name], int) for name in ("start", "end"))
+                or span_value["start"] < 0
+                or span_value["end"] <= span_value["start"]
+            ):
+                _fail("source_span 必须是有效的半开区间", f"{path}.source_span")
+            span = (span_value["start"], span_value["end"])
+        text = _string(item["text"], f"{path}.text", maximum=4_000)
         return cls(
             _identifier(item["fact_id"], f"{path}.fact_id"),
-            _string(item["text"], f"{path}.text", maximum=2_000),
+            text,
             _string_list(item["source_refs"], f"{path}.source_refs", maximum_items=32, maximum_length=128),
+            fact_type,
+            _string(item.get("statement", text), f"{path}.statement", maximum=4_000),
+            _string(item.get("source_ref", "frozen_input"), f"{path}.source_ref", maximum=512),
+            span,
+            _string(item.get("subject", ""), f"{path}.subject", maximum=500, allow_empty=True),
+            _string(item.get("predicate", ""), f"{path}.predicate", maximum=500, allow_empty=True),
+            _string(item.get("value", text), f"{path}.value", maximum=2_000, allow_empty=True),
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {"fact_id": self.fact_id, "text": self.text, "source_refs": list(self.source_refs)}
+        return {
+            "fact_id": self.fact_id,
+            "text": self.text,
+            "source_refs": list(self.source_refs),
+            "fact_type": self.fact_type,
+            "statement": self.statement,
+            "source_ref": self.source_ref,
+            "source_span": None if self.source_span is None else {"start": self.source_span[0], "end": self.source_span[1]},
+            "subject": self.subject,
+            "predicate": self.predicate,
+            "value": self.value,
+        }
 
 
 FACT_SCHEMA = {
@@ -172,11 +218,70 @@ FACT_SCHEMA = {
     "additionalProperties": False,
     "properties": {
         "fact_id": {"type": "string", "pattern": ID_PATTERN.pattern},
-        "text": {"type": "string", "minLength": 1, "maxLength": 2000},
+        "text": {"type": "string", "minLength": 1, "maxLength": 4000},
         "source_refs": {"type": "array", "maxItems": 32, "uniqueItems": True, "items": {"type": "string", "pattern": ID_PATTERN.pattern}},
+        "fact_type": {"type": "string", "enum": ["date", "ordinal", "count", "ratio", "statement", "metric", "frequency", "temporal_range"]},
+        "statement": {"type": "string", "minLength": 1, "maxLength": 4000},
+        "source_ref": {"type": "string", "minLength": 1, "maxLength": 512},
+        "source_span": {
+            "anyOf": [
+                {"type": "null"},
+                {"type": "object", "additionalProperties": False, "properties": {"start": {"type": "integer", "minimum": 0}, "end": {"type": "integer", "minimum": 1}}, "required": ["start", "end"]},
+            ]
+        },
+        "subject": {"type": "string", "maxLength": 500},
+        "predicate": {"type": "string", "maxLength": 500},
+        "value": {"type": "string", "maxLength": 2000},
     },
     "required": ["fact_id", "text", "source_refs"],
 }
+
+
+TEXT_RESOURCE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "resource_id": {"type": "string", "pattern": ID_PATTERN.pattern},
+        "source_ref": {"type": "string", "minLength": 1, "maxLength": 512},
+        "media_type": {"type": "string", "minLength": 1, "maxLength": 128},
+        "content_hash": {"type": "string", "pattern": SHA256_PATTERN.pattern},
+        "content": {"type": "string", "minLength": 1, "maxLength": 200000},
+    },
+    "required": ["resource_id", "source_ref", "media_type", "content_hash", "content"],
+}
+
+
+@dataclass(frozen=True)
+class TextResource:
+    resource_id: str
+    source_ref: str
+    media_type: str
+    content_hash: str
+    content: str
+
+    @classmethod
+    def parse(cls, value: Any, path: str) -> "TextResource":
+        item = _object(value, path, required=("resource_id", "source_ref", "media_type", "content_hash", "content"))
+        content = _string(item["content"], f"{path}.content", maximum=200_000)
+        content_hash = _string(item["content_hash"], f"{path}.content_hash", maximum=64)
+        if not SHA256_PATTERN.fullmatch(content_hash) or hashlib.sha256(content.encode("utf-8")).hexdigest() != content_hash:
+            _fail("文本资源哈希无效", f"{path}.content_hash")
+        return cls(
+            _identifier(item["resource_id"], f"{path}.resource_id"),
+            _string(item["source_ref"], f"{path}.source_ref", maximum=512),
+            _string(item["media_type"], f"{path}.media_type", maximum=128),
+            content_hash,
+            content,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "resource_id": self.resource_id,
+            "source_ref": self.source_ref,
+            "media_type": self.media_type,
+            "content_hash": self.content_hash,
+            "content": self.content,
+        }
 
 
 @dataclass(frozen=True)
@@ -189,6 +294,7 @@ class TaskBrief(Contract):
     style_preferences: dict[str, Any]
     resource_manifest: tuple[ResourceRecord, ...]
     confirmed_facts: tuple[ConfirmedFact, ...]
+    text_resources: tuple[TextResource, ...] = ()
     schema_version: str = CONTRACT_VERSION
 
     TITLE = "task_brief_v1"
@@ -205,13 +311,14 @@ class TaskBrief(Contract):
             "style_preferences": {"type": "object", "maxProperties": 32},
             "resource_manifest": {"type": "array", "maxItems": 256, "items": RESOURCE_SCHEMA},
             "confirmed_facts": {"type": "array", "maxItems": 256, "items": FACT_SCHEMA},
+            "text_resources": {"type": "array", "maxItems": 32, "items": TEXT_RESOURCE_SCHEMA},
         },
         "required": ["schema_version", "goal", "audience", "topic", "slide_count", "language", "style_preferences", "resource_manifest", "confirmed_facts"],
     }
 
     @classmethod
     def parse(cls, value: Any) -> "TaskBrief":
-        item = _object(value, "task_brief", required=("goal", "audience", "topic", "slide_count", "language", "style_preferences", "resource_manifest", "confirmed_facts"))
+        item = _object(value, "task_brief", required=("goal", "audience", "topic", "slide_count", "language", "style_preferences", "resource_manifest", "confirmed_facts"), optional=("text_resources",))
         count = item["slide_count"]
         if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 100:
             _fail("slide_count 必须在 1 到 100 之间", "task_brief.slide_count")
@@ -223,11 +330,17 @@ class TaskBrief(Contract):
             _fail("confirmed_facts 必须是受限数组", "task_brief.confirmed_facts")
         resources = tuple(ResourceRecord.parse(value, f"task_brief.resource_manifest[{index}]") for index, value in enumerate(resources_value))
         facts = tuple(ConfirmedFact.parse(value, f"task_brief.confirmed_facts[{index}]") for index, value in enumerate(facts_value))
+        text_values = item.get("text_resources", ())
+        if not isinstance(text_values, (list, tuple)) or len(text_values) > 32:
+            _fail("text_resources 必须是受限数组", "task_brief.text_resources")
+        text_resources = tuple(TextResource.parse(value, f"task_brief.text_resources[{index}]") for index, value in enumerate(text_values))
         if len({value.resource_id for value in resources}) != len(resources):
             _fail("资源 ID 必须唯一", "task_brief.resource_manifest")
         if len({value.fact_id for value in facts}) != len(facts):
             _fail("事实 ID 必须唯一", "task_brief.confirmed_facts")
-        known_resources = {value.resource_id for value in resources}
+        known_resources = {value.resource_id for value in resources} | {value.resource_id for value in text_resources}
+        if len(known_resources) != len(resources) + len(text_resources):
+            _fail("二进制与文本资源 ID 必须全局唯一", "task_brief.text_resources")
         if any(not set(value.source_refs).issubset(known_resources) for value in facts):
             _fail("事实引用了未知资源", "task_brief.confirmed_facts")
         return cls(
@@ -239,6 +352,7 @@ class TaskBrief(Contract):
             _json_mapping(item["style_preferences"], "task_brief.style_preferences"),
             resources,
             facts,
+            text_resources,
             item.get("schema_version", CONTRACT_VERSION),
         )
 
@@ -253,6 +367,7 @@ class TaskBrief(Contract):
             "style_preferences": self.style_preferences,
             "resource_manifest": [value.to_dict() for value in self.resource_manifest],
             "confirmed_facts": [value.to_dict() for value in self.confirmed_facts],
+            "text_resources": [value.to_dict() for value in self.text_resources],
         }
 
 
@@ -263,6 +378,7 @@ STORY_BEAT_SCHEMA = {
         "beat_id": {"type": "string", "pattern": ID_PATTERN.pattern},
         "purpose": {"type": "string", "minLength": 1, "maxLength": 400},
         "message": {"type": "string", "minLength": 1, "maxLength": 1200},
+        "evidence_refs": {"type": "array", "maxItems": 256, "uniqueItems": True, "items": {"type": "string", "pattern": ID_PATTERN.pattern}},
     },
     "required": ["beat_id", "purpose", "message"],
 }
@@ -273,14 +389,15 @@ class StoryBeat:
     beat_id: str
     purpose: str
     message: str
+    evidence_refs: tuple[str, ...] = ()
 
     @classmethod
     def parse(cls, value: Any, path: str) -> "StoryBeat":
-        item = _object(value, path, required=("beat_id", "purpose", "message"))
-        return cls(_identifier(item["beat_id"], f"{path}.beat_id"), _string(item["purpose"], f"{path}.purpose", maximum=400), _string(item["message"], f"{path}.message", maximum=1_200))
+        item = _object(value, path, required=("beat_id", "purpose", "message"), optional=("evidence_refs",))
+        return cls(_identifier(item["beat_id"], f"{path}.beat_id"), _string(item["purpose"], f"{path}.purpose", maximum=400), _string(item["message"], f"{path}.message", maximum=1_200), _string_list(item.get("evidence_refs", ()), f"{path}.evidence_refs", maximum_items=256, maximum_length=128))
 
     def to_dict(self) -> dict[str, Any]:
-        return {"beat_id": self.beat_id, "purpose": self.purpose, "message": self.message}
+        return {"beat_id": self.beat_id, "purpose": self.purpose, "message": self.message, "evidence_refs": list(self.evidence_refs)}
 
 
 @dataclass(frozen=True)
@@ -759,8 +876,11 @@ def narrative_contract_for_evidence(allowed_evidence: tuple[str, ...]) -> type[N
     allowed = tuple(dict.fromkeys(allowed_evidence))
     schema = copy.deepcopy(NarrativeSpec.SCHEMA)
     schema["properties"]["evidence_refs"]["maxItems"] = len(allowed)
+    beat_evidence = schema["properties"]["story_arc"]["items"]["properties"]["evidence_refs"]
+    beat_evidence["maxItems"] = len(allowed)
     if allowed:
         schema["properties"]["evidence_refs"]["items"] = {"type": "string", "enum": list(allowed)}
+        beat_evidence["items"] = {"type": "string", "enum": list(allowed)}
 
     class BoundNarrativeSpec(NarrativeSpec):
         SCHEMA = schema
@@ -854,8 +974,16 @@ def _theme_provider_dict(value: ThemeTokens) -> dict[str, Any]:
 
 
 def verify_evidence_refs(contract: NarrativeSpec | OutlineSpec, brief: TaskBrief) -> None:
-    allowed = {value.resource_id for value in brief.resource_manifest} | {value.fact_id for value in brief.confirmed_facts}
-    references = contract.evidence_refs if isinstance(contract, NarrativeSpec) else tuple(ref for slide in contract.slides for ref in slide.evidence_refs)
+    allowed = (
+        {value.resource_id for value in brief.resource_manifest}
+        | {value.resource_id for value in brief.text_resources}
+        | {value.fact_id for value in brief.confirmed_facts}
+    )
+    references = (
+        contract.evidence_refs + tuple(ref for beat in contract.story_arc for ref in beat.evidence_refs)
+        if isinstance(contract, NarrativeSpec)
+        else tuple(ref for slide in contract.slides for ref in slide.evidence_refs)
+    )
     unknown = sorted(set(references) - allowed)
     if unknown:
         _fail(f"引用了未知证据：{','.join(unknown)}", "evidence_refs")

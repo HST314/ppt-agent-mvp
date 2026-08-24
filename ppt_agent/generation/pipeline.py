@@ -37,13 +37,16 @@ from .contracts import (
 from .errors import CheckpointConflict, ContractValidationError, ErrorContext
 from .model_gateway import GatewayResult, ModelGateway
 from .prompts import PROMPT_VERSION, narrative_prompt, outline_prompt, sample_prompt, slide_batch_prompt
+from .stage_agent import StageAgentExecutor
 from ..rendering.assets import AssetResolver, ResolvedAsset
 from ..rendering.renderer import DeterministicRenderer, RenderedDeck
 from ..rendering.validator import TechnicalValidator, ValidationReport
 
 
 CHECKPOINT_VERSION = "1.0"
-PIPELINE_VERSION = "1.0.0"
+PIPELINE_VERSION = "2.0.0"
+VALIDATOR_VERSION = "2.0"
+EVIDENCE_VERSION = "2.0"
 
 
 def _now() -> str:
@@ -182,7 +185,39 @@ class FileCheckpointStore:
         authority = task_root / "authority" / f"{key_hash}.json"
         if not authority.is_file():
             return None
-        return self.load(json.loads(authority.read_text(encoding="utf-8"))["checkpoint_id"])
+        checkpoint = self.load(json.loads(authority.read_text(encoding="utf-8"))["checkpoint_id"])
+        return None if checkpoint.metadata.get("status") == "rejected" else checkpoint
+
+    def reject(
+        self,
+        *,
+        task_id: str,
+        stage: str,
+        input_version: str,
+        idempotency_key: str,
+        output: dict[str, Any],
+        reason: str,
+    ) -> dict[str, Any]:
+        """Persist non-authoritative diagnostic evidence for a rejected candidate."""
+
+        task_id = _safe_task_id(task_id)
+        key_hash = hashlib.sha256(idempotency_key.encode()).hexdigest()
+        record = {
+            "schema_version": CHECKPOINT_VERSION,
+            "status": "rejected",
+            "task_id": task_id,
+            "stage": stage,
+            "input_version": input_version,
+            "idempotency_key_sha256": key_hash,
+            "output_sha256": content_sha256(output),
+            "output": json.loads(canonical_json(output)),
+            "reason": reason[:4_000],
+            "created_at": _now(),
+        }
+        rejection_id = f"rejected-{content_sha256(record)}"
+        path = self._task_root(task_id) / "rejected" / f"{rejection_id}.json"
+        self._write_once(path, record)
+        return {**record, "rejection_id": rejection_id}
 
     def load(self, checkpoint_id: str) -> Checkpoint:
         if not isinstance(checkpoint_id, str) or not checkpoint_id.startswith("cp-") or len(checkpoint_id) != 67:
@@ -265,6 +300,7 @@ class GenerationPipeline:
         batch_size: int = 3,
         max_batch_workers: int = 1,
         event_sink: Callable[[dict[str, Any]], None] | None = None,
+        stage_agent: StageAgentExecutor | None = None,
     ):
         if not 1 <= batch_size <= 8:
             raise ValueError("batch_size must be between 1 and 8")
@@ -278,19 +314,65 @@ class GenerationPipeline:
         self.batch_size = batch_size
         self.max_batch_workers = max_batch_workers
         self.event_sink = event_sink
+        self.stage_agent = stage_agent
 
-    def generate_narrative(self, task_id: str, brief: TaskBrief, *, input_version: str | None = None) -> StageResult:
+    def generate_narrative(
+        self,
+        task_id: str,
+        brief: TaskBrief,
+        *,
+        input_version: str | None = None,
+        candidate_validator: Callable[[NarrativeSpec], dict[str, Any] | None] | None = None,
+    ) -> StageResult:
+        self._progress("freezing_inputs", "冻结任务、资源与 Evidence v2")
         input_version = input_version or brief.sha256
         brief_checkpoint = self._brief_checkpoint(task_id, brief, input_version)
-        key = self._key(task_id, "narrative", brief_checkpoint.checkpoint_id)
+        skill_snapshot = self.stage_agent.snapshot if self.stage_agent is not None else None
+        key = self._stage_key(task_id, "narrative", brief_checkpoint.checkpoint_id, skill_snapshot=skill_snapshot)
         existing = self.checkpoints.find(task_id, key)
         if existing:
             return StageResult(existing, NarrativeSpec.parse(existing.output), reused=True)
         self._event(task_id, "narrative", "started")
+        self._progress("resolving_skill", "解析不可变 Skill 快照")
         evidence_ids = tuple(item.resource_id for item in brief.resource_manifest) + tuple(item.fact_id for item in brief.confirmed_facts)
-        gateway_result = self.gateway.generate(narrative_contract_for_evidence(evidence_ids), input=narrative_prompt({"task_brief": brief.to_dict()}), idempotency_key=key, stage="narrative")
+        evidence_ids += tuple(item.resource_id for item in brief.text_resources)
+        contract_type = narrative_contract_for_evidence(evidence_ids)
+        def validate_narrative(candidate):
+            verify_evidence_refs(candidate, brief)
+            return candidate_validator(candidate) if candidate_validator is not None else {}
+        try:
+            gateway_result = self._generate_contract(
+                "narrative",
+                contract_type,
+                payload={"task_brief": brief.to_dict(), "evidence_version": EVIDENCE_VERSION},
+                fallback_input=narrative_prompt({"task_brief": brief.to_dict()}),
+                key=key,
+                instruction=(
+                    "返回 NarrativeSpec JSON：thesis、audience_takeaway、story_arc、evidence_refs、tone。"
+                    "story_arc 每个节点都应返回 beat_id、purpose、message 与 evidence_refs；不得返回 Markdown 包装。"
+                ),
+                validator=validate_narrative,
+                skill_snapshot=skill_snapshot,
+            )
+        except Exception as exc:
+            self._reject_candidate(task_id, "narrative", brief_checkpoint.checkpoint_id, key, exc)
+            self._event(task_id, "narrative", "rejected")
+            raise
         narrative = gateway_result.contract
-        verify_evidence_refs(narrative, brief)
+        self._progress("validating_contract", "校验 Narrative Schema")
+        try:
+            verify_evidence_refs(narrative, brief)
+            if candidate_validator is not None and self.stage_agent is None:
+                self._progress("validating_evidence", "校验事实证据与业务约束")
+                candidate_validator(narrative)
+        except Exception as exc:
+            exc.rejected_output = narrative.to_dict()
+            if self.stage_agent is None:
+                self.gateway.discard(key)
+            self._reject_candidate(task_id, "narrative", brief_checkpoint.checkpoint_id, key, exc)
+            self._event(task_id, "narrative", "rejected")
+            raise
+        self._progress("saving_result", "保存已通过校验的权威结果")
         checkpoint = self._commit_contract(task_id, "narrative", brief_checkpoint.checkpoint_id, narrative, gateway_result, key)
         self._event(task_id, "narrative", "succeeded", checkpoint=checkpoint)
         return StageResult(checkpoint, narrative)
@@ -298,15 +380,44 @@ class GenerationPipeline:
     def generate_outline(self, task_id: str, brief: TaskBrief, narrative_checkpoint_id: str) -> StageResult:
         narrative_checkpoint = self._require_checkpoint(task_id, narrative_checkpoint_id, "narrative")
         narrative = NarrativeSpec.parse(narrative_checkpoint.output)
-        key = self._key(task_id, "outline", narrative_checkpoint_id, brief.sha256)
+        skill_snapshot = self.stage_agent.snapshot if self.stage_agent is not None else None
+        key = self._stage_key(task_id, "outline", narrative_checkpoint_id, brief.sha256, skill_snapshot=skill_snapshot)
         existing = self.checkpoints.find(task_id, key)
         if existing:
             return StageResult(existing, OutlineSpec.parse(existing.output, expected_slide_count=brief.slide_count), reused=True)
         self._event(task_id, "outline", "started")
         evidence_ids = tuple(item.resource_id for item in brief.resource_manifest) + tuple(item.fact_id for item in brief.confirmed_facts)
-        gateway_result = self.gateway.generate(outline_contract_for_evidence(evidence_ids, brief.slide_count), input=outline_prompt({"task_brief": brief.to_dict(), "narrative": narrative.to_dict(), "slide_count": brief.slide_count}), idempotency_key=key, stage="outline")
+        evidence_ids += tuple(item.resource_id for item in brief.text_resources)
+        contract_type = outline_contract_for_evidence(evidence_ids, brief.slide_count)
+        def validate_outline(candidate):
+            projected = OutlineSpec.from_draft(candidate, expected_slide_count=brief.slide_count)
+            verify_evidence_refs(projected, brief)
+            return {}
+        try:
+            gateway_result = self._generate_contract(
+                "outline",
+                contract_type,
+                payload={"task_brief": brief.to_dict(), "narrative": narrative.to_dict(), "slide_count": brief.slide_count, "evidence_version": EVIDENCE_VERSION},
+                fallback_input=outline_prompt({"task_brief": brief.to_dict(), "narrative": narrative.to_dict(), "slide_count": brief.slide_count}),
+                key=key,
+                instruction="返回严格 OutlineDraft JSON；每页包含 role、title、message、evidence_refs、visual_intent，不得返回 Markdown 或 HTML。",
+                validator=validate_outline,
+                skill_snapshot=skill_snapshot,
+            )
+        except Exception as exc:
+            self._reject_candidate(task_id, "outline", narrative_checkpoint_id, key, exc)
+            self._event(task_id, "outline", "rejected")
+            raise
         outline = OutlineSpec.from_draft(gateway_result.contract, expected_slide_count=brief.slide_count)
-        verify_evidence_refs(outline, brief)
+        try:
+            verify_evidence_refs(outline, brief)
+        except Exception as exc:
+            exc.rejected_output = outline.to_dict()
+            if self.stage_agent is None:
+                self.gateway.discard(key)
+            self._reject_candidate(task_id, "outline", narrative_checkpoint_id, key, exc)
+            self._event(task_id, "outline", "rejected")
+            raise
         checkpoint = self._commit_contract(task_id, "outline", narrative_checkpoint_id, outline, gateway_result, key)
         self._event(task_id, "outline", "succeeded", checkpoint=checkpoint)
         return StageResult(checkpoint, outline)
@@ -320,22 +431,27 @@ class GenerationPipeline:
         by_id = {slide.slide_id: slide for slide in outline.slides}
         if any(slide_id not in by_id for slide_id in selected):
             raise ContractValidationError("样品页不在大纲中", context=ErrorContext(stage="sample", field_path="selected_slide_ids"))
-        key = self._key(task_id, "sample", outline_checkpoint_id, content_sha256(selected))
+        skill_snapshot = self.stage_agent.snapshot if self.stage_agent is not None else None
+        key = self._stage_key(task_id, "sample", outline_checkpoint_id, content_sha256(selected), skill_snapshot=skill_snapshot)
         existing = self.checkpoints.find(task_id, key)
         if existing:
             sample, artifact, validation = self._read_rendered_sample(existing)
             return StageResult(existing, sample, artifact, validation, reused=True)
         self._event(task_id, "sample", "started")
         allowed_assets = tuple(item.resource_id for item in brief.resource_manifest)
-        gateway_result = self.gateway.generate(
+        sample_payload = {
+            "task_brief": brief.to_dict(),
+            "outline_checkpoint_id": outline_checkpoint_id,
+            "selected_slides": [by_id[slide_id].to_dict() for slide_id in selected],
+        }
+        gateway_result = self._generate_contract(
+            "sample",
             sample_contract_for_assets(allowed_assets, len(selected)),
-            input=sample_prompt({
-                "task_brief": brief.to_dict(),
-                "outline_checkpoint_id": outline_checkpoint_id,
-                "selected_slides": [by_id[slide_id].to_dict() for slide_id in selected],
-            }),
-            idempotency_key=key,
-            stage="sample",
+            payload=sample_payload,
+            fallback_input=sample_prompt(sample_payload),
+            key=key,
+            instruction="返回严格 SampleSpec JSON 的结构化 content_blocks、theme_tokens 与资源引用；由确定性 renderer 生成 HTML，本阶段不得直接返回 HTML。",
+            skill_snapshot=skill_snapshot,
         )
         sample = gateway_result.contract
         sample = SampleSpec(tuple(replace(slide, slide_id=selected[index], role=by_id[selected[index]].role) for index, slide in enumerate(sample.slides)), sample.theme_tokens, sample.shared_assets, outline_checkpoint_id)
@@ -404,7 +520,8 @@ class GenerationPipeline:
         sample_slides = tuple(SlideSpec.parse(value, f"sample_confirmation.slides[{index}]") for index, value in enumerate(confirmation.output["slides"]))
         sample_by_id = {slide.slide_id: slide for slide in sample_slides}
         remaining = [slide.slide_id for slide in outline.slides if slide.slide_id not in sample_by_id]
-        key = self._key(task_id, "deck", outline_checkpoint_id, sample_confirmation_checkpoint_id)
+        skill_snapshot = self.stage_agent.snapshot if self.stage_agent is not None else None
+        key = self._stage_key(task_id, "deck", outline_checkpoint_id, sample_confirmation_checkpoint_id, skill_snapshot=skill_snapshot)
         existing = self.checkpoints.find(task_id, key)
         if existing:
             deck, artifact, validation = self._read_rendered_deck(existing, outline)
@@ -416,22 +533,26 @@ class GenerationPipeline:
 
         def produce(item: tuple[int, list[str]]) -> tuple[int, list[str], GatewayResult]:
             index, ids = item
-            batch_key = self._key(task_id, "deck_batch", outline_checkpoint_id, sample_confirmation_checkpoint_id, str(index), CONTRACT_VERSION)
+            batch_key = self._stage_key(task_id, "deck_batch", outline_checkpoint_id, sample_confirmation_checkpoint_id, str(index), CONTRACT_VERSION, skill_snapshot=skill_snapshot)
             slides_by_id = {slide.slide_id: slide for slide in outline.slides}
-            result = self.gateway.generate(
+            batch_payload = {
+                "task_brief": brief.to_dict(),
+                "outline_checkpoint_id": outline_checkpoint_id,
+                "sample_checkpoint_id": sample_confirmation_checkpoint_id,
+                "batch_index": index,
+                "requested_slides": [slides_by_id[slide_id].to_dict() for slide_id in ids],
+                "frozen_theme_tokens": frozen_theme.to_dict(),
+                "allowed_layout_families": sorted(frozen_layouts),
+                "allowed_asset_refs": list(frozen_assets),
+            }
+            result = self._generate_contract(
+                "deck_batch",
                 slide_batch_contract_for_assets(frozen_assets, len(ids), tuple(frozen_layouts)),
-                input=slide_batch_prompt({
-                    "task_brief": brief.to_dict(),
-                    "outline_checkpoint_id": outline_checkpoint_id,
-                    "sample_checkpoint_id": sample_confirmation_checkpoint_id,
-                    "batch_index": index,
-                    "requested_slides": [slides_by_id[slide_id].to_dict() for slide_id in ids],
-                    "frozen_theme_tokens": frozen_theme.to_dict(),
-                    "allowed_layout_families": sorted(frozen_layouts),
-                    "allowed_asset_refs": list(frozen_assets),
-                }),
-                idempotency_key=batch_key,
-                stage="deck_batch",
+                payload=batch_payload,
+                fallback_input=slide_batch_prompt(batch_payload),
+                key=batch_key,
+                instruction="返回严格 SlideBatchSpec JSON 的结构化 content_blocks；复用冻结主题、版式与资源许可，由确定性 renderer 生成 HTML。",
+                skill_snapshot=skill_snapshot,
             )
             return index, ids, result
 
@@ -595,7 +716,56 @@ class GenerationPipeline:
 
     @staticmethod
     def _gateway_metadata(result: GatewayResult) -> dict[str, Any]:
-        return {"provider_calls": result.provider_calls, "recovery_count": result.recovery_count, "response_id_sha256": result.response_id_sha256, "model": result.model, "elapsed_ms": result.elapsed_ms, "prompt_version": PROMPT_VERSION}
+        return {"provider_calls": result.provider_calls, "recovery_count": result.recovery_count, "response_id_sha256": result.response_id_sha256, "model": result.model, "elapsed_ms": result.elapsed_ms, "prompt_version": PROMPT_VERSION, "validator_version": VALIDATOR_VERSION, "evidence_version": EVIDENCE_VERSION, **result.metadata}
+
+    def _stage_key(self, *parts: str, skill_snapshot=None) -> str:
+        identity = self.stage_agent.identity(parts[1], skill_snapshot) if self.stage_agent is not None else "structured-provider"
+        return self._key(*parts, identity, PROMPT_VERSION, VALIDATOR_VERSION, EVIDENCE_VERSION)
+
+    def _generate_contract(
+        self,
+        stage: str,
+        contract_type,
+        *,
+        payload: dict[str, Any],
+        fallback_input: Any,
+        key: str,
+        instruction: str,
+        validator=None,
+        skill_snapshot=None,
+    ) -> GatewayResult:
+        if self.stage_agent is not None:
+            self._progress("reading_skill", "Agent 正在开放式读取 Skill 快照")
+            self._progress("provider_working", "Agent 正在生成结构化阶段产物")
+            return self.stage_agent.execute(
+                stage,
+                contract_type,
+                payload=payload,
+                idempotency_key=key,
+                instruction=instruction,
+                validator=validator,
+                snapshot=skill_snapshot,
+            )
+        self._progress("provider_working", "模型正在生成结构化阶段产物")
+        return self.gateway.generate(contract_type, input=fallback_input, idempotency_key=key, stage=stage)
+
+    def _reject_candidate(self, task_id: str, stage: str, input_version: str, key: str, exc: Exception) -> None:
+        output = getattr(exc, "rejected_output", None)
+        if isinstance(output, dict):
+            self.checkpoints.reject(
+                task_id=task_id,
+                stage=stage,
+                input_version=input_version,
+                idempotency_key=key,
+                output=output,
+                reason=str(exc),
+            )
+
+    @staticmethod
+    def _progress(step: str, message: str) -> None:
+        from ..execution import progress
+
+        progress(step, message)
 
     def _assets(self, brief: TaskBrief, resource_ids: Iterable[str]) -> dict[str, ResolvedAsset]:
         return AssetResolver(brief.resource_manifest, self.asset_root).resolve(resource_ids)

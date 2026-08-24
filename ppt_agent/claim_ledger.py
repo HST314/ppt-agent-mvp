@@ -11,6 +11,7 @@ from .errors import ValidationError
 
 _DATE = re.compile(r"(?<!\d)(?:19|20)\d{2}\s*(?:[-/.年])\s*\d{1,2}(?:\s*(?:[-/.月])\s*\d{1,2}\s*日?)?(?!\d)")
 _QUARTER = re.compile(r"(?<!\d)(?:19|20)\d{2}\s*(?:年\s*)?(?:Q[1-4]|第[一二三四1234]季度)", re.I)
+_ORDINAL = re.compile(r"第\s*\d+(?:\s*届)?\s*(?:次|届|号)")
 _NUMBER = r"\d+(?:[\s,，]\d{3})*(?:\.\d+)?"
 # One controlled unit vocabulary is shared by standalone metrics and both
 # endpoints of metric transitions.  Longest/dimension-bearing spellings must
@@ -20,13 +21,17 @@ _UNIT = (
     r"(?:单\s*[/／]\s*小时|件\s*[/／]\s*日|人\s*[/／]\s*天|人天|"
     r"%|％|(?:人民币)?亿元|(?:人民币)?万元|亿美元|万美元|亿元|万元|万人|万家|万条|万次|"
     r"百万\+?|亿\+?|万\+?(?![元人家条次])|美元|人民币|元|个\s*工作日|工作日|"
-    r"毫秒|秒|分钟|小时|天|周|个月|月|年|倍|[×xX]|单|件|条|次|人|家|业务线)"
+    r"毫秒|秒|分钟|小时|天|周|个月|月|年|倍|[×xX]|单|件|条|次|人(?!才)|家|业务线)"
 )
 _METRIC = re.compile(rf"(?<![A-Za-z0-9]){_NUMBER}\s*{_UNIT}(?![A-Za-z])")
 _TRANSITION_WORD = r"(?:→|⇒|->|至|到|提升(?:到|至)|提高(?:到|至)|增长(?:到|至)|增至|升至|下降(?:到|至)|降低(?:到|至)|降至|变为)"
 _TRANSITION = re.compile(
     rf"(?<![A-Za-z0-9])(?P<before>{_NUMBER})\s*(?P<before_unit>{_UNIT})?\s*"
     rf"(?P<operator>{_TRANSITION_WORD})\s*(?P<after>{_NUMBER})\s*(?P<after_unit>{_UNIT})?(?![A-Za-z0-9])"
+)
+_TEMPORAL_RANGE = re.compile(
+    r"(?<!\d)(?P<before>\d{1,2})\s*(?P<before_unit>月|月份)\s*"
+    r"(?:至|到|→|->)\s*(?P<after>\d{1,2})\s*(?P<after_unit>月|月份)(?!\d)"
 )
 _FREQUENCY = re.compile(r"(?:7\s*[×xX]\s*24|每(?:周|月|季度|年)|双周|会后\s*[一二三四五六七八九十两\d]+\s*(?:天|周|个工作日))")
 _LEGAL = re.compile(r"(?:符合|遵守|满足)《[^》]{2,60}》")
@@ -71,7 +76,8 @@ def _legacy_normalized(value: str) -> str:
 
 def _kind(pattern: re.Pattern[str]) -> str:
     return {
-        _DATE: "date", _QUARTER: "quarter", _METRIC: "metric", _TRANSITION: "metric_transition", _FREQUENCY: "frequency",
+        _DATE: "date", _QUARTER: "quarter", _ORDINAL: "ordinal", _TEMPORAL_RANGE: "derived_temporal_range",
+        _METRIC: "metric", _TRANSITION: "metric_transition", _FREQUENCY: "frequency",
         _LEGAL: "legal_commitment", _ORG: "organization_commitment",
     }[pattern]
 
@@ -85,10 +91,10 @@ def _occurrences(text: str) -> list[dict[str, Any]]:
     # artifact.  The visible value is reconstructed without those delimiters.
     scan_text = re.sub(r"[*_`]", " ", text)
     found = []
-    for pattern in (_DATE, _QUARTER, _TRANSITION, _METRIC, _FREQUENCY, _LEGAL, _ORG):
+    for pattern in (_DATE, _QUARTER, _ORDINAL, _TEMPORAL_RANGE, _TRANSITION, _METRIC, _FREQUENCY, _LEGAL, _ORG):
         for match in pattern.finditer(scan_text):
             visible_value = re.sub(r"[*_`]", "", text[match.start():match.end()])
-            if pattern is _TRANSITION:
+            if pattern in {_TRANSITION, _TEMPORAL_RANGE}:
                 before_unit = re.sub(r"\s+", "", match.group("before_unit") or "").replace("／", "/")
                 after_unit = re.sub(r"\s+", "", match.group("after_unit") or "").replace("／", "/")
                 if before_unit and after_unit and before_unit != after_unit:
@@ -100,8 +106,26 @@ def _occurrences(text: str) -> list[dict[str, Any]]:
                 "start": match.start(),
                 "end": match.end(),
             })
+    # Prefer semantic containers over nested numeric fragments. A complete date
+    # is one fact, an ordinal is not a KPI, and a month range is temporal rather
+    # than a metric transition. This also prevents navigation text such as
+    # ``4人才培养`` from manufacturing a headcount claim.
+    protected = [
+        item for item in found
+        if item["kind"] in {"date", "quarter", "ordinal", "derived_temporal_range"}
+    ]
+    filtered = []
+    for item in found:
+        if item["kind"] in {"metric", "metric_transition"} and any(
+            other is not item
+            and other["start"] <= item["start"]
+            and item["end"] <= other["end"]
+            for other in protected
+        ):
+            continue
+        filtered.append(item)
     unique = {}
-    for item in sorted(found, key=lambda value: (value["start"], -(value["end"] - value["start"]))):
+    for item in sorted(filtered, key=lambda value: (value["start"], -(value["end"] - value["start"]))):
         key = (item["start"], item["end"], item["normalized_value"])
         unique.setdefault(key, item)
     return list(unique.values())
@@ -175,6 +199,28 @@ def validate_claim_ledger(ledger: dict[str, Any]) -> dict[str, Any]:
 
 
 def _derived_binding(text: str, occurrence: dict[str, Any], known: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    if occurrence["kind"] == "derived_temporal_range":
+        match = _TEMPORAL_RANGE.fullmatch(re.sub(r"[*_`]", "", occurrence["value"]).strip())
+        if match:
+            endpoint_ids: list[str] = []
+            for month in (int(match.group("before")), int(match.group("after"))):
+                direct = known.get(f"{month}月") or known.get(f"{month}月份")
+                if direct is not None:
+                    endpoint_ids.append(direct["claim_id"])
+                    continue
+                dated = next((
+                    claim for claim in known.values()
+                    if claim.get("kind") == "date"
+                    and re.search(rf"(?:年|[-/.])\s*0?{month}(?:\s*(?:月|[-/.]))", claim.get("value", ""))
+                ), None)
+                if dated is None:
+                    return None
+                endpoint_ids.append(dated["claim_id"])
+            return {
+                "status": "derived",
+                "source_claim_ids": list(dict.fromkeys(endpoint_ids)),
+                "formula": "derived_temporal_range",
+            }
     window = text[max(0, occurrence["start"] - 48): min(len(text), occurrence["end"] + 48)]
     for formula in _FORMULA.finditer(window):
         unit = _normalized(formula.group("unit") or "")

@@ -506,13 +506,13 @@ class StageBAgentTests(unittest.TestCase):
         self.assertEqual(caught.exception.code,"agent_invalid_output")
         self.assertEqual(caught.exception.audit[-1]["reason"],"invalid_output")
 
-    def test_snapshot_is_closed_and_rechecked_on_every_read(self):
+    def test_snapshot_is_closed_and_frozen_for_every_read(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); make_skill(root, {"SKILL.md": b"ok"})
             skill = SkillRuntime(root); (root / "references").mkdir(); (root / "references/unlocked.md").write_text("no")
             with self.assertRaises(ValidationError): skill.read_skill_file("references/unlocked.md")
             (root / "SKILL.md").write_text("tampered")
-            with self.assertRaises(ValidationError): skill.read_skill_file("SKILL.md")
+            self.assertTrue(skill.read_skill_file("SKILL.md")["content"].endswith("ok"))
             with self.assertRaises(ValidationError): skill.read_skill_file("bad\0path")
 
     def test_schema_limits_deadline_and_failure_audit(self):

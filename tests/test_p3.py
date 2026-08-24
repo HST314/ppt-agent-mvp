@@ -4,11 +4,27 @@ from pathlib import Path
 from ppt_agent.api import App
 from ppt_agent.errors import ConflictError, ValidationError
 from ppt_agent.gateways import FakeSkillLoader
+from ppt_agent.p3 import requested_slide_count
 from ppt_agent.service import TaskService
 from ppt_agent.store import WorkspaceStore
 
 
 class P3Tests(unittest.TestCase):
+    def test_page_count_range_and_nested_constraint_do_not_fall_back(self):
+        self.assertEqual(requested_slide_count({"constraints":{"page_count":"10_to_15"}}),10)
+        self.assertEqual(requested_slide_count({"constraints":{"brief":{"页数":"12-15页"}}}),12)
+
+    def test_generation_brief_contains_full_text_resource_and_typed_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service=TaskService(WorkspaceStore(tmp),generation_pipeline=object())
+            service.create("evidence")
+            source={"goal":"发布","audience":"客户","topic":"学院方案","content":"2025年9月30日，经第133次会议研究决定，正式成立集成电路学院"}
+            service.import_input("evidence",source)
+            brief=service._generation_core_brief("evidence")
+            self.assertEqual(len(brief.text_resources),1)
+            self.assertIn(source["content"],brief.text_resources[0].content)
+            self.assertTrue(any(fact.fact_type=="date" and source["content"] in fact.statement for fact in brief.confirmed_facts))
+            self.assertTrue(any(fact.fact_type=="ordinal" and fact.value=="第133次" for fact in brief.confirmed_facts))
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory(); self.service=TaskService(WorkspaceStore(self.tmp.name),skills=FakeSkillLoader("skill-v3")); self.service.create("task-1")
         self.service.import_input("task-1",{"goal":"发布","audience":"客户","topic":"方案","页数":3})

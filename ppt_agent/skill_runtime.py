@@ -113,11 +113,24 @@ class SkillSnapshot:
     description: str
     digest: str
     file_hashes: tuple[tuple[str, str], ...]
+    file_contents: tuple[tuple[str, bytes], ...]
     total_bytes: int
 
     @property
     def manifest(self) -> dict[str, str]:
         return dict(self.file_hashes)
+
+    @property
+    def contents(self) -> dict[str, bytes]:
+        """Frozen bytes used by every runtime created from this snapshot.
+
+        A digest alone detects a mutable source tree but cannot provide the
+        immutable, in-flight Job semantics promised by the Skill protocol.
+        Keeping the bounded bytes in the snapshot means a file replacement can
+        affect only a resolver reload/new Job, never a running one.
+        """
+
+        return dict(self.file_contents)
 
 
 class ActiveSkillResolver:
@@ -239,6 +252,7 @@ class ActiveSkillResolver:
     def _build_snapshot(self, active: str) -> SkillSnapshot:
         root = self._active_root(active)
         hashes: dict[str, str] = {}
+        contents: dict[str, bytes] = {}
         total_bytes = 0
         skill_entry: bytes | None = None
         for path in self._standard_files(root):
@@ -251,6 +265,7 @@ class ActiveSkillResolver:
             if len(hashes) >= self.max_files or total_bytes > self.max_snapshot_bytes:
                 raise ValidationError("Skill 快照超过文件数或总大小上限")
             hashes[relative] = hashlib.sha256(raw).hexdigest()
+            contents[relative] = raw
             if relative == "SKILL.md":
                 skill_entry = raw
         if skill_entry is None:
@@ -272,6 +287,7 @@ class ActiveSkillResolver:
             description=description,
             digest=digest,
             file_hashes=tuple(sorted(hashes.items())),
+            file_contents=tuple(sorted(contents.items())),
             total_bytes=total_bytes,
         )
 
@@ -351,6 +367,8 @@ class SkillRuntime:
         self.max_script_output_bytes = max_script_output_bytes
         self.total_bytes = 0
         self.manifest = snapshot.manifest
+        self.contents = snapshot.contents
+        self._read_cache: dict[tuple[str, int, int | None], dict] = {}
         self.skill_name = snapshot.name
         self.skill_description = snapshot.description
         self.skill_version = snapshot.digest
@@ -443,11 +461,7 @@ class SkillRuntime:
             raise self._whitelist_error(asset, allowed_files)
         if asset and not name.startswith("assets/"):
             raise self._whitelist_error(asset=True, allowed_files=allowed_files)
-        raw = _read_regular_file(
-            path,
-            max_bytes=self.max_file_bytes,
-            limit_message="Skill 单文件超过读取上限",
-        )
+        raw = self.contents[name]
         if hashlib.sha256(raw).hexdigest() != self.manifest[name]:
             raise ValidationError(f"Skill 快照文件校验失败：{name}")
         return path, raw
@@ -459,28 +473,68 @@ class SkillRuntime:
             raise ValidationError("Skill 累计读取超过上限")
         self.total_bytes += size
 
-    def read_skill_file(self, name: str, *, allowed_files: frozenset[str] | None = None) -> dict:
+    @staticmethod
+    def _text_chunk(raw: bytes, offset: int, limit: int | None) -> tuple[str, int, bool]:
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValidationError("Skill 文件 offset 必须是非负整数")
+        if limit is not None and (
+            isinstance(limit, bool) or not isinstance(limit, int) or limit < 1
+        ):
+            raise ValidationError("Skill 文件 limit 必须是正整数")
+        if offset > len(raw):
+            raise ValidationError("Skill 文件 offset 超出文件长度")
+        end = len(raw) if limit is None else min(len(raw), offset + limit)
+        # Byte ranges can land inside a UTF-8 code point. Move only the chunk
+        # end backwards; callers resume at next_offset without data loss.
+        while end > offset:
+            try:
+                content = raw[offset:end].decode("utf-8")
+                return content, end, end == len(raw)
+            except UnicodeDecodeError as exc:
+                if exc.start == 0:
+                    raise ValidationError("Skill 文件 offset 必须位于 UTF-8 字符边界") from exc
+                end -= 1
+        if offset == len(raw):
+            return "", offset, True
+        raise ValidationError("Skill 文件分段读取无法形成 UTF-8 文本")
+
+    def read_skill_file(
+        self,
+        name: str,
+        *,
+        offset: int = 0,
+        limit: int | None = None,
+        allowed_files: frozenset[str] | None = None,
+    ) -> dict:
         name = self._normalize_tool_path(name)
         path, raw = self._locked_bytes(name, allowed_files=allowed_files)
         if path.suffix.lower() not in self.TEXT_SUFFIXES:
             raise ValidationError("Skill 文件不是允许的 UTF-8 文本；二进制 Asset 请用 get_asset_info")
-        self._charge(len(raw))
+        cache_key = (name, offset, limit)
+        cached = self._read_cache.get(cache_key)
+        if cached is not None:
+            return {**cached, "cached": True}
         try:
-            content = raw.decode("utf-8")
+            content, next_offset, eof = self._text_chunk(raw, offset, limit)
         except UnicodeError as exc:
-            self.total_bytes -= len(raw)
             raise ValidationError("Skill 文件无法按 UTF-8 读取") from exc
-        return {
+        returned_bytes = next_offset - offset
+        self._charge(returned_bytes)
+        result = {
             "path": name,
             "content": content,
-            "bytes": len(raw),
+            "bytes": returned_bytes,
+            "offset": offset,
+            "next_offset": next_offset,
+            "eof": eof,
             "sha256": hashlib.sha256(raw).hexdigest(),
         }
+        self._read_cache[cache_key] = result
+        return result
 
     def get_asset_info(self, name: str, *, allowed_files: frozenset[str] | None = None) -> dict:
         name = self._normalize_tool_path(name)
         _, raw = self._locked_bytes(name, asset=True, allowed_files=allowed_files)
-        self._charge(len(raw))
         return {
             "path": name,
             "bytes": len(raw),
@@ -748,7 +802,12 @@ class SkillRuntime:
         if name == "list_skill_files":
             return self.list_skill_files(allowed_files=allowed_files)
         if name == "read_skill_file":
-            return self.read_skill_file(arguments.get("path"), allowed_files=allowed_files)
+            return self.read_skill_file(
+                arguments.get("path"),
+                offset=arguments.get("offset", 0),
+                limit=arguments.get("limit"),
+                allowed_files=allowed_files,
+            )
         if name == "get_asset_info":
             return self.get_asset_info(arguments.get("path"), allowed_files=allowed_files)
         if name == "run_skill_script":

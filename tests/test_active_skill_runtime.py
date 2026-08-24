@@ -77,7 +77,7 @@ class ActiveSkillResolverTests(unittest.TestCase):
             self.assertEqual(new_runtime.read_skill_file("references/b.md")["content"], "B")
             self.assertNotEqual(old_digest, replacement.digest)
 
-    def test_cached_snapshot_excludes_late_files_and_detects_tampering(self):
+    def test_cached_snapshot_excludes_late_files_and_freezes_inflight_bytes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "skills"
             skill = write_skill(root, "alpha", name="alpha-skill", description="Alpha", files={"references/a.md": "A"})
@@ -91,9 +91,12 @@ class ActiveSkillResolverTests(unittest.TestCase):
 
             refreshed = resolver.reload()
             self.assertIn("references/new.md", refreshed.manifest)
+            refreshed_runtime = resolver.runtime()
             (skill / "references/a.md").write_text("changed", encoding="utf-8")
-            with self.assertRaisesRegex(ValidationError, "快照文件校验失败"):
-                runtime.read_skill_file("references/a.md")
+            self.assertEqual(runtime.read_skill_file("references/a.md")["content"], "A")
+            self.assertEqual(refreshed_runtime.read_skill_file("references/a.md")["content"], "A")
+            resolver.reload()
+            self.assertEqual(resolver.runtime().read_skill_file("references/a.md")["content"], "changed")
 
     def test_active_path_and_symlinks_fail_closed(self):
         with tempfile.TemporaryDirectory() as tmp:

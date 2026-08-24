@@ -160,9 +160,11 @@ def questions_for(card):
     result=[]
     for key in card["missing"]:
         prompt, values=specs[key]
+        selected=values[:3]
         result.append({"question_id":f"missing-{key}","field_path":key,"field":key,"prompt":prompt,
           "helper_text":"请选择最符合实际情况的一项，也可以填写自定义答案。",
-          "options":[{"value":value,"label":value,"description":""} for value in values],
+          "options":[{"value":value,"label":value,"description":"选择后将据此确定本阶段内容重点。"} for value in selected],
+          "recommended":selected[0],
           "allow_other":True,"blocking":True})
     return result[:6]
 

@@ -100,7 +100,7 @@ STAGE_OUTPUT_SCHEMAS = {
         "question_id": {"type": "string"}, "field_path": {"type": "string"}, "prompt": {"type": "string"},
         "helper_text": {"type": "string"}, "options": {"type": "array", "items": _object_schema({
             "value": {"type": "string"}, "label": {"type": "string"}, "description": {"type": "string"}
-        }, ["value", "label", "description"])}, "allow_other": {"type": "boolean"}, "blocking": {"type": "boolean"}
+        }, ["value", "label", "description"])}, "recommended": {"type": "string"}, "allow_other": {"type": "boolean"}, "blocking": {"type": "boolean"}
     }, ["question_id", "field_path", "prompt", "helper_text", "options", "allow_other", "blocking"])}}, ["questions"])},
     "narrative": {"name": "narrative", "strict": True, "schema": _object_schema({"markdown": {"type": "string", "minLength": 1, "pattern": r"\S"}}, ["markdown"])},
     "outline": {"name": "outline", "strict": True, "schema": _object_schema({"slides": {
@@ -227,11 +227,21 @@ def _list_skill_files_tool() -> dict:
     return {"type": "function", "name": "list_skill_files", "description": "列出当前 Skill 快照中的标准文件路径；只用于按需发现，不会读取文件正文", "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}
 
 
-def _read_skill_file_tool(paths: frozenset[str] | set[str] | None = None) -> dict:
+def _read_skill_file_tool(
+    paths: frozenset[str] | set[str] | None = None,
+    *,
+    paginated: bool = True,
+) -> dict:
     path_schema: dict[str, Any] = {"type": "string"}
     if paths is not None:
         path_schema["enum"] = sorted(paths)
-    return {"type": "function", "name": "read_skill_file", "description": "读取一个当前 Skill 快照中的 UTF-8 文本文件；必须首先完整读取 SKILL.md", "parameters": {"type": "object", "properties": {"path": path_schema}, "required": ["path"], "additionalProperties": False}}
+    properties: dict[str, Any] = {"path": path_schema}
+    if paginated:
+        properties.update({
+            "offset": {"type": "integer", "minimum": 0},
+            "limit": {"type": "integer", "minimum": 1},
+        })
+    return {"type": "function", "name": "read_skill_file", "description": "读取一个当前 Skill 快照中的 UTF-8 文本文件；大文件可用 offset/limit 分段读取，必须首先完整读取 SKILL.md", "parameters": {"type": "object", "properties": properties, "required": ["path"], "additionalProperties": False}}
 
 
 def _get_asset_info_tool(paths: frozenset[str] | set[str] | None = None) -> dict:
@@ -275,7 +285,7 @@ def _tools_for_stage(
     if stage == "clarification":
         return []
     if not entry_read:
-        return [_read_skill_file_tool(frozenset({SKILL_ENTRY}))]
+        return [_read_skill_file_tool(frozenset({SKILL_ENTRY}), paginated=False)]
     text_files = remaining_text_files
     if text_files is None:
         text_files = frozenset(
@@ -300,10 +310,11 @@ class AgentResult:
     value: dict
     audit: tuple[dict, ...]
     response_id: str | None
+    validation: dict[str, Any] | None = None
 
 
 class AgentRuntime:
-    def __init__(self, client, skill: SkillRuntime, *, max_steps: int = 12, timeout_seconds: float = 60, clock=time.monotonic, max_output_bytes: int = 1024 * 1024, max_tool_calls: int = 24, max_provider_calls: int = 8, max_schema_corrections: int = 1, max_tool_error_rounds: int = 2, max_exploration_rounds: int | None = None, max_unique_files: int = 4, max_skill_bytes: int = 128 * 1024, reserved_final_calls: int = 1):
+    def __init__(self, client, skill: SkillRuntime, *, max_steps: int = 12, timeout_seconds: float = 60, clock=time.monotonic, max_output_bytes: int = 1024 * 1024, max_tool_calls: int = 24, max_provider_calls: int = 8, max_schema_corrections: int = 1, max_tool_error_rounds: int = 2, max_exploration_rounds: int | None = None, max_unique_files: int = 4, max_skill_bytes: int = 128 * 1024, reserved_final_calls: int = 1, allow_schema_override: bool = False):
         self.client, self.skill = client, skill
         self.max_steps, self.timeout_seconds, self.clock = max_steps, timeout_seconds, clock
         self.max_output_bytes, self.max_tool_calls = max_output_bytes, max_tool_calls
@@ -335,19 +346,40 @@ class AgentRuntime:
         self.max_unique_files = max_unique_files
         self.max_skill_bytes = max_skill_bytes
         self.reserved_final_calls = reserved_final_calls
+        self.allow_schema_override = allow_schema_override
         self.skill.max_total_bytes = min(self.skill.max_total_bytes, max_skill_bytes)
         self.last_audit: tuple[dict, ...] = ()
 
-    def run(self, stage: str, payload: dict, *, response_schema: dict | None = None, capability_probe: bool = False) -> AgentResult:
+    def run(
+        self,
+        stage: str,
+        payload: dict,
+        *,
+        response_schema: dict | None = None,
+        capability_probe: bool = False,
+        system_instruction: str | None = None,
+        result_validator=None,
+        max_semantic_corrections: int = 1,
+    ) -> AgentResult:
         from .execution import checkpoint, interruptible, progress, remaining_seconds
         from .model_clients import ProviderCallBudget
         if stage not in STAGES:
             raise ValidationError("Agent 阶段不在允许列表")
         allowed_schemas = (STAGE_OUTPUT_SCHEMAS[stage], STAGE_PROVIDER_SCHEMAS[stage])
-        if response_schema is not None and response_schema not in allowed_schemas:
+        if response_schema is not None and response_schema not in allowed_schemas and not self.allow_schema_override:
             raise ValidationError("阶段输出 Schema 不允许覆盖")
-        local_schema = STAGE_OUTPUT_SCHEMAS[stage]
-        provider_schema = STAGE_PROVIDER_SCHEMAS[stage]
+        local_schema = response_schema or STAGE_OUTPUT_SCHEMAS[stage]
+        provider_schema = _provider_schema(local_schema)
+        if (
+            isinstance(max_semantic_corrections, bool)
+            or not isinstance(max_semantic_corrections, int)
+            or not 0 <= max_semantic_corrections <= 2
+        ):
+            raise ValidationError("语义纠错次数必须是 0 到 2 的整数")
+        if system_instruction is not None and (
+            not isinstance(system_instruction, str) or not system_instruction.strip()
+        ):
+            raise ValidationError("阶段补充指令无效")
         if not isinstance(payload, dict):
             raise ValidationError("Agent 输入无效")
         payload = self._text_only(payload)
@@ -362,6 +394,8 @@ class AgentRuntime:
         stage_tools = _tools_for_stage(stage, self.skill, entry_read=stage == "clarification")
         override = CLARIFICATION_OVERRIDE if stage == "clarification" else PRODUCT_OVERRIDE
         started, audit, tool_count, tool_error_rounds, schema_corrections = self.clock(), [], 0, 0, 0
+        semantic_corrections = 0
+        semantic_evidence = None
         active_step = 0
 
         def metrics(*, provider_calls: int | None = None) -> dict[str, Any]:
@@ -383,7 +417,8 @@ class AgentRuntime:
             )
 
         provider_call_budget = ProviderCallBudget(self.max_provider_calls, provider_claimed)
-        successful_read_count, successful_read_paths = 0, set()
+        successful_read_count, successful_read_paths, completed_read_paths = 0, set(), set()
+        successful_read_keys: set[tuple[str, int, int | None]] = set()
         successful_read_digests: dict[str, str] = {}
         exploration_rounds, repeated_read_count, skill_bytes = 0, 0, 0
         force_final_output = False
@@ -403,7 +438,7 @@ class AgentRuntime:
                 return "tool_final_output"
             return "tool_result"
 
-        def fail(message: str, reason: str, cause=None):
+        def fail(message: str, reason: str, cause=None, rejected_output=None):
             phase = probe_phase(reason) if capability_probe else None
             terminal = {
                 "event": "terminal",
@@ -435,6 +470,8 @@ class AgentRuntime:
                 underlying_code=underlying_code if underlying_code != mapped_code else None,
             )
             error.audit = self.last_audit
+            if rejected_output is not None:
+                error.rejected_output = rejected_output
             if cause is not None:
                 raise error from cause
             raise error
@@ -445,7 +482,10 @@ class AgentRuntime:
                 if stage == "clarification"
                 else "\n这是启动能力探测：必须先调用 read_skill_file 完整读取 SKILL.md，收到工具结果后再提交符合 Schema 的 JSON。"
             )
-        conversation: list[Any] = [{"role": "system", "content": f"当前阶段：{stage}\n阶段目标：{STAGE_PROMPTS[stage]}\n{override}\n{tool_contract}{probe_instruction}\n{_output_contract(local_schema)}"}, {"role": "user", "content": input_json}]
+        stage_goal = STAGE_PROMPTS[stage]
+        if system_instruction:
+            stage_goal = f"{stage_goal}\n当前契约补充要求：{system_instruction.strip()}"
+        conversation: list[Any] = [{"role": "system", "content": f"当前阶段：{stage}\n阶段目标：{stage_goal}\n{override}\n{tool_contract}{probe_instruction}\n{_output_contract(local_schema)}"}, {"role": "user", "content": input_json}]
         effective_round_budget = min(self.max_steps, self.max_provider_calls)
         convergence_step = max(1, (effective_round_budget * 4 + 4) // 5)
         for step in range(1, self.max_steps + 1):
@@ -457,7 +497,7 @@ class AgentRuntime:
             try:
                 tool_choice = None
                 entry_read = SKILL_ENTRY in successful_read_paths
-                remaining_text_files = frozenset(available_text_files - successful_read_paths)
+                remaining_text_files = frozenset(available_text_files - completed_read_paths)
                 request_tools = _tools_for_stage(
                     stage,
                     self.skill,
@@ -467,16 +507,12 @@ class AgentRuntime:
                 request_allowed_files = allowed_skill_files
                 missing_entry = stage in SKILL_STAGES and not entry_read
                 if missing_entry and not capability_probe:
-                    request_tools = [_read_skill_file_tool(frozenset({SKILL_ENTRY}))]
+                    request_tools = [_read_skill_file_tool(frozenset({SKILL_ENTRY}), paginated=False)]
                     tool_choice = {"type": "function", "name": "read_skill_file"}
                 elif (
                     force_final_output
                     or provider_call_budget.claimed >= self.max_provider_calls - self.reserved_final_calls
-                    or (stage in SKILL_STAGES and not recovery_active and (
-                        exploration_rounds >= self.max_exploration_rounds
-                        or successful_read_count >= self.max_unique_files
-                        or skill_bytes >= self.max_skill_bytes
-                    ))
+                    or (stage in SKILL_STAGES and not recovery_active and skill_bytes >= self.max_skill_bytes)
                 ):
                     request_tools = []
                     request_allowed_files = frozenset()
@@ -608,15 +644,20 @@ class AgentRuntime:
                     tool_count += 1
                     if tool_count > self.max_tool_calls:
                         fail("Agent 工具调用超过上限", "tool_call_limit")
-                    repeated = call.name == "read_skill_file" and normalized_path in successful_read_paths
+                    offset = args.get("offset", 0) if isinstance(args, dict) else 0
+                    limit = args.get("limit") if isinstance(args, dict) else None
+                    read_key = (normalized_path, offset, limit)
+                    repeated = call.name == "read_skill_file" and read_key in successful_read_keys
                     if error is None and repeated:
                         repeated_read_count += 1
-                        result = {"ok": True, "path": normalized_path, "already_read": True, "cached": True, "bytes": 0, "sha256": successful_read_digests.get(normalized_path), "message": "该文件已读取；请复用已有上下文并直接提交最终 JSON"}
-                        force_final_output = True
+                        try:
+                            result = self.skill.dispatch(call.name, args, allowed_files=request_allowed_files)
+                            result = {**result, "already_read": True, "cached": True}
+                            force_final_output = True
+                        except (ValidationError, OSError, ValueError) as exc:
+                            result = {"ok": False, "error": {"code": self._tool_error_code(call.name, str(exc)), "message": str(exc)}}
                     elif error is None and call.name not in request_tool_names:
                         result = {"ok": False, "error": {"code": "unauthorized_tool", "message": "当前轮次未授权该工具；请使用已提供的工具或直接提交最终 JSON"}}
-                    elif error is None and call.name == "read_skill_file" and successful_read_count >= self.max_unique_files:
-                        result = {"ok": False, "error": {"code": "quota_exceeded", "message": f"当前阶段最多读取 {self.max_unique_files} 个 Skill 文件；请直接提交最终 JSON"}}
                     else:
                         try:
                             result = error or self.skill.dispatch(call.name, args, allowed_files=request_allowed_files)
@@ -628,9 +669,13 @@ class AgentRuntime:
                     else:
                         successful_calls += 1
                         if call.name == "read_skill_file" and not repeated:
-                            successful_read_count += 1
+                            successful_read_keys.add(read_key)
                             if isinstance(result.get("path"), str):
+                                if result["path"] not in successful_read_paths:
+                                    successful_read_count += 1
                                 successful_read_paths.add(result["path"])
+                                if result.get("eof") is True:
+                                    completed_read_paths.add(result["path"])
                                 if isinstance(result.get("sha256"), str):
                                     successful_read_digests[result["path"]] = result["sha256"]
                             if isinstance(result.get("bytes"), int):
@@ -651,9 +696,7 @@ class AgentRuntime:
                 if recovery_active:
                     remaining_paths = self._remaining_paths(
                         available_text_files,
-                        successful_read_paths,
-                        successful_read_count,
-                        self.max_unique_files,
+                        completed_read_paths,
                     )
                 # Budget failed *model rounds*, not individual calls.  Every
                 # call in one response is processed and fed back as one batch.
@@ -735,6 +778,27 @@ class AgentRuntime:
                     force_final_output = True
                     continue
                 fail(exc.message, "invalid_output", exc)
+            if result_validator is not None:
+                progress("validating_evidence", "校验事实证据与业务约束", metrics())
+                try:
+                    semantic_evidence = result_validator(value)
+                except Exception as exc:
+                    if semantic_corrections < max_semantic_corrections:
+                        semantic_corrections += 1
+                        audit.append({
+                            "step": step,
+                            "event": "semantic_correction",
+                            "attempt": semantic_corrections,
+                            "error_type": type(exc).__name__,
+                        })
+                        progress("correcting", "业务校验未通过，正在进行一次语义纠错", metrics())
+                        conversation.extend([
+                            {"role": "assistant", "content": turn.text or ""},
+                            {"role": "user", "content": f"上次候选未通过证据/业务校验：{str(exc)}。请保留已读取的 Skill 与证据上下文，修正违规字段后重新提交完整 JSON；不要调用工具，不要添加解释。"},
+                        ])
+                        force_final_output = True
+                        continue
+                    fail("Agent 候选在一次语义纠错后仍未通过业务校验", "invalid_output", exc, value)
             if capability_probe and stage != "clarification" and not any(
                 item.get("event") == "tool"
                 and item.get("tool") == "read_skill_file"
@@ -745,7 +809,7 @@ class AgentRuntime:
             audit.append({"event": "terminal", "reason": "success", "tool_calls": tool_count, "provider_calls": provider_call_budget.claimed, "exploration_rounds": exploration_rounds, "cumulative_skill_bytes": skill_bytes, "unique_skill_files": len(successful_read_paths), "applied_skill_files": sorted(successful_read_paths), "skill_entry_read": SKILL_ENTRY in successful_read_paths, "repeated_skill_reads": repeated_read_count})
             progress("agent_completed", "模型输出已返回，正在执行技术校验", metrics())
             self.last_audit = tuple(audit)
-            return AgentResult(value, self.last_audit, turn.response_id)
+            return AgentResult(value, self.last_audit, turn.response_id, semantic_evidence)
         fail("Agent 达到最大步数，未提交阶段产物", "max_steps")
 
     @staticmethod
@@ -806,13 +870,9 @@ class AgentRuntime:
     @staticmethod
     def _remaining_paths(
         available_text_files: frozenset[str],
-        successful_read_paths: set[str],
-        successful_read_count: int,
-        max_unique_files: int = 4,
+        completed_read_paths: set[str],
     ) -> frozenset[str] | None:
-        if successful_read_count >= max_unique_files:
-            return frozenset()
-        return frozenset(available_text_files - successful_read_paths)
+        return frozenset(available_text_files - completed_read_paths)
 
     @staticmethod
     def _tool_recovery_instruction(remaining_paths: frozenset[str] | None) -> str:

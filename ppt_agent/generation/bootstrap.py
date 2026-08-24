@@ -8,8 +8,10 @@ from typing import Any
 from ..browser_inspection import ChromiumDeckInspector
 from ..rendering.renderer import DeterministicRenderer
 from ..rendering.validator import TechnicalValidator
+from ..skill_runtime import ActiveSkillResolver
 from .model_gateway import ModelGateway
 from .pipeline import FileCheckpointStore, GenerationPipeline
+from .stage_agent import StageAgentExecutor
 
 
 class ResponsesProviderAdapter:
@@ -107,10 +109,22 @@ def build_generation_pipeline(config, *, data_root: str | Path, generation_clien
     )
     chromium = resolve_chromium_executable(repository_root)
     root = Path(data_root).resolve()
+    resolver = ActiveSkillResolver(config.skills.root, config.skills.active)
+    stage_agent = StageAgentExecutor(
+        generation_client,
+        resolver,
+        model=config.generation.model,
+        timeout_seconds=config.generation.run_timeout_seconds,
+        max_steps=config.generation.max_steps,
+        max_tool_calls=config.generation.max_tool_calls,
+        max_provider_calls=config.generation.max_provider_calls,
+        stage_budgets=config.generation.stage_budgets,
+    )
     return GenerationPipeline(
         gateway,
         FileCheckpointStore(root / "generation-checkpoints"),
         DeterministicRenderer(),
         TechnicalValidator(ChromiumDeckInspector(executable_path=chromium), require_browser=True),
         asset_root=root,
+        stage_agent=stage_agent,
     )

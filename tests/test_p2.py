@@ -56,7 +56,10 @@ class P2Tests(unittest.TestCase):
   self.assertEqual(clarification["question_source"],"fallback")
   self.assertTrue(clarification["diagnostic_id"].startswith("clarification-"))
   question=clarification["details"][0]
-  self.assertEqual(set(question),{"question_id","field_path","field","prompt","helper_text","options","allow_other","blocking"})
+  self.assertEqual(
+   set(question),
+   {"question_id","field_path","field","prompt","helper_text","options","recommended","allow_other","blocking"},
+  )
   self.assertEqual(set(question["options"][0]),{"value","label","description"})
  def test_batch_requires_complete_round_without_partial_write(self):
   result=self.svc.import_input("task",{"topic":"新品"}); questions=result["clarification"]["details"]

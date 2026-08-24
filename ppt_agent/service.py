@@ -259,10 +259,48 @@ class TaskService:
                 uri=f"{task_id}/resources/{uri[len('resources://') :]}"
             resources.append({key:item[key] for key in ("resource_id","media_type","content_hash")} | {"uri":uri})
         ledger=view.get("claim_ledger") or self._ensure_claim_ledger(task_id,view)
-        facts=[
-            {"fact_id":f"fact-{index:03d}","text":str(claim["value"]),"source_refs":[]}
-            for index,claim in enumerate(ledger.get("claims",[]),1)
-        ]
+        source_text=json.dumps(view.get("source"),ensure_ascii=False,sort_keys=True) if not isinstance(view.get("source"),str) else view.get("source")
+        source_text=source_text or json.dumps(card,ensure_ascii=False,sort_keys=True)
+        text_resource_id="task-card-content"
+        text_resources=[{
+            "resource_id":text_resource_id,
+            "source_ref":"task_card.content_source",
+            "media_type":"text/plain; charset=utf-8",
+            "content_hash":digest(source_text.encode("utf-8")),
+            "content":source_text,
+        }]
+        type_map={
+            "date":"date","quarter":"date","ordinal":"ordinal","metric":"count",
+            "metric_transition":"metric","frequency":"frequency",
+            "derived_temporal_range":"temporal_range",
+        }
+        facts=[]
+        for claim in ledger.get("claims",[]):
+            value=str(claim["value"])
+            start=source_text.find(value)
+            span=None
+            statement=value
+            if start>=0:
+                end=start+len(value)
+                left=max(source_text.rfind(marker,0,start) for marker in ("。","；",";","\n"))+1
+                right_candidates=[source_text.find(marker,end) for marker in ("。","；",";","\n")]
+                right=min((item for item in right_candidates if item>=0),default=len(source_text))
+                left=max(left,start-1_500)
+                right=min(right,end+1_500)
+                statement=source_text[left:right+1].strip() or value
+                span={"start":start,"end":end}
+            facts.append({
+                "fact_id":f"fact-{claim['claim_id'].removeprefix('claim-')}",
+                "text":statement,
+                "source_refs":[text_resource_id],
+                "fact_type":type_map.get(claim.get("kind"),"statement"),
+                "statement":statement,
+                "source_ref":"task_card.content_source",
+                "source_span":span,
+                "subject":str(card.get("topic") or ""),
+                "predicate":"confirmed_source_statement",
+                "value":value,
+            })
         constraints=card.get("constraints") if isinstance(card.get("constraints"),dict) else {}
         style_preferences=constraints.get("style_preferences")
         if not isinstance(style_preferences,dict):
@@ -271,10 +309,11 @@ class TaskService:
             "schema_version":"1.0","goal":card["goal"],"audience":card["audience"],"topic":card["topic"],
             "slide_count":count,"language":str(constraints.get("language") or "zh-CN"),
             "style_preferences":style_preferences,"resource_manifest":resources,"confirmed_facts":facts,
+            "text_resources":text_resources,
         })
     @staticmethod
     def _generation_core_evidence(result):
-        return {
+        evidence={
             "checkpoint_id":result.checkpoint.checkpoint_id,
             "output_sha256":result.checkpoint.output_sha256,
             "contract_name":result.checkpoint.contract_name,
@@ -284,18 +323,34 @@ class TaskService:
             "pipeline_version":result.checkpoint.metadata.get("pipeline_version"),
             "reused":result.reused,
         }
+        for key in ("skill_digest","skill_entry_read","applied_skill_file_hashes","validator_version","evidence_version"):
+            if key in result.checkpoint.metadata: evidence[key]=result.checkpoint.metadata[key]
+        return evidence
     def _version_metadata(self,task_id,kind,artifact_hash):
         return next((item["metadata"] for item in self.versions(task_id,kind) if item["hash"]==artifact_hash),{})
+    @staticmethod
+    def _narrative_markdown_from_core(value,brief):
+        beats="\n".join(f"{index}. **{beat.purpose}**：{beat.message}" for index,beat in enumerate(value.story_arc,1))
+        return (f"# {value.thesis}\n\n## 受众结论\n{value.audience_takeaway}。本叙事围绕{brief.topic}组织已确认内容，"
+                f"帮助{brief.audience}理解关键判断、形成共同认知，并据此推进{brief.goal}。\n\n"
+                f"## 冻结任务上下文\n主题：{brief.topic}\n\n目标：{brief.goal}\n\n受众：{brief.audience}\n\n"
+                f"## 叙事路径\n{beats}\n\n## 表达语气\n{value.tone}\n")
     def _generate_narrative_with_core(self,task_id,view,state,scope):
         brief=self._generation_core_brief(task_id,view)
-        result=self.generation_pipeline.generate_narrative(task_id,brief,input_version=view["snapshot_hash"])
-        value=result.value
-        beats="\n".join(f"{index}. **{beat.purpose}**：{beat.message}" for index,beat in enumerate(value.story_arc,1))
-        text=(f"# {value.thesis}\n\n## 受众结论\n{value.audience_takeaway}。本叙事围绕{brief.topic}组织已确认内容，"
-              f"帮助{brief.audience}理解关键判断、形成共同认知，并据此推进{brief.goal}。\n\n"
-              f"## 冻结任务上下文\n主题：{brief.topic}\n\n目标：{brief.goal}\n\n受众：{brief.audience}\n\n"
-              f"## 叙事路径\n{beats}\n\n## 表达语气\n{value.tone}\n")
         ledger=view["claim_ledger"]; ledger_value={key:value for key,value in ledger.items() if key!="hash"}
+        def validate_candidate(candidate):
+            candidate_text=self._narrative_markdown_from_core(candidate,brief)
+            claim_result=assert_claims_bound(candidate_text,ledger_value,"叙事",allow_disclosed_assumptions=False)
+            quality_result=assert_narrative_quality(candidate_text,view["task_card"])
+            return {"claim_bindings":claim_result["bindings"],"narrative_quality":quality_result}
+        result=self.generation_pipeline.generate_narrative(
+            task_id,
+            brief,
+            input_version=view["snapshot_hash"],
+            candidate_validator=validate_candidate,
+        )
+        value=result.value
+        text=self._narrative_markdown_from_core(value,brief)
         claim_bindings=assert_claims_bound(text,ledger_value,"叙事")
         quality_evidence=assert_narrative_quality(text,view["task_card"])
         prior=self._current_version(task_id,"narrative"); version=len(self.versions(task_id,"narrative"))+1; content_hash=digest(text.encode())
@@ -310,7 +365,10 @@ class TaskService:
         for slide in outline.slides:
             blocks.extend((f"## [{slide.slide_id}] {slide.title}",f"- 页面角色：{slide.role}",f"- 页面目的：{slide.message}",f"- 视觉意图：{slide.visual_intent}"))
             for fact_id in slide.evidence_refs:
-                blocks.append(f"- 确认事实：{facts[fact_id]}"); used.add(fact_id)
+                if fact_id in facts:
+                    blocks.append(f"- 确认事实：{facts[fact_id]}"); used.add(fact_id)
+                else:
+                    blocks.append(f"- 证据资源：{fact_id}")
             blocks.append("")
         remaining=[text for fact_id,text in facts.items() if fact_id not in used]
         if remaining:
@@ -957,16 +1015,18 @@ class TaskService:
         视为"模型没有更多问题"提前确认，流程不被打断。
         """
         if not isinstance(questions,list) or len(questions)>max_questions: raise ValidationError(f"澄清模型 questions 必须为 0 到 {max_questions} 项")
-        required={"question_id","field_path","prompt","helper_text","options","allow_other","blocking"}; seen_ids=set(); seen_paths=set(); known={k for k in ("goal","audience","topic") if k not in card.get("missing",[])}; asked={path for path in asked_field_paths if isinstance(path,str)}; result=[]; filtered=0
+        required={"question_id","field_path","prompt","helper_text","options","allow_other","blocking"}; optional={"recommended"}; seen_ids=set(); seen_paths=set(); known={k for k in ("goal","audience","topic") if k not in card.get("missing",[])}; asked={path for path in asked_field_paths if isinstance(path,str)}; result=[]; filtered=0
         for q in questions:
-            if not isinstance(q,dict) or set(q)!=required: raise ValidationError("澄清问题 Schema 无效")
+            if not isinstance(q,dict) or not required.issubset(q) or set(q)-required-optional: raise ValidationError("澄清问题 Schema 无效")
             if q["question_id"] in seen_ids or q["field_path"] in seen_paths: raise ValidationError("澄清问题存在重复 ID 或字段")
             if q["field_path"] in known or q["field_path"] in asked:
                 filtered+=1; continue
             if not all(isinstance(q[k],str) and q[k].strip() for k in ("question_id","field_path","prompt","helper_text")) or not isinstance(q["allow_other"],bool) or not isinstance(q["blocking"],bool): raise ValidationError("澄清问题字段无效")
             if not isinstance(q["options"],list) or any(not isinstance(o,dict) or set(o)!={"value","label","description"} or not all(isinstance(o[k],str) for k in o) or not o["value"].strip() or not o["label"].strip() for o in q["options"]): raise ValidationError("澄清选项 Schema 无效")
             if len({o["value"] for o in q["options"]})!=len(q["options"]): raise ValidationError("澄清选项重复")
-            seen_ids.add(q["question_id"]); seen_paths.add(q["field_path"]); result.append({**q,"field":q["field_path"]})
+            recommended=q.get("recommended") or (q["options"][0]["value"] if q["options"] else "")
+            if recommended and recommended not in {item["value"] for item in q["options"]}: raise ValidationError("澄清推荐项不在选项中")
+            seen_ids.add(q["question_id"]); seen_paths.add(q["field_path"]); result.append({**q,"recommended":recommended,"field":q["field_path"]})
         return result, filtered
     def _record_clarification(self,task_id,view,questions,status,model,error,action,source="model",extra=None):
         config=self._task_clarification_config(task_id)
