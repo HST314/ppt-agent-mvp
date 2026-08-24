@@ -34,8 +34,8 @@ models:
         max_unique_files: 4
         max_skill_bytes: 131072
         reserved_final_calls: 2
-    # 结构化输出模式：auto=默认，端点不支持 text.format 时自动降级；json_schema=强制发送；prompt=从不发送
-    structured_output: auto
+    # 生成内核强制使用 provider JSON Schema；不支持该能力的端点不会进入 ready。
+    structured_output: json_schema
   inspection:
     provider: openai_responses
     model: your-inspection-model

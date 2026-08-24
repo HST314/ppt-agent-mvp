@@ -141,8 +141,11 @@ class ChromiumDeckInspector:
 
     enforce_on_generation = True
 
-    def __init__(self, *, timeout_ms: int = 15_000):
+    def __init__(self, *, timeout_ms: int = 15_000, executable_path: str | Path | None = None):
         self.timeout_ms = timeout_ms
+        self.executable_path = Path(executable_path).resolve() if executable_path is not None else None
+        if self.executable_path is not None and not self.executable_path.is_file():
+            raise ValueError("Chromium executable_path does not exist")
 
     def inspect(self, html_text: str, expected_slide_ids: list[str], *, visual_quality: bool = False) -> dict:
         started = time.monotonic()
@@ -207,8 +210,13 @@ class ChromiumDeckInspector:
 
         with sync_playwright() as playwright:
             try:
-                browser = playwright.chromium.launch(headless=True)
+                launch_options = {"headless": True}
+                if self.executable_path is not None:
+                    launch_options["executable_path"] = str(self.executable_path)
+                browser = playwright.chromium.launch(**launch_options)
             except Exception:
+                if self.executable_path is not None:
+                    raise
                 # On unsupported Linux distributions Playwright can install
                 # the full Chromium fallback without the separate headless
                 # shell.  Use the verified Playwright-managed executable;

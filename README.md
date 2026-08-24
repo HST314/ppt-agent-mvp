@@ -1,5 +1,7 @@
 # PPT Agent MVP
 
+The contract-first generation core is documented in [docs/rebuild/generation-core.md](docs/rebuild/generation-core.md). It provides versioned model contracts, response recovery, immutable checkpoints, deterministic HTML rendering and atomic offline delivery while preserving the existing workflow, Web API and task store boundaries.
+
 > 一个本地优先、人工可控的 AI 演示文稿工作台：从任务资料、叙事结构和逐页大纲，一路完成样品、全稿、可选自检修改与离线交付。
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)

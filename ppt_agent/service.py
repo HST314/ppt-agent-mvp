@@ -20,6 +20,7 @@ from .diagnostics import log_exception_chain
 from .errors import ConflictError, GatewayError, GatewayUnknownResult, NotFoundError, RuntimeUnavailableError, ValidationError
 from .fsm import TaskState, transition
 from .gateways import FakeGenerationGateway, FakeHtmlBuilder, FakeInspectionGateway, FakeSkillLoader
+from .generation.contracts import TaskBrief
 from .schema import DeliveryManifest, InspectionReport, IssueDisposition
 from .p2 import canonical, digest, now, parse_task_card, questions_for, scan_resources, validate_answer
 from .schema import ClarificationSet, ResourceManifest, TaskCard, TaskInputSnapshot
@@ -174,8 +175,10 @@ def _clarification_directive(config: ClarificationConfig, round_number: int) -> 
     )
 
 class TaskService:
-    def __init__(self,store,generator=None,inspector=None,skills=None,builder=None,clarifier=None,clarification_config=None,settings_store=None,browser_inspector=None,feature_flags=None):
+    def __init__(self,store,generator=None,inspector=None,skills=None,builder=None,clarifier=None,clarification_config=None,settings_store=None,browser_inspector=None,feature_flags=None,generation_pipeline=None):
         self.store=store; self.generator=generator or FakeGenerationGateway(); self.inspector=inspector or FakeInspectionGateway(); self.skills=skills or FakeSkillLoader(); self.builder=builder or FakeHtmlBuilder(); self.clarifier=clarifier
+        self.generation_pipeline=generation_pipeline
+        self._generation_core_health={"ready":True,"status":"not_required"} if generation_pipeline is None else {"ready":False,"status":"not_checked"}
         if feature_flags is None:
             self._feature_flags=FeatureFlagsConfig()
         elif isinstance(feature_flags,FeatureFlagsConfig):
@@ -226,6 +229,109 @@ class TaskService:
             },
             "review":{"default_max_rounds":saved.get("review",{}).get("default_max_rounds",2)},
         }
+    def initialize_generation_core(self):
+        if self.generation_pipeline is None:
+            self._generation_core_health={"ready":True,"status":"not_required"}
+        else:
+            result=self.generation_pipeline.preflight()
+            self._generation_core_health={**result,"status":"ready" if result.get("ready") else "unavailable"}
+        return self.generation_core_health()
+    def generation_core_health(self):
+        return json.loads(json.dumps(self._generation_core_health))
+    def _generation_core_brief(self,task_id,view=None):
+        """Adapt the frozen task input to the model-owned content boundary."""
+        if self.generation_pipeline is None: raise ConflictError("生成内核未配置")
+        view=view or self._p3_input(task_id)
+        card=view["task_card"]
+        count=requested_slide_count(card) or self.get(task_id).get("target_slide_count") or 6
+        resources=[]
+        for item in view.get("manifest",{}).get("resources",[]):
+            uri=item["uri"]
+            if uri.startswith("resources://"):
+                uri=f"{task_id}/resources/{uri[len('resources://') :]}"
+            resources.append({key:item[key] for key in ("resource_id","media_type","content_hash")} | {"uri":uri})
+        ledger=view.get("claim_ledger") or self._ensure_claim_ledger(task_id,view)
+        facts=[
+            {"fact_id":f"fact-{index:03d}","text":str(claim["value"]),"source_refs":[]}
+            for index,claim in enumerate(ledger.get("claims",[]),1)
+        ]
+        constraints=card.get("constraints") if isinstance(card.get("constraints"),dict) else {}
+        style_preferences=constraints.get("style_preferences")
+        if not isinstance(style_preferences,dict):
+            style_preferences={"description":str(style_preferences)} if style_preferences else {}
+        return TaskBrief.parse({
+            "schema_version":"1.0","goal":card["goal"],"audience":card["audience"],"topic":card["topic"],
+            "slide_count":count,"language":str(constraints.get("language") or "zh-CN"),
+            "style_preferences":style_preferences,"resource_manifest":resources,"confirmed_facts":facts,
+        })
+    @staticmethod
+    def _generation_core_evidence(result):
+        return {
+            "checkpoint_id":result.checkpoint.checkpoint_id,
+            "output_sha256":result.checkpoint.output_sha256,
+            "contract_name":result.checkpoint.contract_name,
+            "model":result.checkpoint.model,
+            "provider_calls":result.checkpoint.metadata.get("provider_calls",0),
+            "recovery_count":result.checkpoint.metadata.get("recovery_count",0),
+            "pipeline_version":result.checkpoint.metadata.get("pipeline_version"),
+            "reused":result.reused,
+        }
+    def _version_metadata(self,task_id,kind,artifact_hash):
+        return next((item["metadata"] for item in self.versions(task_id,kind) if item["hash"]==artifact_hash),{})
+    def _generate_narrative_with_core(self,task_id,view,state,scope):
+        brief=self._generation_core_brief(task_id,view)
+        result=self.generation_pipeline.generate_narrative(task_id,brief,input_version=view["snapshot_hash"])
+        value=result.value
+        beats="\n".join(f"{index}. **{beat.purpose}**：{beat.message}" for index,beat in enumerate(value.story_arc,1))
+        text=(f"# {value.thesis}\n\n## 受众结论\n{value.audience_takeaway}。本叙事围绕{brief.topic}组织已确认内容，"
+              f"帮助{brief.audience}理解关键判断、形成共同认知，并据此推进{brief.goal}。\n\n"
+              f"## 冻结任务上下文\n主题：{brief.topic}\n\n目标：{brief.goal}\n\n受众：{brief.audience}\n\n"
+              f"## 叙事路径\n{beats}\n\n## 表达语气\n{value.tone}\n")
+        ledger=view["claim_ledger"]; ledger_value={key:value for key,value in ledger.items() if key!="hash"}
+        claim_bindings=assert_claims_bound(text,ledger_value,"叙事")
+        quality_evidence=assert_narrative_quality(text,view["task_card"])
+        prior=self._current_version(task_id,"narrative"); version=len(self.versions(task_id,"narrative"))+1; content_hash=digest(text.encode())
+        model=NarrativeDocument.parse({"document_id":f"narrative-{content_hash[:16]}","task_id":task_id,"version":version,"markdown":text,"content_hash":content_hash,"created_at":now(),"schema_version":"1.0"})
+        metadata={"parent":prior,"action":"generate" if not prior else "regenerate","scope":scope,"summary":"生成整稿叙事结构","model":result.checkpoint.model,"input_snapshot_hash":view["snapshot_hash"],"claim_ledger_hash":ledger["hash"],"claim_bindings":claim_bindings["bindings"],"unbound_claim_count":0,"narrative_quality":quality_evidence,"generation_core":self._generation_core_evidence(result)}
+        h=self._record_p3(task_id,"narrative",model,metadata,"narrative_generate")
+        if state.stage in {state.stage.CLARIFICATION,state.stage.CREATED}: self.command(task_id,f"narrative-stage-{h[:12]}","advance")
+        else: self._reset_narrative_gate(task_id,h)
+        return self.planning_view(task_id)
+    def _outline_markdown_from_core(self,outline,brief):
+        facts={fact.fact_id:fact.text for fact in brief.confirmed_facts}; used=set(); blocks=["# 逐页大纲",""]
+        for slide in outline.slides:
+            blocks.extend((f"## [{slide.slide_id}] {slide.title}",f"- 页面角色：{slide.role}",f"- 页面目的：{slide.message}",f"- 视觉意图：{slide.visual_intent}"))
+            for fact_id in slide.evidence_refs:
+                blocks.append(f"- 确认事实：{facts[fact_id]}"); used.add(fact_id)
+            blocks.append("")
+        remaining=[text for fact_id,text in facts.items() if fact_id not in used]
+        if remaining:
+            insert_at=blocks.index("",2)+1 if len(blocks)>2 else len(blocks)
+            blocks[insert_at:insert_at]=[f"- 确认事实：{text}" for text in remaining]
+        return "\n".join(blocks).rstrip()+"\n"
+    @staticmethod
+    def _design_intent_from_core(theme,layouts):
+        return validate_design_intent({
+            "style_summary":"确定性契约驱动的演示设计",
+            "color_strategy":f"背景 {theme.background}、正文 {theme.text}、主色 {theme.primary}、强调色 {theme.accent}",
+            "typography_strategy":f"标题使用 {theme.font_heading}，正文使用 {theme.font_body}",
+            "layout_principles":["固定 1280×720 画布与安全边距",f"仅使用已确认版式族：{', '.join(sorted(layouts))}"],
+            "rationale":"样品确认后冻结主题、字体、配色与版式族并复用于全稿",
+        })
+    @staticmethod
+    def _generation_core_preview_html(artifact,brief,controlled):
+        """Adapt verified offline asset paths to the existing inert preview boundary."""
+        source=artifact.html
+        suffixes={"image/png":".png","image/jpeg":".jpg","image/webp":".webp","image/gif":".gif"}
+        for record in brief.resource_manifest:
+            marker="/resources/"
+            if marker not in record.uri: continue
+            legacy_uri="resources://"+record.uri.split(marker,1)[1]
+            data_url=controlled.get(legacy_uri)
+            suffix=suffixes.get(record.media_type)
+            if data_url and suffix:
+                source=source.replace(f"assets/{record.content_hash}{suffix}",data_url)
+        return source
     def _runtime_gateways(self):
         return list({id(x):x for x in (self.generator,self.inspector,self.builder,self.clarifier) if hasattr(x,"probe_capabilities")}.values())
     def _disabled_release_features(self):
@@ -1360,6 +1466,12 @@ class TaskService:
     def generate_narrative(self,task_id,prompt=None,scope="all"):
         self._require_actionable(task_id)
         view=self._p3_input(task_id); state=TaskState.parse(view["state"])
+        current=self._current_version(task_id,"narrative")
+        if self.generation_pipeline is not None and prompt is None and scope=="all":
+            if current and self._version_metadata(task_id,"narrative",current).get("generation_core"):
+                return self.planning_view(task_id)
+            if not current:
+                return self._generate_narrative_with_core(task_id,view,state,scope)
         skill=self.skills.load("narrative"); prior=self._current_version(task_id,"narrative")
         ledger=view["claim_ledger"]; ledger_value={key:value for key,value in ledger.items() if key!="hash"}
         if isinstance(self.generator,FakeGenerationGateway):
@@ -1441,6 +1553,16 @@ class TaskService:
         if not narrative: raise ConflictError("须先生成叙事结构")
         state=TaskState.parse(self.get(task_id))
         if state.mode=="manual" and self._confirmed_narrative_hash(task_id) != narrative: raise ConflictError("manual 模式须先确认当前版本叙事结构")
+        current=self._current_version(task_id,"outline")
+        narrative_meta=self._version_metadata(task_id,"narrative",narrative)
+        if self.generation_pipeline is not None and prompt is None and not slide_ids and narrative_meta.get("generation_core"):
+            if current and self._version_metadata(task_id,"outline",current).get("generation_core"):
+                return self.planning_view(task_id)
+            if not current:
+                brief=self._generation_core_brief(task_id,view)
+                result=self.generation_pipeline.generate_outline(task_id,brief,narrative_meta["generation_core"]["checkpoint_id"])
+                text=self._outline_markdown_from_core(result.value,brief)
+                return self.edit_outline(task_id,text,"生成逐页大纲",actor="system",extra_metadata={"generation_core":self._generation_core_evidence(result)})
         skill=self.skills.load("outline"); count=requested_slide_count(view["task_card"]); resources=view["manifest"].get("resources",[])
         ledger=view["claim_ledger"]; ledger_value={key:value for key,value in ledger.items() if key!="hash"}
         current=self._current_version(task_id,"outline")
@@ -1498,7 +1620,7 @@ class TaskService:
                             "rule":"重新提交完整 slides；逐字覆盖 required_claims_verbatim 的每个 value，尤其不得合并、概括或遗漏预算拆分。missing_required_claims_verbatim 是上一候选明确缺失的子集。不得新增 Claim Ledger 之外的量化事实。",
                         }}
         return self.edit_outline(task_id,text,"生成逐页大纲",actor="system",skill=skill)
-    def edit_outline(self,task_id,markdown,summary="直接编辑",actor="user",skill=None):
+    def edit_outline(self,task_id,markdown,summary="直接编辑",actor="user",skill=None,extra_metadata=None):
         self._require_actionable(task_id)
         view=self._p3_input(task_id); expected=requested_slide_count(view["task_card"])
         markdown=normalize_outline_markdown(markdown,view["manifest"].get("resources",[]),expected)
@@ -1518,6 +1640,7 @@ class TaskService:
         model=SlideOutline.parse({"outline_id":f"outline-{content_hash[:16]}","task_id":task_id,"version":version,"markdown":markdown,"slide_ids":slide_ids,"content_hash":content_hash,"created_at":now(),"schema_version":"1.0"})
         meta={"parent":prior,"action":"generate" if not prior else "edit","summary":summary,"affected":affected,"unchanged":[sid for sid in blocks if sid in before and blocks[sid]==before[sid]],"authoritative":True,"invalidated":{"sample":affected,"deck":affected},"claim_ledger_hash":ledger["hash"],"claim_bindings":claim_bindings["bindings"],"unbound_claim_count":0,"required_claim_ids":claim_bindings["required_claim_ids"],"required_claim_ids_by_slide":required_claim_ids_by_slide}
         if skill: meta["skill"]={"action":"outline","version":skill["version"],"hash":digest(skill["content"].encode()),"included":["outline"],"trimmed":["narrative","html","inspection"]}
+        if extra_metadata: meta.update(extra_metadata)
         h=self._record_p3(task_id,"outline",model,meta,"outline_generate" if not prior else "outline_edit",actor)
         self._invalidate_outline_confirmation(task_id,h)
         self._invalidate_sample_gate(task_id,h)
@@ -1656,7 +1779,20 @@ class TaskService:
         required_claims=self._required_claims_verbatim(task_id,list(selection["slide_ids"]),contract,ledger)
         required_claims_by_slide=self._required_claims_by_slide(task_id,list(selection["slide_ids"]),ledger)
         if prompt: rules.append(prompt.strip())
-        if isinstance(self.builder,FakeHtmlBuilder):
+        outline_meta=self._version_metadata(task_id,"outline",outline)
+        current_sample=view.get("sample")
+        if (self.generation_pipeline is not None and prompt is None and outline_meta.get("generation_core")
+            and current_sample and current_sample.get("metadata",{}).get("generation_core")
+            and current_sample["metadata"].get("selection_hash")==selection["hash"]):
+            return view
+        if self.generation_pipeline is not None and prompt is None and outline_meta.get("generation_core"):
+            brief=self._generation_core_brief(task_id)
+            result=self.generation_pipeline.generate_sample(task_id,brief,outline_meta["generation_core"]["checkpoint_id"],selected_slide_ids=selection["slide_ids"])
+            source=self._generation_core_preview_html(result.artifact,brief,assets)
+            design_intent=self._design_intent_from_core(result.value.theme_tokens,{slide.layout_family for slide in result.value.slides})
+            shared_assets={"css":""}
+            generation={**self._generation_core_evidence(result),"attempts":1,"retry_count":0,"max_attempts":1,"design_intent":design_intent,"shared_assets":shared_assets,"validation_hash":result.validation.evidence_hash,"renderer_version":result.artifact.renderer_version}
+        elif isinstance(self.builder,FakeHtmlBuilder):
             design_intent=validate_design_intent(self.builder.design_intent)
             shared_assets=validate_shared_design_assets(self.builder.shared_assets)
             source=render(data["markdown"],selection["slide_ids"],rules,assets=assets,design_contract=contract_value,contract_hash=contract["hash"],design_intent=design_intent,shared_assets=shared_assets)
@@ -1670,6 +1806,7 @@ class TaskService:
         html_text,gate=self._post_render_gate(task_id,source,list(selection["slide_ids"]),contract,ledger,assets,generation.get("attempt_evidence_hashes"))
         version=len(self.versions(task_id,"sample"))+1; content_hash=digest(html_text.encode()); model=DeckArtifact.parse({"artifact_id":f"sample-{content_hash[:16]}","task_id":task_id,"version":version,"kind":"sample","outline_hash":outline,"content_hash":content_hash,"created_at":now(),"schema_version":"1.0"})
         prior=self._current_version(task_id,"sample"); meta={"html":html_text,"selection_hash":selection["hash"],"parent":prior,"summary":"生成真实 HTML 样品","scope":"global","global_rules":rules,"local_exceptions":{},"build":"success","generation":generation,"design_intent":generation.get("design_intent",default_design_intent()),"shared_design_assets":generation.get("shared_assets",{"css":""}),"presentation_technical_contract_hash":contract["hash"],"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate":gate}
+        if "checkpoint_id" in generation: meta["generation_core"]={key:generation[key] for key in ("checkpoint_id","output_sha256","contract_name","model","provider_calls","recovery_count","pipeline_version","reused")}
         h=self._record_p3(task_id,"sample",model,meta,"sample_generate")
         self._invalidate_sample_gate(task_id,h)
         return self.sample_view(task_id)
@@ -1732,11 +1869,17 @@ class TaskService:
                 raise ConflictError("当前阶段不能确认样品")
             pages=self._slide_fragments(sample["html"])
             if set(pages) != set(selection["slide_ids"]): raise ConflictError("样品页面边界无效，无法确认")
+            core_confirmation=None
+            core_sample=sample["metadata"].get("generation_core")
+            if self.generation_pipeline is not None and core_sample:
+                core_result=self.generation_pipeline.confirm_sample(task_id,core_sample["checkpoint_id"])
+                core_confirmation=self._generation_core_evidence(core_result)
             new=transition(state,"confirm_sample",actor="user")
             confirmed_pages={sid:{"html":fragment,"sha256":digest(fragment.encode())} for sid,fragment in pages.items()}
             design_intent=validate_design_intent(sample["metadata"].get("design_intent"))
             shared_assets=validate_shared_design_assets(sample["metadata"].get("shared_design_assets"))
             result={"confirmed_outline_hash":outline,"confirmed_sample_hash":sample["hash"],"confirmed_content_hash":sample["content_hash"],"selection_hash":view["selection"]["hash"],"presentation_technical_contract_hash":contract["hash"],"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate_hash":sample["metadata"]["post_render_gate"]["evidence_hash"],"confirmed_pages":confirmed_pages,"design_intent":design_intent,"design_intent_hash":digest(canonical(design_intent)),"shared_design_assets":shared_assets,"shared_design_assets_hash":digest(canonical(shared_assets))}
+            if core_confirmation: result["generation_core_confirmation"]=core_confirmation
             event={"event_id":hashlib.sha256(f"{task_id}:confirm-sample:{sample['hash']}".encode()).hexdigest()[:24],"command_id":f"confirm-sample-{sample['hash'][:16]}","action":"confirm_sample_version","actor":"user","request_hash":sample["hash"],"at":utcnow(),"from":state.to_dict(),"to":new.to_dict(),"result":result}
             self.store.commit(task_id,new.to_dict(),event)
             return self.sample_view(task_id)
@@ -1816,6 +1959,24 @@ class TaskService:
         sample_fragments={sid:item["html"] for sid,item in confirmed_pages.items()}
         if not sample_fragments or any(digest(fragment.encode()) != confirmed_pages[sid].get("sha256") for sid,fragment in sample_fragments.items()):
             raise ConflictError("确认样品原始页面或 SHA-256 无效")
+        outline_meta=self._version_metadata(task_id,"outline",outline)
+        core_confirmation=confirmation.get("generation_core_confirmation")
+        if self.generation_pipeline is not None and outline_meta.get("generation_core") and core_confirmation:
+            current=self.deck_view(task_id).get("deck")
+            if current and current.get("metadata",{}).get("generation_core") and current["metadata"].get("sample_hash")==sample["hash"]:
+                return self.deck_view(task_id)
+            brief=self._generation_core_brief(task_id)
+            core_result=self.generation_pipeline.generate_deck(task_id,brief,outline_meta["generation_core"]["checkpoint_id"],core_confirmation["checkpoint_id"])
+            review_result=self.generation_pipeline.create_review_input(task_id,core_result.checkpoint.checkpoint_id)
+            html_text=self._generation_core_preview_html(core_result.artifact,brief,assets)
+            html_text=self._replace_slide_fragments(html_text,sample_fragments)
+            html_text,gate=self._post_render_gate(task_id,html_text,ids,contract,ledger,assets)
+            deck_fragments=self._slide_fragments(html_text)
+            preserved={sid:digest(deck_fragments[sid].encode())==digest(fragment.encode()) for sid,fragment in sample_fragments.items()}
+            if not all(preserved.values()): raise ConflictError("确认样品发生未提示变化")
+            core_evidence=self._generation_core_evidence(core_result)
+            core_evidence["review_checkpoint_id"]=review_result.checkpoint.checkpoint_id
+            return self._commit_candidate_deck(task_id,html_text,outline,{"parent":token["parent_deck_hash"],"summary":"生成未检查候选稿","scope":"global","affected":ids,"sample_hash":sample["hash"],"sample_pages_preserved":preserved,"outline_consistent":True,"inspection_status":"pending","global_rules":meta.get("global_rules",[]),"local_exceptions":meta.get("local_exceptions",{}),"generation_batches":core_result.checkpoint.metadata.get("batches",[]),"design_intent":design_intent,"shared_design_assets":shared_assets,"presentation_technical_contract_hash":contract["hash"],"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate":gate,"generation_core":core_evidence},"deck_generate",token)
         generation_batches=[]
         if isinstance(self.builder,FakeHtmlBuilder):
             html_text=render(data["markdown"],ids,meta.get("global_rules",[]),meta.get("local_exceptions",{}),assets,contract_value,contract["hash"],design_intent=design_intent,shared_assets=shared_assets)

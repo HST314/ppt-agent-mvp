@@ -39,11 +39,12 @@ def create_app(
             coordinator.initialize_recovery()
             bootstrap["recovery"]="ready"
             capabilities=service.initialize_runtime()
+            generation_core=service.initialize_generation_core()
             # Startup completion and provider capability are separate signals.
             # A later background probe can recover capability without mutating
             # this one-shot bootstrap state.
             bootstrap["runtime"]="ready"
-            if capabilities.get("ready") and not shutdown.is_set(): coordinator.resume_recovered_queued()
+            if capabilities.get("ready") and generation_core.get("ready") and not shutdown.is_set(): coordinator.resume_recovered_queued()
         except Exception:
             pending="recovery" if bootstrap["recovery"]=="starting" else "runtime"
             bootstrap[pending]="failed"
@@ -78,9 +79,10 @@ def create_app(
 
     def runtime_payload():
         capabilities=service.runtime_health()
+        generation_core=service.generation_core_health()
         config_summary=service.runtime_config_summary()
         startup=startup_status()
-        ready=capabilities["ready"] and startup=="ready"
+        ready=capabilities["ready"] and generation_core["ready"] and startup=="ready"
         return {
             "status": "ok" if ready else "unavailable",
             "stage": "P8",
@@ -91,6 +93,7 @@ def create_app(
             "config_summary_sha256": hashlib.sha256(json.dumps(config_summary,sort_keys=True,separators=(",",":")).encode()).hexdigest(),
             "clarification_mode":"model" if service.clarifier is not None else "fake",
             "model_capabilities":capabilities,
+            "generation_core":generation_core,
             "release":service.release_status(),
             "startup_status":startup,
             "startup_components":dict(bootstrap),
@@ -138,6 +141,7 @@ def create_app(
     @app.post("/v1/runtime/recheck", tags=["runtime"])
     def recheck_runtime():
         capabilities=service.initialize_runtime()
+        service.initialize_generation_core()
         bootstrap["runtime"]="ready"
         return runtime_payload()
 

@@ -1,0 +1,20 @@
+{
+  "schema_version": "1.0",
+  "commit": "cdf2b0e2de2f9d021fa6e3592847af1a319f8f0f",
+  "tree": "7f119e670bc6ba2120e6629115b75d6f1f37e073",
+  "commit_count": 150,
+  "merge_commit_count": 0,
+  "runtime": {
+    "python": "3.10.12",
+    "openai": "1.99.9",
+    "playwright": "1.54.0",
+    "chromium": "139.0.7258.5"
+  },
+  "files": {
+    "requirements.txt": "8e5416f6fa702e4e005b28f46fd19cc8cde6bd371a8f07b8460dcdef9f4afdc2",
+    "requirements-browser.txt": "69075054c6d3bf5e0104bbc5d72895f380f050216a76ee8978dc4fbfd62f95e8",
+    "config/ppt-agent.yaml": "2bcc077576d39f59eb5ff0aeee6304f71167a560ff26595b640bbd292c7a7dcf",
+    "scripts/start.py": "f9ebb8c11f1904c7fb9bad89d820a8eee21954f5da3490f0fba5f22bc4f9ffc9",
+    "scripts/verify_standard_tests.py": "d880497437a5145e8c31547a9f7f1b4adf0ecc7ca5b1af69a8c132f5d4e77ff3"
+  }
+}

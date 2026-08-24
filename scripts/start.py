@@ -7,6 +7,7 @@ import uvicorn
 
 from ppt_agent.config import load_config
 from ppt_agent.gateways import agent_gateways_from_config
+from ppt_agent.generation.bootstrap import build_generation_pipeline
 from ppt_agent.service import TaskService
 from ppt_agent.store import WorkspaceStore
 from ppt_agent.web import create_app
@@ -16,5 +17,7 @@ load_dotenv(".env")  # 在程序启动时自动读取当前目录下的 .env 文
 p=argparse.ArgumentParser(); p.add_argument("--host",default="127.0.0.1"); p.add_argument("--port",type=int,default=8000); p.add_argument("--data",default=".ppt-agent-data")
 a=p.parse_args()
 config=load_config()
-service=TaskService(WorkspaceStore(a.data),clarification_config=config.clarification,**agent_gateways_from_config(config))
+ports=agent_gateways_from_config(config)
+generation_pipeline=build_generation_pipeline(config,data_root=a.data,generation_client=ports["generator"].client,repository_root=Path(__file__).resolve().parents[1]) if config.mode=="agent" else None
+service=TaskService(WorkspaceStore(a.data),clarification_config=config.clarification,generation_pipeline=generation_pipeline,**ports)
 uvicorn.run(create_app(service),host=a.host,port=a.port)

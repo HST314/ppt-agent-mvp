@@ -39,13 +39,13 @@ class StageAConfigTests(unittest.TestCase):
         with patch.dict(os.environ,env,clear=True), patch("ppt_agent.config.load_dotenv"):
             cfg = load_config(ROOT / "config/ppt-agent.yaml")
         self.assertEqual(cfg.mode, "agent")
-        self.assertEqual(cfg.generation.structured_output, "auto")
+        self.assertEqual(cfg.generation.structured_output, "json_schema")
         self.assertNotIn("secret", str(cfg.public()))
 
         with patch.dict(os.environ,env,clear=True), patch("ppt_agent.config.load_dotenv"):
             example=load_config(ROOT / "config/ppt-agent.agent.example.yaml")
         self.assertEqual(example.mode,"agent")
-        self.assertEqual(example.generation.structured_output,"auto")
+        self.assertEqual(example.generation.structured_output,"json_schema")
 
     def test_timeout_split_defaults_and_legacy_alias(self):
         env={"GEN_KEY":"secret","GEN_URL":"https://gen.example/v1"}

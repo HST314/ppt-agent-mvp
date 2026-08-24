@@ -4,4 +4,6 @@ __pycache__/
 .venv/
 .pylibs/
 .ppt-agent-data/
+.playwright-browsers/
+.release-artifacts/
 config/*.local.yaml
