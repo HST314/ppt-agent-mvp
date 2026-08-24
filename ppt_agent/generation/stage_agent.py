@@ -147,6 +147,7 @@ class StageAgentExecutor:
                     exc.rejected_output = last_candidate
                 raise
         contract = contract_type.parse(result.value)
+        run = next(item for item in result.audit if item.get("event") == "run")
         terminal = next((item for item in reversed(result.audit) if item.get("event") == "terminal"), {})
         applied = terminal.get("applied_skill_files", [])
         file_hashes = snapshot.manifest
@@ -160,6 +161,11 @@ class StageAgentExecutor:
             elapsed_ms=round((time.monotonic() - started) * 1000, 3),
             metadata={
                 "stage_agent_version": STAGE_AGENT_VERSION,
+                "provider_input_sha256": run.get("input_sha256"),
+                "schema_correction_count": sum(
+                    item.get("event") in {"schema_correction", "technical_correction"}
+                    for item in result.audit
+                ),
                 "skill_digest": snapshot.digest,
                 "skill_entry_read": bool(terminal.get("skill_entry_read")),
                 "applied_skill_file_hashes": {

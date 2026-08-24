@@ -55,6 +55,8 @@ class ReleaseReadinessTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/release-matrix.yml").read_text(encoding="utf-8")
         self.assertIn("verify_release_matrix.py --profile full", workflow)
         self.assertIn("verify_release_matrix.py --profile real-model", workflow)
+        self.assertIn("--evidence-file .release-artifacts/real-model/evidence.json", workflow)
+        self.assertIn("actions/upload-artifact@v4", workflow)
 
     def test_release_document_declares_flags_rollout_and_immutable_rollback(self):
         document = (ROOT / "docs/release-skill-runtime-v2.md").read_text(encoding="utf-8")

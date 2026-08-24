@@ -430,7 +430,7 @@ class TaskService:
             "pipeline_version":result.checkpoint.metadata.get("pipeline_version"),
             "reused":result.reused,
         }
-        for key in ("generation_mode","skill_digest","skill_entry_read","applied_skill_file_hashes","validator_version","evidence_version","context_snapshot_id","context_snapshot_hash","stage_payload_hash","context_sections_read","operation","artifact_kind","modification_scope","change_type","requested_slide_ids","modified_slide_ids","preserved_slide_ids","design_system_changed","page_contract_hashes"):
+        for key in ("generation_mode","skill_digest","skill_entry_read","applied_skill_file_hashes","provider_input_sha256","schema_correction_count","validator_version","evidence_version","context_snapshot_id","context_snapshot_hash","stage_payload_hash","context_sections_read","operation","artifact_kind","modification_scope","change_type","requested_slide_ids","modified_slide_ids","preserved_slide_ids","design_system_changed","page_contract_hashes"):
             if key in result.checkpoint.metadata: evidence[key]=result.checkpoint.metadata[key]
         return evidence
     def _version_metadata(self,task_id,kind,artifact_hash):

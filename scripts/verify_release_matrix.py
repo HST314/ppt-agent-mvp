@@ -43,6 +43,7 @@ def main() -> int:
     parser.add_argument("--profile", choices=sorted(PROFILES), default="standard")
     parser.add_argument("--config", type=Path, help="Runtime YAML for the real-model lane")
     parser.add_argument("--env-file", type=Path, help="dotenv file for the real-model lane")
+    parser.add_argument("--evidence-file", type=Path, help="Secret-free JSON evidence output for the real-model lane")
     parser.add_argument("--list", action="store_true", help="Print the matrix without running it")
     args = parser.parse_args()
     selected = PROFILES[args.profile]
@@ -58,6 +59,8 @@ def main() -> int:
                 command.extend(("--config", str(args.config)))
             if args.env_file:
                 command.extend(("--env-file", str(args.env_file)))
+            if args.evidence_file:
+                command.extend(("--evidence-file", str(args.evidence_file)))
         started = time.monotonic()
         completed = subprocess.run(command, cwd=ROOT, check=False)
         results.append({
