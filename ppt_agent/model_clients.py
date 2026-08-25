@@ -356,7 +356,7 @@ class OpenAIResponsesClient:
             401: ("model_authentication_failed", "模型服务认证失败，请联系管理员检查凭据", False, "authentication"),
             403: ("model_permission_denied", "模型服务拒绝访问，请联系管理员检查权限", False, "permission"),
             404: ("model_not_found", "配置的模型或端点不存在，请联系管理员检查配置", False, "not_found"),
-            429: ("model_rate_limited", "模型服务请求过于频繁，请等待后重新探测", True, "rate_limit"),
+            429: ("model_rate_limited", "模型服务请求过于频繁，请等待后重试当前任务", True, "rate_limit"),
         }
         if status == 400 and format_rejection == "invalid_schema":
             code, message, retryable, category = (
@@ -370,7 +370,7 @@ class OpenAIResponsesClient:
         elif 500 <= status <= 599:
             code, message, retryable, category = (
                 "model_upstream_unavailable",
-                "模型服务暂时不可用，请稍后重新探测",
+                "模型服务暂时不可用，请稍后重试当前任务",
                 True,
                 "upstream",
             )

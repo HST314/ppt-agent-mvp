@@ -86,7 +86,7 @@ python -m uvicorn main_front:app --host 127.0.0.1 --port 8000
 - 健康检查：<http://127.0.0.1:8000/healthz>
 - 组件与交互状态：<http://127.0.0.1:8000/components>
 
-Web 存活端点会先开放，历史 Job 恢复和真实模型能力探测在后台继续。看到 `/readyz` 中 `"runtime_ready": true`，说明依赖模型的操作已就绪；检测期间工作台会显示“后台初始化中”。真实模型模式会分别验证严格 JSON Schema，以及合法工具调用 → `function_call_output` → 最终结构化结果的完整回合；探测失败时服务仍可打开并提供诊断，但 `/readyz` 返回 503，模型 Job 不会入队。
+Web 存活端点会先开放，历史 Job 恢复与本地生成依赖检查在后台完成。模型仅在用户创建澄清、叙事、大纲、样品、全稿或检查 Job 时调用；Job 会直接发送该阶段的真实输入。调用失败会形成带诊断 ID 的明确失败记录，当前阶段保留重试入口。`/readyz` 只反映本地数据目录、浏览器和发布开关等服务前置条件。
 
 如果启动仍提示 `locked Chromium executable is unavailable`，先确认安装命令与 Uvicorn 使用的是同一个虚拟环境。自定义缓存目录时，安装与启动必须设置相同的 `PLAYWRIGHT_BROWSERS_PATH`；离线环境可用 `PPT_AGENT_CHROMIUM_EXECUTABLE` 指向已预置的 Chromium 可执行文件。
 
@@ -209,7 +209,7 @@ feature_flags:
 
 生成链路由 `PresentationTechnicalContract` 约束画布、页面 ID、资源、安全和交付等通用技术事实；视觉语言由 Agent 根据当前 Skill 产出的 `DesignIntent` 与共享 CSS 资产表达。样品生成会返回代表页、设计意图和共享资产，用户确认后全稿批次必须复用这组已冻结上下文。服务端 assembler 只负责公共 HTML 外壳、页面顺序、导航与离线资源，不选择风格、版式或 DOM 骨架。
 
-启动后用 `/livez` 检查 Web 进程存活，用 `/readyz` 检查真实模型运行契约；模型认证、模型名、限流、上游故障或能力探测失败时 `/readyz` 返回 503，依赖模型的 Job 不会入队。修复配置或等待上游恢复后，可从工作台“设置 → 系统与显示”执行一次显式重新检测。设置页保存的工作流、Job 与自检默认值会原子更新当前全局 YAML，不会写入任务数据目录。`/healthz` 保留兼容用途，并与 readiness 使用相同的 200/503 语义。
+启动后用 `/livez` 检查 Web 进程存活，用 `/readyz` 检查本地生成依赖和发布开关。模型认证、模型名、限流、上游故障或请求超时会直接记录在对应 Job；用户可在当前阶段修复配置、等待限流窗口或调整输入后重新生成。设置页保存的工作流、Job 与自检默认值会原子更新当前全局 YAML，不会写入任务数据目录。`/healthz` 保留兼容用途，并与 readiness 使用相同的 200/503 语义。
 
 ## 工作流与架构
 

@@ -56,7 +56,7 @@ python3 scripts/verify_release_matrix.py --profile full
 python3 scripts/verify_release_matrix.py --profile real-model
 ```
 
-该旅程执行能力探测、资料导入、多轮澄清、叙事、大纲、样品、全稿、检查、定稿和离线交付；在叙事阶段故意损坏一次真实模型的已完成 JSON turn，验证同一真实模型能响应 Schema correction 并成功收敛。输出只包含任务 ID、开关、布尔门禁结果和内容哈希，不输出密钥、Prompt 或模型正文。
+该旅程从资料导入开始，依次执行多轮澄清、叙事、大纲、样品、全稿、检查、定稿和离线交付；在叙事阶段故意损坏一次真实模型的已完成 JSON turn，验证同一真实模型能响应 Schema correction 并成功收敛。输出只包含任务 ID、开关、布尔门禁结果和内容哈希，不输出密钥、Prompt 或模型正文。
 
 ## 灰度步骤
 

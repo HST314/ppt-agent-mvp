@@ -77,38 +77,28 @@ class FrontendAssetTests(unittest.TestCase):
             check=True,
         )
 
-    def test_runtime_status_is_server_backed_and_recovery_is_actionable(self):
+    def test_runtime_status_is_server_backed_and_generation_is_on_demand(self):
         app = (FRONTEND / "static/js/app.js").read_text()
         api = (FRONTEND / "static/js/api.js").read_text()
         input_stage = (FRONTEND / "static/js/stages/input.js").read_text()
         self.assertIn('runtimeFetch("/livez"', api)
-        self.assertIn('runtimeFetch(recheck ? "/v1/runtime/recheck" : "/v1/runtime/status"', api)
+        self.assertIn('runtimeFetch("/v1/runtime/status"', api)
         self.assertIn("runtimeFetch", api)
-        self.assertIn("timeout: recheck ? 90_000 : 8_000", api)
         self.assertIn("backendReachable: true, runtimeReady: null", api)
-        for label in ("浏览器在线", "后端可达", "模型可用", "模型不可用"):
+        for label in ("浏览器在线", "后端可达", "模型：按任务调用"):
             self.assertIn(label, app)
         self.assertIn('role: "status"', app)
         self.assertIn("runtimeSignature", app)
-        self.assertIn("模型能力探测详情", app)
-        self.assertIn("失败检查", app)
-        self.assertIn("探测 ID", app)
-        self.assertIn("runtimeProbes", api)
-        self.assertIn('data-requires-runtime="true"', app)
         self.assertIn("model_authentication_failed", input_stage)
         self.assertIn("model_rate_limited", input_stage)
         self.assertIn("model_upstream_unavailable", input_stage)
         self.assertIn("Agent 审计 ID", input_stage)
-        self.assertIn("复制探测 ID", input_stage)
         self.assertIn("waiting_for_runtime", input_stage)
         self.assertIn("立即重试澄清问题", input_stage)
         self.assertIn("无需再次点击", input_stage)
-        self.assertIn("模型恢复探测中", app)
         self.assertIn('role: "alert"', input_stage)
-        for label in ("失败阶段", "工具调用数", "底层错误"):
-            self.assertIn(label, app + input_stage)
-        for code in ("probe_tool_call_missing", "probe_tool_round_failed", "probe_tool_final_invalid_output"):
-            self.assertIn(code, input_stage)
+        self.assertNotIn("recheckRuntime", api)
+        self.assertNotIn("runtimeProbes", api)
 
     def test_untrusted_content_is_not_assigned_to_inner_html(self):
         javascript = "\n".join(path.read_text() for path in (FRONTEND / "static/js").rglob("*.js"))
@@ -184,11 +174,9 @@ class FrontendAssetTests(unittest.TestCase):
         # 派发前二次校验 mismatch：所有 Job 创建入口（含 requiresRuntime=false 的
         # delivery.publish）无条件先过版本门禁，模型就绪校验仅限运行时操作。
         self.assertIn("ensureVersionMatchAllowed", app)
-        self.assertIn("await ensureVersionMatchAllowed();", app.split("async function ensureRuntimeActionAllowed", 1)[1])
         tracked = app.split("async function startTrackedJob", 1)[1].split("const job = await create();", 1)[0]
         self.assertIn("await ensureVersionMatchAllowed();", tracked)
-        self.assertIn("if (requiresRuntime) assertRuntimeReady();", tracked)
-        self.assertNotIn("if (requiresRuntime) await ensureRuntimeActionAllowed();", tracked)
+        self.assertNotIn("assertRuntimeReady", tracked)
         self.assertIn("runtimeVersionMismatch()", app.split("async function ensureVersionMatchAllowed", 1)[1])
         # 版本阻断状态独立于 disabled 当前值：mismatch 期间始终打标，
         # 解除时只恢复版本门禁自己禁用的控件，不误改业务禁用态。
@@ -198,8 +186,7 @@ class FrontendAssetTests(unittest.TestCase):
         self.assertIn("versionPrevEnabled", version_gate)
         self.assertIn('document.dispatchEvent(new CustomEvent("versiongatechange"))', app)
         self.assertIn('document.addEventListener("versiongatechange", updateGate', input_stage)
-        # runAction 自动入队入口经统一版本守卫二次校验；按钮层用独立的版本门禁，
-        # 模型不可用但版本一致时不得误伤（后端对该场景有降级路径）。
+        # runAction 自动入队入口经统一版本守卫二次校验；按钮层用独立的版本门禁。
         self.assertIn("setVersionMatchGuard", app + shared)
         self.assertIn("if (requiresVersionMatch && versionMatchGuard) await versionMatchGuard();", shared)
         self.assertIn('"data-requires-version-match": options.requiresVersionMatch ? "true" : null', shell)

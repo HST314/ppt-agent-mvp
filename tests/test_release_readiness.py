@@ -23,7 +23,7 @@ class ReleaseReadinessTests(unittest.TestCase):
             self.assertFalse(status["write_enabled"])
             self.assertFalse(status["legacy_implementation_present"])
             self.assertEqual(status["rollback_mode"], "traffic_to_previous_release")
-            self.assertEqual(service.initialize_runtime()["status"], "rollout_disabled")
+            self.assertEqual(service.initialize_runtime()["status"], "on_demand")
             with self.assertRaises(RuntimeUnavailableError) as caught:
                 service.require_runtime_ready()
             self.assertEqual(caught.exception.failed_check, "skill_runtime_v2")

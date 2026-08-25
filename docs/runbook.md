@@ -15,7 +15,7 @@
 python -m uvicorn main_front:app --host 127.0.0.1 --port 8000
 ```
 
-该命令启动 FastAPI/Uvicorn Web 适配层。Web 端口先开放，历史 Job 扫描与模型能力探测在后台执行；`/livez` 只检查 Web 进程存活并始终返回 200，`/readyz` 检查真实模型运行契约，未就绪时返回 503。兼容端点 `/healthz` 与 readiness 使用相同的 200/503 语义；浏览器轮询 `/v1/runtime/status`，通过 `startup_status` 与 `runtime_ready` 区分“后端已启动 / 模型检测中 / 可用或失败”。真实模型模式必须满足 `runtime_ready=true` 且 `model_capabilities.status=ready`。启动按顺序验证基础文本响应、严格 JSON Schema、强制函数调用与结果回传；相同客户端、端点、模型、凭据和协议模式的网关只执行一次能力探测。基础探测遇到 SDK 响应解析异常时最多重试一次，其他业务调用不会因此扩大重试范围。任一检查最终失败即停止，状态中保留 `probe_id`、`failed_check` 与精确业务错误码，依赖模型的 Job 在入队和执行前都会关闭失败。脱敏且可跨重启读取的探测记录由 `GET /v1/runtime/probes` 导出；服务端日志会以同一 `diagnostic_id`、`probe_id` 输出无本地变量且已脱敏的完整异常因果链。修复配置后可在“设置 → 系统与显示”重新检测。`/`、`/tasks/{task_id}` 和 `/components` 使用独立 `frontend/` 静态资源。
+该命令启动 FastAPI/Uvicorn Web 适配层。Web 端口先开放，历史 Job 扫描与本地生成依赖检查在后台执行；`/livez` 只检查 Web 进程存活并始终返回 200，`/readyz` 检查数据目录、浏览器和发布开关等本地前置条件，未就绪时返回 503。兼容端点 `/healthz` 与 readiness 使用相同的 200/503 语义；浏览器轮询 `/v1/runtime/status` 展示后端连接、版本与本地依赖状态。模型只在业务 Job 执行时收到该阶段的真实输入；失败会写入 Job 的稳定错误码、诊断 ID 与 Agent 审计 ID，当前阶段保持可重试。`/`、`/tasks/{task_id}` 和 `/components` 使用独立 `frontend/` 静态资源。
 
 样品、全稿和自检预览由 `/v1/tasks/{task_id}/previews/{hash}` 提供。端点只接受当前任务内 `sample`/`deck` 版本，返回 `no-store`、`SAMEORIGIN` 与禁止脚本的独立 CSP；HTTP(S)、Base64 与相对图片仅作为展示资源开放。相对资源再经 `/preview-assets/{hash}/{path}` 校验当前任务、版本、manifest 与文件 hash。应用壳 CSP 不允许内联脚本或样式。预览异常时先核对 hash 与资源清单，不要绕过端点直接读取工作区文件。
 
@@ -69,12 +69,11 @@ python3 scripts/verify_offline_delivery.py .ppt-agent-data/tasks/<task-id>/deliv
 `feature_flags.skill_runtime_v2` 与 `feature_flags.technical_gate_v2` 必须同时为 `true` 才接收新写任务。关闭任一开关后 readiness 返回 503、历史内容仍可只读，且不会回退或绕过已删除的旧实现。灰度采用独立部署的 `5% → 25% → 100%` 流量档位；回滚时先关闭候选写入，再把流量切回上一个不可变版本。完整命令、观察指标与终止条件见 `docs/release-skill-runtime-v2.md`。
 
 - 启动时报配置错误：确认 YAML 字段白名单、`gateway.mode`，以及 YAML 引用的环境变量均已在 `.env` 配置。
-- `model_authentication_failed` / `model_permission_denied` / `model_not_found` / `model_request_invalid`：属于确定性配置故障，修复凭据、权限、模型名或 Responses/Schema 兼容性后重新探测，不要连续重试。
-- `model_rate_limited`：遵守响应中的 `retry_after_seconds`（如有），等待后重新探测。
-- `model_upstream_unavailable`：等待供应商恢复后重新探测；不要以连续提交代替健康检查。
-- `model_timeout` / `model_connection_error`：结果可能未知，不得自动重试；先用 `agent_audit_id`、诊断 ID 和供应商请求记录核对结果。
+- `model_authentication_failed` / `model_permission_denied` / `model_not_found` / `model_request_invalid`：修复凭据、权限、模型名或 Responses/Schema 配置后，在当前阶段重新生成。
+- `model_rate_limited`：遵守响应中的 `retry_after_seconds`（如有），等待后重新生成。
+- `model_upstream_unavailable`：等待供应商恢复后重新生成。
+- `model_timeout` / `model_connection_error`：结果可能未知；先用 `agent_audit_id`、诊断 ID 和供应商请求记录核对是否产生新版本，再由用户发起新的生成任务。
 - `gateway_error`：无法进一步分类的 SDK/HTTP 故障；根据诊断 ID 检查运行日志，确认原因后再操作。
-- `probe_invalid_output` / `probe_tool_call_missing` / `probe_tool_round_failed` / `probe_tool_final_invalid_output` / `probe_step_limit`：分别表示严格 Schema 失败、未执行强制工具调用、工具结果回传失败、工具调用后最终 Schema 输出失败或步数边界未满足。结合 `failed_check`、`probe_phase`、`terminal_reason`、`tool_calls`、`underlying_code` 与 `probe_id` 查询 `/v1/runtime/probes`，确认模型能力与端点配置后再重新检测。
 - Skill 校验失败：检查 `skills.root` / `skills.active` 是否指向标准 Skill 目录，确认 `SKILL.md` frontmatter、路径边界、普通文件类型和软链接限制；运行时完整性以目录内容摘要为准，不要求 `SKILL_LOCK.json`。
 - Skill 脚本 advisory：`sandbox_unavailable` / `interpreter_unavailable` 表示部署环境缺少 Bubblewrap 或对应解释器；`script_timeout` / `script_output_limit` / `script_nonzero_exit` 都不会阻断 Job。不要把脚本 stdin、参数或输出全文复制到状态日志；按脱敏审计中的 advisory code 排查即可。
 - 自检出现 `render_unavailable`：确认已执行 `python3 -m playwright install chromium` 且系统共享库齐全；修复后重新执行检查，禁止人工把缺失浏览器当作通过。

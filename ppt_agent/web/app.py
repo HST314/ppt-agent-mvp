@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 import threading
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -31,35 +31,15 @@ def create_app(
     if not (frontend / "index.html").is_file():
         raise RuntimeError(f"frontend assets missing: {frontend}")
     coordinator = JobService(service, defer_queued_recovery=True, defer_recovery_scan=True)
-    shutdown=threading.Event()
-    bootstrap={"recovery":"starting","clarification":"starting","runtime":"starting","generation_core":"starting"}
+    bootstrap={"recovery":"starting","generation_core":"starting"}
 
     def initialize_background():
         try:
-            service.initialize_clarification_runtime()
-            bootstrap["clarification"]="ready"
-        except Exception:
-            bootstrap["clarification"]="failed"
-            logging.exception("background clarification initialization failed")
-        finally:
-            # The light probe has reached a terminal state.  Persisted Jobs can
-            # now either run or fail explicitly; none remain in an endless
-            # startup spinner.  Legacy waiting inputs are repaired as well.
-            coordinator.resume_clarification_queued()
-            coordinator.reconcile_waiting_clarifications()
-        try:
-            capabilities=service.initialize_runtime()
-            bootstrap["runtime"]="ready"
-            generation_core=service.initialize_generation_core()
+            service.initialize_generation_core()
             bootstrap["generation_core"]="ready"
-            # Startup completion and provider capability are separate signals.
-            # A later background probe can recover capability without mutating
-            # this one-shot bootstrap state.
-            if capabilities.get("ready") and generation_core.get("ready") and not shutdown.is_set(): coordinator.resume_recovered_queued()
         except Exception:
-            pending="runtime" if bootstrap["runtime"]=="starting" else "generation_core"
-            bootstrap[pending]="failed"
-            logging.exception("background startup initialization failed")
+            bootstrap["generation_core"]="failed"
+            logging.exception("background generation core initialization failed")
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -68,13 +48,14 @@ def create_app(
             # input so saving a task card can always create its durable Job.
             coordinator.initialize_recovery()
             bootstrap["recovery"]="ready"
+            coordinator.resume_recovered_queued()
+            coordinator.reconcile_waiting_clarifications()
         except Exception:
             bootstrap["recovery"]="failed"
             logging.exception("startup Job recovery failed")
         thread=threading.Thread(target=initialize_background,name="ppt-startup",daemon=True)
         thread.start()
         yield
-        shutdown.set()
         thread.join(timeout=1)
         coordinator.close()
 
@@ -102,7 +83,7 @@ def create_app(
         generation_core=service.generation_core_health()
         config_summary=service.runtime_config_summary()
         startup=startup_status()
-        ready=capabilities["ready"] and generation_core["ready"] and startup=="ready"
+        ready=generation_core["ready"] and startup=="ready" and service.release_status()["write_enabled"]
         return {
             "status": "ok" if ready else "unavailable",
             "stage": "P8",
@@ -159,24 +140,6 @@ def create_app(
     @app.get("/v1/runtime/status", tags=["runtime"])
     def runtime_status():
         return runtime_payload()
-
-    @app.post("/v1/runtime/recheck", tags=["runtime"])
-    def recheck_runtime():
-        service.initialize_clarification_runtime()
-        bootstrap["clarification"]="ready"
-        coordinator.resume_clarification_queued()
-        coordinator.reconcile_waiting_clarifications()
-        capabilities=service.initialize_runtime()
-        generation_core=service.initialize_generation_core()
-        bootstrap["runtime"]="ready"
-        bootstrap["generation_core"]="ready"
-        if capabilities.get("ready") and generation_core.get("ready"):
-            coordinator.resume_recovered_queued()
-        return runtime_payload()
-
-    @app.get("/v1/runtime/probes", tags=["runtime"])
-    def runtime_probes(limit: int = Query(default=20,ge=1,le=100)):
-        return {"probes":service.runtime_probes(limit)}
 
     app.mount("/static", StaticFiles(directory=frontend / "static", check_dir=True), name="static")
     app.include_router(jobs.router)

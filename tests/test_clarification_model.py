@@ -77,7 +77,7 @@ class ClarificationModelTests(unittest.TestCase):
         result=service.use_fallback_clarification("task"); self.assertEqual(result["question_source"],"fallback"); self.assertTrue(result["details"])
     def test_gateway_error_semantics_and_correlation_survive_in_clarification(self):
         error=GatewayError(
-            "模型服务请求过于频繁，请等待后重新探测",
+            "模型服务请求过于频繁，请等待后重试当前任务",
             code="model_rate_limited",
             retryable=True,
             retry_after_seconds=23,

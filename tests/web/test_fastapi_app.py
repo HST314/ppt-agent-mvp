@@ -1,18 +1,13 @@
-import json
 import tempfile
 import threading
 import time
 import unittest
-from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
 from ppt_agent.config import ClarificationConfig
 from ppt_agent.errors import GatewayError, RuntimeUnavailableError
-from ppt_agent.gateways import AgentGateway
-from ppt_agent.model_clients import OpenAIResponsesClient
 from ppt_agent.service import TaskService
-from ppt_agent.skill_runtime import SkillRuntime
 from ppt_agent.store import WorkspaceStore
 from ppt_agent.web import create_app
 from ppt_agent.web.assets import FRONTEND_BUILD
@@ -28,15 +23,6 @@ class FastAPIAppTests(unittest.TestCase):
     def tearDown(self):
         self.client.__exit__(None, None, None)
         self.tmp.cleanup()
-
-    def wait_for_runtime_probe(self,client,timeout=3):
-        deadline=time.monotonic()+timeout
-        while time.monotonic()<deadline:
-            response=client.get("/v1/runtime/status").json()
-            if response["model_capabilities"].get("checked"):
-                return response
-            time.sleep(.01)
-        self.fail("后台模型能力探测未在时限内完成")
 
     def wait_for_startup(self,client,timeout=3):
         deadline=time.monotonic()+timeout
@@ -62,7 +48,7 @@ class FastAPIAppTests(unittest.TestCase):
         self.assertEqual(health.status_code, 200)
         self.assertEqual(health.json()["web_runtime"], "fastapi")
         self.assertTrue(health.json()["runtime_ready"])
-        self.assertEqual(health.json()["model_capabilities"]["status"],"not_required")
+        self.assertEqual(health.json()["model_capabilities"]["status"],"on_demand")
         self.assertRegex(health.json()["backend_commit"],r"^(unknown|[0-9a-fA-F]{7,40})$")
         self.assertRegex(health.json()["config_summary_sha256"],r"^[0-9a-f]{64}$")
         self.assertEqual(health.headers["x-content-type-options"], "nosniff")
@@ -99,118 +85,66 @@ class FastAPIAppTests(unittest.TestCase):
         self.assertEqual(legacy.status_code, 404)
         self.assertNotIn("unsafe-inline", legacy.headers["content-security-policy"])
 
-    def test_liveness_opens_before_background_runtime_readiness(self):
-        class BlockingRuntimeService(TaskService):
+    def test_liveness_opens_before_local_prerequisites_finish(self):
+        class BlockingCoreService(TaskService):
             def __init__(self,store):
                 super().__init__(store)
-                self.probe_started=threading.Event()
-                self.release_probe=threading.Event()
+                self.check_started=threading.Event()
+                self.release_check=threading.Event()
 
-            def initialize_runtime(self):
-                self.probe_started.set()
-                self.release_probe.wait(3)
-                return super().initialize_runtime()
+            def initialize_generation_core(self):
+                self.check_started.set()
+                self.release_check.wait(3)
+                return super().initialize_generation_core()
 
         with tempfile.TemporaryDirectory() as root:
-            service=BlockingRuntimeService(WorkspaceStore(root))
+            service=BlockingCoreService(WorkspaceStore(root))
             try:
                 with TestClient(create_app(service)) as client:
-                    self.assertTrue(service.probe_started.wait(1))
+                    self.assertTrue(service.check_started.wait(1))
                     self.assertEqual(client.get("/livez").status_code,200)
                     starting=client.get("/v1/runtime/status").json()
                     self.assertEqual(starting["startup_status"],"starting")
                     self.assertEqual(starting["startup_components"],{
-                        "recovery":"ready","clarification":"ready",
-                        "runtime":"starting","generation_core":"starting",
+                        "recovery":"ready","generation_core":"starting",
                     })
                     self.assertFalse(starting["runtime_ready"])
                     self.assertEqual(client.get("/readyz").status_code,503)
-                    service.release_probe.set()
+                    service.release_check.set()
                     ready=self.wait_for_startup(client)
                     self.assertEqual(ready["startup_status"],"ready")
                     self.assertTrue(ready["runtime_ready"])
                     self.assertEqual(client.get("/readyz").status_code,200)
             finally:
-                service.release_probe.set()
+                service.release_check.set()
 
-    def test_input_persists_job_during_clarification_probe_and_auto_dispatches(self):
-        class BlockingClarifier:
+    def test_input_dispatches_clarification_directly(self):
+        class DirectClarifier:
             model="clarification-only"
             def __init__(self):
-                self.probe_started=threading.Event()
-                self.release_probe=threading.Event()
                 self.calls=0
+                self.status_calls=0
             def set_audit_sink(self,_sink): pass
-            def probe_clarification_capabilities(self):
-                self.probe_started.set()
-                self.release_probe.wait(3)
-                return {"basic_response":True,"clarification_json_schema":True}
-            def probe_capabilities(self): return {"strict_json_schema":True}
+            def probe_capabilities(self):
+                self.status_calls += 1
+                raise AssertionError("status must not contact the model")
             def clarify(self,_payload):
                 self.calls+=1
                 return {"questions":[],"model":self.model}
 
         with tempfile.TemporaryDirectory() as root:
-            clarifier=BlockingClarifier()
+            clarifier=DirectClarifier()
             service=TaskService(WorkspaceStore(root),clarifier=clarifier)
-            try:
-                with TestClient(create_app(service)) as client:
-                    self.assertTrue(clarifier.probe_started.wait(1))
-                    client.post("/v1/tasks",json={"task_id":"queued-cold","mode":"manual"})
-                    started=time.monotonic()
-                    imported=client.post("/v1/tasks/queued-cold/input",json={"source":{"topic":"新品"}})
-                    self.assertLess(time.monotonic()-started,1)
-                    job_id=imported.json()["clarification"]["job_id"]
-                    queued=client.get(f"/v1/jobs/{job_id}").json()
-                    self.assertEqual(queued["status"],"queued")
-                    self.assertEqual(queued["current_step"],"waiting_clarification_runtime")
-                    self.assertEqual(queued["deadline_seconds"],90)
-                    self.assertIsNone(queued["deadline_at"])
-                    clarifier.release_probe.set()
-                    self.assertEqual(self.wait_for_job(client,job_id)["status"],"succeeded")
-                    self.assertTrue(client.get("/v1/tasks/queued-cold/input").json()["clarification"]["confirmed"])
-                    self.assertEqual(clarifier.calls,1)
-            finally:
-                clarifier.release_probe.set()
-
-    def test_clarification_runs_while_unrelated_full_runtime_probe_is_blocked(self):
-        class Clarifier:
-            model="clarification-only"
-            def __init__(self): self.calls=0
-            def set_audit_sink(self,_sink): pass
-            def probe_clarification_capabilities(self):
-                return {"basic_response":True,"clarification_json_schema":True}
-            def clarify(self,_payload):
-                self.calls+=1
-                return {"questions":[],"model":self.model}
-
-        class BlockingFullRuntime(TaskService):
-            def __init__(self,store,clarifier):
-                super().__init__(store,clarifier=clarifier)
-                self.full_probe_started=threading.Event()
-                self.release_full_probe=threading.Event()
-            def initialize_runtime(self):
-                self.full_probe_started.set()
-                self.release_full_probe.wait(3)
-                return super().initialize_runtime()
-
-        with tempfile.TemporaryDirectory() as root:
-            clarifier=Clarifier()
-            service=BlockingFullRuntime(WorkspaceStore(root),clarifier)
-            try:
-                with TestClient(create_app(service)) as client:
-                    self.assertTrue(service.full_probe_started.wait(1))
-                    status=client.get("/v1/runtime/status").json()
-                    self.assertEqual(status["startup_status"],"starting")
-                    self.assertTrue(status["clarification_runtime_ready"])
-                    self.assertFalse(status["runtime_ready"])
-                    client.post("/v1/tasks",json={"task_id":"independent","mode":"manual"})
-                    imported=client.post("/v1/tasks/independent/input",json={"source":{"topic":"新品"}}).json()
-                    job=self.wait_for_job(client,imported["clarification"]["job_id"])
-                    self.assertEqual(job["status"],"succeeded")
-                    self.assertEqual(clarifier.calls,1)
-            finally:
-                service.release_full_probe.set()
+            with TestClient(create_app(service)) as client:
+                client.post("/v1/tasks",json={"task_id":"direct-cold","mode":"manual"})
+                started=time.monotonic()
+                imported=client.post("/v1/tasks/direct-cold/input",json={"source":{"topic":"新品"}})
+                self.assertLess(time.monotonic()-started,1)
+                job_id=imported.json()["clarification"]["job_id"]
+                self.assertEqual(self.wait_for_job(client,job_id)["status"],"succeeded")
+                self.assertTrue(client.get("/v1/tasks/direct-cold/input").json()["clarification"]["confirmed"])
+                self.assertEqual(clarifier.calls,1)
+                self.assertEqual(clarifier.status_calls,0)
 
     def test_startup_repairs_legacy_waiting_input_without_manual_click(self):
         class Clarifier:
@@ -242,175 +176,32 @@ class FastAPIAppTests(unittest.TestCase):
                 self.assertTrue(client.get("/v1/tasks/legacy-wait/input").json()["clarification"]["confirmed"])
                 self.assertEqual(clarifier.calls,1)
 
-    def test_failed_startup_model_probe_marks_readiness_unavailable(self):
-        class ProbeFailure:
-            model="probe-model"
+    def test_runtime_status_is_on_demand_and_has_no_model_recheck_routes(self):
+        class DirectGateway:
+            model="direct-model"
+            calls=0
             def set_audit_sink(self,_sink): pass
-            def probe_capabilities(self): raise RuntimeError("provider details must stay private")
+            def probe_capabilities(self):
+                self.calls += 1
+                raise AssertionError("runtime status must not contact the model")
+
         with tempfile.TemporaryDirectory() as root:
-            service=TaskService(WorkspaceStore(root),generator=ProbeFailure())
+            gateway=DirectGateway()
+            service=TaskService(WorkspaceStore(root),generator=gateway)
             with TestClient(create_app(service)) as client:
-                self.wait_for_runtime_probe(client)
-                health_response=client.get("/healthz")
-                ready_response=client.get("/readyz")
-                live_response=client.get("/livez")
-                browser_status_response=client.get("/v1/runtime/status")
-                health=health_response.json()
-                probes=client.get("/v1/runtime/probes?limit=1").json()["probes"]
-            self.assertEqual(health_response.status_code,503)
-            self.assertEqual(ready_response.status_code,503)
-            self.assertEqual(live_response.status_code,200)
-            self.assertEqual(browser_status_response.status_code,200)
-            self.assertFalse(browser_status_response.json()["runtime_ready"])
-            self.assertEqual(live_response.json()["status"],"ok")
-            self.assertFalse(health["runtime_ready"])
-            self.assertEqual(health["status"],"unavailable")
-            self.assertEqual(health["model_capabilities"]["error"]["code"],"capability_probe_failed")
-            self.assertEqual(health["model_capabilities"]["failed_check"],"capability_contract")
-            self.assertRegex(health["model_capabilities"]["probe_id"],r"^runtime-probe-[0-9a-f]{32}$")
-            self.assertEqual(probes[0]["probe_id"],health["model_capabilities"]["probe_id"])
-            self.assertEqual(probes[0]["events"][-1]["sdk_exception_type"],"RuntimeError")
-            self.assertEqual(TaskService(WorkspaceStore(root)).runtime_probes(1)[0]["probe_id"],probes[0]["probe_id"])
-            self.assertNotIn("provider details",str(health))
-            self.assertNotIn("provider details",str(probes))
-
-    def test_real_adapter_unknown_sdk_failures_map_each_probe_layer_and_persist_safely(self):
-        class ProbeSDK:
-            def __init__(self, fail_at):
-                self.responses = self
-                self.fail_at = set(fail_at)
-                self.calls = 0
-
-            def create(self, **_kwargs):
-                if _kwargs.get("text",{}).get("format",{}).get("name")=="clarification":
-                    return SimpleNamespace(output_text='{"questions":[]}',id="clarification-probe-id",output=[])
-                self.calls += 1
-                if self.calls in self.fail_at:
-                    raise RuntimeError("raw provider message with secret-key")
-                responses = {
-                    1: SimpleNamespace(output_text="OK", id="provider-basic-id", output=[]),
-                    2: SimpleNamespace(output_text='{"slides":[{"title":"探测","purpose":"验证","content_markdown":"- 内容","resource_uris":[]}]}', id="provider-schema-id", output=[]),
-                    3: SimpleNamespace(
-                        output_text="",
-                        id="provider-tool-id",
-                        output=[SimpleNamespace(type="function_call", name="read_skill_file", arguments='{"path":"SKILL.md"}', call_id="provider-call-id")],
-                    ),
-                    4: SimpleNamespace(output_text='{"markdown":"probe-ok"}', id="provider-final-id", output=[]),
-                }
-                return responses[self.calls]
-
-        config = SimpleNamespace(
-            model="probe-model",
-            api_key="secret-key",
-            base_url="https://provider.example/v1",
-            timeout_seconds=1,
-        )
-        cases = {
-            "basic_response": ((1, 2), "probe_basic_response_failed"),
-            "strict_json_schema": ((2,), "probe_invalid_output"),
-            "tool_round_trip": ((3,), "probe_tool_round_failed"),
-        }
-        for failed_check, (fail_at, expected_code) in cases.items():
-            with self.subTest(failed_check=failed_check), tempfile.TemporaryDirectory() as root:
-                adapter = OpenAIResponsesClient(config, sdk_client=ProbeSDK(fail_at))
-                gateway = AgentGateway(adapter, skill=SkillRuntime.builtin(), model=config.model)
-                service = TaskService(WorkspaceStore(root), generator=gateway, clarifier=gateway)
-                with TestClient(create_app(service)) as client:
-                    status = self.wait_for_runtime_probe(client)["model_capabilities"]
-                    persisted = client.get("/v1/runtime/probes?limit=1").json()["probes"][0]
-                    clarification_status=client.get("/v1/runtime/status").json()["clarification_runtime"]
-
-                probe_id = status["probe_id"]
-                self.assertEqual(status["failed_check"], failed_check)
-                self.assertEqual(status["error"]["code"], expected_code)
-                self.assertEqual(status["error"]["probe_id"], probe_id)
-                self.assertEqual(persisted["probe_id"], probe_id)
-                self.assertEqual(persisted["failed_check"], failed_check)
-                self.assertEqual(persisted["error"]["code"], expected_code)
-                failure_event = persisted["events"][-1]
-                self.assertEqual(failure_event["error_code"], expected_code)
-                self.assertEqual(failure_event["category"], "sdk_error")
-                self.assertEqual(failure_event["sdk_exception_type"], "RuntimeError")
-                self.assertTrue(clarification_status["ready"])
-                self.assertEqual(clarification_status["models"][0]["checks"]["clarification_json_schema"],True)
-
-                restarted = TaskService(WorkspaceStore(root)).runtime_probes(1)[0]
-                self.assertEqual(restarted, persisted)
-                serialized = json.dumps(
-                    {"status": status, "persisted": persisted, "clarification":clarification_status,"restarted": restarted}
-                )
-                self.assertNotIn("raw provider message", serialized)
-                self.assertNotIn("secret-key", serialized)
-
-    def test_tool_probe_failure_modes_persist_precise_diagnostics_across_restart(self):
-        class ProbeSDK:
-            def __init__(self, scenario):
-                self.responses = self
-                self.scenario = scenario
-                self.calls = 0
-
-            def create(self, **_kwargs):
-                if _kwargs.get("text",{}).get("format",{}).get("name")=="clarification":
-                    return SimpleNamespace(output_text='{"questions":[]}',id="clarification-probe-id",output=[])
-                self.calls += 1
-                common = {
-                    1: SimpleNamespace(output_text="OK", id="provider-basic-id", output=[]),
-                    2: SimpleNamespace(output_text='{"slides":[{"title":"探测","purpose":"验证","content_markdown":"- 内容","resource_uris":[]}]}', id="provider-schema-id", output=[]),
-                }
-                if self.calls in common:
-                    return common[self.calls]
-                if self.scenario == "missing":
-                    return SimpleNamespace(output_text="I will not call a tool", id="provider-no-tool-id", output=[])
-                if self.calls == 3:
-                    return SimpleNamespace(
-                        output_text="",
-                        id="provider-tool-id",
-                        output=[SimpleNamespace(type="function_call", name="read_skill_file", arguments='{"path":"SKILL.md"}', call_id="provider-call-id")],
-                    )
-                return SimpleNamespace(output_text="not-json", id=f"provider-invalid-{self.calls}", output=[])
-
-        cases = {
-            "missing": ("probe_tool_call_missing", "tool_request", "capability_probe_failed", 0),
-            "final_invalid": ("probe_tool_final_invalid_output", "tool_final_output", "invalid_output", 1),
-        }
-        config = SimpleNamespace(
-            model="probe-model",
-            api_key="secret-key",
-            base_url="https://provider.example/v1",
-            timeout_seconds=1,
-        )
-        for scenario, (code, phase, reason, tool_calls) in cases.items():
-            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as root:
-                adapter = OpenAIResponsesClient(config, sdk_client=ProbeSDK(scenario))
-                gateway = AgentGateway(adapter, skill=SkillRuntime.builtin(), model=config.model)
-                service = TaskService(WorkspaceStore(root), generator=gateway, clarifier=gateway)
-                with TestClient(create_app(service)) as client:
-                    status = self.wait_for_runtime_probe(client)["model_capabilities"]
-                    persisted = client.get("/v1/runtime/probes?limit=1").json()["probes"][0]
-                    clarification_status=client.get("/v1/runtime/status").json()["clarification_runtime"]
-
-                for error in (status["error"], persisted["error"]):
-                    self.assertEqual(error["code"], code)
-                    self.assertEqual(error["probe_phase"], phase)
-                    self.assertEqual(error["terminal_reason"], reason)
-                    self.assertEqual(error["tool_calls"], tool_calls)
-                self.assertEqual(persisted["failed_check"], "tool_round_trip")
-                self.assertEqual(persisted["events"][-1]["probe_phase"], phase)
-                self.assertTrue(clarification_status["ready"])
-                self.assertEqual(clarification_status["models"][0]["checks"]["clarification_json_schema"],True)
-                self.assertEqual(TaskService(WorkspaceStore(root)).runtime_probes(1)[0], persisted)
-
-                serialized = json.dumps({"status": status, "persisted": persisted,"clarification":clarification_status})
-                self.assertNotIn("I will not call a tool", serialized)
-                self.assertNotIn("not-json", serialized)
-                self.assertNotIn("secret-key", serialized)
+                self.wait_for_startup(client)
+                health=client.get("/v1/runtime/status").json()
+                self.assertEqual(client.post("/v1/runtime/recheck").status_code,404)
+                self.assertEqual(client.get("/v1/runtime/probes").status_code,404)
+            self.assertTrue(health["model_capabilities"]["ready"])
+            self.assertEqual(health["model_capabilities"]["status"],"on_demand")
+            self.assertEqual(gateway.calls,0)
 
     def test_answer_completion_enqueues_next_configured_clarification_round(self):
         class MultiRoundClarifier:
             model="multi-round-model"
             def __init__(self): self.calls=[]
             def set_audit_sink(self,_sink): pass
-            def probe_capabilities(self): return {"strict_json_schema":True}
             def clarify(self,payload):
                 self.calls.append(payload)
                 if payload["clarification_context"]["round"]==1:
@@ -452,21 +243,19 @@ class FastAPIAppTests(unittest.TestCase):
                 previous=clarifier.calls[1]["clarification_context"]["previous_qa"]
                 self.assertEqual(previous[0]["answers"],{question["question_id"]:"管理层"})
 
-    def test_unready_clarifier_persists_failed_job_and_preserves_fallback(self):
-        class UnreadyClarifier:
-            model="unready-model"
+    def test_clarifier_failure_persists_failed_job_and_preserves_fallback(self):
+        class FailingClarifier:
+            model="failing-model"
             calls=0
             def set_audit_sink(self,_sink): pass
-            def probe_capabilities(self):
+            def clarify(self,_payload):
+                self.calls += 1
                 raise GatewayError(
                     "模型服务认证失败，请联系管理员检查凭据",
                     code="model_authentication_failed",
                 )
-            def clarify(self,_payload):
-                self.calls += 1
-                raise AssertionError("unready model must not be invoked")
         with tempfile.TemporaryDirectory() as root:
-            clarifier=UnreadyClarifier()
+            clarifier=FailingClarifier()
             service=TaskService(WorkspaceStore(root),clarifier=clarifier)
             with TestClient(create_app(service)) as client:
                 client.post("/v1/tasks",json={"task_id":"unready","mode":"manual"})
@@ -481,26 +270,22 @@ class FastAPIAppTests(unittest.TestCase):
                 self.assertEqual(view["clarification"]["status"],"failed")
                 self.assertEqual(view["state"]["waiting_reason"],"clarification_failed")
                 self.assertEqual(view["state"]["required_action"],"retry_clarification")
-                self.assertEqual(error["code"],"runtime_unavailable")
-                self.assertEqual(error["runtime_error_code"],"model_authentication_failed")
-                self.assertEqual(error["failed_check"],"clarification_json_schema")
-                self.assertRegex(error["probe_id"],r"^clarification-probe-[0-9a-f]{32}$")
+                self.assertEqual(error["code"],"model_authentication_failed")
                 jobs=client.get("/v1/tasks/unready/jobs").json()["jobs"]
                 self.assertEqual(len(jobs),1)
                 self.assertEqual(jobs[0]["deadline_seconds"],90)
                 fallback=client.post("/v1/tasks/unready/clarifications/fallback",json={"confirm":True})
                 self.assertEqual(fallback.status_code,200)
                 self.assertEqual(fallback.json()["question_source"],"fallback")
-            self.assertEqual(clarifier.calls,0)
+            self.assertEqual(clarifier.calls,1)
 
     def test_classified_job_failure_keeps_readiness_and_public_error(self):
         class RateLimitedGateway:
             model="rate-limited-model"
             def set_audit_sink(self,_sink): pass
-            def probe_capabilities(self): return {"strict_json_schema":True}
             def generate(self,_action,_payload,*,skill):
                 raise GatewayError(
-                    "模型服务请求过于频繁，请等待后重新探测",
+                    "模型服务请求过于频繁，请等待后重试",
                     code="model_rate_limited",
                     retryable=True,
                     retry_after_seconds=11,
@@ -528,7 +313,6 @@ class FastAPIAppTests(unittest.TestCase):
                 self.assertEqual(job["error"]["code"],"model_rate_limited")
                 self.assertTrue(job["error"]["retryable"])
                 self.assertEqual(job["error"]["retry_after_seconds"],11)
-                # 429 限流属于模型行为类失败：记录在本任务，不翻转全局运行时就绪
                 ready=client.get("/readyz")
                 self.assertEqual(ready.status_code,200)
 

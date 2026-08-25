@@ -108,7 +108,7 @@ class RuntimeUnavailableError(DomainError):
 
     def __init__(
         self,
-        message: str = "模型运行时尚未就绪，请修复配置并重新探测",
+        message: str = "当前实例暂不接受新的写任务，请联系管理员恢复服务配置后重试",
         *,
         runtime_error_code: str | None = None,
         retryable: bool = False,

@@ -10,12 +10,6 @@ export class ApiError extends Error {
     this.retryable = details.retryable === true;
     this.retryAfterSeconds = details.retry_after_seconds || null;
     this.runtimeErrorCode = details.runtime_error_code || null;
-    this.probeId = details.probe_id || null;
-    this.failedCheck = details.failed_check || null;
-    this.probePhase = details.probe_phase || null;
-    this.terminalReason = details.terminal_reason || null;
-    this.toolCalls = Number.isInteger(details.tool_calls) ? details.tool_calls : null;
-    this.underlyingCode = details.underlying_code || null;
     this.status = details.status || 0;
   }
 }
@@ -49,8 +43,6 @@ export async function request(path, options = {}) {
 
 export const api = {
   runtimeStatus: () => runtimeStatus(),
-  recheckRuntime: () => runtimeStatus(true),
-  runtimeProbes: (limit = 20) => request(`/v1/runtime/probes?limit=${encodeURIComponent(limit)}`),
   listTasks: (controller) => request("/v1/tasks", { controller }),
   createTask: (payload) => request("/v1/tasks", { method: "POST", body: payload }),
   shell: (taskId, controller) => request(`/v1/tasks/${encodeURIComponent(taskId)}/shell`, { controller }),
@@ -110,7 +102,7 @@ export const api = {
   cancelJob: (jobId) => request(`/v1/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST", body: {} }),
 };
 
-async function runtimeStatus(recheck = false) {
+async function runtimeStatus() {
   let live;
   let liveData;
   try {
@@ -120,14 +112,11 @@ async function runtimeStatus(recheck = false) {
   }
   if (!live.ok) return { backendReachable: false, runtimeReady: false, live: liveData, ready: null };
   try {
-    const { response: ready, data: readyData } = await runtimeFetch(recheck ? "/v1/runtime/recheck" : "/v1/runtime/status", {
-      method: recheck ? "POST" : "GET",
-      timeout: recheck ? 90_000 : 8_000,
-    });
+    const { response: ready, data: readyData } = await runtimeFetch("/v1/runtime/status");
     return { backendReachable: true, runtimeReady: readyData.runtime_ready === true, live: liveData, ready: readyData };
   } catch (_error) {
-    // Liveness already succeeded. A slow readiness/model probe must never be
-    // mislabeled as a dead backend; leave model readiness unknown instead.
+    // Liveness already succeeded, so keep the backend reachable even when the
+    // optional local prerequisite status cannot be read.
     return { backendReachable: true, runtimeReady: null, live: liveData, ready: null };
   }
 }

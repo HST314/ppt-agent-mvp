@@ -266,17 +266,10 @@ def main() -> int:
             generation_pipeline=pipeline,
             **ports,
         )
-        runtime_health = service.initialize_runtime()
-        if not runtime_health.get("ready"):
-            raise RuntimeUnavailableError(
-                "真实模型能力探测未通过",
-                runtime_error_code=(runtime_health.get("error") or {}).get("code"),
-                failed_check=runtime_health.get("failed_check"),
-            )
         core_health = service.initialize_generation_core()
         if not core_health.get("ready"):
             raise RuntimeUnavailableError(
-                "真实模型生成内核能力探测未通过",
+                "本地生成依赖未就绪",
                 runtime_error_code="generation_core_unavailable",
                 failed_check="generation_core",
             )

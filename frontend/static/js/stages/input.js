@@ -1,6 +1,6 @@
-import { api } from "../api.js?v=2026.08.24.091507484151";
-import { badge, button, confirmationDialog, element, field, metadataList, shortHash } from "../components/index.js?v=2026.08.24.091507484151";
-import { actionMessage, invalidationNotice, runAction, section, stageGrid } from "./shared.js?v=2026.08.24.091507484151";
+import { api } from "../api.js?v=2026.08.25.023156421530";
+import { badge, button, confirmationDialog, element, field, metadataList, shortHash } from "../components/index.js?v=2026.08.25.023156421530";
+import { actionMessage, invalidationNotice, runAction, section, stageGrid } from "./shared.js?v=2026.08.25.023156421530";
 
 const FIELD_LABELS = { goal: "演示目标", audience: "主要受众", topic: "核心主题" };
 const WARNING_LABELS = {
@@ -269,16 +269,11 @@ function clarificationFailed(clarification, context) {
       metadataList([
         ["错误代码", error.code || "clarification_generation_failed"],
         error.runtime_error_code ? ["运行时错误", error.runtime_error_code] : null,
-        error.failed_check ? ["失败检查", runtimeCheckLabel(error.failed_check)] : null,
-        error.probe_phase ? ["失败阶段", runtimePhaseLabel(error.probe_phase)] : null,
-        Number.isInteger(error.tool_calls) ? ["工具调用数", String(error.tool_calls)] : null,
         error.underlying_code ? ["底层错误", error.underlying_code] : null,
-        error.probe_id ? ["探测 ID", error.probe_id] : null,
         ["诊断 ID", error.diagnostic_id || "—"],
         ["Agent 审计 ID", error.agent_audit_id || "—"],
       ].filter(Boolean)),
       error.agent_audit_id ? copyValueButton("复制审计 ID", error.agent_audit_id) : null,
-      error.probe_id ? copyValueButton("复制探测 ID", error.probe_id) : null,
     ]),
     element("div", { className: "clarification-failure-actions" }, [retry, fallback]),
     element("p", { className: "field__hint", text: advice }),
@@ -313,14 +308,11 @@ function clarificationWaitingForRuntime(clarification, context) {
       element("p", { text: "这是旧版本遗留的无 Job 状态。服务会自动补建持久化澄清任务；无需新建任务或重新导入资料。" }),
       metadataList([
         error.runtime_error_code ? ["运行时错误", error.runtime_error_code] : null,
-        error.failed_check ? ["失败检查", runtimeCheckLabel(error.failed_check)] : null,
-        error.probe_id ? ["探测 ID", error.probe_id] : null,
       ].filter(Boolean)),
-      error.probe_id ? copyValueButton("复制探测 ID", error.probe_id) : null,
     ]),
     element("div", { className: "clarification-failure-actions" }, [resume, fallback]),
     element("p", { className: "field__hint", text: clarificationRecoveryAdvice(error) }),
-    element("p", { className: "field__hint", text: "系统会对未知传输故障做独立能力探测，但不会重放结果未知的旧 Job。" }),
+    element("p", { className: "field__hint", text: "原任务记录会保留；重试会创建新的后台任务。" }),
     message,
   ], { description: "冻结输入和资源清单保持不变；正常路径会自动恢复，手动重试仅用于异常处置。" });
 }
@@ -329,39 +321,22 @@ function clarificationRecoveryAdvice(error) {
   const code = error.code || "clarification_generation_failed";
   const cause = error.runtime_error_code || code;
   if (["model_authentication_failed", "model_permission_denied", "model_not_found", "model_request_invalid"].includes(cause)) {
-    return "这是确定性配置故障。请联系管理员修复模型凭据、权限、模型名或结构化输出配置，再从连接状态执行“重新检测模型”；不要连续重试。";
+    return "请联系管理员修复模型凭据、权限、模型名或请求配置，完成后重新生成。";
   }
   if (cause === "model_rate_limited") {
     const wait = error.retry_after_seconds ? `至少等待 ${error.retry_after_seconds} 秒后` : "等待限流窗口结束后";
-    return `${wait}重新检测模型，确认恢复后再生成；不要连续点击重试。`;
+    return `${wait}重新生成；不要连续点击重试。`;
   }
   if (cause === "model_upstream_unavailable") {
-    return "上游模型服务暂时异常。请稍后重新检测，确认“模型可用”后再生成。";
+    return "上游模型服务暂时异常，请稍后重新生成。";
   }
   if (["model_timeout", "model_connection_error", "gateway_unknown_result"].includes(cause)) {
-    return "本次请求结果可能未知。请先使用审计 ID 核对供应商记录，再重新检测模型；不要直接重复提交。";
-  }
-  if (cause === "probe_tool_call_missing") {
-    return "模型忽略了强制工具调用。请联系管理员确认模型支持函数调用与 tool_choice，切换到兼容模型后重新检测；不要连续重试。";
-  }
-  if (cause === "probe_tool_round_failed") {
-    return "模型端点未完成工具结果回传。请联系管理员核对 Responses API 续轮格式或切换兼容端点，重新检测通过后再生成。";
-  }
-  if (cause === "probe_tool_final_invalid_output") {
-    return "工具调用已完成，但模型最终输出未通过 JSON Schema。请联系管理员核对模型的结构化输出能力，修复后重新检测。";
+    return "本次生成没有获得确定结果。请确认当前阶段没有新增版本后，点击重新生成；原任务记录与审计 ID 会保留。";
   }
   if (code === "runtime_unavailable") {
-    return "模型运行时未通过就绪检查。请在右上角设置中重新检测；仍失败时按运行时错误代码联系管理员。";
+    return "当前实例暂不接受新的写任务，请联系管理员恢复服务配置后重新生成。";
   }
-  return "请先复制诊断信息并联系管理员核对运行日志；确认模型恢复后再重新生成。使用系统兜底问题仍需明确确认。";
-}
-
-function runtimeCheckLabel(check) {
-  return ({ basic_response: "基础文本响应", clarification_json_schema: "澄清 JSON Schema", strict_json_schema: "严格 JSON Schema", tool_round_trip: "工具调用与结果回传", capability_contract: "能力契约" })[check] || check;
-}
-
-function runtimePhaseLabel(phase) {
-  return ({ basic_response: "基础响应", strict_json_schema: "结构化输出", tool_request: "请求工具调用", tool_result: "回传工具结果", tool_final_output: "工具轮最终输出" })[phase] || phase;
+  return "请保留诊断 ID 并重新生成；若连续失败，再联系管理员核对运行日志。";
 }
 
 function copyValueButton(label, value) {

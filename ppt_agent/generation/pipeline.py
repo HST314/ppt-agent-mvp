@@ -1677,16 +1677,7 @@ class GenerationPipeline:
             shutil.rmtree(probe, ignore_errors=True)
         checks["asset_root"] = self.asset_root.is_dir() and os.access(self.asset_root, os.R_OK)
         checks["chromium"] = self.validator.readiness()
-        capability = getattr(self.gateway.provider, "probe_capabilities", None)
-        if callable(capability):
-            try:
-                values = capability()
-                checks["provider"] = {"ready": bool(values and all(values.values())), "checks": values}
-            except Exception as exc:
-                checks["provider"] = {"ready": False, "error_type": type(exc).__name__}
-        else:
-            checks["provider"] = {"ready": True, "checks": "deferred"}
-        ready = bool(checks["data_directory"] and checks["temporary_directory"] and checks["asset_root"] and checks["chromium"].get("ready") and checks["provider"].get("ready"))
+        ready = bool(checks["data_directory"] and checks["temporary_directory"] and checks["asset_root"] and checks["chromium"].get("ready"))
         renderer_version = AGENT_HTML_RENDERER_VERSION if self.generation_mode == "agent_html" else self.renderer.version
         return {
             "ready": ready,

@@ -1,11 +1,11 @@
-import { api, ApiError } from "./api.js?v=2026.08.24.091507484151";
-import { JobTracker } from "./job-tracker.js?v=2026.08.24.091507484151";
-import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.24.091507484151";
-import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.24.091507484151";
-import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.24.091507484151";
-import { inlineError, setBusy } from "./components/index.js?v=2026.08.24.091507484151";
-import { renderStage } from "./stages/index.js?v=2026.08.24.091507484151";
-import { setVersionMatchGuard } from "./stages/shared.js?v=2026.08.24.091507484151";
+import { api, ApiError } from "./api.js?v=2026.08.25.023156421530";
+import { JobTracker } from "./job-tracker.js?v=2026.08.25.023156421530";
+import { currentRoute, installRouter, navigate } from "./router.js?v=2026.08.25.023156421530";
+import { applyTheme, badge, brandMark, button, element, icon, iconButton, preferredTheme, showToast } from "./shell.js?v=2026.08.25.023156421530";
+import { bindJobIntent, clearIdempotencyKey, getOrCreateIdempotencyKey, storageKeyForJob, storedJobIntents } from "./store.js?v=2026.08.25.023156421530";
+import { inlineError, setBusy } from "./components/index.js?v=2026.08.25.023156421530";
+import { renderStage } from "./stages/index.js?v=2026.08.25.023156421530";
+import { setVersionMatchGuard } from "./stages/shared.js?v=2026.08.25.023156421530";
 
 const app = document.getElementById("app");
 const APP_BUILD = document.querySelector('meta[name="app-build"]')?.content || "unknown";
@@ -20,7 +20,7 @@ let activeController = null;
 let hasUnsavedDraft = false;
 let renderedAuthority = null;
 let acceptedLocation = `${window.location.pathname}${window.location.search}${window.location.hash}`;
-let runtimeProbe = null;
+let runtimeRequest = null;
 let versionMismatchNotified = false;
 let runtimeState = { browserOnline: navigator.onLine, backendReachable: null, runtimeReady: null, health: null };
 
@@ -177,38 +177,14 @@ function renderRuntimeBadges(group) {
   const backendLabel = runtimeState.backendReachable === null ? "后端检测中" : runtimeState.backendReachable ? "后端可达" : "后端不可达";
   const backendTone = runtimeState.backendReachable === null ? "warning" : runtimeState.backendReachable ? "success" : "danger";
   const versionMismatch = runtimeVersionMismatch();
-  let modelLabel = "模型检测中";
-  let modelTone = "warning";
-  if (runtimeState.health?.startup_status === "starting") {
-    if (runtimeState.health?.clarification_runtime_ready) {
-      modelLabel = "澄清模型可用·后续能力检测中";
-      modelTone = "primary";
-    } else {
-      modelLabel = "澄清模型连接中";
-    }
-  } else if (runtimeState.health?.clarification_mode === "fake" && runtimeState.runtimeReady) {
-    modelLabel = "模型：本地模式";
-    modelTone = "primary";
-  } else if (runtimeState.runtimeReady === true) {
-    modelLabel = "模型可用";
-    modelTone = "success";
-  } else if (runtimeState.health?.model_capabilities?.status === "recovering") {
-    modelLabel = "模型恢复探测中";
-  } else if (runtimeState.runtimeReady === false) {
-    modelLabel = "模型不可用";
-    modelTone = "danger";
-  }
+  const modelLabel = runtimeState.health?.clarification_mode === "fake" ? "模型：本地模式" : "模型：按任务调用";
+  const modelTone = "primary";
   const signature = JSON.stringify([browserLabel, browserTone, backendLabel, backendTone, modelLabel, modelTone, versionMismatch]);
   if (group.dataset.runtimeSignature === signature) return;
   group.dataset.runtimeSignature = signature;
   const browser = badge(browserLabel, browserTone);
   const backend = badge(backendLabel, backendTone);
   const model = badge(modelLabel, modelTone);
-  const code = runtimeState.health?.model_capabilities?.error?.code;
-  const phase = runtimeState.health?.model_capabilities?.error?.probe_phase;
-  const failedCheck = runtimeState.health?.model_capabilities?.failed_check;
-  const probeId = runtimeState.health?.model_capabilities?.probe_id;
-  if (code) model.title = [`运行时错误：${code}`,failedCheck ? `失败检查：${runtimeCheckLabel(failedCheck)}` : null,phase ? `失败阶段：${runtimePhaseLabel(phase)}` : null,probeId ? `探测 ID：${probeId}` : null].filter(Boolean).join(" · ");
   if (versionMismatch) {
     const warning = badge("版本不一致·需重启", "danger");
     warning.title = `前端 Build ${APP_BUILD} · 后端 Build ${runtimeState.health.frontend_build} · 后端 commit ${(runtimeState.health.backend_commit || "unknown").slice(0, 12)}`;
@@ -218,14 +194,14 @@ function renderRuntimeBadges(group) {
   group.replaceChildren(browser, backend, model);
 }
 
-async function refreshRuntimeStatus(recheck = false) {
-  if (runtimeProbe) return runtimeProbe;
+async function refreshRuntimeStatus() {
+  if (runtimeRequest) return runtimeRequest;
   if (!navigator.onLine) {
     runtimeState = { browserOnline: false, backendReachable: false, runtimeReady: false, health: null };
     updateRuntimeUI();
     return runtimeState;
   }
-  runtimeProbe = api[recheck ? "recheckRuntime" : "runtimeStatus"]().then((result) => {
+  runtimeRequest = api.runtimeStatus().then((result) => {
     runtimeState = {
       browserOnline: navigator.onLine,
       backendReachable: result.backendReachable,
@@ -234,37 +210,14 @@ async function refreshRuntimeStatus(recheck = false) {
     };
     updateRuntimeUI();
     return runtimeState;
-  }).finally(() => { runtimeProbe = null; });
-  return runtimeProbe;
+  }).finally(() => { runtimeRequest = null; });
+  return runtimeRequest;
 }
 
 function updateRuntimeUI() {
   document.querySelectorAll("[data-runtime-status]").forEach(renderRuntimeBadges);
-  document.querySelectorAll("[data-runtime-probe-details]").forEach(renderRuntimeProbeDetails);
   document.querySelectorAll("[data-runtime-version-details]").forEach(renderRuntimeVersionDetails);
   const versionMismatch = runtimeVersionMismatch();
-  document.querySelectorAll('[data-requires-runtime="true"]').forEach((control) => {
-    if (runtimeState.runtimeReady && !versionMismatch) {
-      if (control.dataset.runtimeDisabled === "true") {
-        control.disabled = false;
-        delete control.dataset.runtimeDisabled;
-        control.removeAttribute("aria-description");
-        control.title = "";
-      }
-      return;
-    }
-    if (!control.disabled) control.dataset.runtimeDisabled = "true";
-    control.disabled = true;
-    const reason = versionMismatch
-      ? "前端与后端版本不一致，请先重启后端服务"
-      : runtimeState.backendReachable === false
-        ? "后端服务当前不可达"
-        : runtimeState.health?.startup_status === "starting"
-          ? "后台正在恢复任务并检测运行时，请稍后"
-          : "模型运行时不可用，请先重新检测";
-    control.title = reason;
-    control.setAttribute("aria-description", reason);
-  });
   // 版本阻断状态（data-version-disabled）独立于 disabled 当前值：mismatch 期间
   // 始终打标，动态业务闸据此保持禁用；仅记录版本门禁自己禁用的控件
   // （data-version-prev-enabled），解除时只恢复这些控件，不误改业务禁用态。
@@ -301,17 +254,6 @@ async function ensureVersionMatchAllowed() {
   if (runtimeVersionMismatch()) {
     throw new ApiError("前端与后端版本不一致，请先重启后端服务再执行该操作", { code: "version_mismatch", status: 409 });
   }
-}
-
-function assertRuntimeReady() {
-  if (!runtimeState.runtimeReady) {
-    throw new ApiError("模型运行时不可用，请先在连接状态中重新检测", { code: "runtime_unavailable", status: 503 });
-  }
-}
-
-async function ensureRuntimeActionAllowed() {
-  await ensureVersionMatchAllowed();
-  assertRuntimeReady();
 }
 
 function syncVersionBanner() {
@@ -1000,7 +942,6 @@ async function startJob(taskId, operation, payload, route, { buttonNode = null, 
     buttonNode,
     region,
     intent,
-    requiresRuntime: operation !== "delivery.publish",
     create: () => api.createJob(taskId, { operation, payload, idempotency_key: intent.value }),
   });
 }
@@ -1014,21 +955,17 @@ async function retryClarification(taskId, route, { buttonNode = null, region = n
     region,
     intent,
     busyLabel: "正在创建重试任务…",
-    requiresRuntime: false,
     create: () => api.retryClarification(taskId, intent.value),
   });
   if (job && !["succeeded", "failed", "cancelled", "interrupted"].includes(job.status)) renderRoute(currentRoute());
   return job;
 }
 
-async function startTrackedJob({ taskId, route, buttonNode, region, intent, create, requiresRuntime = true, busyLabel = "正在创建后台任务…" }) {
+async function startTrackedJob({ taskId, route, buttonNode, region, intent, create, busyLabel = "正在创建后台任务…" }) {
   region?.replaceChildren();
   setBusy(buttonNode, true, busyLabel);
   try {
-    // 版本门禁无条件先行：包括 delivery.publish 在内的所有 Job 创建路径，
-    // 在派发前都必须通过前后端版本一致性校验；模型就绪校验仅限运行时操作。
     await ensureVersionMatchAllowed();
-    if (requiresRuntime) assertRuntimeReady();
     const job = await create();
     bindJobIntent(job, intent.storageKey);
     let activeRegion = document.getElementById("active-job-region");
@@ -1332,7 +1269,7 @@ function modelSettings(models) {
   return element("section",{className:"card settings-panel"},[
     element("div",{className:"card__header"},[element("div",{},[element("h2",{text:"模型与凭证状态"}),element("p",{className:"muted",text:"仅显示环境变量名称和安全摘要，不回显密钥。"})]),badge(models.mode==="agent" ? "Agent 模式" : "本地模式","primary")]),
     gateways.length ? element("div",{className:"model-list"},gateways.map((item)=>element("article",{className:"notice"},[element("strong",{text:item.model}),element("p",{text:`${item.type} · Key ${item.config?.api_key_env || "—"} · Base URL ${item.config?.base_url_env || "—"}`} )]))) : element("p",{className:"muted",text:"当前使用本地确定性模式，无外部模型凭证。"}),
-    runtimeStatusBadges(),runtimeProbeDetails(),
+    runtimeStatusBadges(),
   ]);
 }
 
@@ -1357,10 +1294,9 @@ function systemSettings() {
   const current=document.documentElement.dataset.theme;
   return element("section",{className:"card settings-panel"},[
     element("div",{className:"card__header"},[element("div",{},[element("h2",{text:"系统与显示"}),element("p",{className:"muted",text:"前后端版本与后端提交校验。"})])]),
-    runtimeStatusBadges(),runtimeVersionDetails(),runtimeProbeDetails(),
+    runtimeStatusBadges(),runtimeVersionDetails(),
     element("div",{className:"button-row"},[
       button(current==="dark" ? "切换浅色主题" : "切换深色主题",{onClick:(event)=>{ const next=document.documentElement.dataset.theme==="dark" ? "light" : "dark"; applyTheme(next); event.currentTarget.textContent=next==="dark" ? "切换浅色主题" : "切换深色主题"; }}),
-      button("重新检测模型",{kind:"secondary",onClick:async(event)=>{ const control=event.currentTarget; setBusy(control,true,"正在检测…"); await refreshRuntimeStatus(true); setBusy(control,false); }}),
     ]),
   ]);
 }
@@ -1468,15 +1404,6 @@ function openSettings() {
         element("span", { className: "field__label", text: "服务连接" }),
         runtimeStatusBadges(),
         runtimeVersionDetails(),
-        runtimeProbeDetails(),
-        button("重新检测模型", { onClick: async (event) => {
-          const control = event.currentTarget;
-          setBusy(control, true, "正在重新检测…");
-          await refreshRuntimeStatus(true);
-          control.disabled = false;
-          control.textContent = "重新检测模型";
-          showToast(runtimeState.runtimeReady ? "模型运行时已就绪" : "模型仍不可用，请按错误代码检查配置");
-        } }),
       ]),
     ]),
     element("div", { className: "dialog__actions" }, [button("关闭", { kind: "primary", onClick: () => {
@@ -1487,38 +1414,6 @@ function openSettings() {
   document.body.append(dialog);
   dialog.addEventListener("cancel", () => window.setTimeout(() => dialog.remove(), 0), { once: true });
   dialog.showModal();
-}
-
-function runtimeProbeDetails() {
-  const container = element("div", { "data-runtime-probe-details": "true" });
-  renderRuntimeProbeDetails(container);
-  return container;
-}
-
-function renderRuntimeProbeDetails(container) {
-  const capabilities = runtimeState.health?.model_capabilities;
-  if (!capabilities?.probe_id) {
-    container.replaceChildren();
-    return;
-  }
-  const error = capabilities.error || {};
-  container.replaceChildren(element("dl", { className: "metadata-list", "aria-label": "模型能力探测详情" }, [
-    element("div", {}, [element("dt", { text: "探测 ID" }), element("dd", { text: capabilities.probe_id })]),
-    capabilities.failed_check ? element("div", {}, [element("dt", { text: "失败检查" }), element("dd", { text: runtimeCheckLabel(capabilities.failed_check) })]) : null,
-    error.probe_phase ? element("div", {}, [element("dt", { text: "失败阶段" }), element("dd", { text: runtimePhaseLabel(error.probe_phase) })]) : null,
-    Number.isInteger(error.tool_calls) ? element("div", {}, [element("dt", { text: "工具调用数" }), element("dd", { text: String(error.tool_calls) })]) : null,
-    error.code ? element("div", {}, [element("dt", { text: "运行时错误" }), element("dd", { text: error.code })]) : null,
-    error.underlying_code ? element("div", {}, [element("dt", { text: "底层错误" }), element("dd", { text: error.underlying_code })]) : null,
-    error.message ? element("div", {}, [element("dt", { text: "错误详情" }), element("dd", { text: error.message })]) : null,
-  ]));
-}
-
-function runtimeCheckLabel(check) {
-  return ({ basic_response: "基础文本响应", clarification_json_schema: "澄清 JSON Schema", strict_json_schema: "严格 JSON Schema", tool_round_trip: "工具调用与结果回传", capability_contract: "能力契约" })[check] || check;
-}
-
-function runtimePhaseLabel(phase) {
-  return ({ basic_response: "基础响应", strict_json_schema: "结构化输出", tool_request: "请求工具调用", tool_result: "回传工具结果", tool_final_output: "工具轮最终输出" })[phase] || phase;
 }
 
 function progress(value, valueLabel, step) {

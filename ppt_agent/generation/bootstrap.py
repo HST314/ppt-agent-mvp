@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 import sys
@@ -28,27 +27,6 @@ class ResponsesProviderAdapter:
             response_schema=request["response_schema"],
             timeout_seconds=request.get("timeout_seconds"),
         )
-
-    def probe_capabilities(self) -> dict[str, bool]:
-        """Prove the production model can enforce a strict JSON Schema."""
-        turn = self.client.create(
-            input=[{"role": "user", "content": "Return an object whose ready field is true."}],
-            tools=[],
-            response_schema={
-                "name": "generation_core_readiness",
-                "strict": True,
-                "schema": {
-                    "type": "object",
-                    "properties": {"ready": {"type": "boolean", "const": True}},
-                    "required": ["ready"],
-                    "additionalProperties": False,
-                },
-            },
-            timeout_seconds=min(float(self.client.config.request_timeout_seconds), 30.0),
-        )
-        payload = json.loads(turn.text)
-        valid = payload == {"ready": True}
-        return {"basic_response": valid, "json_schema": valid}
 
     def retrieve(self, response_id: str):
         request_client = self.client._request_client()

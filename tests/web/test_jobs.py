@@ -6,10 +6,9 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
-from ppt_agent.errors import ConflictError, GatewayError, GatewayUnknownResult, RuntimeUnavailableError
+from ppt_agent.errors import ConflictError, GatewayError
 from ppt_agent.execution import ExecutionDeadlineExceeded, progress
 from ppt_agent.service import TaskService
 from ppt_agent.store import WorkspaceStore
@@ -80,97 +79,23 @@ class JobServiceTests(unittest.TestCase):
             self.assertEqual(found["task_id"], "snapshot-safe")
             jobs.close()
 
-    def test_runtime_probe_deduplicates_equal_capability_identities(self):
-        class ProbeGateway:
-            def __init__(self,name,key): self.model=name; self.key=key; self.calls=0
+    def test_runtime_status_uses_on_demand_policy_without_provider_calls(self):
+        class DirectGateway:
+            model="direct-model"
+            calls=0
             def set_audit_sink(self,_sink): pass
-            def capability_probe_key(self): return self.key
-            def probe_capabilities(self,probe_id=None):
-                self.calls+=1
-                return {"basic_response":True,"strict_json_schema":True,"tool_round_trip":True}
+            def probe_capabilities(self):
+                self.calls += 1
+                raise AssertionError("status reads must not contact the provider")
 
         with tempfile.TemporaryDirectory() as root:
-            generation=ProbeGateway("shared-model","same-config")
-            inspection=ProbeGateway("shared-model","same-config")
-            service=TaskService(WorkspaceStore(root),generator=generation,inspector=inspection)
+            gateway=DirectGateway()
+            service=TaskService(WorkspaceStore(root),generator=gateway)
             health=service.initialize_runtime()
 
         self.assertTrue(health["ready"])
-        self.assertEqual((generation.calls,inspection.calls),(1,0))
-        self.assertEqual(len(health["models"]),2)
-        self.assertTrue(health["models"][1]["probe_reused"])
-        self.assertEqual(health["models"][1]["probe_source_gateway_index"],0)
-
-    def test_probe_failure_logs_full_redacted_chain_under_public_diagnostic_id(self):
-        class FailingClient:
-            config=SimpleNamespace(api_key="path-secret-9f5b")
-            def probe_diagnostic_context(self):
-                return {
-                    "adapter":"test-adapter",
-                    "sdk":"test-sdk",
-                    "sdk_version":"1.2.3",
-                    "endpoint":"https://provider.example/v1/path-secret-9f5b",
-                    "request_path":"https://provider.example/v1/path-secret-9f5b/responses",
-                    "context":{
-                        "headers":{"Authorization":"Bearer bearer-context-secret"},
-                        "trace":"upstream Bearer bearer-trace-secret",
-                        "details":[
-                            "password=named-context-secret",
-                            '{"api_key":"json-named-context-secret"}',
-                            {
-                                "api_key":"structured-context-secret",
-                                "client_secret":["nested-structured-secret"],
-                            },
-                        ],
-                    },
-                }
-
-        class FailingProbeGateway:
-            model="probe-model"
-            client=FailingClient()
-            def set_audit_sink(self,_sink): pass
-            def probe_capabilities(self,probe_id=None):
-                try:
-                    raise AttributeError("parser exposed path-secret-9f5b")
-                except AttributeError as cause:
-                    raise GatewayError(
-                        "模型 SDK 返回了无法分类的失败，请联系管理员核对运行日志",
-                        audit_details={"category":"sdk_error","sdk_exception_type":"AttributeError"},
-                    ) from cause
-
-        with tempfile.TemporaryDirectory() as root:
-            service=TaskService(WorkspaceStore(root),generator=FailingProbeGateway())
-            with self.assertLogs("ppt_agent.runtime",level="ERROR") as captured:
-                health=service.initialize_runtime()
-            persisted=service.runtime_probes(1)[0]
-
-        diagnostic_id=health["error"]["diagnostic_id"]
-        log="\n".join(captured.output)
-        payload=json.loads(captured.records[0].getMessage())
-        self.assertEqual(persisted["error"]["diagnostic_id"],diagnostic_id)
-        self.assertIn(diagnostic_id,log)
-        self.assertIn(health["probe_id"],log)
-        self.assertIn("AttributeError",log)
-        self.assertIn("GatewayError",log)
-        self.assertIn("The above exception was the direct cause",log)
-        self.assertIn('"adapter": "test-adapter"',log)
-        self.assertIn('"sdk_version": "1.2.3"',log)
-        self.assertEqual(payload["endpoint"],"https://provider.example/v1/[REDACTED]")
-        self.assertEqual(payload["request_path"],"https://provider.example/v1/[REDACTED]/responses")
-        self.assertEqual(payload["context"]["headers"]["Authorization"],"[REDACTED]")
-        self.assertEqual(payload["context"]["trace"],"upstream Bearer [REDACTED]")
-        self.assertEqual(payload["context"]["details"][0],"password=[REDACTED]")
-        self.assertIn('[REDACTED]',payload["context"]["details"][1])
-        self.assertEqual(payload["context"]["details"][2]["api_key"],"[REDACTED]")
-        self.assertEqual(payload["context"]["details"][2]["client_secret"],["[REDACTED]"])
-        self.assertNotIn("path-secret-9f5b",log)
-        self.assertNotIn("bearer-context-secret",log)
-        self.assertNotIn("bearer-trace-secret",log)
-        self.assertNotIn("named-context-secret",log)
-        self.assertNotIn("json-named-context-secret",log)
-        self.assertNotIn("structured-context-secret",log)
-        self.assertNotIn("nested-structured-secret",log)
-        self.assertNotIn("parser exposed",log)
+        self.assertEqual(health["status"],"on_demand")
+        self.assertEqual(gateway.calls,0)
 
     def test_stage_deadline_keeps_diagnostic_id_and_specific_error_code(self):
         with tempfile.TemporaryDirectory() as root:
@@ -190,39 +115,23 @@ class JobServiceTests(unittest.TestCase):
             self.assertEqual(error["diagnostic_id"], service.failure.diagnostic_id)
             jobs.close()
 
-    def test_agent_runtime_starts_closed_before_capability_probe(self):
-        class ModelGateway:
-            model = "model"
-            def set_audit_sink(self, _sink): pass
-            def probe_capabilities(self): return {"strict_json_schema": True}
-        with tempfile.TemporaryDirectory() as root:
-            service = TaskService(WorkspaceStore(root), generator=ModelGateway())
-            self.assertEqual(service.runtime_health()["status"], "not_checked")
-            self.assertFalse(service.runtime_health()["ready"])
-            service.initialize_runtime()
-            self.assertTrue(service.runtime_health()["ready"])
-
-    def test_runtime_is_rechecked_before_a_queued_job_crosses_model_boundary(self):
+    def test_queued_job_invokes_domain_operation_directly(self):
         with tempfile.TemporaryDirectory() as root:
             service = TaskService(WorkspaceStore(root))
-            service.create("gated")
-            service.command("gated", "to-clarification", "advance")
-            service.command("gated", "to-narrative", "advance")
+            service.create("direct")
+            service.command("direct", "to-clarification", "advance")
+            service.command("direct", "to-narrative", "advance")
             executor = DeferredExecutor()
             jobs = JobService(service, executor=executor)
-            created, _ = jobs.create("gated", "narrative.generate", {}, "gate-key")
-            service.record_runtime_failure(GatewayError("auth", code="model_authentication_failed"))
-            with patch.object(service, "generate_narrative", wraps=service.generate_narrative) as generate:
+            created, _ = jobs.create("direct", "narrative.generate", {}, "direct-key")
+            with patch.object(service, "generate_narrative", return_value={"accepted":True}) as generate:
                 function, args = executor.calls.pop(0)
                 function(*args)
-            self.assertFalse(generate.called)
-            failed = jobs.get(created["job_id"])
-            self.assertEqual(failed["status"], "failed")
-            self.assertEqual(failed["error"]["code"], "runtime_unavailable")
-            self.assertEqual(failed["error"]["runtime_error_code"], "model_authentication_failed")
+            generate.assert_called_once_with("direct",None,"all")
+            self.assertEqual(jobs.get(created["job_id"])["status"], "succeeded")
             jobs.close()
 
-    def test_recovered_queued_job_can_wait_for_startup_readiness_probe(self):
+    def test_recovered_queued_job_resumes_after_local_recovery(self):
         with tempfile.TemporaryDirectory() as root:
             service = TaskService(WorkspaceStore(root))
             service.create("deferred")
@@ -240,136 +149,73 @@ class JobServiceTests(unittest.TestCase):
             self.assertEqual(len(executor.calls), 1)
             recovered.close()
 
-    def test_queued_clarification_fails_explicitly_when_its_runtime_degrades(self):
+    def test_clarification_failure_is_task_scoped_and_retry_calls_model_again(self):
         class Clarifier:
             model="clarifier"
+            calls=0
             def clarify(self,_payload):
-                raise AssertionError("unready clarification runtime must block before provider call")
+                self.calls += 1
+                if self.calls == 1:
+                    raise GatewayError("认证失败",code="model_authentication_failed")
+                return {"questions":[],"model":self.model}
         with tempfile.TemporaryDirectory() as root:
-            service = TaskService(WorkspaceStore(root),clarifier=Clarifier())
-            service.create("clarification-gated")
-            service.import_input("clarification-gated", {"topic": "新品"})
+            clarifier=Clarifier()
+            service = TaskService(WorkspaceStore(root),clarifier=clarifier)
+            service.create("clarification-retry")
+            service.import_input("clarification-retry", {"topic": "新品"})
             executor = DeferredExecutor()
             jobs = JobService(service, executor=executor)
             created, _ = jobs.create(
-                "clarification-gated",
+                "clarification-retry",
                 "clarification.generate",
                 {},
-                "clarification-gate-key",
+                "clarification-first-key",
             )
-            failure = GatewayError("auth", code="model_authentication_failed")
-            service.record_clarification_runtime_failure(failure)
             function, args = executor.calls.pop(0)
             function(*args)
-            clarification = service.input_view("clarification-gated")["clarification"]
+            clarification = service.input_view("clarification-retry")["clarification"]
             self.assertEqual(clarification["status"], "failed")
-            self.assertEqual(clarification["error"]["code"], "runtime_unavailable")
-            state=service.get("clarification-gated")
+            self.assertEqual(clarification["error"]["code"], "model_authentication_failed")
+            state=service.get("clarification-retry")
             self.assertEqual(state["waiting_reason"],"clarification_failed")
             self.assertEqual(state["required_action"],"retry_clarification")
-            # 落入本任务记录的运行时错误换发本任务自己的诊断 ID，且不引用
-            # 其他任务的 Agent 审计，避免跨任务错误污染。
-            self.assertNotEqual(clarification["error"]["diagnostic_id"], failure.diagnostic_id)
-            self.assertNotIn("agent_audit_id", clarification["error"])
             self.assertEqual(jobs.get(created["job_id"])["status"], "failed")
+            retry,_=jobs.create("clarification-retry","clarification.generate",{},"clarification-retry-key")
+            function,args=executor.calls.pop(0)
+            function(*args)
+            self.assertEqual(jobs.get(retry["job_id"])["status"],"succeeded")
+            self.assertEqual(clarifier.calls,2)
+            self.assertTrue(service.input_view("clarification-retry")["clarification"]["confirmed"])
             jobs.close()
 
-    def test_only_transport_auth_and_upstream_failures_degrade_global_runtime(self):
-        behavior_codes = ("gateway_error", "probe_tool_final_invalid_output")
-        degrading_codes = (
-            "model_timeout",
-            "model_connection_error",
-            "model_authentication_failed",
-            "model_permission_denied",
-            "model_upstream_unavailable",
-        )
-        for code in behavior_codes:
-            with self.subTest(code=code), tempfile.TemporaryDirectory() as root:
-                service = TaskService(WorkspaceStore(root))
-                service.record_runtime_failure(GatewayError("模型行为失败", code=code))
-                self.assertTrue(service.runtime_health()["ready"])
-        for code in degrading_codes:
-            with self.subTest(code=code), tempfile.TemporaryDirectory() as root:
-                service = TaskService(WorkspaceStore(root))
-                service.record_runtime_failure(GatewayError("服务降级", code=code))
-                self.assertFalse(service.runtime_health()["ready"])
-        with tempfile.TemporaryDirectory() as root:
-            service=TaskService(WorkspaceStore(root))
-            service.record_runtime_failure(GatewayUnknownResult("结果未知",code="model_timeout"))
-            self.assertEqual(service.runtime_health()["status"],"recovering")
-
-    def test_unknown_job_is_not_replayed_and_pure_probe_recovers_runtime(self):
-        class ProbeGateway:
-            model="recovering-model"
-            def __init__(self): self.probe_calls=0
-            def set_audit_sink(self,_sink): pass
-            def probe_capabilities(self,probe_id=None):
-                self.probe_calls+=1
-                return {"basic_response":True,"strict_json_schema":True,"tool_round_trip":True}
-
-        class UnknownNarrativeService(TaskService):
-            def __init__(self,store,gateway):
-                super().__init__(store,generator=gateway)
-                self.narrative_calls=0
+    def test_failed_generation_keeps_runtime_available_for_user_retry(self):
+        class RetryService(TaskService):
+            calls=0
             def generate_narrative(self,task_id,prompt=None,scope="all"):
-                self.narrative_calls+=1
-                raise GatewayUnknownResult(
-                    "模型请求结果未知",
-                    code="model_timeout",
-                    audit_details={"transport_phase":"unknown","result_certainty":"unknown"},
-                )
+                self.calls += 1
+                if self.calls == 1:
+                    raise GatewayError("上游暂时不可用",code="model_upstream_unavailable",retryable=True)
+                return {"accepted":True}
 
         with tempfile.TemporaryDirectory() as root:
-            gateway=ProbeGateway()
-            service=UnknownNarrativeService(WorkspaceStore(root),gateway)
-            service.initialize_runtime()
-            service.create("unknown")
-            service.command("unknown","to-clarification","advance")
-            service.command("unknown","to-narrative","advance")
-            jobs=JobService(service,runtime_recovery_delays=(0,))
-            try:
-                created,_=jobs.create("unknown","narrative.generate",{},"unknown-key")
-                deadline=time.monotonic()+3
-                while time.monotonic()<deadline:
-                    if jobs.get(created["job_id"])["status"]=="failed" and service.runtime_health().get("ready"):
-                        break
-                    time.sleep(.01)
-                self.assertEqual(jobs.get(created["job_id"])["status"],"failed")
-                self.assertTrue(service.runtime_health()["ready"])
-                self.assertEqual(service.narrative_calls,1)
-                self.assertEqual(gateway.probe_calls,2)
-            finally:
-                jobs.close()
-
-    def test_runtime_gate_reissues_diagnostic_and_drops_foreign_audit(self):
-        with tempfile.TemporaryDirectory() as root:
-            service = TaskService(WorkspaceStore(root))
-            failure = GatewayError("上游不可用", code="model_upstream_unavailable")
-            failure.agent_audit_id = "agent-audit-from-another-task"
-            service.record_runtime_failure(failure)
-            with self.assertRaises(RuntimeUnavailableError) as caught:
-                service.require_runtime_ready()
-            error = caught.exception.public()["error"]
-            self.assertEqual(error["runtime_error_code"], "model_upstream_unavailable")
-            self.assertNotEqual(error["diagnostic_id"], failure.diagnostic_id)
-            self.assertNotIn("agent_audit_id", error)
-
-    def test_probe_originated_runtime_error_keeps_probe_audit_reference(self):
-        class FailingProbeGateway:
-            model = "probe-model"
-            def set_audit_sink(self, _sink): pass
-            def probe_capabilities(self, probe_id=None):
-                error = GatewayError("认证失败", code="model_authentication_failed")
-                error.agent_audit_id = "agent-audit-probe"
-                raise error
-        with tempfile.TemporaryDirectory() as root:
-            service = TaskService(WorkspaceStore(root), generator=FailingProbeGateway())
-            service.initialize_runtime()
-            with self.assertRaises(RuntimeUnavailableError) as caught:
-                service.require_runtime_ready()
-            error = caught.exception.public()["error"]
-            self.assertEqual(error["agent_audit_id"], "agent-audit-probe")
-            self.assertTrue(error["probe_id"])
+            service=RetryService(WorkspaceStore(root))
+            service.create("retry")
+            service.command("retry","to-clarification","advance")
+            service.command("retry","to-narrative","advance")
+            executor=DeferredExecutor()
+            jobs=JobService(service,executor=executor)
+            first,_=jobs.create("retry","narrative.generate",{},"retry-first")
+            function,args=executor.calls.pop(0)
+            function(*args)
+            self.assertEqual(jobs.get(first["job_id"])["status"],"failed")
+            self.assertEqual(jobs.get(first["job_id"])["error"]["code"],"model_upstream_unavailable")
+            self.assertTrue(service.runtime_health()["ready"])
+            second,_=jobs.create("retry","narrative.generate",{},"retry-second")
+            function,args=executor.calls.pop(0)
+            function(*args)
+            self.assertEqual(jobs.get(second["job_id"])["status"],"succeeded")
+            self.assertEqual(service.calls,2)
+            jobs.close()
 
     def test_atomic_json_retries_transient_replace_and_cleans_temp_file(self):
         with tempfile.TemporaryDirectory() as root:

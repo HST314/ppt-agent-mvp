@@ -5,11 +5,10 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 from ppt_agent.generation import bootstrap
-from ppt_agent.generation.bootstrap import ResponsesProviderAdapter, resolve_chromium_executable
+from ppt_agent.generation.bootstrap import resolve_chromium_executable
 from ppt_agent.generation.model_gateway import ModelGateway
 from ppt_agent.generation.pipeline import FileCheckpointStore, GenerationPipeline
 from ppt_agent.rendering.renderer import DeterministicRenderer
@@ -27,17 +26,6 @@ class StubPipeline:
     def preflight(self):
         self.calls += 1
         return {"ready": self.ready, "pipeline_version": "1.0.0", "checks": {"chromium": {"ready": self.ready}}}
-
-
-class StructuredProbeClient:
-    def __init__(self, text='{"ready":true}'):
-        self.text = text
-        self.config = SimpleNamespace(request_timeout_seconds=60)
-        self.calls = []
-
-    def create(self, **request):
-        self.calls.append(request)
-        return SimpleNamespace(text=self.text)
 
 
 class GenerationCoreServiceAdapterTests(unittest.TestCase):
@@ -80,18 +68,6 @@ class GenerationCoreServiceAdapterTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(RuntimeError, "python -m playwright install chromium"):
                     resolve_chromium_executable(Path(root) / "repository")
-
-    def test_provider_preflight_proves_strict_schema_support(self):
-        client = StructuredProbeClient()
-        result = ResponsesProviderAdapter(client).probe_capabilities()
-        self.assertEqual(result, {"basic_response": True, "json_schema": True})
-        self.assertTrue(client.calls[0]["response_schema"]["strict"])
-        self.assertEqual(client.calls[0]["response_schema"]["schema"]["additionalProperties"], False)
-
-    def test_provider_preflight_rejects_nonconforming_output(self):
-        client = StructuredProbeClient('{"ready":false}')
-        result = ResponsesProviderAdapter(client).probe_capabilities()
-        self.assertEqual(result, {"basic_response": False, "json_schema": False})
 
     def test_task_service_exposes_generation_preflight_without_workflow_authority(self):
         with tempfile.TemporaryDirectory() as root:

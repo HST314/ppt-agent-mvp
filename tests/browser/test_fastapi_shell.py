@@ -253,7 +253,7 @@ class FastAPIShellBrowserGate(unittest.TestCase):
         page.get_by_text("后端可达", exact=True).first.wait_for()
 
         self.assertEqual(page.get_by_text("后端不可达", exact=True).count(), 0)
-        self.assertTrue(page.get_by_text("模型检测中", exact=True).first.is_visible())
+        self.assertTrue(page.get_by_text("模型：按任务调用", exact=True).first.is_visible())
         self.assertTrue(errors and all("ERR_FAILED" in error for error in errors))
         page.close()
 
@@ -375,38 +375,29 @@ class FastAPIShellBrowserGate(unittest.TestCase):
         self.assertEqual(errors, [])
         page.close()
 
-    def test_unready_model_is_not_shown_as_green_and_fallback_remains_available(self):
-        class UnreadyClarifier:
-            model = "unready-browser-model"
+    def test_model_failure_is_shown_on_job_and_fallback_remains_available(self):
+        class FailingClarifier:
+            model = "failing-browser-model"
             calls = 0
-            def probe_capabilities(self):
+            def clarify(self, _payload):
+                self.calls += 1
                 raise GatewayError(
                     "模型服务认证失败，请联系管理员检查凭据",
                     code="model_authentication_failed",
                 )
-            def clarify(self, _payload):
-                self.calls += 1
-                raise AssertionError("unready model must not be called")
 
-        clarifier = UnreadyClarifier()
+        clarifier = FailingClarifier()
         self.service.clarifier = clarifier
-        self.service.initialize_clarification_runtime()
-        self.service.initialize_runtime()
-        self.service.create("runtime-unready")
+        self.service.create("runtime-failure")
         page, errors = self.new_page(375, 820, "reduce")
-        page.goto(self.base + "/tasks/runtime-unready?stage=created")
+        page.goto(self.base + "/tasks/runtime-failure?stage=created")
         page.get_by_role("link", name="设置", exact=True).click()
         page.get_by_role("heading", name="任务与运行设置", exact=True).wait_for()
         page.get_by_role("tab", name="模型", exact=True).click()
         settings = page.locator("#settings-panel-models")
         settings.get_by_text("浏览器在线", exact=True).wait_for()
         settings.get_by_text("后端可达", exact=True).wait_for()
-        settings.get_by_text("模型不可用", exact=True).wait_for()
-        self.assertEqual(settings.get_by_text("模型可用", exact=True).count(), 0)
-        self.assertTrue(settings.get_by_text("失败检查", exact=True).is_visible())
-        self.assertTrue(settings.get_by_text("能力契约", exact=True).is_visible())
-        self.assertTrue(settings.get_by_text("探测 ID", exact=True).is_visible())
-        self.assertRegex(settings.locator("dl.metadata-list").inner_text(),r"runtime-probe-[0-9a-f]{32}")
+        settings.get_by_text("模型：按任务调用", exact=True).wait_for()
         page.get_by_role("link", name="工作区", exact=True).click()
         page.get_by_role("heading", name="任务/资料", exact=True).wait_for()
 
@@ -417,14 +408,12 @@ class FastAPIShellBrowserGate(unittest.TestCase):
         self.assertFalse(retry.is_disabled())
         self.assertFalse(page.get_by_role("button", name="使用系统兜底问题").is_disabled())
         self.assertTrue(page.get_by_text("model_authentication_failed", exact=True).is_visible())
-        self.assertTrue(page.get_by_text("澄清 JSON Schema", exact=True).is_visible())
-        self.assertTrue(page.get_by_role("button", name="复制探测 ID").is_visible())
-        self.assertTrue(page.get_by_text("这是确定性配置故障", exact=False).is_visible())
+        self.assertTrue(page.get_by_text("请联系管理员修复模型凭据", exact=False).is_visible())
 
         page.get_by_role("button", name="使用系统兜底问题").click()
         page.get_by_role("dialog").get_by_role("button", name="确认使用兜底问题").click()
         page.get_by_role("heading", name="需求澄清", exact=True).wait_for()
-        self.assertEqual(clarifier.calls, 0)
+        self.assertEqual(clarifier.calls, 1)
         self.assert_no_page_overflow(page)
         self.assertEqual(errors, [])
         page.close()

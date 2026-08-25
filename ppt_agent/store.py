@@ -298,19 +298,6 @@ class WorkspaceStore:
                 with open(path,"a",encoding="utf-8") as f:
                     f.write(line); f.flush(); os.fsync(f.fileno())
 
-    def append_runtime_probe(self, record):
-        """Persist a global, secret-free readiness probe independently of tasks."""
-        path=self.root/"runtime-probes.jsonl"
-        with self._guard:
-            with open(path,"a",encoding="utf-8") as f:
-                f.write(json.dumps(record,ensure_ascii=False,separators=(",",":"))+"\n")
-                f.flush(); os.fsync(f.fileno())
-
-    def runtime_probes(self,limit=20):
-        if isinstance(limit,bool) or not isinstance(limit,int) or not 1 <= limit <= 100: raise ValidationError("探测记录 limit 必须是 1 到 100")
-        path=self.root/"runtime-probes.jsonl"
-        records=[] if not path.exists() else [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
-        return records[-limit:][::-1]
     def agent_audits(self,task_id=None,job_id=None):
         task_path=self._task(task_id)/"agent-audit.jsonl" if task_id is not None else None
         path=task_path if task_path is not None and task_path.exists() else self.root/"agent-audit.jsonl"
