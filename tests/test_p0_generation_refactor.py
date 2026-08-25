@@ -280,7 +280,7 @@ class P0GenerationRefactorTests(unittest.TestCase):
             self.assertEqual(generation["fallback"]["strategy"],"frozen_outline_generic_shell")
             self.assertEqual(generation["fallback"]["reason"],"technical_validation_failed")
             self.assertNotIn("@import",sample["html"])
-            self.assertTrue(sample["metadata"]["post_render_gate"]["passed"])
+            self.assertTrue(sample["metadata"]["preview"]["ready"])
             attempts=[json.loads(svc.version("task",item)) for item in generation["attempt_evidence_hashes"]]
             self.assertEqual([item["status"] for item in attempts],["correction_required","accepted"])
             self.assertIsNone(attempts[1]["generation_error"])
@@ -296,7 +296,7 @@ class P0GenerationRefactorTests(unittest.TestCase):
 
             self.assertEqual(len(builder.calls),2)
             self.assertEqual(builder.calls[1]["technical_correction"]["reason"],"unbound_claims")
-            self.assertEqual(sample["metadata"]["post_render_gate"]["claims"]["unbound_count"],0)
+            self.assertTrue(sample["metadata"]["preview"]["ready"])
             self.assertNotIn("999%",sample["html"])
 
     def test_safe_fallback_still_fails_closed_when_browser_gate_blocks(self):
@@ -340,7 +340,7 @@ class P0GenerationRefactorTests(unittest.TestCase):
             attempts=[json.loads(svc.version("geometry",item)) for item in generation["attempt_evidence_hashes"]]
             self.assertEqual([item["status"] for item in attempts],["correction_required","accepted"])
             self.assertEqual(attempts[1]["parent_attempt_id"],generation["attempt_evidence_hashes"][0])
-            self.assertEqual(sample["metadata"]["post_render_gate"]["generation_attempt_evidence_hashes"],generation["attempt_evidence_hashes"])
+            self.assertTrue(sample["metadata"]["preview"]["ready"])
 
     def test_sample_exposes_only_read_only_skill_tools_and_server_assembles_public_shell(self):
         fragment='<section class="slide" id="slide-1" data-slide-id="slide-1"><h1>样品</h1></section>'
@@ -514,7 +514,7 @@ class P0GenerationRefactorTests(unittest.TestCase):
             self.assertEqual(attempts[1]["parent_attempt_id"],generation["attempt_evidence_hashes"][0])
             self.assertEqual(correction_evidence["parent_attempt_id"],generation["attempt_evidence_hashes"][0])
             self.assertEqual(correction_evidence["correction"]["missing_required_claims_by_slide"],correction["missing_required_claims_by_slide"])
-            self.assertEqual(sample["metadata"]["post_render_gate"]["generation_attempt_evidence_hashes"],generation["attempt_evidence_hashes"])
+            self.assertTrue(sample["metadata"]["preview"]["ready"])
 
     def test_sample_claim_on_wrong_page_is_corrected_from_page_mapping(self):
         with tempfile.TemporaryDirectory() as root:
@@ -531,8 +531,7 @@ class P0GenerationRefactorTests(unittest.TestCase):
             correction=builder.calls[1]["technical_correction"]
             missing_pages={slide_id for slide_id,claims in correction["missing_required_claims_by_slide"].items() if claims}
             self.assertEqual(len(missing_pages),1)
-            self.assertEqual(sample["metadata"]["post_render_gate"]["claims"]["missing_required_count"],0)
-            self.assertIsNotNone(sample["metadata"]["post_render_gate"]["claims"]["page_coverage"])
+            self.assertTrue(sample["metadata"]["preview"]["ready"])
 
     def test_reported_duration_and_budget_omissions_keep_their_target_pages_in_correction(self):
         with tempfile.TemporaryDirectory() as root:
@@ -558,7 +557,7 @@ class P0GenerationRefactorTests(unittest.TestCase):
             self.assertEqual(set(mapped_missing),{"12 周","80 万元"})
             for value,slide_id in mapped_missing.items():
                 self.assertIn(value,{item["value"] for item in correction["required_claims_by_slide"][slide_id]})
-            self.assertEqual(sample["metadata"]["post_render_gate"]["claims"]["missing_required_count"],0)
+            self.assertTrue(sample["metadata"]["preview"]["ready"])
 
     def test_persistent_wrong_page_claim_is_bound_into_target_page_server_slot(self):
         with tempfile.TemporaryDirectory() as root:
@@ -576,7 +575,7 @@ class P0GenerationRefactorTests(unittest.TestCase):
             self.assertEqual(materialization["placements"][0]["slide_id"],next(
                 slide_id for slide_id,claims in builder.calls[0]["required_claims_by_slide"].items() if claims
             ))
-            self.assertEqual(sample["metadata"]["post_render_gate"]["claims"]["missing_required_count"],0)
+            self.assertTrue(sample["metadata"]["preview"]["ready"])
             self.assertIn('data-server-materialized="true"',sample["html"])
 
     def test_agent_builder_exposes_page_visible_claim_boundary_self_check(self):
@@ -623,7 +622,7 @@ class P0GenerationRefactorTests(unittest.TestCase):
             )
             materialization=sample["metadata"]["generation"]["server_claim_materialization"]
             self.assertEqual(materialization["materialized_count"],1)
-            self.assertEqual(sample["metadata"]["post_render_gate"]["claims"]["missing_required_count"],0)
+            self.assertTrue(sample["metadata"]["preview"]["ready"])
             self.assertIn('data-server-materialized="true">80 万元</span>',sample["html"])
 
     def test_deck_batch_accepts_confirmed_design_tokens_without_retry(self):

@@ -1225,6 +1225,10 @@ class TaskService:
             summary="；".join(f"{item.get('code')}:{item.get('evidence','')}" for item in evidence["blockers"][:5])
             raise ValidationError(f"TechnicalGate 渲染后硬门禁未通过（evidence {evidence_hash[:12]}）：{summary}")
         return html_text,evidence
+    def _prepare_sample_preview(self,html_text,contract):
+        self.require_release_write_enabled()
+        contract_value={key:value for key,value in contract.items() if key!="hash"}
+        return apply_presentation_technical_contract(html_text,contract_value,contract["hash"])
     def _latest_generation_audit_id(self,task_id,action):
         if not hasattr(self.store,"agent_audits"): return ""
         context=current_agent_audit_context()
@@ -1876,7 +1880,8 @@ class TaskService:
             else:
                 design_intent=self._design_intent_from_core(result.value.theme_tokens,{slide.layout_family for slide in result.value.slides})
                 shared_assets={"css":""}
-            generation={**self._generation_core_evidence(result),"attempts":1,"retry_count":0,"max_attempts":1,"design_intent":design_intent,"shared_assets":shared_assets,"validation_hash":result.validation.evidence_hash,"renderer_version":result.artifact.renderer_version}
+            generation={**self._generation_core_evidence(result),"attempts":1,"retry_count":0,"max_attempts":1,"design_intent":design_intent,"shared_assets":shared_assets,"renderer_version":result.artifact.renderer_version}
+            if result.validation is not None: generation["validation_hash"]=result.validation.evidence_hash
         elif isinstance(self.builder,FakeHtmlBuilder):
             design_intent=validate_design_intent(self.builder.design_intent)
             shared_assets=validate_shared_design_assets(self.builder.shared_assets)
@@ -1887,10 +1892,10 @@ class TaskService:
                 task_id,data["markdown"],action="sample",slide_ids=list(selection["slide_ids"]),assets=assets,
                 context={"rules":rules,"design_contract":contract_value,"design_contract_hash":contract["hash"],"claim_ledger":ledger_value,"claim_ledger_hash":ledger["hash"],"required_claims_verbatim":required_claims,"required_claims_by_slide":required_claims_by_slide},
             )
-        progress("validating_html", "校验 HTML")
-        html_text,gate=self._post_render_gate(task_id,source,list(selection["slide_ids"]),contract,ledger,assets,generation.get("attempt_evidence_hashes"))
+        progress("saving_preview", "保存样品预览")
+        html_text=self._prepare_sample_preview(source,contract)
         version=len(self.versions(task_id,"sample"))+1; content_hash=digest(html_text.encode()); model=DeckArtifact.parse({"artifact_id":f"sample-{content_hash[:16]}","task_id":task_id,"version":version,"kind":"sample","outline_hash":outline,"content_hash":content_hash,"created_at":now(),"schema_version":"1.0"})
-        prior=self._current_version(task_id,"sample"); meta={"html":html_text,"selection_hash":selection["hash"],"parent":prior,"summary":"生成真实 HTML 样品","scope":"global","global_rules":rules,"local_exceptions":{},"build":"success","generation":generation,"design_intent":generation.get("design_intent",default_design_intent()),"shared_design_assets":generation.get("shared_assets",{"css":""}),"presentation_technical_contract_hash":contract["hash"],"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate":gate}
+        prior=self._current_version(task_id,"sample"); meta={"html":html_text,"selection_hash":selection["hash"],"parent":prior,"summary":"生成真实 HTML 样品","scope":"global","global_rules":rules,"local_exceptions":{},"build":"success","generation":generation,"design_intent":generation.get("design_intent",default_design_intent()),"shared_design_assets":generation.get("shared_assets",{"css":""}),"presentation_technical_contract_hash":contract["hash"],"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"preview":{"ready":True,"rendered_html_hash":content_hash,"slide_ids":list(selection["slide_ids"])}}
         if generation.get("page_contract_hashes"): meta["page_contract_hashes"]=generation["page_contract_hashes"]
         if "checkpoint_id" in generation:
             keys=("checkpoint_id","output_sha256","contract_name","model","provider_calls","recovery_count","pipeline_version","generation_mode","reused","context_snapshot_id","context_snapshot_hash","stage_payload_hash","context_sections_read")
@@ -1936,7 +1941,8 @@ class TaskService:
             prior_intent=validate_design_intent(result.value.design_intent)
             prior_assets=validate_shared_design_assets({"css":result.value.shared_css})
             core_evidence=self._generation_core_evidence(result)
-            generation={**core_evidence,"attempts":1,"retry_count":result.checkpoint.metadata.get("recovery_count",0),"max_attempts":2,"design_intent":prior_intent,"shared_assets":prior_assets,"validation_hash":result.validation.evidence_hash,"renderer_version":result.artifact.renderer_version}
+            generation={**core_evidence,"attempts":1,"retry_count":result.checkpoint.metadata.get("recovery_count",0),"max_attempts":1,"design_intent":prior_intent,"shared_assets":prior_assets,"renderer_version":result.artifact.renderer_version}
+            if result.validation is not None: generation["validation_hash"]=result.validation.evidence_hash
         elif isinstance(self.builder,FakeHtmlBuilder):
             source=render(data["markdown"],ids,rules,exceptions,assets,contract_value,contract["hash"],design_intent=prior_intent,shared_assets=prior_assets)
             generation={"attempts":1,"retry_count":0,"max_attempts":1,"design_intent":prior_intent,"shared_assets":prior_assets}
@@ -1945,9 +1951,9 @@ class TaskService:
                 task_id,data["markdown"],action="sample",slide_ids=ids,assets=assets,
                 context={"rules":rules,"exceptions":exceptions,"previous_slides":previous_slides,"prompt":prompt,"scope":scope,"slide_id":slide_id,"element_id":element_id,"design_contract":contract_value,"design_contract_hash":contract["hash"],"claim_ledger":ledger_value,"claim_ledger_hash":ledger["hash"],"required_claims_verbatim":required_claims,"required_claims_by_slide":required_claims_by_slide,"design_intent":prior_intent,"shared_assets":prior_assets},
             )
-        html_text,gate=self._post_render_gate(task_id,source,ids,contract,ledger,assets,generation.get("attempt_evidence_hashes"))
+        html_text=self._prepare_sample_preview(source,contract)
         version=len(self.versions(task_id,"sample"))+1; ch=digest(html_text.encode()); model=DeckArtifact.parse({"artifact_id":f"sample-{ch[:16]}","task_id":task_id,"version":version,"kind":"sample","outline_hash":outline,"content_hash":ch,"created_at":now(),"schema_version":"1.0"})
-        modification_meta={"html":html_text,"selection_hash":view["selection"]["hash"],"parent":sample["hash"],"summary":prompt.strip(),"scope":scope,"scope_understanding":understanding,"slide_id":slide_id,"element_id":element_id,"global_rules":rules,"local_exceptions":exceptions,"build":"success","generation":generation,"design_intent":generation.get("design_intent",sample["metadata"].get("design_intent",default_design_intent())),"shared_design_assets":generation.get("shared_assets",sample["metadata"].get("shared_design_assets",{"css":""})),"presentation_technical_contract_hash":contract["hash"],"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate":gate}
+        modification_meta={"html":html_text,"selection_hash":view["selection"]["hash"],"parent":sample["hash"],"summary":prompt.strip(),"scope":scope,"scope_understanding":understanding,"slide_id":slide_id,"element_id":element_id,"global_rules":rules,"local_exceptions":exceptions,"build":"success","generation":generation,"design_intent":generation.get("design_intent",sample["metadata"].get("design_intent",default_design_intent())),"shared_design_assets":generation.get("shared_assets",sample["metadata"].get("shared_design_assets",{"css":""})),"presentation_technical_contract_hash":contract["hash"],"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"preview":{"ready":True,"rendered_html_hash":ch,"slide_ids":ids}}
         if core_evidence:
             modification_meta["generation_core"]=core_evidence
             modification_meta["page_contract_hashes"]=core_evidence.get("page_contract_hashes",{})
@@ -1968,9 +1974,8 @@ class TaskService:
                 raise ConflictError("须先基于当前大纲和页面选择重新生成样品")
             contract,ledger=self._generation_contracts(task_id,outline)
             if (sample["metadata"].get("design_contract_hash")!=contract["hash"]
-                or sample["metadata"].get("claim_ledger_hash")!=ledger["hash"]
-                or not sample["metadata"].get("post_render_gate",{}).get("passed")):
-                raise ConflictError("样品未绑定当前 PresentationTechnicalContract、Claim Ledger 或渲染硬门禁证据")
+                or sample["metadata"].get("claim_ledger_hash")!=ledger["hash"]):
+                raise ConflictError("样品未绑定当前 PresentationTechnicalContract 或 Claim Ledger")
             state=TaskState.parse(self.get(task_id))
             if state.stage==state.stage.DECK and state.sample_confirmed and view["confirmation"]:
                 return view
@@ -1987,7 +1992,7 @@ class TaskService:
             confirmed_pages={sid:{"html":fragment,"sha256":digest(fragment.encode())} for sid,fragment in pages.items()}
             design_intent=validate_design_intent(sample["metadata"].get("design_intent"))
             shared_assets=validate_shared_design_assets(sample["metadata"].get("shared_design_assets"))
-            result={"confirmed_outline_hash":outline,"confirmed_sample_hash":sample["hash"],"confirmed_content_hash":sample["content_hash"],"selection_hash":view["selection"]["hash"],"presentation_technical_contract_hash":contract["hash"],"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"post_render_gate_hash":sample["metadata"]["post_render_gate"]["evidence_hash"],"confirmed_pages":confirmed_pages,"design_intent":design_intent,"design_intent_hash":digest(canonical(design_intent)),"shared_design_assets":shared_assets,"shared_design_assets_hash":digest(canonical(shared_assets))}
+            result={"confirmed_outline_hash":outline,"confirmed_sample_hash":sample["hash"],"confirmed_content_hash":sample["content_hash"],"selection_hash":view["selection"]["hash"],"presentation_technical_contract_hash":contract["hash"],"design_contract_hash":contract["hash"],"claim_ledger_hash":ledger["hash"],"confirmed_pages":confirmed_pages,"design_intent":design_intent,"design_intent_hash":digest(canonical(design_intent)),"shared_design_assets":shared_assets,"shared_design_assets_hash":digest(canonical(shared_assets))}
             if core_confirmation: result["generation_core_confirmation"]=core_confirmation
             event={"event_id":hashlib.sha256(f"{task_id}:confirm-sample:{sample['hash']}".encode()).hexdigest()[:24],"command_id":f"confirm-sample-{sample['hash'][:16]}","action":"confirm_sample_version","actor":"user","request_hash":sample["hash"],"at":utcnow(),"from":state.to_dict(),"to":new.to_dict(),"result":result}
             self.store.commit(task_id,new.to_dict(),event)

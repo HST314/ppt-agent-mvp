@@ -1288,6 +1288,8 @@ def _bind_html_contract(schema: dict[str, Any], allowed_assets: Sequence[str], s
 @lru_cache(maxsize=128)
 def html_sample_contract_for_assets(allowed_assets: tuple[str, ...], slide_ids: tuple[str, ...]) -> type[HtmlSampleSpec]:
     schema = _bind_html_contract(HtmlSampleSpec.SCHEMA, tuple(dict.fromkeys(allowed_assets)), tuple(slide_ids))
+    schema["properties"]["slides"]["minItems"] = len(slide_ids)
+    schema["properties"]["slides"]["maxItems"] = len(slide_ids)
 
     class BoundHtmlSampleSpec(HtmlSampleSpec):
         SCHEMA = schema

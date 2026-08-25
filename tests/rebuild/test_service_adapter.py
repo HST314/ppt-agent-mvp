@@ -107,7 +107,8 @@ class GenerationCoreServiceAdapterTests(unittest.TestCase):
             self.assertEqual(outline["metadata"]["generation_core"]["contract_name"], "outline_spec_v1")
             service.confirm_outline("task")
             sample = service.generate_sample("task")["sample"]
-            self.assertTrue(sample["metadata"]["post_render_gate"]["passed"])
+            self.assertTrue(sample["metadata"]["preview"]["ready"])
+            self.assertNotIn("post_render_gate", sample["metadata"])
             self.assertEqual(sample["metadata"]["generation_core"]["contract_name"], "sample_spec_v1")
             confirmation = service.confirm_sample("task")["confirmation"]
             self.assertEqual(confirmation["generation_core_confirmation"]["contract_name"], "frozen_sample_v1")

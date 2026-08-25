@@ -15,7 +15,7 @@ from ppt_agent.service import TaskService
 from ppt_agent.skill_runtime import ActiveSkillResolver
 from ppt_agent.store import WorkspaceStore
 
-from .support import ContractProvider, asset_record, brief
+from .support import ContractProvider, DESIGN_INTENT, asset_record, brief, html_slide
 
 
 class ForbiddenDeterministicRenderer:
@@ -27,6 +27,11 @@ class ForbiddenDeterministicRenderer:
     def render(self, *_args, **_kwargs):
         self.calls += 1
         raise AssertionError("agent_html must not invoke DeterministicRenderer.render")
+
+
+class ForbiddenSampleValidator:
+    def validate(self, *_args, **_kwargs):
+        raise AssertionError("sample preview must not invoke the technical validator")
 
 
 class AssetHtmlProvider(ContractProvider):
@@ -94,6 +99,8 @@ class AgentHtmlPipelineTests(unittest.TestCase):
         self.assertIn("editorial", sample.artifact.html)
         self.assertIn(sample.value.shared_css, sample.artifact.html)
         self.assertNotIn("content_blocks", sample.checkpoint.output)
+        self.assertIsNone(sample.validation)
+        self.assertNotIn("validation", sample.checkpoint.output)
 
         confirmation = self.pipeline.confirm_sample("html-task", sample.checkpoint.checkpoint_id)
         self.assertEqual(confirmation.checkpoint.contract_name, "frozen_html_sample_v1")
@@ -374,7 +381,63 @@ class AgentHtmlPipelineTests(unittest.TestCase):
         expected_path = f"assets/{task_brief.resource_manifest[0].content_hash}.png"
         self.assertNotIn("resources://", sample.artifact.html)
         self.assertIn(expected_path, sample.artifact.html)
-        self.assertEqual(sample.validation.asset_paths, (expected_path,))
+        self.assertIsNone(sample.validation)
+
+    def test_sample_publishes_preview_directly(self):
+        task_brief = brief(3)
+        narrative = self.pipeline.generate_narrative("preview-task", task_brief)
+        outline = self.pipeline.generate_outline("preview-task", task_brief, narrative.checkpoint.checkpoint_id)
+        selected = self.pipeline.select_representative_slides(outline.value)
+        candidate = {
+            "schema_version": "1.0",
+            "shared_css": ".slide{background:#0F172A;color:#F8FAFC}",
+            "design_intent": DESIGN_INTENT,
+            "slides": [html_slide(slide_id) for slide_id in selected],
+            "outline_checkpoint_id": outline.checkpoint.checkpoint_id,
+        }
+
+        class Client:
+            def __init__(self):
+                self.calls = []
+                self.turns = [
+                    ModelTurn(None, "skill", (ModelToolCall("read_skill_file", '{"path":"SKILL.md"}', "read-skill"),)),
+                    ModelTurn(json.dumps(candidate, ensure_ascii=False), "candidate"),
+                ]
+
+            def create(self, **request):
+                self.calls.append(request)
+                return self.turns.pop(0)
+
+        client = Client()
+        skill = self.root / "skills" / "preview"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(
+            "---\nname: preview-skill\ndescription: Design sample pages\n---\nDesign the requested pages.\n",
+            encoding="utf-8",
+        )
+        pipeline = GenerationPipeline(
+            ModelGateway(ContractProvider(), model="unused"),
+            self.pipeline.checkpoints,
+            self.renderer,
+            ForbiddenSampleValidator(),
+            asset_root=self.root,
+            stage_agent=StageAgentExecutor(
+                client,
+                ActiveSkillResolver(self.root / "skills", "preview"),
+                model="stage-agent",
+                max_steps=4,
+                max_provider_calls=4,
+            ),
+            generation_mode="agent_html",
+        )
+
+        sample = pipeline.generate_sample("preview-task", task_brief, outline.checkpoint.checkpoint_id)
+
+        self.assertIn('<section class="slide ', sample.artifact.html)
+        self.assertIsNone(sample.validation)
+        self.assertEqual(sample.checkpoint.metadata["recovery_count"], 0)
+        self.assertEqual(sample.checkpoint.metadata["semantic_validation"], {})
+        self.assertEqual(len(client.calls), 2)
 
 
 if __name__ == "__main__":

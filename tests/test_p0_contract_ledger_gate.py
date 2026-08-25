@@ -397,7 +397,7 @@ class ContractLedgerGateTests(unittest.TestCase):
             self.assertEqual(packaged_evidence, canonical_post_render_evidence(gate))
             self.assertEqual(digest(packaged_evidence), gate["evidence_hash"])
 
-    def test_terminal_green_geometry_reconciles_autofit_convergence_in_hashed_evidence(self):
+    def test_sample_preview_is_saved_immediately(self):
         with tempfile.TemporaryDirectory() as root:
             browser = AutofitGenerationBrowser()
             service = self._service(root, browser)
@@ -416,21 +416,14 @@ class ContractLedgerGateTests(unittest.TestCase):
                 self.assertEqual(max_rounds, MAX_CASCADE_ROUNDS)
                 return {**fitted, "html": html_text}
 
-            with patch("ppt_agent.service.fit_deck_html", side_effect=fit):
+            with patch("ppt_agent.service.fit_deck_html", side_effect=fit) as mocked_fit:
                 sample = service.generate_sample("task")["sample"]
 
-            gate = sample["metadata"]["post_render_gate"]
-            self.assertTrue(gate["geometry"]["passed"])
-            self.assertEqual(gate["geometry"]["overflow_count"], 0)
-            self.assertEqual(gate["overflow_autofit"]["remaining"], [])
-            self.assertTrue(gate["overflow_autofit"]["converged"])
-            self.assertEqual(gate["overflow_autofit"]["rules"], fitted["rules"])
-            self.assertEqual(gate["overflow_autofit"]["rounds"], MAX_CASCADE_ROUNDS)
-            raw = canonical_post_render_evidence(gate)
-            self.assertEqual(digest(raw), gate["evidence_hash"])
-            self.assertEqual(service.version("task", gate["evidence_hash"]), raw)
+            mocked_fit.assert_not_called()
+            self.assertTrue(sample["metadata"]["preview"]["ready"])
+            self.assertFalse(service.versions("task", "post-render-gate-evidence"))
 
-    def test_terminal_overflow_keeps_autofit_fail_closed_for_regeneration(self):
+    def test_sample_preview_keeps_model_html_for_user_review(self):
         with tempfile.TemporaryDirectory() as root:
             service = self._service(root, OverflowGenerationBrowser())
             self._to_outline(service)
@@ -452,18 +445,12 @@ class ContractLedgerGateTests(unittest.TestCase):
                     "remaining": remaining,
                 }
 
-            with patch("ppt_agent.service.fit_deck_html", side_effect=fit):
-                with self.assertRaisesRegex(ValidationError, "渲染后硬门禁未通过"):
-                    service.generate_sample("task")
+            with patch("ppt_agent.service.fit_deck_html", side_effect=fit) as mocked_fit:
+                sample = service.generate_sample("task")["sample"]
 
-            records = service.versions("task", "post-render-gate-evidence")
-            self.assertEqual(len(records), 1)
-            evidence = json.loads(service.version("task", records[0]["hash"]))
-            self.assertFalse(evidence["geometry"]["passed"])
-            self.assertEqual(evidence["geometry"]["overflow_count"], 1)
-            self.assertFalse(evidence["overflow_autofit"]["converged"])
-            self.assertEqual(evidence["overflow_autofit"]["remaining"], remaining)
-            self.assertFalse(service.versions("task", "sample"))
+            mocked_fit.assert_not_called()
+            self.assertTrue(sample["metadata"]["preview"]["ready"])
+            self.assertEqual(len(service.versions("task", "sample")), 1)
 
     def test_finalize_rejects_tampered_gate_evidence_without_saving_a_fact(self):
         with tempfile.TemporaryDirectory() as root:
@@ -508,16 +495,17 @@ class ContractLedgerGateTests(unittest.TestCase):
 
             self.assertEqual(len(service.versions("task", "narrative")), before)
 
-    def test_generation_overflow_is_rejected_before_sample_artifact_is_saved(self):
+    def test_generation_candidate_is_published_as_sample_preview(self):
         with tempfile.TemporaryDirectory() as root:
             service = self._service(root, OverflowGenerationBrowser())
             self._to_outline(service)
             service.select_samples("task", ["slide-1"])
 
-            with self.assertRaisesRegex(ValidationError, "渲染后硬门禁未通过"):
-                service.generate_sample("task")
+            sample = service.generate_sample("task")["sample"]
 
-            self.assertFalse(service.versions("task", "sample"))
+            self.assertTrue(sample["metadata"]["preview"]["ready"])
+            self.assertEqual(len(service.versions("task", "sample")), 1)
+            self.assertFalse(service.versions("task", "post-render-gate-evidence"))
 
     def test_missing_facts_are_materialized_without_adding_a_style_gate(self):
         with tempfile.TemporaryDirectory() as root:
@@ -532,9 +520,8 @@ class ContractLedgerGateTests(unittest.TestCase):
             generation = sample["metadata"]["generation"]
             self.assertEqual(len(builder.calls), 2)
             self.assertGreater(generation["server_claim_materialization"]["materialized_count"], 0)
-            self.assertEqual(sample["metadata"]["post_render_gate"]["claims"]["missing_required_count"], 0)
-            self.assertNotIn("canonical_validator", sample["metadata"]["post_render_gate"])
-            self.assertEqual(sample["metadata"]["post_render_gate"]["layout"]["technical_binding_percent"], 100)
+            self.assertTrue(sample["metadata"]["preview"]["ready"])
+            self.assertNotIn("post_render_gate", sample["metadata"])
 
     def test_stale_automatic_sample_selection_is_refreshed_on_generation(self):
         with tempfile.TemporaryDirectory() as root:
@@ -551,27 +538,17 @@ class ContractLedgerGateTests(unittest.TestCase):
             self.assertEqual(generated["selection"]["outline_hash"], generated["outline_hash"])
             self.assertEqual(generated["selection"]["metadata"]["strategy"], "representative-diversity-v1")
 
-    def test_failed_gate_persists_evidence_with_blocker_diagnostics(self):
+    def test_sample_preview_records_preview_metadata(self):
         with tempfile.TemporaryDirectory() as root:
             service = self._service(root, OverflowGenerationBrowser())
             self._to_outline(service)
             service.select_samples("task", ["slide-1"])
 
-            with self.assertRaisesRegex(ValidationError, "渲染后硬门禁未通过（evidence [0-9a-f]{12}）"):
-                service.generate_sample("task")
+            sample = service.generate_sample("task")["sample"]
 
-            self.assertFalse(service.versions("task", "sample"))
-            records = service.versions("task", "post-render-gate-evidence")
-            self.assertEqual(len(records), 1)
-            self.assertIs(records[0]["metadata"]["passed"], False)
-            self.assertEqual(records[0]["metadata"]["immutable"], True)
-            evidence = json.loads(service.version("task", records[0]["hash"]))
-            self.assertFalse(evidence["passed"])
-            self.assertEqual(evidence["geometry"]["overflow_count"], 1)
-            blocker = next(item for item in evidence["blockers"] if item["code"] == "content_out_of_bounds")
-            self.assertEqual(blocker["slide_id"], "slide-1")
-            self.assertEqual(blocker["element_id"], "body")
-            self.assertEqual(post_render_evidence_hash(evidence), records[0]["hash"])
+            self.assertTrue(sample["metadata"]["preview"]["ready"])
+            self.assertEqual(len(service.versions("task", "sample")), 1)
+            self.assertFalse(service.versions("task", "post-render-gate-evidence"))
 
 
 if __name__ == "__main__":

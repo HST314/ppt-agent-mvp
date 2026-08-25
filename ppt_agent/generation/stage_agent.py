@@ -140,7 +140,7 @@ class StageAgentExecutor:
                         + instruction
                     ),
                     result_validator=validate_candidate,
-                    max_semantic_corrections=1,
+                    max_semantic_corrections=0 if runtime_stage == "sample" else 1,
                 )
             except Exception as exc:
                 if last_candidate is not None and not hasattr(exc, "rejected_output"):
