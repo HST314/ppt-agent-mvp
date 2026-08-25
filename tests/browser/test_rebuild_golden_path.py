@@ -65,7 +65,7 @@ class RebuildGoldenPathBrowserTests(unittest.TestCase):
         report = validator.validate(artifact.html, [item["slide_id"] for item in slides])
         self.assertTrue(report.passed)
 
-    def test_fresh_task_reaches_a_browser_validated_deck_once(self):
+    def test_fresh_task_publishes_sample_preview_and_validates_deck_once(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
             provider = ContractProvider()
@@ -85,7 +85,11 @@ class RebuildGoldenPathBrowserTests(unittest.TestCase):
             sample = pipeline.generate_sample("browser-task", task_brief, outline.checkpoint.checkpoint_id)
             confirmation = pipeline.confirm_sample("browser-task", sample.checkpoint.checkpoint_id)
             deck = pipeline.generate_deck("browser-task", task_brief, outline.checkpoint.checkpoint_id, confirmation.checkpoint.checkpoint_id)
-            self.assertTrue(sample.validation.browser["available"])
+            self.assertIsNone(sample.validation)
+            self.assertNotIn("validation", sample.checkpoint.output)
+            self.assertEqual(sample.artifact.html, sample.checkpoint.output["rendered_html"])
+            self.assertEqual(sample.artifact.sha256, sample.checkpoint.output["rendered_sha256"])
+            self.assertTrue(all(f'data-slide-id="{slide.slide_id}"' in sample.artifact.html for slide in sample.value.slides))
             self.assertTrue(deck.validation.browser["passed"])
             self.assertEqual(len(deck.value.slides), 4)
             calls = len(provider.calls)

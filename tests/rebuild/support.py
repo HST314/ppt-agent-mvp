@@ -36,7 +36,11 @@ def html_slide(slide_id: str) -> dict:
             f'<section class="slide editorial" id="{slide_id}" data-slide-id="{slide_id}">'
             f'<h1 data-element-id="title">{slide_id}</h1><p>Agent HTML content</p></section>'
         ),
-        "slide_css": f"#{slide_id} h1{{font-size:52px;color:#22D3EE}}",
+        "slide_css": (
+            f"#{slide_id}{{font-family:Arial,sans-serif}}"
+            f"#{slide_id} h1{{margin:0;font-size:52px;line-height:1.2;color:#22D3EE}}"
+            f"#{slide_id} p{{margin:16px 0 0;font-size:20px;line-height:1.4}}"
+        ),
         "asset_refs": [],
         "speaker_notes": "",
     }
