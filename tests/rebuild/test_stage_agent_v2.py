@@ -133,7 +133,7 @@ class StageAgentV2Tests(unittest.TestCase):
                 "schema_version": "1.0",
                 "shared_css": ".slide{background:#0F172A;color:#F8FAFC}",
                 "design_intent": DESIGN_INTENT,
-                "slides": [html_slide("slide-001"), html_slide("slide-002")],
+                "slides": [html_slide("slide-002"), html_slide("slide-001")],
                 "outline_checkpoint_id": "cp-outline",
             }
             client = ScriptedAgentClient([
@@ -156,7 +156,8 @@ class StageAgentV2Tests(unittest.TestCase):
                 instruction="Return HtmlSampleSpec with html_fragment and shared_css.",
             )
             self.assertIsInstance(result.contract, HtmlSampleSpec)
-            self.assertEqual(result.contract.slides[0].html_fragment, output["slides"][0]["html_fragment"])
+            self.assertEqual([slide.slide_id for slide in result.contract.slides], ["slide-001", "slide-002"])
+            self.assertEqual(result.contract.slides[0].html_fragment, output["slides"][1]["html_fragment"])
             self.assertEqual(client.calls[-1]["response_schema"]["name"], "html_sample_spec_v1")
             self.assertEqual(result.metadata["provider_input_sha256"], content_sha256(payload))
             self.assertEqual(result.metadata["schema_correction_count"], 0)

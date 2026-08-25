@@ -4,7 +4,7 @@ import hashlib, json, re, uuid
 from dataclasses import dataclass
 from typing import Protocol
 from .errors import GatewayError, RuntimeUnavailableError, ValidationError
-from .agent_runtime import AgentRuntime, STAGE_OUTPUT_SCHEMAS, STAGE_PROVIDER_SCHEMAS, _extract_json_object, normalize_rendering_output
+from .agent_runtime import AgentRuntime, STAGE_OUTPUT_SCHEMAS, STAGE_PROVIDER_SCHEMAS, _extract_json_object, normalize_rendering_output, normalize_sample_rendering_output
 from .audit import current_agent_audit_context
 from .claim_ledger import audit_html_claims_by_slide
 from .design_contract import validate_design_intent, validate_shared_design_assets
@@ -367,7 +367,11 @@ class AgentGateway:
         agent_context["presentation_technical_contract"] = technical_contract
         agent_context["presentation_technical_contract_hash"] = technical_contract_hash
         value = self._run(stage, {"outline": outline, **agent_context})
-        rendering = normalize_rendering_output(value, expected)
+        rendering = (
+            normalize_sample_rendering_output(value, expected)
+            if action == "sample"
+            else normalize_rendering_output(value, expected)
+        )
         slides = rendering["slides"]
         design_intent = rendering["design_intent"]
         shared_assets = rendering["shared_assets"]

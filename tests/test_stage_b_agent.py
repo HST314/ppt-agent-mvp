@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import httpx
 from openai import APIConnectionError, APIStatusError, APITimeoutError
 
-from ppt_agent.agent_runtime import AgentRuntime, STAGE_OUTPUT_SCHEMAS, STAGE_PROVIDER_SCHEMAS, STAGE_PROMPTS, TOOLS
+from ppt_agent.agent_runtime import AgentRuntime, STAGE_OUTPUT_SCHEMAS, STAGE_PROVIDER_SCHEMAS, STAGE_PROMPTS, TOOLS, normalize_sample_rendering_output
 from ppt_agent.errors import GatewayError, GatewayUnknownResult, ValidationError
 from ppt_agent.gateways import AgentGateway
 from ppt_agent.model_clients import ModelToolCall, ModelTurn, OpenAIResponsesClient
@@ -488,18 +488,34 @@ class StageBAgentTests(unittest.TestCase):
         self.assertEqual(caught.exception.audit[-1]["reason"], "invalid_output")
         self.assertEqual(len(exhausted.inputs), 2)
 
-    def test_rendering_fragment_failure_gets_one_bounded_technical_correction(self):
+    def test_sample_fragment_is_normalized_for_preview_without_correction(self):
         bad=json.dumps({"slides":[{"slide_id":"slide-1","html":"<html><body>wrong shell</body></html>"}]})
-        fixed=json.dumps({"slides":[{"slide_id":"slide-1","html":"```html\n<section class=\"slide\"><h1>ok</h1></section>\n```"}]})
         skill_turn=skill_entry_turn("skill-call")
-        client=ScriptedClient([skill_turn,ModelTurn(bad,"bad"),ModelTurn(fixed,"fixed")])
+        client=ScriptedClient([skill_turn,ModelTurn(bad,"candidate")])
         result=AgentRuntime(client,SkillRuntime.builtin()).run("sample",{"slide_ids":["slide-1"]})
         fragment=result.value["slides"][0]["html"]
-        self.assertTrue(fragment.startswith('<section data-slide-id="slide-1" id="slide-1" class="slide">'))
-        self.assertEqual(sum(item.get("event")=="technical_correction" for item in result.audit),1)
-        self.assertIn("technical_correction",str(client.inputs[2]["input"]))
-        self.assertEqual(client.inputs[2]["tool_choice"],"none")
+        self.assertEqual(fragment,'<section class="slide" id="slide-1" data-slide-id="slide-1">wrong shell</section>')
+        self.assertEqual(sum(item.get("event")=="technical_correction" for item in result.audit),0)
+        self.assertEqual(len(client.inputs),2)
+        self.assertNotIn("run_skill_script", {tool["name"] for tool in client.inputs[1]["tools"]})
 
+    def test_sample_duplicate_model_ids_are_bound_to_preview_slots(self):
+        value = {
+            "slides": [
+                {"slide_id": "model-page", "html": '<section class="custom">first</section>'},
+                {"slide_id": "model-page", "html": '<section class="custom">second</section>'},
+            ]
+        }
+
+        result = normalize_sample_rendering_output(value, ["slide-1", "slide-2"])
+
+        self.assertEqual([item["slide_id"] for item in result["slides"]], ["slide-1", "slide-2"])
+        self.assertIn('class="slide custom" id="slide-1" data-slide-id="slide-1"', result["slides"][0]["html"])
+        self.assertIn('class="slide custom" id="slide-2" data-slide-id="slide-2"', result["slides"][1]["html"])
+
+    def test_deck_fragment_failure_still_gets_one_bounded_technical_correction(self):
+        bad=json.dumps({"slides":[{"slide_id":"slide-1","html":"<html><body>wrong shell</body></html>"}]})
+        skill_turn=skill_entry_turn("skill-call")
         exhausted=ScriptedClient([skill_turn,ModelTurn(bad,"bad-1"),ModelTurn(bad,"bad-2")])
         with self.assertRaises(GatewayError) as caught:
             AgentRuntime(exhausted,SkillRuntime.builtin()).run("deck",{"slide_ids":["slide-1"]})

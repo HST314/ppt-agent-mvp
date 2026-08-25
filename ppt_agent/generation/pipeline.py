@@ -775,7 +775,6 @@ class GenerationPipeline:
             tuple(candidate_by_id[slide_id] for slide_id in selected),
             outline_checkpoint_id,
         )
-        self._assert_html_contract(sample.slides, selected, allowed_assets, "sample")
         artifact = self._assemble_agent_html(sample.slides, sample.shared_css, sample.design_intent, brief)
         output = {
             **sample.to_dict(),

@@ -52,10 +52,8 @@ STAGE_PROMPTS = {
         "只为外层状态机指定的代表页生成 section 片段，不得扩展到全稿。先依据已读取的当前 Skill 与页面内容形成"
         "DesignIntent，说明风格、配色、排版、布局原则及理由，并把跨页复用的 CSS 放入 shared_assets.css。"
         "PresentationTechnicalContract 只规定画布、页面 ID、资源、安全与交付边界，不规定风格、class 或布局。"
-        "required_claims_by_slide 中每个 value 必须逐字出现在对应页面的可见正文。每项 html 必须是单个 class 包含 slide、"
-        "id 与 data-slide-id 均等于给定 ID 的 section；不要生成 html/head/body/style/script。可主动调用 Skill 自检工具并"
-        "自行修正审美问题，其建议不属于框架门禁。若输入包含 technical_correction，只修复其中明确的 Schema、页面集合、"
-        "资源、安全或渲染错误后重新提交完整结果。"
+        "required_claims_by_slide 中每个 value 必须逐字出现在对应页面的可见正文。直接提交一次可展示的样品结果；"
+        "页面顺序、页面 ID 与 section 外壳由框架按样品槽位归一化，本阶段不运行审美或渲染自检。"
     ),
     "deck": (
         "只为外层状态机给定的未确认页面生成 section 片段，不得重做确认样品或生成公共 shell。必须复用输入中的"
@@ -230,6 +228,91 @@ def normalize_rendering_output(value: dict, expected_slide_ids: list[str]) -> di
     }
 
 
+def normalize_sample_rendering_output(value: dict, expected_slide_ids: list[str]) -> dict:
+    """Bind model sample pages to preview slots without treating them as a gate.
+
+    A sample is an exploratory preview, so page order and model-authored IDs are
+    presentation details rather than acceptance criteria.  Preserve pages by ID
+    when the model returned the requested set; otherwise preserve model order
+    and bind each page to the corresponding preview slot.  Fragment shells are
+    repaired locally so a displayable candidate does not consume another model
+    round merely because it omitted framework-owned section attributes.
+    """
+    if not expected_slide_ids or len(set(expected_slide_ids)) != len(expected_slide_ids):
+        raise GatewayError("渲染请求的页面 ID 无效")
+    slides = value.get("slides")
+    if not isinstance(slides, list) or len(slides) != len(expected_slide_ids) or any(not isinstance(item, dict) for item in slides):
+        # Shape errors still belong to the JSON contract.  Leave them untouched
+        # so the normal Schema path can report/correct them.
+        return value
+
+    actual_ids = [item.get("slide_id") for item in slides]
+    if (
+        all(isinstance(slide_id, str) for slide_id in actual_ids)
+        and len(set(actual_ids)) == len(actual_ids)
+        and set(actual_ids) == set(expected_slide_ids)
+    ):
+        by_id = {item["slide_id"]: item for item in slides}
+        ordered = [by_id[slide_id] for slide_id in expected_slide_ids]
+    else:
+        ordered = slides
+
+    normalized = []
+    for slide_id, item in zip(expected_slide_ids, ordered):
+        fragment_field = "html_fragment" if "html_fragment" in item else "html"
+        fragment = item.get(fragment_field)
+        if isinstance(fragment, str) and fragment.strip():
+            fragment = _normalize_sample_fragment(fragment, slide_id)
+        normalized.append({**item, "slide_id": slide_id, fragment_field: fragment})
+
+    uses_html_fragment = any("html_fragment" in item for item in slides)
+    if uses_html_fragment:
+        result = {**value, "slides": normalized}
+        if "design_intent" in value:
+            result["design_intent"] = validate_design_intent(value.get("design_intent"))
+        return result
+    return {
+        "slides": normalized,
+        "design_intent": validate_design_intent(value.get("design_intent")),
+        "shared_assets": validate_shared_design_assets(value.get("shared_assets")),
+    }
+
+
+def _normalize_sample_fragment(fragment: str, slide_id: str) -> str:
+    """Return a preview section while preserving the model-authored body."""
+    fragment = fragment.strip()
+    if fragment.startswith("```"):
+        fragment = re.sub(r"^```[a-zA-Z]*\s*", "", fragment)
+        fragment = re.sub(r"\s*```$", "", fragment).strip()
+
+    body = re.search(r"<body\b[^>]*>(?P<content>[\s\S]*?)</body>\s*(?:</html>)?\s*$", fragment, re.I)
+    if body:
+        fragment = body.group("content").strip()
+
+    opening = re.match(r"<section\b[^>]*>", fragment, re.I)
+    if opening is None:
+        return f'<section class="slide" id="{slide_id}" data-slide-id="{slide_id}">{fragment}</section>'
+
+    tag = opening.group(0)
+    class_match = re.search(r"\bclass\s*=\s*(['\"])(.*?)\1", tag, re.I | re.S)
+    classes = class_match.group(2).split() if class_match else []
+    if "slide" not in classes:
+        classes.insert(0, "slide")
+
+    def set_attribute(source: str, name: str, attribute_value: str) -> str:
+        pattern = re.compile(rf"\s{name}\s*=\s*(['\"])[\s\S]*?\1", re.I)
+        replacement = f' {name}="{attribute_value}"'
+        return pattern.sub(replacement, source, count=1) if pattern.search(source) else source[:-1] + replacement + ">"
+
+    tag = set_attribute(tag, "class", " ".join(classes))
+    tag = set_attribute(tag, "id", slide_id)
+    tag = set_attribute(tag, "data-slide-id", slide_id)
+    normalized = tag + fragment[opening.end():]
+    if not re.search(r"</section>\s*$", normalized, re.I):
+        normalized += "</section>"
+    return normalized
+
+
 def _list_skill_files_tool() -> dict:
     return {"type": "function", "name": "list_skill_files", "description": "列出当前 Skill 快照中的标准文件路径；只用于按需发现，不会读取文件正文", "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}
 
@@ -308,7 +391,7 @@ def _tools_for_stage(
         _list_skill_files_tool(),
         *([_read_skill_file_tool(text_files)] if text_files else []),
         *([_get_asset_info_tool(assets)] if assets else []),
-        *([_run_skill_script_tool(scripts)] if scripts else []),
+        *([_run_skill_script_tool(scripts)] if scripts and stage != "sample" else []),
     ]
 
 
@@ -758,7 +841,8 @@ class AgentRuntime:
                         value["design_intent"] = payload["confirmed_design_intent"]
                     if "shared_assets" not in value and payload.get("confirmed_shared_assets") is not None:
                         value["shared_assets"] = payload["confirmed_shared_assets"]
-                    value = normalize_rendering_output(value, list(payload.get("slide_ids") or []))
+                    normalizer = normalize_sample_rendering_output if stage == "sample" else normalize_rendering_output
+                    value = normalizer(value, list(payload.get("slide_ids") or []))
                 except GatewayError as exc:
                     if schema_corrections < self.max_schema_corrections:
                         schema_corrections += 1
