@@ -261,9 +261,24 @@ def normalize_sample_rendering_output(value: dict, expected_slide_ids: list[str]
     for slide_id, item in zip(expected_slide_ids, ordered):
         fragment_field = "html_fragment" if "html_fragment" in item else "html"
         fragment = item.get(fragment_field)
+        source_slide_ids = {
+            candidate
+            for candidate in (
+                item.get("slide_id"),
+                *(_sample_fragment_root_ids(fragment) if isinstance(fragment, str) else ()),
+            )
+            if isinstance(candidate, str) and candidate
+        }
         if isinstance(fragment, str) and fragment.strip():
             fragment = _normalize_sample_fragment(fragment, slide_id)
-        normalized.append({**item, "slide_id": slide_id, fragment_field: fragment})
+        normalized_item = {**item, "slide_id": slide_id, fragment_field: fragment}
+        if "slide_css" in item:
+            normalized_item["slide_css"] = _normalize_sample_slide_css(
+                item.get("slide_css"),
+                source_slide_ids,
+                slide_id,
+            )
+        normalized.append(normalized_item)
 
     uses_html_fragment = any("html_fragment" in item for item in slides)
     if uses_html_fragment:
@@ -276,6 +291,62 @@ def normalize_sample_rendering_output(value: dict, expected_slide_ids: list[str]
         "design_intent": validate_design_intent(value.get("design_intent")),
         "shared_assets": validate_shared_design_assets(value.get("shared_assets")),
     }
+
+
+def _sample_fragment_root_ids(fragment: str) -> set[str]:
+    """Return framework-owned IDs declared by a model sample root."""
+    fragment = fragment.strip()
+    if fragment.startswith("```"):
+        fragment = re.sub(r"^```[a-zA-Z]*\s*", "", fragment)
+        fragment = re.sub(r"\s*```$", "", fragment).strip()
+    body = re.search(r"<body\b[^>]*>(?P<content>[\s\S]*?)</body>\s*(?:</html>)?\s*$", fragment, re.I)
+    if body:
+        fragment = body.group("content").strip()
+    opening = re.match(r"<section\b[^>]*>", fragment, re.I)
+    if opening is None:
+        return set()
+    tag = opening.group(0)
+    declared = set()
+    for name in ("id", "data-slide-id"):
+        match = re.search(rf"\s{re.escape(name)}\s*=\s*(['\"])(.*?)\1", tag, re.I | re.S)
+        if match and match.group(2):
+            declared.add(match.group(2))
+    return declared
+
+
+def _normalize_sample_slide_css(css: Any, source_slide_ids: set[str], slide_id: str) -> Any:
+    """Rebind only page-root selectors when a sample moves to a preview slot."""
+    if not isinstance(css, str) or not css or not source_slide_ids:
+        return css
+    id_selector = re.compile(r"#(?P<slide_id>[A-Za-z0-9_-]+)")
+    attribute_selector = re.compile(
+        r"\[\s*data-slide-id\s*=\s*(?P<quote>['\"])(?P<slide_id>.*?)"
+        r"(?P=quote)\s*\]",
+        re.I | re.S,
+    )
+
+    def rewrite_selectors(match: re.Match) -> str:
+        selectors = match.group("selectors")
+        selectors = id_selector.sub(
+            lambda selector: f"#{slide_id}"
+            if selector.group("slide_id") in source_slide_ids
+            else selector.group(0),
+            selectors,
+        )
+        selectors = attribute_selector.sub(
+            lambda selector: f'[data-slide-id="{slide_id}"]'
+            if selector.group("slide_id") in source_slide_ids
+            else selector.group(0),
+            selectors,
+        )
+        return selectors + "{" + match.group("declarations") + "}"
+
+    return re.sub(
+        r"(?P<selectors>[^{}]+)\{(?P<declarations>[^{}]*)\}",
+        rewrite_selectors,
+        css,
+        flags=re.S,
+    )
 
 
 def _normalize_sample_fragment(fragment: str, slide_id: str) -> str:

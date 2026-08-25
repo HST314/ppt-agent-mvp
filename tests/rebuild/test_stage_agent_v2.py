@@ -162,6 +162,67 @@ class StageAgentV2Tests(unittest.TestCase):
             self.assertEqual(result.metadata["provider_input_sha256"], content_sha256(payload))
             self.assertEqual(result.metadata["schema_correction_count"], 0)
 
+    def test_sample_stage_rebinds_model_ids_in_page_css_without_correction(self):
+        scenarios = {
+            "duplicate": ("model-page", "model-page"),
+            "deviated": ("model-alpha", "model-beta"),
+        }
+        for scenario, model_ids in scenarios.items():
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                skill = root / "skills" / "open"
+                skill.mkdir(parents=True)
+                (skill / "SKILL.md").write_text(
+                    "---\nname: open-skill\ndescription: Open HTML skill\n---\nDesign the requested pages.\n",
+                    encoding="utf-8",
+                )
+                slides = []
+                for index, model_id in enumerate(model_ids, start=1):
+                    slides.append({
+                        **html_slide(model_id),
+                        "slide_css": (
+                            f"#{model_id} #chart-{index}{{color:#22D3EE}}"
+                            f'[data-slide-id="{model_id}"] .body{{font-size:20px}}'
+                        ),
+                    })
+                output = {
+                    "schema_version": "1.0",
+                    "shared_css": ".slide{background:#0F172A;color:#F8FAFC}",
+                    "design_intent": DESIGN_INTENT,
+                    "slides": slides,
+                    "outline_checkpoint_id": "cp-outline",
+                }
+                client = ScriptedAgentClient([
+                    ModelTurn(None, "entry-response", (ModelToolCall("read_skill_file", '{"path":"SKILL.md"}', "entry-call"),)),
+                    ModelTurn(json.dumps(output, ensure_ascii=False), "html-candidate"),
+                ])
+                executor = StageAgentExecutor(
+                    client,
+                    ActiveSkillResolver(root / "skills", "open"),
+                    model="scripted",
+                    max_steps=4,
+                    max_provider_calls=4,
+                )
+                expected_ids = ("slide-001", "slide-002")
+
+                result = executor.execute(
+                    "sample",
+                    html_sample_contract_for_assets((), expected_ids),
+                    payload={"slide_ids": list(expected_ids)},
+                    idempotency_key=f"html-sample-{scenario}",
+                    instruction="Return HtmlSampleSpec with html_fragment, slide_css and shared_css.",
+                )
+
+                self.assertIsInstance(result.contract, HtmlSampleSpec)
+                self.assertEqual([slide.slide_id for slide in result.contract.slides], list(expected_ids))
+                self.assertEqual(result.metadata["schema_correction_count"], 0)
+                self.assertEqual(len(client.calls), 2)
+                for index, (slide, expected_id) in enumerate(zip(result.contract.slides, expected_ids), start=1):
+                    self.assertIn(f"#{expected_id} #chart-{index}", slide.slide_css)
+                    self.assertIn(f'[data-slide-id="{expected_id}"] .body', slide.slide_css)
+                    self.assertIn(f"#chart-{index}", slide.slide_css)
+                    self.assertNotIn(model_ids[index - 1], slide.slide_css)
+
 
 if __name__ == "__main__":
     unittest.main()
