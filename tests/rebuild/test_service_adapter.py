@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
-from ppt_agent.generation.bootstrap import ResponsesProviderAdapter
+from ppt_agent.generation import bootstrap
+from ppt_agent.generation.bootstrap import ResponsesProviderAdapter, resolve_chromium_executable
 from ppt_agent.generation.model_gateway import ModelGateway
 from ppt_agent.generation.pipeline import FileCheckpointStore, GenerationPipeline
 from ppt_agent.rendering.renderer import DeterministicRenderer
@@ -37,6 +41,46 @@ class StructuredProbeClient:
 
 
 class GenerationCoreServiceAdapterTests(unittest.TestCase):
+    def test_chromium_resolver_finds_windows_browser_in_default_cache(self):
+        with tempfile.TemporaryDirectory() as root:
+            executable = Path(root) / "ms-playwright" / "chromium-1181" / "chrome-win" / "chrome.exe"
+            executable.parent.mkdir(parents=True)
+            executable.touch()
+            with (
+                patch.object(bootstrap.sys, "platform", "win32"),
+                patch.dict(os.environ, {"LOCALAPPDATA": root}, clear=False),
+            ):
+                resolved = resolve_chromium_executable(Path(root) / "repository")
+            self.assertEqual(resolved, executable.resolve())
+
+    def test_chromium_resolver_is_safe_inside_running_event_loop(self):
+        with tempfile.TemporaryDirectory() as root:
+            repository = Path(root)
+            executable = (
+                repository
+                / ".playwright-browsers"
+                / "chromium_headless_shell-1181"
+                / "chrome-win"
+                / "headless_shell.exe"
+            )
+            executable.parent.mkdir(parents=True)
+            executable.touch()
+
+            async def resolve_from_async_context():
+                return resolve_chromium_executable(repository)
+
+            self.assertEqual(asyncio.run(resolve_from_async_context()), executable.resolve())
+
+    def test_missing_chromium_error_explains_install_command(self):
+        with tempfile.TemporaryDirectory() as root:
+            missing = Path(root) / "missing"
+            with (
+                patch.object(bootstrap, "_default_playwright_browser_root", return_value=missing),
+                patch.object(bootstrap, "_find_managed_chromium", return_value=None),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "python -m playwright install chromium"):
+                    resolve_chromium_executable(Path(root) / "repository")
+
     def test_provider_preflight_proves_strict_schema_support(self):
         client = StructuredProbeClient()
         result = ResponsesProviderAdapter(client).probe_capabilities()

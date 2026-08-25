@@ -53,6 +53,7 @@ cd ppt-agent-mvp
 python3 -m venv .venv
 source .venv/bin/activate
 python3 -m pip install -r requirements.txt
+python3 -m playwright install chromium
 ```
 
 Windows PowerShell 激活虚拟环境：
@@ -60,9 +61,18 @@ Windows PowerShell 激活虚拟环境：
 ```powershell
 .venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
+python -m playwright install chromium
 ```
 
 如果 Debian/Ubuntu 提示缺少 `venv`，先安装与当前 Python 版本匹配的 `python3-venv` 系统包。
+
+`requirements.txt` 已固定安装 `playwright==1.54.0` Python 包，但 pip 的 requirements 格式不能下载 Playwright 的 Chromium 浏览器二进制。因此每次新建虚拟环境或换电脑后，都必须在**同一个已激活的虚拟环境**中执行一次 `python -m playwright install chromium`。浏览器会进入 Playwright 的用户缓存，后续正常启动无需重复下载。
+
+安装后可在启动前验证项目能识别浏览器：
+
+```bash
+python -c "from pathlib import Path; from ppt_agent.generation.bootstrap import resolve_chromium_executable; p=resolve_chromium_executable(Path.cwd()); print(p); assert p.is_file()"
+```
 
 ### 3. 启动本地服务
 
@@ -77,6 +87,8 @@ python -m uvicorn main_front:app --host 127.0.0.1 --port 8000
 - 组件与交互状态：<http://127.0.0.1:8000/components>
 
 Web 存活端点会先开放，历史 Job 恢复和真实模型能力探测在后台继续。看到 `/readyz` 中 `"runtime_ready": true`，说明依赖模型的操作已就绪；检测期间工作台会显示“后台初始化中”。真实模型模式会分别验证严格 JSON Schema，以及合法工具调用 → `function_call_output` → 最终结构化结果的完整回合；探测失败时服务仍可打开并提供诊断，但 `/readyz` 返回 503，模型 Job 不会入队。
+
+如果启动仍提示 `locked Chromium executable is unavailable`，先确认安装命令与 Uvicorn 使用的是同一个虚拟环境。自定义缓存目录时，安装与启动必须设置相同的 `PLAYWRIGHT_BROWSERS_PATH`；离线环境可用 `PPT_AGENT_CHROMIUM_EXECUTABLE` 指向已预置的 Chromium 可执行文件。
 
 澄清阶段不开放 Skill 工具，模型直接根据冻结原文、规范化任务卡和资源摘要输出问题。其他阶段先只暴露当前 Skill 的名称、描述与 `read_skill_file(SKILL.md)`；入口完整读取后才开放文件发现、按需文本读取、Asset 元数据与可选脚本自检。未读入口只纠正一次。工具协议错误按模型回合计数：同一响应的所有调用会完整返回结果，连续两个没有任何有效调用的错误回合才会失败关闭。
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import sys
 from typing import Any
 
 from ..browser_inspection import ChromiumDeckInspector
@@ -63,6 +64,42 @@ class ResponsesProviderAdapter:
                 request_client.close()
 
 
+_CHROMIUM_EXECUTABLE_PATTERNS = (
+    "chromium-*/chrome-win/chrome.exe",
+    "chromium-*/chrome-linux/chrome",
+    "chromium-*/chrome-linux64/chrome",
+    "chromium-*/chrome-mac/Chromium.app/Contents/MacOS/Chromium",
+    "chromium-*/chrome-mac-arm64/Chromium.app/Contents/MacOS/Chromium",
+    "chromium_headless_shell-*/chrome-win/headless_shell.exe",
+    "chromium_headless_shell-*/chrome-linux/headless_shell",
+    "chromium_headless_shell-*/chrome-mac/headless_shell",
+    "chromium_headless_shell-*/chrome-headless-shell-win64/headless_shell.exe",
+    "chromium_headless_shell-*/chrome-headless-shell-linux64/headless_shell",
+    "chromium_headless_shell-*/chrome-headless-shell-mac-*/headless_shell",
+)
+
+
+def _default_playwright_browser_root() -> Path:
+    if sys.platform == "win32":
+        local_app_data = os.getenv("LOCALAPPDATA", "").strip()
+        if local_app_data:
+            return Path(local_app_data) / "ms-playwright"
+        return Path.home() / "AppData" / "Local" / "ms-playwright"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Caches" / "ms-playwright"
+    cache_home = os.getenv("XDG_CACHE_HOME", "").strip()
+    return (Path(cache_home) if cache_home else Path.home() / ".cache") / "ms-playwright"
+
+
+def _find_managed_chromium(managed_roots: list[Path]) -> Path | None:
+    for managed in managed_roots:
+        for pattern in _CHROMIUM_EXECUTABLE_PATTERNS:
+            candidates = sorted(managed.glob(pattern), reverse=True)
+            if candidates:
+                return candidates[0].resolve()
+    return None
+
+
 def resolve_chromium_executable(repository_root: str | Path | None = None) -> Path:
     configured = os.getenv("PPT_AGENT_CHROMIUM_EXECUTABLE", "").strip()
     if configured:
@@ -75,23 +112,26 @@ def resolve_chromium_executable(repository_root: str | Path | None = None) -> Pa
     playwright_browsers_path = os.getenv("PLAYWRIGHT_BROWSERS_PATH", "").strip()
     if playwright_browsers_path and playwright_browsers_path != "0":
         managed_roots.append(Path(playwright_browsers_path).resolve())
-    for managed in managed_roots:
-        candidates = sorted(managed.glob("chromium_headless_shell-*/chrome-linux/headless_shell"), reverse=True)
-        if not candidates:
-            candidates = sorted(managed.glob("chromium-*/chrome-linux/chrome"), reverse=True)
-        if candidates:
-            return candidates[0].resolve()
 
     try:
-        from playwright.sync_api import sync_playwright
+        import playwright
 
-        with sync_playwright() as playwright:
-            candidate = Path(playwright.chromium.executable_path).resolve()
-        if candidate.is_file():
-            return candidate
+        managed_roots.append(Path(playwright.__file__).resolve().parent / "driver" / "package" / ".local-browsers")
     except Exception:
         pass
-    raise RuntimeError("locked Chromium executable is unavailable")
+    managed_roots.append(_default_playwright_browser_root())
+
+    unique_roots = list(dict.fromkeys(path.resolve() for path in managed_roots))
+    candidate = _find_managed_chromium(unique_roots)
+    if candidate is not None and candidate.is_file():
+        return candidate
+
+    checked = ", ".join(str(path) for path in unique_roots)
+    raise RuntimeError(
+        "locked Chromium executable is unavailable; run "
+        "`python -m playwright install chromium` with the active virtual environment "
+        f"or set PPT_AGENT_CHROMIUM_EXECUTABLE; checked: {checked}"
+    )
 
 
 def build_generation_pipeline(config, *, data_root: str | Path, generation_client, repository_root: str | Path | None = None) -> GenerationPipeline | None:
